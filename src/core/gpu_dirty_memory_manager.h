@@ -10,6 +10,7 @@
 #pragma once
 
 #include <atomic>
+#include <algorithm>
 #include <bit>
 #include <functional>
 #include <mutex>
@@ -31,6 +32,16 @@ public:
     ~GPUDirtyMemoryManager() = default;
 
     void Collect(PAddr address, size_t size) {
+        // One transform covers one page_size chunk; a write may span several.
+        while (size != 0) {
+            const size_t in_chunk = (std::min)(size, page_size - (address & page_mask));
+            CollectChunk(address, in_chunk);
+            address += in_chunk;
+            size -= in_chunk;
+        }
+    }
+
+    void CollectChunk(PAddr address, size_t size) {
         TransformAddress t = BuildTransform(address, size);
         TransformAddress tmp, original;
         do {
