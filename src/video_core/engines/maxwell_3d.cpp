@@ -22,6 +22,7 @@
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "video_core/dirty_flags.h"
+#include "video_core/control/channel_state.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/nx2.h"
 #include "video_core/gpu.h"
@@ -887,6 +888,12 @@ void Maxwell3D::ProcessQueryGet() {
         static_cast<VideoCommon::QueryType>(regs.report_semaphore.query.report.Value());
     const u32 payload = regs.report_semaphore.payload;
     const u32 subreport = regs.report_semaphore.query.sub_report;
+    if (g_nx2_ampere && sequence_address == 0 &&
+        regs.report_semaphore.query.operation == Regs::ReportSemaphore::Operation::Release) {
+        // NVN2's syncpoint increment (video_core/nx2.h, queue syncpoints).
+        nx2_channel->Nx2IncrementSyncpoint();
+        return;
+    }
     switch (regs.report_semaphore.query.operation) {
     case Regs::ReportSemaphore::Operation::Release:
         if (regs.report_semaphore.query.short_query != 0) {
@@ -1274,6 +1281,19 @@ GPUVAddr ReportAddress(std::span<const u32> regs) {
            regs[MAXWELL3D_REG_INDEX(report_semaphore.address_low)];
 }
 constexpr u64 ReportBytes = 16;
+
+// The bytes a report writes. At address 0 on Switch 2 it is the channel's syncpoint increment,
+// which writes its queue's word (ChannelState::Nx2IncrementSyncpoint).
+void NoteReportWrite(VideoCommon::GpuSplit& split, const MemoryManager& memory,
+                     std::span<const u32> regs, const Control::ChannelState& channel) {
+    GPUVAddr address = ReportAddress(regs);
+    if (address == 0 && g_nx2_ampere) {
+        address = channel.nx2_syncpoint_word.load(std::memory_order_relaxed);
+    }
+    if (address != 0) {
+        split.NoteWrite(memory, address, ReportBytes);
+    }
+}
 
 // Counters and timed releases are written when the host query completes, not when the back runs
 // them: early MME DMA reads of their bytes wait until the back ran the report and the result
@@ -1699,7 +1719,7 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         // The back writes the value after its shadow RAM step (ProcessCBData), as `value` here.
         split.NoteConstBufferWrite(memory_manager, *cb_write, &value, 1, (std::min)(cb_room, 1U));
     } else if (method == MAXWELL3D_REG_INDEX(report_semaphore.query)) {
-        split.NoteWrite(memory_manager, ReportAddress(fs.regs), ReportBytes);
+        NoteReportWrite(split, memory_manager, fs.regs, *nx2_channel);
         NoteLateReport(split, memory_manager, fs.regs);
     }
 }
@@ -1870,7 +1890,7 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
         split.NoteConstBufferWrite(memory_manager, *cb_write, base_start, amount,
                                    (std::min)(cb_room, amount));
     } else if (method == MAXWELL3D_REG_INDEX(report_semaphore.query) && amount != 0) {
-        split.NoteWrite(memory_manager, ReportAddress(fs.regs), ReportBytes);
+        NoteReportWrite(split, memory_manager, fs.regs, *nx2_channel);
         NoteLateReport(split, memory_manager, fs.regs);
     }
 }

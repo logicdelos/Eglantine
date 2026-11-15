@@ -393,6 +393,13 @@ void Puller::ProcessFenceActionMethod(DmaPusher& dma_pusher) {
         VideoCommon::GpuSplit::Get().NoteSync();
         break;
     case Puller::FenceOperation::Increment:
+        if (regs.fence_action.nx2_raise != 0) {
+            OnBack([channel = &dma_pusher.channel_state, value = regs.fence_value] {
+                       channel->Nx2RaiseSyncpoint(value);
+                   },
+                   VideoCommon::GpuSplit::Effect::None);
+            break;
+        }
         OnBack(
             [rasterizer = dma_pusher.rasterizer,
              id = static_cast<u32>(regs.fence_action.syncpoint_id.Value())] {
@@ -430,27 +437,20 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         const auto properties = g_nx2_ampere && (regs.semaphore_trigger & (1U << 24)) != 0
                                     ? VideoCommon::QueryPropertiesFlags::IsAFence
                                     : VideoCommon::QueryPropertiesFlags::HasTimeout;
-        const GPUVAddr mirror = g_nx2_ampere ? Nx2SemaphoreMirror(sequence_address) : 0;
-        if (mirror != 0) {
-            LOG_DEBUG(HW_GPU, "Switch 2 semaphore {:#x}={:#x} mirrored to {:#x}", sequence_address, payload, mirror);
-            VideoCommon::GpuSplit::Get().NoteWrite(dma_pusher.memory_manager, mirror, 16);
+        if (g_nx2_ampere) {
+            // A release into the second page of a queue region names the channel's queue: its
+            // syncpoint word is at the same offset in the first page (video_core/nx2.h).
+            if (const GPUVAddr word = Nx2QueueSyncpointWord(sequence_address); word != 0) {
+                dma_pusher.channel_state.nx2_syncpoint_word.store(word, std::memory_order_relaxed);
+            }
         }
         OnBackRelease(dma_pusher, sequence_address,
-                      [rasterizer = dma_pusher.rasterizer, sequence_address, mirror, properties, payload] {
+                      [rasterizer = dma_pusher.rasterizer, sequence_address, properties, payload] {
                           rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload, properties, payload, 0);
-                          if (mirror != 0) {
-                              rasterizer->Query(mirror, VideoCommon::QueryType::Payload, properties, payload, 0);
-                          }
                       });
         if (AcquireStatsEnabled() && VideoCommon::GpuSplit::Get().Active()) {
             if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(sequence_address)) {
                 QueuedReleases()[*device] = {VideoCommon::GpuSplit::Get().WritePosition(), payload};
-            }
-        }
-        // After the release's entry was sent, so its position covers it.
-        if (auto& split = VideoCommon::GpuSplit::Get(); mirror != 0 && split.Active()) {
-            if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(mirror)) {
-                split.NoteAsyncWrite(*device, 16);
             }
         }
     } else if (g_nx2_ampere) {

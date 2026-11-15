@@ -46,6 +46,7 @@ nvhost_gpu::nvhost_gpu(Core::System& system_, EventInterface& events_interface_,
       syncpoint_manager{core_.GetSyncpointManager()}, nvmap{core.GetNvMapFile()},
       channel_state{system.GPU().AllocateChannel()} {
     channel_syncpoint = syncpoint_manager.AllocateSyncpoint(false);
+    channel_state->nx2_syncpoint = channel_syncpoint;
     sm_exception_breakpoint_int_report_event =
         events_interface.CreateEvent("GpuChannelSMExceptionBreakpointInt");
     sm_exception_breakpoint_pause_report_event =
@@ -378,25 +379,27 @@ static boost::container::small_vector<Tegra::CommandHeader, 512> BuildIncrementC
     return result;
 }
 
-// Switch 2 pushbuffers signal completion with semaphore releases, never host1x syncpoint methods,
-// but the driver still has the kernel raise the syncpoint max by the submission's increment value
-// and then waits for that value. Append the increments after its commands.
-static boost::container::small_vector<Tegra::CommandHeader, 512> BuildIncrementCountCommandList(
-    NvFence fence, u32 count) {
-    boost::container::small_vector<Tegra::CommandHeader, 512> result{
+// Switch 2 pushbuffers never use host1x syncpoint methods: the kernel raises the syncpoint max by
+// the submission's increment value and the commands make that many increments themselves, as
+// engine semaphore releases at address 0 (ChannelState::Nx2IncrementSyncpoint). Append a raise
+// to the submission's value, which makes whatever they did not.
+static boost::container::small_vector<Tegra::CommandHeader, 512> BuildRaiseCommandList(
+    NvFence fence) {
+    Tegra::Engines::Puller::FenceAction raise{};
+    raise.op.Assign(Tegra::Engines::Puller::FenceOperation::Increment);
+    raise.nx2_raise.Assign(1);
+    raise.syncpoint_id.Assign(fence.id);
+    return {
         Tegra::BuildCommandHeader(Tegra::BufferMethods::WaitForIdle, 1,
                                   Tegra::SubmissionMode::Increasing),
         {},
         Tegra::BuildCommandHeader(Tegra::BufferMethods::SyncpointPayload, 1,
                                   Tegra::SubmissionMode::Increasing),
-        {}};
-    for (u32 i = 0; i < count; ++i) {
-        result.push_back(Tegra::BuildCommandHeader(Tegra::BufferMethods::SyncpointOperation, 1,
-                                                   Tegra::SubmissionMode::Increasing));
-        result.push_back(
-            BuildFenceAction(Tegra::Engines::Puller::FenceOperation::Increment, fence.id));
-    }
-    return result;
+        {fence.value},
+        Tegra::BuildCommandHeader(Tegra::BufferMethods::SyncpointOperation, 1,
+                                  Tegra::SubmissionMode::Increasing),
+        {raise.raw},
+    };
 }
 
 static boost::container::small_vector<Tegra::CommandHeader, 512> BuildIncrementWithWfiCommandList(
@@ -505,11 +508,11 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
     u32 increment{(flags.fence_increment.Value() != 0 ? 2 : 0) +
                   (flags.increment_value.Value() != 0 ? params.fence.value : 0)};
     params.fence.value = syncpoint_manager.IncrementSyncpointMaxExt(channel_syncpoint, increment);
+    channel_state->nx2_syncpoint_max.store(params.fence.value, std::memory_order_relaxed);
     gpu.PushGPUEntries(bind_id, std::move(entries));
 
     if (g_nx2_driver && !flags.fence_increment.Value() && increment > 0) {
-        gpu.PushGPUEntries(bind_id,
-                           Tegra::CommandList{BuildIncrementCountCommandList(params.fence, increment)});
+        gpu.PushGPUEntries(bind_id, Tegra::CommandList{BuildRaiseCommandList(params.fence)});
     }
 
     if (flags.fence_increment.Value()) {

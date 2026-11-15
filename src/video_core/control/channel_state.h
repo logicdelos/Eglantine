@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <memory>
 
 #include "common/common_types.h"
@@ -39,6 +40,13 @@ struct ChannelState {
 
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
 
+    /// Switch 2: an engine's semaphore release at address 0, one increment of the channel's
+    /// syncpoint (video_core/nx2.h, queue syncpoints). Runs where the rasterizer does.
+    void Nx2IncrementSyncpoint();
+
+    /// Switch 2: the end of a submission, whose increments reach `value` (nvhost_gpu).
+    void Nx2RaiseSyncpoint(u32 value);
+
     struct Payload {
         explicit Payload(Core::System& system, MemoryManager& memory_manager, ChannelState& channel_state);
 
@@ -62,6 +70,15 @@ struct ChannelState {
     s32 bind_id = -1;
     u64 program_id = 0;
     bool initialized = false;
+
+    /// Switch 2: the channel's syncpoint, the highest value its submissions reach, and the GPU
+    /// address of the word its queue's waits read (0 until the queue released its slot).
+    u32 nx2_syncpoint = 0;
+    std::atomic<u32> nx2_syncpoint_max{};
+    std::atomic<u64> nx2_syncpoint_word{};
+
+private:
+    void Nx2WriteSyncpointWord();
 };
 
 } // namespace Control

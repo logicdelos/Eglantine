@@ -24,6 +24,7 @@
 #include "common/settings.h"
 #include "shader_recompiler/exception.h"
 #include "core/core.h"
+#include "video_core/control/channel_state.h"
 #include "video_core/gpu_split.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_diag.h"
@@ -115,7 +116,8 @@ void KeplerCompute::CallStateMethod(Core::System& system, u32 method, u32 method
 
 // SET_REPORT_SEMAPHORE_A-D (0x6c0-0x6c3): address high/low, payload, then operation in bits 1:0
 // (release / acquire / report only / trap), reduction enable bit 3 with the op in bits 11:9, and
-// a one-word (no timestamp) structure in bit 28. NVN2 releases queue syncs from compute this way.
+// a one-word (no timestamp) structure in bit 28. NVN2 releases queue syncs from compute this way;
+// a release at address 0 is the channel's syncpoint increment (video_core/nx2.h).
 void KeplerCompute::ProcessNativeReportSemaphore(u32 argument) {
     const GPUVAddr address = (GPUVAddr{native_registers[0x6c0] & 0x1ffffff} << 32) |
                              native_registers[0x6c1];
@@ -132,6 +134,9 @@ void KeplerCompute::ProcessNativeReportSemaphore(u32 argument) {
         return;
     }
     if (address == 0) {
+        if (operation == 0) {
+            nx2_channel->Nx2IncrementSyncpoint();
+        }
         return;
     }
     if ((argument >> 3) & 1) {
@@ -2098,9 +2103,14 @@ void KeplerCompute::FrontNoteWrites(VideoCommon::GpuSplit& split, FrontState& fs
         const GPUVAddr qmd = ((GPUVAddr{fs.registers[0xc6]} << 32) | fs.registers[0xc7]) << 8;
         split.NoteWrite(memory_manager, qmd, 256);
     } else if (method == 0x6c3) {
-        split.NoteWrite(memory_manager,
-                        (GPUVAddr{fs.registers[0x6c0] & 0x1ffffff} << 32) | fs.registers[0x6c1],
-                        16);
+        GPUVAddr address = (GPUVAddr{fs.registers[0x6c0] & 0x1ffffff} << 32) | fs.registers[0x6c1];
+        if (address == 0) {
+            // The syncpoint increment writes the queue's word (ChannelState).
+            address = nx2_channel->nx2_syncpoint_word.load(std::memory_order_relaxed);
+        }
+        if (address != 0) {
+            split.NoteWrite(memory_manager, address, 16);
+        }
     }
 }
 

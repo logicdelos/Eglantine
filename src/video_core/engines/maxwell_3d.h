@@ -40,6 +40,9 @@ class System;
 namespace Tegra {
 class MemoryManager;
 struct Nx2DrawPrograms;
+namespace Control {
+struct ChannelState;
+}
 }
 
 namespace VideoCommon {
@@ -71,6 +74,9 @@ public:
 
     /// Binds a rasterizer to this engine.
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
+
+    /// The channel this engine belongs to (ChannelState::Payload).
+    Control::ChannelState* nx2_channel = nullptr;
 
     /// Register structure of the Maxwell3D engine.
     struct Regs {

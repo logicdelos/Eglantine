@@ -72,6 +72,9 @@ public:
     union FenceAction {
         u32 raw;
         BitField<0, 1, FenceOperation> op;
+        /// Not a hardware bit, nvhost_gpu sets it on the command it appends to a Switch 2
+        /// submission: increment until the syncpoint reaches the payload.
+        BitField<1, 1, u32> nx2_raise;
         BitField<8, 24, u32> syncpoint_id;
     };
 

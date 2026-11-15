@@ -8,6 +8,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "common/assert.h"
+#include "core/core.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/dma_pusher.h"
 #include "video_core/engines/fermi_2d.h"
@@ -16,9 +17,12 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/engines/puller.h"
+#include "video_core/host1x/host1x.h"
 #include "video_core/macro.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/query_cache/types.h"
+#include "video_core/rasterizer_interface.h"
 
 namespace Tegra::Control {
 namespace {
@@ -65,7 +69,10 @@ ChannelState::Payload::Payload(Core::System& system, MemoryManager& memory_manag
     , kepler_memory(memory_manager)
     , nv01_timer(memory_manager)
     , dma_pusher(system, memory_manager, channel_state)
-{}
+{
+    maxwell_3d.nx2_channel = &channel_state;
+    kepler_compute.nx2_channel = &channel_state;
+}
 
 ChannelState::ChannelState(s32 bind_id_)
     : bind_id{bind_id_}
@@ -99,6 +106,43 @@ void ChannelState::BindRasterizer(VideoCore::RasterizerInterface* rasterizer) {
     payload->kepler_compute.BindRasterizer(rasterizer);
     payload->maxwell_dma.BindRasterizer(rasterizer);
     //payload->nv01_timer.BindRasterizer(rasterizer);
+}
+
+void ChannelState::Nx2IncrementSyncpoint() {
+    auto& dma_pusher = payload->dma_pusher;
+    const u32 value =
+        dma_pusher.system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(nx2_syncpoint);
+    // Never past what the kernel handed out: waits on later submissions would pass early.
+    if (static_cast<s32>(nx2_syncpoint_max.load(std::memory_order_relaxed) - value) <= 0) {
+        return;
+    }
+    dma_pusher.rasterizer->SignalSyncPoint(nx2_syncpoint);
+    Nx2WriteSyncpointWord();
+}
+
+void ChannelState::Nx2RaiseSyncpoint(u32 value) {
+    auto& dma_pusher = payload->dma_pusher;
+    const auto& syncpoints = dma_pusher.system.Host1x().GetSyncpointManager();
+    bool raised = false;
+    while (static_cast<s32>(value - syncpoints.GetGuestSyncpointValue(nx2_syncpoint)) > 0) {
+        dma_pusher.rasterizer->SignalSyncPoint(nx2_syncpoint);
+        raised = true;
+    }
+    if (raised) {
+        Nx2WriteSyncpointWord();
+    }
+}
+
+void ChannelState::Nx2WriteSyncpointWord() {
+    auto& dma_pusher = payload->dma_pusher;
+    const u64 word = nx2_syncpoint_word.load(std::memory_order_relaxed);
+    if (word == 0 || Nx2QueueSyncpointWord(word + 0x1000) != word) {
+        return; // No queue, or its region is gone
+    }
+    // As a one-word release: it lands in order with the releases around it.
+    dma_pusher.rasterizer->Query(
+        word, VideoCommon::QueryType::Payload, VideoCommon::QueryPropertiesFlags::IsAFence,
+        dma_pusher.system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(nx2_syncpoint), 0);
 }
 
 } // namespace Tegra::Control

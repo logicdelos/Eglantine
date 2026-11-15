@@ -38,6 +38,9 @@ class GpuSplit;
 
 namespace Tegra {
 class MemoryManager;
+namespace Control {
+struct ChannelState;
+}
 }
 
 namespace VideoCore {
@@ -73,6 +76,9 @@ public:
 
     /// Binds a rasterizer to this engine.
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
+
+    /// The channel this engine belongs to (ChannelState::Payload).
+    Control::ChannelState* nx2_channel = nullptr;
 
     /// The channel's MME data RAM, shared with its 3D engine.
     void SetNativeDataRam(std::array<u32, 0xc00>* data_ram) {

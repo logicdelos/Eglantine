@@ -309,10 +309,14 @@ inline void Nx2ClearAsyncReports() {
     return (g_nx2_gpu_written_pages[page / 64].load(std::memory_order_relaxed) >> (page % 64)) & 1;
 }
 
-// NVN2 queues release their progress values into the second page of a two-page GPU-accessible
-// region and GPU acquires read the same offsets in the first page (the CPU polls the second).
-// Something on the console copies one into the other; until that is known, the puller mirrors
-// releases that land in a second page. Every queue has such a region, so keep a small table.
+// NVN2 queues order their command lists with GPU acquires on one word per queue, at the queue's
+// offset in the first page of a two-page GPU-accessible region. The word holds the queue's
+// channel syncpoint value: each of a list's increments is an engine semaphore release at
+// address 0 with payload 1, and 3D lists write the new value into the word right before it;
+// compute lists do not, so the increment writes it (ChannelState::Nx2IncrementSyncpoint). The
+// puller's release at the end of a list goes to the same offset in the second page (a count of
+// GPFIFO entries the CPU polls) and names the queue's word. Every queue has such a region, so
+// keep a small table.
 inline constexpr size_t Nx2MaxSemaphoreRegions = 32;
 inline std::array<std::atomic<u64>, Nx2MaxSemaphoreRegions> g_nx2_semaphore_regions{}; // starts
 
@@ -560,8 +564,9 @@ inline bool Nx2SparseUnwritten(u64 gpu_address, u64 size) {
     return true;
 }
 
-/// GPU VA in the first page that mirrors a release at `address`, or 0.
-inline u64 Nx2SemaphoreMirror(u64 address) {
+/// GPU VA of the queue syncpoint word (first page) of a release at `address` in the second
+/// page of a queue region, or 0.
+inline u64 Nx2QueueSyncpointWord(u64 address) {
     for (const auto& region : g_nx2_semaphore_regions) {
         const u64 start = region.load(std::memory_order_relaxed);
         if (start == 0) {
