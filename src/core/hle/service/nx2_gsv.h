@@ -3993,8 +3993,9 @@ private:
         rb.PushCopyObjects(ctx, m_syncpt_events[1]->GetReadableEvent());
     }
 
-    // Mirrors Eden's guest syncpoint values into the shared RO page. Returns true if any changed.
-    bool UpdateSyncptValues() {
+    // Mirrors Eden's guest syncpoint values into the shared RO page. Returns true if any changed;
+    // `changed_ids` (optional) gets a bit per syncpoint whose value moved.
+    bool UpdateSyncptValues(std::array<u64, 0x40>* changed_ids = nullptr) {
         auto& manager = system.Host1x().GetSyncpointManager();
         bool changed = false;
         manager.WithGuestValuesStable([&] {
@@ -4004,6 +4005,9 @@ private:
                 if (m_syncpt_memory->Read64(address) != value) {
                     m_syncpt_memory->Write64(address, value);
                     changed = true;
+                    if (changed_ids != nullptr && id / 64 < changed_ids->size()) {
+                        (*changed_ids)[id / 64] |= u64{1} << (id % 64);
+                    }
                 }
             }
         });
@@ -4017,7 +4021,8 @@ private:
         if (m_syncpt_memory == nullptr) {
             return;
         }
-        UpdateSyncptValues();
+        std::array<u64, 0x40> changed_ids{};
+        UpdateSyncptValues(&changed_ids);
         bool acked = false;
         const u32 words = (m_syncpt_count + 63) / 64;
         for (u32 w = 0; w < words; ++w) {
@@ -4025,6 +4030,12 @@ private:
             const u64 ro_address = m_syncpt_ro + SyncptRoBitsOffset + w * 8;
             if (m_syncpt_memory->Read64(ro_address) != rw_bits) {
                 m_syncpt_memory->Write64(ro_address, rw_bits);
+                acked = true;
+            }
+            // A wait armed on a syncpoint whose value just moved is woken too: re-arming the same
+            // bit leaves the bit set unchanged, and a client that only re-arms would otherwise sleep
+            // until its own timeout (Ocarina of Time: 1 s freezes, every channel waiting).
+            if (w < changed_ids.size() && (rw_bits & changed_ids[w]) != 0) {
                 acked = true;
             }
         }
