@@ -24,6 +24,8 @@ public:
     explicit NullSinkStreamImpl(Core::System& system_, StreamType type_)
         : SinkStream{system_, type_} {}
     ~NullSinkStreamImpl() override {}
+    // Start() is deliberately not overridden: the stream stays paused and never queues, which is
+    // how the audio renderer manager knows nothing paces it and waits by wall clock instead.
     void AppendBuffer(SinkBuffer&, std::span<s16>) override {}
     std::vector<s16> ReleaseBuffer(u64) override {
         return {};

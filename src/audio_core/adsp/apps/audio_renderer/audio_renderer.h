@@ -71,6 +71,13 @@ public:
     void Signal();
     void Wait();
 
+    /**
+     * Check whether the last render pass was held back by a running sink stream (the back-pressure
+     * of its device callback). When false, nothing paced that pass and the caller must.
+     * Valid after Wait() returned for that pass.
+     */
+    bool LastRenderWasPaced() const noexcept;
+
     void Send(Direction dir, u32 message);
     u32 Receive(Direction dir);
 
@@ -104,6 +111,8 @@ private:
     std::jthread main_thread{};
     /// The current state
     std::atomic<bool> running{};
+    /// Whether the last render pass was paced by a running sink stream, set before the response
+    std::atomic<bool> last_render_paced{};
     /// Shared memory of input command buffers, set by host, read by DSP
     std::array<CommandBuffer, MaxRendererSessions> command_buffers{};
     /// The command lists to process

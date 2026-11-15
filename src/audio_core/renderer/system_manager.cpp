@@ -29,22 +29,32 @@ void SystemManager::InitializeUnsafe() {
         thread = std::jthread([this](std::stop_token stop_token) {
             Common::SetCurrentThreadName("AudioRenderSystemManager");
             Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
+            // One audio frame (TargetSampleCount at TargetSampleRate).
+            constexpr auto frame_period{std::chrono::microseconds{5000}};
+            auto deadline{std::chrono::steady_clock::now()};
             while (active && !stop_token.stop_requested()) {
-                bool any_active{false};
                 {
                     std::scoped_lock l{mutex1};
                     for (auto system : systems) {
                         system->SendCommandToDsp();
-                        any_active |= system->IsActive();
                     }
                 }
                 audio_renderer.Signal();
                 audio_renderer.Wait();
-                // With no active renderer nothing paces the loop (the sink only blocks the ADSP
-                // while it has a command buffer to render), so wait one audio frame instead of
-                // ping-ponging with the ADSP at full speed.
-                if (!any_active) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+                // A running sink stream blocks the ADSP until its device consumes a buffer, which
+                // is the pacing. When nothing did (null sink, no renderer with commands, a stream
+                // that never started) hold the loop to one frame per period against a steady
+                // clock, so the rate is real time and does not drift with the work done per pass.
+                // mutex1 is not held here, so Add/Remove are never blocked by this wait.
+                const auto now{std::chrono::steady_clock::now()};
+                if (audio_renderer.LastRenderWasPaced()) {
+                    deadline = now;
+                    continue;
+                }
+                deadline += frame_period;
+                if (deadline > now) {
+                    Common::StoppableTimedWait(stop_token, deadline - now);
                 }
             }
         });

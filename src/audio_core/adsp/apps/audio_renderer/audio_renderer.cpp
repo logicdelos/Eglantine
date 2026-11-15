@@ -83,6 +83,10 @@ void AudioRenderer::Wait() {
     PostDSPClearCommandBuffer();
 }
 
+bool AudioRenderer::LastRenderWasPaced() const noexcept {
+    return last_render_paced;
+}
+
 void AudioRenderer::Send(Direction dir, u32 message) {
     mailbox.Send(dir, std::move(message));
 }
@@ -160,11 +164,14 @@ void AudioRenderer::Main(std::stop_token stop_token) {
         case Message::Render: {
             if (system.IsShuttingDown()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                last_render_paced = true;
                 mailbox.Send(Direction::Host, Message::RenderResponse);
                 continue;
             }
             std::array<bool, MaxRendererSessions> buffers_reset{};
             std::array<u64, MaxRendererSessions> render_times_taken{};
+            // Back-pressure of the first session with commands paces the whole pass.
+            Sink::SinkStream* pacing_stream{};
             const auto start_time{system.CoreTiming().GetGlobalTimeUs().count()};
 
             for (u32 index = 0; index < MaxRendererSessions; index++) {
@@ -198,8 +205,9 @@ void AudioRenderer::Main(std::stop_token stop_token) {
                     max_time = (std::min)(command_buffer.time_limit, max_time);
                     command_list_processor.SetProcessTimeMax(max_time);
 
-                    if (index == 0) {
-                        streams[index]->WaitFreeSpace(stop_token);
+                    if (index == 0 && pacing_stream == nullptr) {
+                        pacing_stream = streams[index];
+                        pacing_stream->WaitFreeSpace(stop_token);
                     }
 
                     // Process the command list
@@ -213,8 +221,16 @@ void AudioRenderer::Main(std::stop_token stop_token) {
                     command_buffer.remaining_command_count =
                         command_list_processor.GetRemainingCommandCount();
                     command_buffer.render_time_taken_us = end_time - start_time;
+
+                    if (pacing_stream == nullptr) {
+                        pacing_stream = streams[index];
+                        pacing_stream->WaitFreeSpace(stop_token);
+                    }
                 }
             }
+            // A stream that is still paused (null sink, no device sink command, backend that failed
+            // to start) never frees space, so WaitFreeSpace did not hold this pass back.
+            last_render_paced = pacing_stream != nullptr && !pacing_stream->IsPaused();
             mailbox.Send(Direction::Host, Message::RenderResponse);
         } break;
         default:
