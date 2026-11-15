@@ -24,8 +24,6 @@ public:
     explicit IAudioOutManager(Core::System& system_);
     ~IAudioOutManager() override;
 
-    Result SetAllAudioOutVolume(f32 volume);
-
 private:
     Result ListAudioOuts(OutArray<AudioDeviceName, BufferAttr_HipcMapAlias> out_audio_outs,
                          Out<u32> out_count);

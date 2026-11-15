@@ -130,8 +130,12 @@ u64 DeviceSession::GetPlayedSampleCount() const {
     return played_sample_count;
 }
 
+void DeviceSession::SetPlayedSampleBase(u64 base) {
+    played_sample_base = base;
+}
+
 std::optional<std::chrono::nanoseconds> DeviceSession::ThreadFunc() {
-    played_sample_count = stream->GetExpectedPlayedSampleCount();
+    played_sample_count = played_sample_base + stream->GetExpectedPlayedSampleCount();
     if (type == Sink::StreamType::Out) {
         system.AudioCore().GetAudioManager().SetEvent(Event::Type::AudioOutManager, true);
     } else {

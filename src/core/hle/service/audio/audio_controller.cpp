@@ -4,9 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "audio_core/audio_core.h"
 #include "core/hle/service/audio/audio_controller.h"
-#include "core/hle/service/audio/audio_out_manager.h"
+#include "core/hle/service/audio/errors.h"
 #include "core/core.h"
 #include "core/hle/service/cmif_serialization.h"
 #include "core/hle/service/ipc_helpers.h"
@@ -90,36 +89,19 @@ IAudioController::IAudioController(Core::System& system_)
         system.ServiceManager().GetService<Service::Set::ISystemSettingsServer>("set:sys", true);
     notification_event = service_context.CreateEvent("IAudioController:NotificationEvent");
 
-    // Probably shouldn't do this in constructor?
-    try {
-        const int ui_volume = Settings::values.volume.GetValue();
-        const int mapped = static_cast<int>(std::lround((static_cast<double>(ui_volume) / 100.0) * 15.0));
-        const auto active_idx = static_cast<size_t>(m_active_target);
-        if (active_idx < m_target_volumes.size()) {
-            m_target_volumes[active_idx] = std::clamp(mapped, 0, 15);
-        }
+    // The level itself is applied once, by the sink through Settings::Volume() (volume and
+    // audio_muted). The sink's system and device volumes stay the game's own: writing the level
+    // into them as well made a 50 % setting play at about a seventh.
+    const int ui_volume = Settings::values.volume.GetValue();
+    const int mapped = static_cast<int>(std::lround((static_cast<double>(ui_volume) / 100.0) * 15.0));
+    const auto active_idx = static_cast<size_t>(m_active_target);
+    if (active_idx < m_target_volumes.size()) {
+        m_target_volumes[active_idx] = std::clamp(mapped, 0, 15);
+    }
 
-        const bool muted = Settings::values.audio_muted.GetValue();
-        for (auto& m : m_target_muted) {
-            m = muted;
-        }
-
-        if (!muted && active_idx < m_target_volumes.size()) {
-            const float vol_f = static_cast<float>(m_target_volumes[active_idx]) / 15.0f;
-            try {
-                auto& sink = system.AudioCore().GetOutputSink();
-                sink.SetSystemVolume(vol_f);
-                sink.SetDeviceVolume(vol_f);
-            } catch (...) {
-                LOG_WARNING(Audio, "Failed to apply initial sink volume from settings");
-            }
-
-            if (auto audout_mgr = system.ServiceManager().GetService<Service::Audio::IAudioOutManager>("audout:u")) {
-                audout_mgr->SetAllAudioOutVolume(static_cast<float>(m_target_volumes[active_idx]) / 15.0f);
-            }
-        }
-    } catch (...) {
-        // Catch if something fails, since this is constructor
+    const bool muted = Settings::values.audio_muted.GetValue();
+    for (auto& m : m_target_muted) {
+        m = muted;
     }
 }
 
@@ -259,23 +241,6 @@ Result IAudioController::SetTargetVolume(Set::AudioOutputModeTarget target, s32 
 
     m_target_volumes[idx] = target_volume;
 
-    if (m_active_target == target && !m_target_muted[idx]) {
-        const float vol = static_cast<float>(target_volume) / 15.0f;
-        // try catch this, as we don't know how it handles it when no output is set.
-        // we already have audio issues when no output is set, so catch.
-        try {
-            auto& sink = system.AudioCore().GetOutputSink();
-            sink.SetSystemVolume(vol);
-            sink.SetDeviceVolume(vol);
-        } catch (...) {
-            LOG_WARNING(Audio, "Failed to set sink system volume");
-        }
-
-        if (auto audout_mgr = system.ServiceManager().GetService<IAudioOutManager>("audout:u")) {
-            audout_mgr->SetAllAudioOutVolume(vol);
-        }
-    }
-
     if (m_active_target == target) {
         const int ui_volume = static_cast<int>(std::lround((static_cast<double>(target_volume) / 15.0) * 100.0));
         Settings::values.volume.SetValue(static_cast<u8>(std::clamp(ui_volume, 0, 100)));
@@ -307,32 +272,6 @@ Result IAudioController::SetTargetMute(bool is_muted, Set::AudioOutputModeTarget
     }
 
     m_target_muted[idx] = is_muted;
-
-    if (m_active_target == target) {
-        try {
-            auto& sink = system.AudioCore().GetOutputSink();
-            if (is_muted) {
-                sink.SetSystemVolume(0.0f);
-                sink.SetDeviceVolume(0.0f);
-            } else {
-                const float vol = static_cast<float>(m_target_volumes[idx]) / 15.0f;
-                sink.SetSystemVolume(vol);
-                sink.SetDeviceVolume(vol);
-            }
-        } catch (...) {
-            LOG_WARNING(Audio, "Failed to set sink system volume on mute change");
-        }
-
-        // Also update any open audout sessions via the audout:u service.
-        if (auto audout_mgr = system.ServiceManager().GetService<IAudioOutManager>("audout:u")) {
-            if (is_muted) {
-                audout_mgr->SetAllAudioOutVolume(0.0f);
-            } else {
-                const float vol = static_cast<float>(m_target_volumes[idx]) / 15.0f;
-                audout_mgr->SetAllAudioOutVolume(vol);
-            }
-        }
-    }
 
     Settings::values.audio_muted.SetValue(is_muted);
 

@@ -114,6 +114,14 @@ public:
      */
     u64 GetPlayedSampleCount() const;
 
+    /**
+     * Set the position on the session's sample timeline at which the current stream starts.
+     * A stream counts played samples from zero, buffer timestamps continue across Stop/Start.
+     *
+     * @param base - Timestamp of the first sample the current stream plays.
+     */
+    void SetPlayedSampleBase(u64 base);
+
     /*
      * CoreTiming callback to increment played_sample_count over time.
      */
@@ -147,6 +155,8 @@ private:
     u64 applet_resource_user_id{};
     /// Total number of samples played by this device session
     std::atomic<u64> played_sample_count{};
+    /// Timeline position at which the current stream started
+    std::atomic<u64> played_sample_base{};
     /// Event increasing the played sample count every 5ms
     std::shared_ptr<Core::Timing::EventType> thread_event;
     /// Is this session initialised?

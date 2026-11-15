@@ -106,15 +106,4 @@ Result IAudioOutManager::OpenAudioOutAuto(
     R_SUCCEED();
 }
 
-Result IAudioOutManager::SetAllAudioOutVolume(f32 volume) {
-    std::scoped_lock l{impl->mutex};
-    for (auto& session : impl->sessions) {
-        if (session) {
-            session->GetSystem().SetVolume(volume);
-        }
-    }
-
-    R_SUCCEED();
-}
-
 } // namespace Service::Audio
