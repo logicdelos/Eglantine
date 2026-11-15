@@ -112,6 +112,9 @@ static void PrintCodeAddress(const char* label, const void* address) {
 }
 
 static LONG WINAPI WriteCrashDump(EXCEPTION_POINTERS* exception) {
+    // Up to 4 KiB of the log sits in the file buffer and dies with the process: the lines that
+    // lead to the crash. Stop() only flushes the backends.
+    Common::Log::Stop();
     static std::atomic<bool> written{};
     const char* directory = std::getenv("EDEN_NX2_CRASH_DUMP");
     if (directory == nullptr || written.exchange(true)) {

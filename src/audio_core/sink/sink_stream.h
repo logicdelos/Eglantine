@@ -236,6 +236,8 @@ protected:
     u32 device_channels{2};
     /// Is this stream currently paused?
     std::atomic<bool> paused{true};
+    /// The device stopped calling back (unplugged, driver reset): audio is dropped until it does.
+    std::atomic<bool> stalled{false};
     /// Name of this stream
     std::string name{};
 
@@ -253,6 +255,8 @@ private:
     u64 level_frames{};
     /// Number of buffers waiting to be played
     std::atomic<u32> queued_buffers{};
+    /// Device callbacks received, to tell a dead device from a paused emulation
+    std::atomic<u64> callback_count{};
     /// The ring size for audio out buffers (usually 4, rarely 2 or 8)
     u32 max_queue_size{};
     /// Locks access to sample count tracking info

@@ -498,9 +498,10 @@ void PresentManager::PresentThread(std::stop_token token) {
     }
 }
 
-void PresentManager::RecreateSwapchain(Frame* frame) {
-    swapchain.Create(*surface, frame->width, frame->height); // Pass raw pointer
+bool PresentManager::RecreateSwapchain(Frame* frame) {
+    const bool created = swapchain.Create(*surface, frame->width, frame->height); // Pass raw pointer
     SetImageCount();
+    return created;
 }
 
 void PresentManager::SetImageCount() {
@@ -577,8 +578,13 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
         RecreateSwapchain(frame);
     }
 
-    while (swapchain.AcquireNextImage(!use_present_thread)) {
-        RecreateSwapchain(frame);
+    // Nothing can be presented to a surface without area (minimised window): recreating in a
+    // loop there never ends, and it holds the present thread or the GPU thread for as long.
+    for (u32 attempt = 0; swapchain.AcquireNextImage(!use_present_thread); ++attempt) {
+        if (attempt == MAX_PRESENT_ATTEMPTS || !RecreateSwapchain(frame)) {
+            DiscardFrame(frame);
+            return;
+        }
     }
 
     const vk::CommandBuffer cmdbuf{frame->cmdbuf};

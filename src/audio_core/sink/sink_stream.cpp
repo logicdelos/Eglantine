@@ -11,6 +11,7 @@
 #include <array>
 #include <atomic>
 #include <cstdlib>
+#include <chrono>
 #include <memory>
 #include <span>
 #include <vector>
@@ -22,6 +23,7 @@
 #include "common/fixed_point.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
+#include "common/logging.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 
@@ -29,6 +31,9 @@ namespace AudioCore::Sink {
 
 void SinkStream::AppendBuffer(SinkBuffer& buffer, std::span<s16> samples) {
     if (type == StreamType::In)
+        return;
+    // Nothing consumes the queue while the device is dead; it would grow without bound.
+    if (stalled.load(std::memory_order_relaxed))
         return;
 
     constexpr s32 min = (std::numeric_limits<s16>::min)();
@@ -121,6 +126,8 @@ void SinkStream::ProcessAudioIn(std::span<const s16> input_buffer, std::size_t n
     const std::size_t frame_size = num_channels;
     const std::size_t frame_size_bytes = frame_size * sizeof(s16);
     size_t frames_written{0};
+    callback_count.fetch_add(1, std::memory_order_relaxed);
+    stalled.store(false, std::memory_order_relaxed);
 
     // If we're paused or going to shut down, we don't want to consume buffers as coretiming is
     // paused and we'll desync, so just return.
@@ -175,6 +182,8 @@ void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::siz
     const std::size_t frame_size_bytes = frame_size * sizeof(s16);
     size_t frames_written{0};
     size_t actual_frames_written{0};
+    callback_count.fetch_add(1, std::memory_order_relaxed);
+    stalled.store(false, std::memory_order_relaxed);
 
     if (system.IsPaused() || system.IsShuttingDown()) {
         if (system.IsShuttingDown()) {
@@ -253,13 +262,29 @@ void SinkStream::WaitFreeSpace(std::stop_token stop_token) {
     std::unique_lock lk{release_mutex};
 
     auto can_continue = [this]() {
-        return paused || queued_buffers < max_queue_size;
+        return paused || stalled || queued_buffers < max_queue_size;
     };
 
     release_cv.wait_for(lk, std::chrono::milliseconds(7), can_continue);
 
     if (queued_buffers > max_queue_size + 3) {
-        release_cv.wait(lk, stop_token, can_continue);
+        // Space is freed by the device callback only. A device that stopped calling back would
+        // hold the audio renderer here for ever, and the game with it: after a period without
+        // any callback, stop applying back-pressure and drop audio until the device returns.
+        static constexpr std::chrono::seconds stall_timeout{2};
+        for (;;) {
+            const u64 callbacks_before = callback_count.load(std::memory_order_relaxed);
+            if (release_cv.wait_for(lk, stop_token, stall_timeout, can_continue) ||
+                stop_token.stop_requested()) {
+                break;
+            }
+            if (callback_count.load(std::memory_order_relaxed) == callbacks_before) {
+                stalled = true;
+                LOG_ERROR(Audio_Sink, "Stream {} got no device callback for {} s, dropping audio",
+                          name, stall_timeout.count());
+                break;
+            }
+        }
     }
 }
 

@@ -88,7 +88,8 @@ private:
 
     void CopyToSwapchainImpl(Frame* frame);
 
-    void RecreateSwapchain(Frame* frame);
+    /// Returns false when the surface has no area and the swapchain could not be recreated.
+    bool RecreateSwapchain(Frame* frame);
 
     void DiscardFrame(Frame* frame);
 

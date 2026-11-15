@@ -135,7 +135,7 @@ Swapchain::Swapchain(
 
 Swapchain::~Swapchain() = default;
 
-void Swapchain::Create(
+bool Swapchain::Create(
     VkSurfaceKHR_T* surface_,
     u32 width_,
     u32 height_)
@@ -149,7 +149,7 @@ void Swapchain::Create(
     const auto physical_device = device.GetPhysical();
     const auto capabilities{physical_device.GetSurfaceCapabilitiesKHR(VkSurfaceKHR(surface))};
     if (capabilities.maxImageExtent.width == 0 || capabilities.maxImageExtent.height == 0) {
-        return;
+        return false;
     }
 
     // Submitted work may still wait on the old acquire/present semaphores; destroying them under
@@ -169,9 +169,14 @@ void Swapchain::Create(
 
     resource_ticks.clear();
     resource_ticks.resize(image_count);
+    return true;
 }
 
 bool Swapchain::AcquireNextImage(bool may_flush) {
+    if (!swapchain) {
+        // Never created: the surface had no area yet.
+        return true;
+    }
     const VkResult result = device.GetLogical().AcquireNextImageKHR(
         *swapchain, (std::numeric_limits<u64>::max)(), *present_semaphores[frame_index],
         VK_NULL_HANDLE, &image_index);

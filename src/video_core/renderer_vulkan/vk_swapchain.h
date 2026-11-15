@@ -34,13 +34,15 @@ public:
     ~Swapchain();
 
     /// Creates (or recreates) the swapchain with a given size.
-    void Create(
+    /// Returns false, keeping the previous swapchain, while the surface has no area (minimised).
+    bool Create(
         VkSurfaceKHR_T* surface,
         u32 width,
         u32 height);
 
     /// Acquires the next image in the swapchain, waits as needed.
     /// `may_flush`: false on the async present thread (see Scheduler::Wait).
+    /// Returns true when no image was acquired and the swapchain has to be recreated.
     bool AcquireNextImage(bool may_flush = true);
 
     /// Presents the rendered image to the swapchain.

@@ -9,6 +9,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <bit>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 
@@ -149,13 +150,24 @@ NvResult nvhost_ctrl::IocCtrlEventWait(IocCtrlEventWaitParams& params, bool is_a
 
     must_unmark_fail = false;
 
+    // A fence that never signals (lost GPU work, device loss) must not hold this thread for ever
+    // with the application stalled and the event lock taken: past the bound the call takes the
+    // same path as a first attempt and the game waits on the event or polls again.
+    static constexpr std::chrono::milliseconds host_wait_bound{500};
     const auto check_failing = [&]() {
         if (events[slot].fails > 2) {
             VideoCommon::Nx2GpuLatency::NoteGuestWait();
+            bool reached{};
             {
                 auto lk = system.StallApplication();
-                host1x_syncpoint_manager.WaitHost(fence_id, target_value);
+                reached =
+                    host1x_syncpoint_manager.WaitHostFor(fence_id, target_value, host_wait_bound);
                 system.UnstallApplication();
+            }
+            if (!reached) {
+                LOG_WARNING(Service_NVDRV, "Syncpoint {} did not reach {} within {} ms", fence_id,
+                            target_value, host_wait_bound.count());
+                return false;
             }
             params.value.raw = target_value;
             return true;

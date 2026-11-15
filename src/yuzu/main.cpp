@@ -45,6 +45,8 @@
 
 #ifdef _WIN32
 #include <QScreen>
+#include <windows.h>
+#include "common/logging.h"
 
 static void OverrideWindowsFont() {
     // Qt5 chooses these fonts on Windows and they have fairly ugly alphanumeric/cyrillic characters
@@ -202,6 +204,13 @@ int main(int argc, char* argv[]) {
 
 #ifdef YUZU_CRASH_DUMPS
     Breakpad::InstallCrashHandler();
+#elif defined(_WIN32)
+    // Up to 4 KiB of the log sits in the file buffer and dies with the process: the lines that
+    // lead to a crash. Stop() only flushes the backends.
+    SetUnhandledExceptionFilter([](EXCEPTION_POINTERS*) -> LONG {
+        Common::Log::Stop();
+        return EXCEPTION_CONTINUE_SEARCH;
+    });
 #endif
 
     // Init settings params

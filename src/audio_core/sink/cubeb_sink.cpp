@@ -131,13 +131,16 @@ public:
      *                 Default false.
      */
     void Start(bool resume = false) override {
-        if (!ctx || !paused) {
+        // Without a backend stream nothing consumes the queue: stay paused so that
+        // WaitFreeSpace does not hold the audio renderer.
+        if (!ctx || !stream_backend || !paused) {
             return;
         }
 
         paused = false;
         if (cubeb_stream_start(stream_backend) != CUBEB_OK) {
             LOG_CRITICAL(Audio_Sink, "Error starting cubeb stream");
+            paused = true;
         }
     }
 
@@ -145,7 +148,7 @@ public:
      * Stop the sink stream.
      */
     void Stop() override {
-        if (!ctx || paused) {
+        if (!ctx || !stream_backend || paused) {
             return;
         }
 
