@@ -88,5 +88,5 @@ See `findings/services-fs.json`. Short list:
 - NUP zstd members decompress whole per miss with no de-duplication (since `39216de` a member is decompressed by one thread at a time and the others take the cached copy); spill files are never evicted.
 - `list_lock` held across disk reads in `RealVfsFile::Read` (since `39216de` only for files opened writable; a read-only file reads under its own `io_mutex`); `RegisteredCache::GetFileAtID` probes five layouts and each probe hashes with SHA-256; `FollowsTwoDigitDirFormat` uses `std::regex`.
 - `ApplyLayeredFS` extracts and rebuilds the entire RomFS whenever any layer exists.
-- `InstallNSP` (`frontend_common/content_manager.h`) installed a truncated file after a short read or write; since `39216de` it fails. `InstallNCA` in the same header and `VfsRawCopy` (`registered_cache.cpp:464`) still ignore one.
+- `InstallNSP` (`frontend_common/content_manager.h`) installed a truncated file after a short read or write; since `39216de` it fails. `InstallNCA` in the same header fails the same way since `44bbe5a`. `VfsRawCopy` (`vfs/vfs.cpp:507`), which `registered_cache.cpp:464` calls, already failed on a short read or write.
 - Not opened: `fssystem/*`, `bcat` news msgpack, `ro`, `pm`, `spl`, `es`, `ncm`, `pctl`, most loaders; no claims are made about them.

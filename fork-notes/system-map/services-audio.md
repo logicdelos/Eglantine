@@ -32,7 +32,7 @@
 
 - **Service/HLE thread**: all IPC. Takes the manager's `std::recursive_mutex`, then `AudioBuffers::lock` (recursive).
 - **AudioRenderSystemManager** (High priority): holds `SystemManager::mutex1` while it calls `System::SendCommandToDsp` (takes `System::lock`), then `Signal()` and `Wait()` on the ADSP mailbox with no timeout.
-- **DSP_AudioRenderer_Main** (High priority, performance cores): receives `Render`, calls `SinkStream::WaitFreeSpace` for session 0 only, runs `CommandListProcessor::Process`, appends to the sink stream.
+- **DSP_AudioRenderer_Main** (High priority, performance cores): receives `Render`, calls `SinkStream::WaitFreeSpace` for the first session with a command buffer (session 0 only before `be1fd16`), runs `CommandListProcessor::Process`, appends to the sink stream.
 - **Host audio callback** (cubeb or SDL thread): `SinkStream::ProcessAudioOutAndRender` pops the queue under `release_mutex`, pops samples under the ring's own mutex, and `notify_one`s `release_cv`.
 - **AudioManager** thread: waits up to 2 s on an event, runs the out/in `BufferReleaseAndRegister` callbacks while holding the event lock. `ClearManager` takes `{manager lock, event lock}`.
 - **CoreTiming thread**: `DeviceSession::ThreadFunc` every 5 ms (sets `played_sample_count`, sets the AudioManager event) and the sysmix `Drain` every 5 ms (takes the stream-list mutex, reads and writes guest memory).
@@ -44,7 +44,7 @@
 1. Guest opens `audren:u` (`IAudioRendererManager::OpenAudioRenderer`), creating `Renderer::Renderer` -> `Manager::AddSystem` -> `SystemManager::Add` -> first system triggers `InitializeUnsafe` -> `AudioRenderer::Start` (`CreateSinkStreams`, mailbox init, ADSP thread).
 2. Guest `RequestUpdate` -> `System::Update` parses behaviour, memory pools, voices, mixes, effects, sinks; `GenerateCommand` fills the command workbuffer.
 3. Host thread loop: `SendCommandToDsp` publishes buffer pointer and size when the previous list finished, else re-sends the old one; `Signal()`; `Wait()`; `PostDSPClearCommandBuffer`.
-4. ADSP `Main` handles `Render`: per session `WaitFreeSpace` (session 0) -> `Process` -> sets `remaining_command_count`, `render_time_taken_us` -> reply `RenderResponse`.
+4. ADSP `Main` handles `Render`: per session `WaitFreeSpace` (first session with commands: before `Process` for session 0, after it for another) -> `Process` -> sets `remaining_command_count`, `render_time_taken_us` -> reply `RenderResponse`.
 5. `DeviceSinkCommand::Process` builds a `SinkBuffer` and calls `SinkStream::AppendBuffer`: volume = `system_volume * device_volume * Settings::Volume()`, channel conversion, `queue.EmplaceWait`, `samples_buffer.Push`, `++queued_buffers`; `Start()` if paused.
 6. Host callback `ProcessAudioOutAndRender`: pop buffer, copy samples, on empty queue repeat `last_frame`, `--queued_buffers`, notify `release_cv`.
 7. audout: `Out::AppendBuffer` -> `AudioBuffers` -> `ReleaseAndRegisterBuffers` (manager thread) -> `DeviceSession::AppendBuffers` copies guest PCM and calls `AppendBuffer`; released when `played_sample_count >= end_timestamp`, where the count is `min(real elapsed*48000, frames written) + 1200`.
@@ -75,7 +75,7 @@ See `findings/services-audio.json`. Summary:
 
 - Audio-out restart: `played_sample_count` regresses while `end_timestamp` keeps growing (buffers stop being released).
 - `aud:u` creates a new audren and audout manager per call (hang in `AudioRenderer::Start`, lost release callbacks).
-- Render manager thread has no pacing when no system is active, session 0 is gone, or the Null sink is selected. `fd1acac` adds a 5 ms sleep per pass for the first case; the other two still spin.
+- Render manager thread had no pacing when no system is active, session 0 is gone, or the Null sink is selected. `fd1acac` added a 5 ms sleep per pass for the first case. `be1fd16` covers all three: the ADSP waits on the first session with commands, and the manager waits to a 5 ms steady-clock deadline after any pass that no started stream held back (`AudioRenderer::LastRenderWasPaced`). Still unpaced: a started stream whose device has stalled (`SinkStream::stalled`).
 - `AppendBuffer` enqueues before it pushes samples, and the callback ignores the pop count.
 - `WaitFreeSpace` has an unbounded wait; shutdown deadlocks if the sink stops.
 - `Renderer::Initialize` swallows `System::Initialize` errors; `SystemManager::Add` races with the render thread.
