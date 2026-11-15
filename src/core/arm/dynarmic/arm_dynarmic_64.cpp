@@ -65,9 +65,13 @@ std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
     if (!m_memory.IsValidVirtualAddressRange(vaddr, sizeof(u32)))
         return std::nullopt;
     auto const aligned_vaddr = vaddr & ~Core::Memory::YUZU_PAGEMASK;
-    if (last_code_addr != aligned_vaddr) {
+    // The generation is read before the page so an invalidation that lands during the read leaves
+    // this cache tagged with the old generation and forces a refetch on the next call.
+    const u32 generation = code_generation.load(std::memory_order_acquire);
+    if (last_code_addr != aligned_vaddr || cached_code_generation != generation) {
         m_memory.ReadBlock(aligned_vaddr, &cached_code_page, sizeof(cached_code_page));
         last_code_addr = aligned_vaddr;
+        cached_code_generation = generation;
     }
     return cached_code_page.inst[(vaddr & Core::Memory::YUZU_PAGEMASK) / sizeof(u32)];
 }
@@ -533,7 +537,8 @@ void ArmDynarmic64::SignalInterrupt(Kernel::KThread* thread) {
 }
 
 void ArmDynarmic64::ClearInstructionCache() {
-    m_cb->last_code_addr = u64(-1);
+    // Other threads must not write the owner's cached-page tag; bump the generation instead.
+    m_cb->code_generation.fetch_add(1, std::memory_order_release);
     m_jit->ClearCache();
     VideoCommon::Nx2Spikes::Note(VideoCommon::Nx2Spikes::Event::JitClear);
 }
@@ -541,8 +546,9 @@ void ArmDynarmic64::ClearInstructionCache() {
 void ArmDynarmic64::InvalidateCacheRange(u64 addr, std::size_t size) {
     // Drop the cached code page too: blocks recompiled after the invalidation would
     // otherwise still decode the old instructions (e.g. a gdbstub breakpoint written
-    // into or removed from that page).
-    m_cb->last_code_addr = u64(-1);
+    // into or removed from that page). This runs on other threads as well, so it bumps a
+    // generation the owner checks rather than writing the owner's last_code_addr.
+    m_cb->code_generation.fetch_add(1, std::memory_order_release);
     m_jit->InvalidateCacheRange(addr, size);
     VideoCommon::Nx2Spikes::Note(VideoCommon::Nx2Spikes::Event::JitInvalidate, {}, size);
 }

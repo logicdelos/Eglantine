@@ -847,7 +847,17 @@ HostMemory::HostMemory(size_t backing_size_, size_t virtual_size_)
     } else {
         LOG_WARNING(HW_Memory, "Platform can support fastmem, but can't create it");
         fallback_buffer = true;
-        backing_base = static_cast<u8*>(impl->Allocate(backing_size));
+        void* const fallback = impl->Allocate(backing_size);
+        // Nothing can run without the backing memory; stop here instead of crashing later on a
+        // null-based pointer. (Allocate returns MAP_FAILED, not null, on POSIX.)
+#ifdef _WIN32
+        if (fallback == nullptr) {
+#else
+        if (fallback == MAP_FAILED) {
+#endif
+            UNREACHABLE_MSG("Unable to allocate the {:#x} byte guest memory backing", backing_size);
+        }
+        backing_base = static_cast<u8*>(fallback);
         virtual_base = nullptr;
         impl.reset();
     }
