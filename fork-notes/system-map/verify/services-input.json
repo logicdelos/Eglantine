@@ -1,0 +1,118 @@
+[
+  {
+    "idx": 0,
+    "title": "NPad::ControllerUpdate mutates shared memory and controller state from the input thread without any lock",
+    "verdict": "confirmed",
+    "confidence": 0.7,
+    "trigger": "A pad connects/disconnects while a game polls it: e.g. the Qt thread runs EmulatedController::DisableConfiguration -> Connect()/Disconnect() (or the HLE controller applet calls Connect(true)), TriggerOnChange invokes the NPad callback on that thread, and ControllerUpdate -> UpdateControllerAt -> InitNewlyAddedController/DisconnectNpad writes style_tag, colors, WriteEmptyEntry LIFOs and controller.is_connected with neither NPad::mutex nor shared_mutex, while the core-timing thread concurrently runs NPad::OnUpdate under shared_mutex and writes the same LIFOs and reads is_connected.",
+    "impact": "Rare torn or duplicated LIFO entries / sampling numbers and flapping connected state in guest shared memory (a missed or doubled input frame, a controller briefly shown with wrong style). No crash expected: the writes are plain stores into a fixed shared-memory page. Battery path only stores single enum bytes.",
+    "reasoning": "ControllerUpdate is registered as an EmulatedController change callback and is invoked synchronously by TriggerOnChange on whichever thread called Connect/Disconnect (Qt config thread, applet thread, android JNI). Nothing in ControllerUpdate or its callees (UpdateControllerAt, InitNewlyAddedController, DisconnectNpad) takes NPad::mutex or shared_mutex, whereas OnUpdate and RequestPadStateUpdate take shared_mutex on the core-timing thread and touch the same LIFOs and the is_connected flag. So the race exists exactly as described; its observable effect is small because the data is just guest-visible state that tolerates a glitch.",
+    "fix_note": "The suggested lock is not safe as written. TriggerOnChange holds the non-recursive EmulatedController::callback_mutex while calling ControllerUpdate; HLE service paths already hold shared_mutex (and often NPad::mutex) and then call DisconnectNpad -> device->Disconnect() -> TriggerOnChange, i.e. order shared_mutex -> callback_mutex. Taking shared_mutex inside the callback creates the inverse order callback_mutex -> shared_mutex (AB/BA deadlock), and taking the non-recursive NPad::mutex would self-deadlock on those same re-entrant paths. A safer fix is to only record a dirty flag/pending-update in the callback and let NPad::OnUpdate (already under shared_mutex) apply the connect/disconnect on the core-timing thread.",
+    "evidence": [
+      {
+        "file": "src/hid_core/resources/npad/npad.cpp",
+        "line": 146,
+        "quote": "void NPad::ControllerUpdate(Kernel::KernelCore& kernel, Core::HID::ControllerTriggerType type, std::size_t controller_idx) {"
+      },
+      {
+        "file": "src/hid_core/resources/npad/npad.cpp",
+        "line": 174,
+        "quote": "            UpdateControllerAt(kernel, data->aruid, npad_type, npad_id, is_connected);"
+      },
+      {
+        "file": "src/hid_core/resources/npad/npad.cpp",
+        "line": 496,
+        "quote": "    std::scoped_lock lock{*applet_resource_holder.shared_mutex};"
+      },
+      {
+        "file": "src/hid_core/resources/npad/npad.cpp",
+        "line": 866,
+        "quote": "    WriteEmptyEntry(shared_memory);"
+      },
+      {
+        "file": "src/hid_core/frontend/emulated_controller.cpp",
+        "line": 1913,
+        "quote": "            poller.on_change(type);"
+      }
+    ]
+  },
+  {
+    "idx": 1,
+    "title": "ControllerUpdate returns instead of continuing, so one up-to-date aruid stops updates for all later aruids",
+    "verdict": "confirmed_narrow",
+    "confidence": 0.6,
+    "trigger": "Two or more aruid slots are assigned (game aruid plus an applet/system aruid; each process registers via hid_registration), controller_data is kept per aruid with its own is_connected. Slot A (lower index) is assigned but its controller.is_connected is false (e.g. its supported style set does not include the pad, so InitNewlyAddedController returned early, or style set not yet configured) while a later slot B has is_connected true. The pad is then disconnected: the Disconnected callback sees device false == A.is_connected false and executes 'return', so B is never passed to DisconnectNpad. NPad::OnUpdate cannot repair it because it skips controllers with !device->IsConnected() before reaching RequestPadStateUpdate. B keeps a stale connected style/LIFO state.",
+    "impact": "A guest/applet using the later aruid keeps seeing a disconnected pad as connected (no style-set-update event, shared memory not cleared). The same early-return can also skip later slots on Connect if the OnUpdate thread initialised slot A between device connect and the callback, but there OnUpdate heals slot B within 1 ms. The Battery 'return' is harmless since all slots share the same device state.",
+    "reasoning": "The loop body uses 'return' in the connected/disconnected comparison and in the Battery case, where the null-data case right above uses 'continue', so a slot that already matches terminates processing of every higher slot. Per-aruid is_connected can legitimately differ between slots because InitNewlyAddedController sets it only when the aruid supports that style. The disconnect case is not compensated elsewhere since OnUpdate bails out for disconnected devices. Requires multiple assigned aruids with differing style support, hence narrow.",
+    "fix_note": "Replacing the two returns with 'continue' is correct (the Battery return could stay, it is equivalent). The controller_idx bounds return at the loop top can also be 'break'/'continue' but is harmless since all arrays have the same size. Risk: after the change a later slot gets UpdateControllerAt where it previously did not, so it also sends its style-set-update event; that is the intended behaviour.",
+    "evidence": [
+      {
+        "file": "src/hid_core/resources/npad/npad.cpp",
+        "line": 171,
+        "quote": "            if (is_connected == controller.is_connected) {"
+      },
+      {
+        "file": "src/hid_core/resources/npad/npad.cpp",
+        "line": 172,
+        "quote": "                return;"
+      },
+      {
+        "file": "src/hid_core/resources/npad/npad.cpp",
+        "line": 523,
+        "quote": "            if (controller_type == Core::HID::NpadStyleIndex::None ||"
+      },
+      {
+        "file": "src/hid_core/resources/npad/npad.cpp",
+        "line": 524,
+        "quote": "                !controller.device->IsConnected()) {"
+      },
+      {
+        "file": "src/hid_core/resources/npad/npad.cpp",
+        "line": 198,
+        "quote": "    if (!npad_resource.IsControllerSupported(aruid, controller.device->GetNpadStyleIndex())) {"
+      }
+    ]
+  },
+  {
+    "idx": 2,
+    "title": "Joy-Con input thread starts before callbacks are installed",
+    "verdict": "confirmed_narrow",
+    "confidence": 0.55,
+    "trigger": "Joycons::RegisterNewDevice calls handle->InitializeDevice(), which starts the InputThread jthread and sets disable_input_thread=false, and only then calls handle->SetCallbacks(callbacks). The device is already streaming standard-mode reports (and hidapi has queued some), so if InputThread gets a report and reaches OnNewData -> joycon_poller->UpdateColor / ReadActiveMode before SetCallbacks assigns the std::function members, an empty std::function is invoked (std::bad_function_call) inside the jthread body, which calls std::terminate. Concurrent assignment of the std::function members while the thread reads them is also an unsynchronised race. The window is only microseconds in practice because the freshly started thread first sleeps 3 ms while disable_input_thread is still true; it needs the registering thread to be preempted for several ms between InitializeDevice and SetCallbacks (heavy load) to hit.",
+    "impact": "Process abort (std::terminate from an uncaught exception in the Joy-Con input thread) when a Joy-Con/Pro Controller is connected under heavy CPU load or an unlucky scheduling pause; otherwise nothing.",
+    "reasoning": "The ordering defect is real: the thread is live and unblocked when InitializeDevice returns, JoyconPoller is created with empty callbacks, and every poller path calls the std::function members without a null check. SetCallbacks does no locking either. The 3 ms sleep taken by the thread while disable_input_thread is true (initial value set at the top of InitializeDevice) makes the failure window tiny, so this is a latent race rather than a frequent crash.",
+    "fix_note": "Right direction: pass callbacks into InitializeDevice (or construct the poller with them) so they are in place before the thread is created. Alternatively keep disable_input_thread true until SetCallbacks has run, or null-check/mutex the callbacks. Nothing else depends on SetCallbacks being separate.",
+    "evidence": [
+      {
+        "file": "src/input_common/drivers/joycon.cpp",
+        "line": 210,
+        "quote": "        handle->InitializeDevice();"
+      },
+      {
+        "file": "src/input_common/drivers/joycon.cpp",
+        "line": 211,
+        "quote": "        handle->SetCallbacks(callbacks);"
+      },
+      {
+        "file": "src/input_common/helpers/joycon_driver.cpp",
+        "line": 132,
+        "quote": "            std::jthread([this](std::stop_token stop_token) { InputThread(stop_token); });"
+      },
+      {
+        "file": "src/input_common/helpers/joycon_driver.cpp",
+        "line": 135,
+        "quote": "    disable_input_thread = false;"
+      },
+      {
+        "file": "src/input_common/helpers/joycon_driver.cpp",
+        "line": 202,
+        "quote": "        joycon_poller->UpdateColor(color);"
+      },
+      {
+        "file": "src/input_common/helpers/joycon_protocol/poller.cpp",
+        "line": 45,
+        "quote": "    callbacks.on_battery_data(data.battery_status);"
+      }
+    ]
+  }
+]

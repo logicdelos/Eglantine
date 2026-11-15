@@ -1,0 +1,122 @@
+[
+  {
+    "title": "CDmaPusher writes a guest-chosen register index into a 0x20-entry array",
+    "kind": "robustness",
+    "severity": "high",
+    "confidence": 0.65,
+    "file": "src/video_core/cdma_pusher.cpp",
+    "line": 108,
+    "quote": "        thi_regs.reg_array[method] = arg;",
+    "explanation": "ThiRegisters::reg_array has NUM_REGS = 0x20 u32 entries (cdma_pusher.h:78,97). `method` comes from the guest command stream: method_offset is a 12-bit field, plus `lbs` (up to 31) for masked writes, plus one increment per word of an Incrementing/NonIncrementing run whose count is a 16-bit field. Nothing bounds `method` before the store, so a guest (or a bug in guest nvdrv/vic user code) can write a u32 up to ~0x1000+0xFFFF entries past the array into whatever follows thi_regs in the CDmaPusher object (and beyond). The same unchecked index is then used for the ThiMethod switch.",
+    "suggested_fix": "Reject (log and skip) any method >= ThiRegisters::NUM_REGS before the store; also clamp the incrementing run. Do the same in Vic::ProcessMethod and Nvdec::ProcessMethod.",
+    "how_to_verify": "Reading: confirm no mask on method_offset/lbs between ProcessCommands and ExecuteCommand. Experiment: feed a CDmaPusher test command list with an Incrementing submission at method_offset 0x1f and count 0x40 under ASan/_GLIBCXX_ASSERTIONS-style bounds checking (std::array operator[] hardening) and watch it trip."
+  },
+  {
+    "title": "Nvdec/Vic ProcessMethod index their register arrays with an unchecked 32-bit method",
+    "kind": "robustness",
+    "severity": "medium",
+    "confidence": 0.55,
+    "file": "src/video_core/host1x/nvdec.cpp",
+    "line": 38,
+    "quote": "    regs.reg_array[method] = argument;",
+    "explanation": "CDmaPusher::ExecuteCommand's SetMethod1 passes thi_regs.method_0 (a guest-written u32) straight to ProcessMethod. NvdecRegisters::reg_array is std::array<u64, 0x178>; VicRegisters::reg_array (vic.cpp:102) is std::array<u32, 0x446>. Any method beyond the array is an out-of-bounds store of a guest-chosen value at a guest-chosen offset (an u32 index scaled by 8 bytes for Nvdec), reachable from any process that can open the nvdec/vic channel.",
+    "suggested_fix": "if (method >= NvdecRegisters::NUM_REGS) { LOG_ERROR(...); return; } (and the same with VicRegisters::NUM_REGS in Vic::ProcessMethod).",
+    "how_to_verify": "Read cdma_pusher.cpp SetMethod1 and confirm method_0 is not range-limited; write a unit test that calls Nvdec::ProcessMethod(0x1000, 1) with bounds checking enabled."
+  },
+  {
+    "title": "StopDevice destroys Nvdec/Vic members while the base CDmaPusher thread may still be decoding",
+    "kind": "race",
+    "severity": "medium",
+    "confidence": 0.4,
+    "file": "src/video_core/host1x/host1x.cpp",
+    "line": 45,
+    "quote": "    devices[fd].emplace<std::monostate>();",
+    "explanation": "The device runs its command loop on a std::jthread owned by the base class CDmaPusher (cdma_pusher.cpp ProcessCommands lambda), which calls the derived ProcessMethod/Execute (reads `regs`, `decoder`, `output_surface`). emplace<monostate> runs ~Nvdec/~Vic, which destroys the derived members first (Vic::~Vic also calls frame_queue.Close(id)); the base destructor is `= default`, so the jthread is only request_stop()+join()ed after those members are gone. If the thread is mid-Execute/Decode (or a command list is still queued) when the guest closes the channel, it uses destroyed objects. Closing a channel with a decode in flight is the trigger.",
+    "suggested_fix": "Stop and join the thread at the top of ~Nvdec and ~Vic (or add a virtual Stop() called by Host1x::StopDevice before emplace), then destroy members.",
+    "how_to_verify": "Stress: queue a large H264 decode then close the nvdec fd immediately under a TSan/ASan build; or insert a sleep inside Nvdec::Execute and call StopDevice and see a use-after-destroy report."
+  },
+  {
+    "title": "WaitForSyncOperation has no shutdown path and NotifyShutdown never wakes sync_request_cv",
+    "kind": "robustness",
+    "severity": "medium",
+    "confidence": 0.4,
+    "file": "src/video_core/gpu.cpp",
+    "line": 154,
+    "quote": "        sync_request_cv.wait(lck, [this, fence] { return CurrentSyncRequestFence() >= fence; });",
+    "explanation": "The sync fence is advanced only by TickWork on the GPU thread (GPUTickCommand). CPU threads blocked here (OnCPURead, WaitForIdle, InvalidateRegion with preserve_gpu_writes, GetAppletCaptureBuffer) wait with no stop token and no shutting_down check, unlike WaitForComposite. If the GPU thread has already been stopped or is stuck (see the acquire loop finding), those threads never return and emulation shutdown hangs.",
+    "suggested_fix": "Add a shutting_down/stop predicate to the wait and notify sync_request_cv in NotifyShutdown; return early from callers when shutting down.",
+    "how_to_verify": "Call RequestSyncOperation from a test thread after ThreadManager::ShutDown and check that WaitForSyncOperation never returns; or reproduce by stopping emulation during a heavy CPU read-back."
+  },
+  {
+    "title": "Non-Ampere semaphore acquire spins forever on the GPU thread with no power-off check",
+    "kind": "robustness",
+    "severity": "medium",
+    "confidence": 0.4,
+    "file": "src/video_core/engines/puller.cpp",
+    "line": 411,
+    "quote": "    while (word != value) {",
+    "explanation": "ProcessSemaphoreAcquire loops, calling ReleaseFences and re-reading guest memory, until the semaphore word equals the value. Nothing in the loop checks system.IsPoweredOn(), the thread's stop token, or an iteration cap (the TODO about acquire_timeout confirms it). If the releasing work never arrives (guest bug, a dropped writer, or shutdown while a channel waits) the GPU thread burns a core forever and ThreadManager::NotifyShutdown's join blocks. The Ampere path avoids this with PendingAcquire, so only the non-Ampere path is affected.",
+    "suggested_fix": "Break out when !system.IsPoweredOn() (pass through the same suspend/pending mechanism as the Ampere path) and add a timeout warning.",
+    "how_to_verify": "Boot a non-NX2 title that issues an acquire with an unreachable value (or patch a test to do so) and close the emulator; check whether the GPU thread joins."
+  },
+  {
+    "title": "Ampere semaphore-acquire gate stops draining and releasing fences after 256 acquires",
+    "kind": "logic_error",
+    "severity": "low",
+    "confidence": 0.3,
+    "file": "src/video_core/engines/puller.cpp",
+    "line": 441,
+    "quote": "        checks.fetch_add(1, std::memory_order_relaxed) >= 256) {",
+    "explanation": "The comment says the DrainBack/ReleaseFences/read only feeds a warning. But ReleaseFences has a behavioural effect (it releases delayed fences the guest may be waiting on) and DrainBack orders back-thread writes before later reads. After 256 acquire calls (static, process-wide, not per channel) or 8 reports the function returns early, so later acquires neither flush pending fences nor drain, and ordering depends only on the PendingAcquire path. Counters are static and shared across all channels and across game restarts within one process.",
+    "suggested_fix": "Split the warning diagnostics from the fence release: always call ReleaseFences/DrainBack (or document why they are redundant) and gate only the logging.",
+    "how_to_verify": "Add a counter around ReleaseFences in this function and run a game with delayed fence behaviour; check whether late acquires depend on that release (guest hang after the 256th acquire)."
+  },
+  {
+    "title": "DmaPusher waits on sync_cv with no timeout or stop check on the GPU thread",
+    "kind": "robustness",
+    "severity": "low",
+    "confidence": 0.3,
+    "file": "src/video_core/dma_pusher.cpp",
+    "line": 143,
+    "quote": "        sync_cv.wait(lk, [this]() { return synced; });",
+    "explanation": "When sync_memory_operations is on and a pushbuffer entry has the sync bit, the GPU thread blocks until a fence callback sets `synced`. If the fence never signals (rasterizer shut down, channel torn down), the GPU thread hangs and shutdown join blocks. Additionally `signal_sync` (written without sync_mutex at line 356) and `synced` (written under the mutex in the callback) are adjacent bit-fields in one storage unit, so those concurrent writes are a data race on the same memory location. Default for sync_memory_operations is false, which limits exposure.",
+    "suggested_fix": "Use a wait with the thread stop token or a bounded wait_for; make the two flags separate std::atomic<bool> or protect both with sync_mutex.",
+    "how_to_verify": "Enable sync_memory_operations, run a title and close it mid-frame; check the GPU thread in a debugger. Check the declaration of signal_sync/synced in dma_pusher.h for the bit-field layout."
+  },
+  {
+    "title": "GpuSplit::async_writes grows with every distinct report address and is only cleared on Stop",
+    "kind": "memory",
+    "severity": "low",
+    "confidence": 0.3,
+    "file": "src/video_core/gpu_split.h",
+    "line": 291,
+    "quote": "            async_writes[slot] = write_position;",
+    "explanation": "async_writes is an unordered_map keyed by 16-byte device slot, written by NoteAsyncWrite for each late report/OnBackRelease and erased only in Stop(). A title that writes reports to many distinct addresses (ring buffers of query results, per-frame allocated semaphores) accumulates entries for the whole session, and HasAsyncWrite does one hash lookup per 16 bytes of the queried range, which gets costly for large ranges. Growth is bounded by the number of distinct report addresses so impact is small in practice.",
+    "suggested_fix": "Prune entries with write_position <= consumed on Publish (or use a fixed-size direct-mapped table), and early-out HasAsyncWrite when the map is empty.",
+    "how_to_verify": "Log async_writes.size() every few seconds over a long session with the split active; see whether it plateaus."
+  },
+  {
+    "title": "DeferFunction heap-allocates a std::function that leaks if the back thread is stopped first",
+    "kind": "memory",
+    "severity": "low",
+    "confidence": 0.25,
+    "file": "src/video_core/gpu_split.cpp",
+    "line": 362,
+    "quote": "    auto* const heap = new std::function<void()>(std::move(func));",
+    "explanation": "The pointer is stored in the ring and deleted by the back after running it. Stop() resets the ring state without visiting unconsumed Call entries, so any function still queued when the split stops (mid-game settings change or shutdown) is never deleted, leaking the closure and anything it captures. It also never runs, so the work it represents is silently dropped. Small and rare.",
+    "suggested_fix": "On Stop, drain the back before resetting (or walk the remaining entries and delete the heap pointers).",
+    "how_to_verify": "Queue a DeferFunction with a capturing shared_ptr, then call GpuSplit::Stop before the back consumes it, and check the use count / run a leak sanitizer."
+  },
+  {
+    "title": "FrameQueue::PushDecodeOrder evicts arbitrary frames because the map is unordered",
+    "kind": "logic_error",
+    "severity": "low",
+    "confidence": 0.3,
+    "file": "src/video_core/host1x/host1x.h",
+    "line": 82,
+    "quote": "                it->second.m_decode_order.erase(it->second.m_decode_order.begin(), it2);",
+    "explanation": "m_decode_order is std::unordered_map<u64, shared_ptr<Frame>>. When it exceeds MAX_DECODE_MAP the code erases [begin(), begin()+excess), which is the first buckets in hash order rather than the oldest frames, and can drop the frame just inserted. VIC then fails to find the frame for its luma offset (the Vic::Execute 'failed to get frame' path) and shows stale or no video. Only matters when the guest lets more than MAX_DECODE_MAP decoded frames pile up unconsumed.",
+    "suggested_fix": "Keep an insertion-order deque of offsets alongside the map and evict from its front.",
+    "how_to_verify": "Unit test: push MAX_DECODE_MAP+1 frames with increasing offsets and check which keys survive."
+  }
+]

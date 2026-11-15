@@ -1,0 +1,110 @@
+[
+  {
+    "title": "NIFM SetNetworkProfile copies a guest-controlled SSID length into a 33-byte stack buffer",
+    "kind": "memory",
+    "severity": "medium",
+    "confidence": 0.85,
+    "file": "src/core/hle/service/nifm/nifm.cpp",
+    "line": 777,
+    "quote": "std::memcpy(prof.ssid.data(), np->wireless_setting_data.ssid.data(), prof.ssid_len);",
+    "explanation": "prof.ssid_len is the guest's u8 ssid_length (0..255) read from the input buffer. prof.ssid is std::array<char, 0x21> in PendingProfile on the service thread stack, and the source array np->wireless_setting_data.ssid is also 0x21 bytes. Nothing clamps ssid_len, so a request with ssid_length > 33 writes up to 222 bytes past the end of prof.ssid on the stack and reads past the source array. Normal guests send <= 32, so this needs a malformed or hostile request (or a homebrew that fills the struct oddly).",
+    "suggested_fix": "Clamp: prof.ssid_len = std::min<u8>(np->wireless_setting_data.ssid_length, 0x20), or reject with ResultInvalidInput when ssid_length > 0x20, as IRequest::SetNetworkProfileId already does.",
+    "how_to_verify": "Call nifm SetNetworkProfile (IGeneralService cmd) from a homebrew with ssid_length = 0xFF and watch for stack corruption / ASAN report, or read the code path: PendingProfile::ssid is 0x21 bytes (nifm.cpp:242) and no bound is applied between lines 767 and 777."
+  },
+  {
+    "title": "BSD Recv/RecvFrom/Send/SendTo pass raw guest flags to Socket methods that only support MSG_DONTWAIT",
+    "kind": "logic_error",
+    "severity": "medium",
+    "confidence": 0.55,
+    "file": "src/core/hle/service/sockets/bsd.cpp",
+    "line": 2032,
+    "quote": "return Translate(descriptor->socket->Recv(flags, message));",
+    "explanation": "BSD_USA::Recv/RecvFrom/Send/SendTo hand the guest's u32 flags unchanged to RecvImpl/RecvFromImpl/SendImpl/SendToImpl, which hand them to Network::Socket::Recv/RecvFrom/Send/SendTo. Those start with ASSERT((flags & ~FLAG_MSG_DONTWAIT) == 0) (internal_network/network.cpp 1076, 1091, 1168, 1187) and only act on the DONTWAIT bit. RecvMMsg/SendMMsg do validate flags and return EINVAL, so the other paths are inconsistent. A guest recv(MSG_PEEK) is therefore executed as a consuming recv (data lost to the guest's next read), and MSG_NOSIGNAL / MSG_WAITALL are silently ignored. ASSERT is soft unless Settings::values.use_debug_asserts is on (AssertFailSoftImpl), so by default this logs a critical line and continues; with use_debug_asserts it breaks into the debugger.",
+    "suggested_fix": "Mask/translate flags in the four handlers the way RecvMMsg does: reject unsupported bits with EINVAL (or implement MSG_PEEK in Socket::Recv through Network::Socket) and drop MSG_NOSIGNAL.",
+    "how_to_verify": "From a guest or homebrew, bind a UDP socket, send it a datagram, call bsd Recv (cmd 8) with flags=MSG_PEEK (0x2) twice: on hardware both return the same data; here the second call blocks or returns the next datagram. A 'assert (flags & ~FLAG_MSG_DONTWAIT) == 0' critical log line appears."
+  },
+  {
+    "title": "Plain Recv/Accept/Connect block one of only three bsd server threads on the host",
+    "kind": "robustness",
+    "severity": "medium",
+    "confidence": 0.5,
+    "file": "src/core/hle/service/sockets/bsd.cpp",
+    "line": 1366,
+    "quote": "work.Execute(this);",
+    "explanation": "ExecuteWork runs Execute and Response synchronously on the calling server thread. For RecvWork/RecvFromWork/AcceptWork/ConnectWork on a blocking socket, Execute blocks in the host recv/WSAPoll(-1)/connect. sockets.cpp:92 starts only 3 server threads for the shared bsdsocket ServerManager (one is the base thread plus StartAdditionalHostThreads(\"bsdsocket\", 2)). Select, Poll, blocking eventfd and RecvMMsg/SendMMsg were moved to the deferral mechanism for exactly this reason (comments in bsd.cpp), but plain Recv/Accept/Connect were not. With three guest threads blocked in recv/accept (or a connect to a dead host), every other bsd request, including the Send that would unblock them, waits.",
+    "suggested_fix": "Route blocking Recv/RecvFrom/Accept/Connect through the same deferral path as Select/Poll (poll for readiness in the SelectNotifier thread, then complete non-blocking), or raise the thread count and bound the number of simultaneously blocking calls.",
+    "how_to_verify": "In a homebrew, open 3 blocking TCP sockets to a silent server and call recv on each from 3 threads, then from a 4th thread call send/socket on a fresh fd: the 4th call should hang until one of the recv calls returns."
+  },
+  {
+    "title": "IScanRequest destructor closes its events before joining the scan worker that signals them",
+    "kind": "race",
+    "severity": "medium",
+    "confidence": 0.5,
+    "file": "src/core/hle/service/nifm/nifm.cpp",
+    "line": 276,
+    "quote": "svc_ctx.CloseEvent(evt_scan_complete);",
+    "explanation": "~IScanRequest sets state to Idle, closes evt_scan_complete and evt_processing, and only then joins `worker`. WorkerThread calls Network::ScanWifiNetworks(3s) and then Finish(), which does evt_scan_complete->Signal(). If the guest releases the IScanRequest while a scan is running (up to 3 s), Signal() runs on a KEvent whose reference was already dropped; once the guest has also closed its readable-event handle the KEvent is freed. The join also blocks the service thread for the rest of the scan, and that thread is a guest-core-3 thread.",
+    "suggested_fix": "Join the worker first (after making the worker abort early), then close the events.",
+    "how_to_verify": "Guest: nifm CreateScanRequest, Submit, close the interface and the event handles immediately; run with a debug allocator / ASAN and check for use-after-free in KEvent::Signal from the scan thread."
+  },
+  {
+    "title": "Domain object_id 0 from the guest throws std::out_of_range on the service thread",
+    "kind": "robustness",
+    "severity": "low",
+    "confidence": 0.7,
+    "file": "src/core/hle/service/hle_ipc.cpp",
+    "line": 55,
+    "quote": "return !DomainHandler(object_id - 1).expired();",
+    "explanation": "HasSessionRequestHandler (and HandleDomainSyncRequest at line 111/121) only reject object_id > count. object_id 0 passes, becomes index size_t(-1), fails the soft ASSERT_MSG in DomainHandler and then domain_handlers.at() throws std::out_of_range. Nothing in ServerManager catches it, so the host process terminates. The guest controls object_id in the DomainMessageHeader.",
+    "suggested_fix": "Treat object_id == 0 like out of range: `if (object_id == 0 || object_id > DomainHandlerCount())` in all three places.",
+    "how_to_verify": "From a homebrew, convert a session to a domain and send a Request with DomainMessageHeader.object_id = 0; the emulator aborts with an uncaught std::out_of_range."
+  },
+  {
+    "title": "Domain handler slots are never reused, so the per-session handler vector only grows",
+    "kind": "memory",
+    "severity": "low",
+    "confidence": 0.5,
+    "file": "src/core/hle/service/hle_ipc.h",
+    "line": 145,
+    "quote": "domain_handlers.emplace_back(std::move(handler));",
+    "explanation": "CloseDomainHandler sets the slot to nullptr; AppendDomainHandler always appends. A long-lived domain session that creates and closes many short-lived sub-interfaces (for example a service that returns a new interface per call, such as account/profile or fs file objects) grows the vector by one pointer per interface for the lifetime of the session. Object ids also climb without bound, whereas the real kernel recycles them. Growth is small per object, so impact is modest.",
+    "suggested_fix": "Keep a free list of closed slots and reuse the lowest free index in AppendDomainHandler (object id = index + 1).",
+    "how_to_verify": "Log domain_handlers.size() at the end of a long play session in a game that opens and closes many IFile/IStorage objects over one fsp-srv domain; it equals the total number ever opened rather than the number open."
+  },
+  {
+    "title": "Failed handle-table Add in WriteToOutgoingCommandBuffer drops the reply and leaks the remaining moved objects",
+    "kind": "memory",
+    "severity": "low",
+    "confidence": 0.4,
+    "file": "src/core/hle/service/hle_ipc.cpp",
+    "line": 288,
+    "quote": "R_TRY(handle_table.Add(kernel, &handle, object));",
+    "explanation": "In the move-object loop, R_TRY returns from the function on the first failed Add. The reply words are not written, the objects not yet added keep the reference that AddMoveObject took (session client ends created for PushIpcInterface), and the SessionCountMax reservation made in PushIpcInterface is not released until those objects are closed. Handle table full is rare, so the trigger is a guest leaking handles.",
+    "suggested_fix": "On failure, close every remaining outgoing move object and still write a result code into the reply.",
+    "how_to_verify": "Fill the guest handle table (svc CreateEvent in a loop until it fails), then issue a request that returns a new interface; observe a missing reply and a growing SessionCountMax usage."
+  },
+  {
+    "title": "IRequest::SetNetworkProfileId returns raw result 1 instead of success",
+    "kind": "logic_error",
+    "severity": "low",
+    "confidence": 0.4,
+    "file": "src/core/hle/service/nifm/nifm.cpp",
+    "line": 449,
+    "quote": "rb.Push(1);",
+    "explanation": "The response builder has 2 words (a result code). Push(1) is the int overload, so the result word is the raw value 1 (module 1, description 0), a non-success code, on the success path. Every other stubbed handler in this class pushes ResultSuccess. The handler also reads a u32 ssid_length although the real command takes a 16-byte network profile id. A guest that checks the result of SetNetworkProfileId will see a failure.",
+    "suggested_fix": "Push ResultSuccess and parse the real uuid argument (or drop the ssid_length check).",
+    "how_to_verify": "Call nifm IRequest cmd 9 from a homebrew and print the result code; it is 0x1 instead of 0."
+  },
+  {
+    "title": "UnregisterService erases the port entry without closing its KClientPort",
+    "kind": "memory",
+    "severity": "low",
+    "confidence": 0.3,
+    "file": "src/core/hle/service/sm/sm.cpp",
+    "line": 107,
+    "quote": "service_ports.erase(name);",
+    "explanation": "The ServiceManager destructor closes every remaining KClientPort in service_ports, but UnregisterService only erases the map entry, so the reference taken at registration is never closed for services that are unregistered at runtime. Only a handful of services unregister, so the leak is small.",
+    "suggested_fix": "Call the same close routine the destructor uses on the erased KClientPort before erasing.",
+    "how_to_verify": "Register and unregister a named service in a test and check the KClientPort reference count / object count afterwards."
+  }
+]

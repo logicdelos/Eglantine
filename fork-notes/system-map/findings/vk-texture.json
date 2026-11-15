@@ -1,0 +1,110 @@
+[
+  {
+    "title": "Queued 3D-BC unswizzle task outlives its image",
+    "kind": "robustness",
+    "severity": "medium",
+    "confidence": 0.4,
+    "file": "src/video_core/texture_cache/texture_cache.h",
+    "line": 2879,
+    "quote": "    Image& image = slot_images[task.image_id];",
+    "explanation": "DeleteImage cancels matching entries in async_decodes but never touches unswizzle_queue. TickAsyncUnswizzle then does slot_images[task.image_id] on an erased or recycled slot and keeps a deferred staging buffer that is never freed. The GC skips IsDecoding images, but UnmapMemory and JoinImages (overlap deletion) delete images without that check. Only reachable with gpu_unswizzle_enabled (default false) and a big BCn 3D texture whose unswizzle spans several frames (one slice batch every 5 frames).",
+    "suggested_fix": "In DeleteImage, erase unswizzle_queue entries for image_id (free task.staging_buffer via runtime.FreeDeferredStagingBuffer if initialized) and reset current_unswizzle_frame; or have TickAsyncUnswizzle drop tasks whose slot is gone or whose generation changed.",
+    "how_to_verify": "Enable gpu_unswizzle_enabled, load a title with a large BC 3D texture, and unmap or overwrite its guest range while the unswizzle is in progress; the next TickAsyncUnswizzle reads a freed slot (debug SlotVector asserts or ASSERT(false) in AccelerateImageUpload)."
+  },
+  {
+    "title": "Async decode contexts are destroyed before the decoder thread joins",
+    "kind": "race",
+    "severity": "medium",
+    "confidence": 0.35,
+    "file": "src/video_core/texture_cache/texture_cache_base.h",
+    "line": 676,
+    "quote": "    std::vector<std::unique_ptr<AsyncDecodeContext>> async_decodes;",
+    "explanation": "texture_decode_worker (line 674) is declared before async_decodes (line 676). Members are destroyed in reverse order, so the AsyncDecodeContext objects are freed first and the TextureDecoder jthread is joined afterwards. A ConvertImage task that is running at shutdown writes decoded_data, copies and complete through a raw pointer into the freed context. Window is small (shutdown while a decode is in flight), but title 1 streams about 40 decodes a second.",
+    "suggested_fix": "Declare async_decodes before texture_decode_worker, or stop and join the worker in ~TextureCache before anything else is destroyed.",
+    "how_to_verify": "Check member order in texture_cache_base.h; stress test: close the emulator during a texture-streaming scene under ASan/Application Verifier and look for a heap use-after-free in the TextureDecoder thread."
+  },
+  {
+    "title": "GC eviction of a GPU-modified image stalls the GPU once per image",
+    "kind": "performance",
+    "severity": "medium",
+    "confidence": 0.5,
+    "file": "src/video_core/texture_cache/texture_cache.h",
+    "line": 214,
+    "quote": "            runtime.Finish();",
+    "explanation": "RunGarbageCollector's Cleanup downloads each must_download image with runtime.Finish() (scheduler.Finish, a full submit and wait) before deleting it. With up to 10-40 iterations per frame in high or aggressive mode and several render targets evicted, each eviction costs a CPU-GPU round trip in TickFrame on the GPU thread. DownloadMemory already batches several images behind one Finish.",
+    "suggested_fix": "Collect all must_download candidates of a pass, record their downloads, call runtime.Finish() once, then swizzle back and delete.",
+    "how_to_verify": "Run with EDEN_NX2_TC_LOG set under memory pressure, count Finish() calls per GC pass, and check frame-time spikes on frames where GC evicts GpuModified images."
+  },
+  {
+    "title": "Unclamped subtraction of the scaled size in DeleteImage",
+    "kind": "logic_error",
+    "severity": "low",
+    "confidence": 0.4,
+    "file": "src/video_core/texture_cache/texture_cache.h",
+    "line": 4045,
+    "quote": "        total_used_memory -= GetScaledImageSizeBytes(image);",
+    "explanation": "Unlike the next line, this subtraction has no std::min clamp. TickFrame replaces total_used_memory with the driver figure minus sentenced bytes, which can be below the sum of the estimates, so with resolution scaling above 1x the u64 wraps. A wrapped total keeps RunGarbageCollector in aggressive mode (total < critical never becomes true) until the next TickFrame reset, evicting costly images that did not need to go.",
+    "suggested_fix": "Use total_used_memory -= (std::min)(total_used_memory, GetScaledImageSizeBytes(image)).",
+    "how_to_verify": "Set resolution scaling to 2x, force a small total_used_memory (EDEN_NX2_TC_CRITICAL_MIB tiny), delete a rescaled image in a GC pass, and print total_used_memory."
+  },
+  {
+    "title": "Immediate-delete condition in the garbage collector can never be true",
+    "kind": "dead_code",
+    "severity": "low",
+    "confidence": 0.8,
+    "file": "src/video_core/texture_cache/texture_cache.h",
+    "line": 224,
+    "quote": "        DeleteImage(image_id, image.scale_tick > frame_tick + 5);",
+    "explanation": "scale_tick is only ever set to frame_tick + 1 (InvalidateScale and the ScaleUp paths), and frame_tick only grows, so image.scale_tick > frame_tick + 5 is always false. The immediate_delete argument is therefore always false from the collector.",
+    "suggested_fix": "Drop the argument or change the condition to what was intended (for example scale_tick > frame_tick).",
+    "how_to_verify": "grep scale_tick: the only writes are 'frame_tick + 1'."
+  },
+  {
+    "title": "Memory estimate of trimmed ASTC arrays ignores the host trimming",
+    "kind": "memory",
+    "severity": "low",
+    "confidence": 0.3,
+    "file": "src/video_core/texture_cache/texture_cache.h",
+    "line": 2766,
+    "quote": "        tentative_size = TranscodedAstcSize(tentative_size, image.info.format);",
+    "explanation": "ImageMemoryBytes uses the full guest size run through TranscodedAstcSize for AcceleratedUpload ASTC images. For a huge ASTC array that keeps only a 256-512 MiB tail of its mip chain on the host (TrimmedLevels) and is not sparse (so not Unbacked), the estimate can be tens of GB. RegisterImage and the sentenced byte counters then use it, and one deletion makes Cleanup think it freed everything, which ends the collection pass early. Also TranscodedAstcSize divides by 8 or 4 for the BC1/BC3 recompression setting even when the host holds RGBA8.",
+    "suggested_fix": "Return the actual host allocation size for TrimmedLevels images (host_level_offset based) and for the GPU-decoded RGBA8 path.",
+    "how_to_verify": "Load a title with an 8192x8192x17 ASTC array outside the sparse region, print ImageMemoryBytes against the VMA allocation size."
+  },
+  {
+    "title": "Temporary copy buffers are kept forever",
+    "kind": "memory",
+    "severity": "low",
+    "confidence": 0.4,
+    "file": "src/video_core/renderer_vulkan/vk_texture_cache.cpp",
+    "line": 1317,
+    "quote": "    buffers[level] = memory_allocator.CreateBuffer(temp_ci, MemoryUsage::DeviceLocal);",
+    "explanation": "GetTemporaryBuffer caches one DeviceLocal buffer per power-of-two size and never frees any. One reinterpret of a large depth-stencil to colour alias creates for example a 256 MiB buffer that stays for the process lifetime, outside the texture cache budget (the GC cannot see it).",
+    "suggested_fix": "Free buffers that were not used for N frames in TickFrame, or take them from the staging pool.",
+    "how_to_verify": "Log GetTemporaryBuffer sizes during a long session and compare with VMA statistics (LogMemoryStatistics)."
+  },
+  {
+    "title": "GetTemporaryBuffer indexes past the array when the size is 0",
+    "kind": "robustness",
+    "severity": "low",
+    "confidence": 0.2,
+    "file": "src/video_core/renderer_vulkan/vk_texture_cache.cpp",
+    "line": 1299,
+    "quote": "    const auto level = (8 * sizeof(size_t)) - std::countl_zero(needed_size - 1ULL);",
+    "explanation": "needed_size - 1ULL wraps for 0, countl_zero gives 0, level becomes 64 and buffers[64] is out of range (array has 64 entries). ReinterpretImage passes the sum of extent products, which is 0 if every copy has an empty extent.",
+    "suggested_fix": "Clamp: if needed_size == 0 use 1.",
+    "how_to_verify": "Call ReinterpretImage with a zero-extent copy under a debug STL (assert on std::array operator[])."
+  },
+  {
+    "title": "Sampler cache is never evicted",
+    "kind": "memory",
+    "severity": "low",
+    "confidence": 0.3,
+    "file": "src/video_core/texture_cache/texture_cache.h",
+    "line": 3585,
+    "quote": "        pair->second = slot_samplers.insert(runtime, config);",
+    "explanation": "Each distinct TSCEntry creates a Sampler (up to 32 VkSampler variants) that stays in slot_samplers and the per-channel map for the life of the process. NVIDIA allows about 4000 live samplers (maxSamplerAllocationCount); a title that animates LOD bias or border colour can reach it and CreateSampler then fails. Upstream behaviour, no guard in the fork.",
+    "suggested_fix": "Count live samplers against the device limit and recycle the least recently used ones, or quantize LOD bias.",
+    "how_to_verify": "Log slot_samplers size over a long session and compare with maxSamplerAllocationCount."
+  }
+]

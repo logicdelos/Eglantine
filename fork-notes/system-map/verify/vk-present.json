@@ -1,0 +1,36 @@
+[
+  {
+    "idx": 0,
+    "title": "Endless swapchain-recreate loop when the surface reports a zero extent",
+    "verdict": "confirmed_narrow",
+    "confidence": 0.5,
+    "trigger": "Async presentation on (or a window that becomes 0-sized between Composite's IsShown() check and the present). A frame is already queued/being presented when the Qt window is minimised or resized to zero height. Surface caps then report maxImageExtent 0. If vkAcquireNextImageKHR on the existing swapchain returns VK_ERROR_OUT_OF_DATE_KHR (driver dependent), AcquireNextImage returns is_outdated=true, RecreateSwapchain -> Swapchain::Create clears is_outdated and returns early at the zero-extent check without creating anything, the next acquire on the same old swapchain is out of date again, and the while loop spins until the window is restored.",
+    "impact": "VulkanPresent thread (or the GPU thread when async presentation is off) busy-spins at 100% of a core while the window is minimised, holding swapchain_mutex; BlitScreen::WaitIdle -> WaitPresent blocks behind it, so a resource update on the GPU thread stalls until restore. Recovers when the window is restored (Create then succeeds). If the very first Create returned early the swapchain handle is null and acquire dereferences a null handle (crash or validation error); only possible if the window starts at 0 size.",
+    "evidence": [
+      {"file": "src/video_core/renderer_vulkan/vk_present_manager.cpp", "line": 580, "quote": "    while (swapchain.AcquireNextImage(!use_present_thread)) {"},
+      {"file": "src/video_core/renderer_vulkan/vk_swapchain.cpp", "line": 143, "quote": "    is_outdated = false;"},
+      {"file": "src/video_core/renderer_vulkan/vk_swapchain.cpp", "line": 151, "quote": "    if (capabilities.maxImageExtent.width == 0 || capabilities.maxImageExtent.height == 0) {"},
+      {"file": "src/video_core/renderer_vulkan/vk_swapchain.cpp", "line": 229, "quote": "    return is_outdated;"},
+      {"file": "src/video_core/renderer_vulkan/renderer_vulkan.cpp", "line": 221, "quote": "    if (!render_window.IsShown()) {"}
+    ],
+    "reasoning": "The code path is as described: Create resets is_outdated before the zero-extent early return, so the loop condition is re-evaluated only by a fresh acquire on the stale swapchain, and no bound or discard exists. Composite skips minimised windows (GRenderWindow::IsShown is !isMinimized), so only a frame already in the queue or a race with the Qt thread reaches it, and whether Windows/NVIDIA returns OUT_OF_DATE (rather than SUCCESS) from acquire on a minimised surface is driver behaviour I cannot decide from the code. The spin is not permanent: restoring the window lets Create succeed.",
+    "fix_note": "Right direction: bound the loop and DiscardFrame when Create did not produce a swapchain. Make Create return bool (false on zero extent) and keep is_outdated true on that path, and also guard against a null swapchain handle before acquire. Care: DiscardFrame must still signal present_done (it does via the dummy submit) so the frame returns to free_queue."
+  },
+  {
+    "idx": 1,
+    "title": "Anti-aliasing pass destroyed while earlier frames may still be using it",
+    "verdict": "confirmed_narrow",
+    "confidence": 0.75,
+    "trigger": "FXAA or SMAA enabled (default is off). Then either (a) the AA setting changes at runtime: SetAntiAliasPass does anti_alias.emplace<...>() with no wait, and BlitScreen::DrawToFrame only calls WaitIdle for scaling-filter/size/format changes, not AA changes; or (b) the guest framebuffer width/height/pixel format changes (e.g. docked/undocked switch, resolution change on loading screens): RefreshResources emplaces monostate (destroying the FXAA/SMAA images, views, pipelines, descriptor sets) before ReleaseRawImages() waits on resource_ticks. Frames submitted for other swapchain image indices (only resource_ticks[image_index] is waited per draw) can still be executing or even still be queued in the scheduler worker with raw handles captured by the Record lambdas.",
+    "impact": "Vulkan validation errors for destroying in-use objects (VUID-vkDestroy*), and on a driver that does not tolerate it a TDR/device lost or a crash; most often nothing visible on NVIDIA. Only when AA is enabled and a size/format/setting change happens.",
+    "evidence": [
+      {"file": "src/video_core/renderer_vulkan/present/layer.cpp", "line": 223, "quote": "    anti_alias.emplace<std::monostate>();"},
+      {"file": "src/video_core/renderer_vulkan/present/layer.cpp", "line": 225, "quote": "    ReleaseRawImages();"},
+      {"file": "src/video_core/renderer_vulkan/present/layer.cpp", "line": 119, "quote": "    scheduler.Wait(resource_ticks[image_index]);"},
+      {"file": "src/video_core/renderer_vulkan/present/layer.cpp", "line": 296, "quote": "    for (const u64 tick : resource_ticks) {"},
+      {"file": "src/video_core/renderer_vulkan/present/fxaa.cpp", "line": 97, "quote": "    updates.push_back(CreateWriteDescriptorSet(image_infos, *m_sampler, image_view, image.descriptor_sets[0], 1));"}
+    ],
+    "reasoning": "ConfigureDraw runs RefreshResources and SetAntiAliasPass before its own Wait(resource_ticks[image_index]), and that wait covers a single index; ReleaseRawImages (which waits on all ticks) runs only after the AA object has been destroyed. The FXAA/SMAA destructors are defaulted, so the Vulkan wrappers destroy immediately. The setting-change path has no wait at all, and BlitScreen's WaitIdle triggers do not include the AA setting. The window is small and AA is off by default, hence narrow.",
+    "fix_note": "Suggested fix is correct: in RefreshResources move the loop 'for tick in resource_ticks: scheduler.Wait(tick)' (i.e. ReleaseRawImages' wait) before the emplace, and add the same wait in SetAntiAliasPass before replacing a non-monostate pass (SetPostProcessPass already does this). Cost: one GPU sync on a rare event; no risk beyond a brief stall. Waiting on scheduler.CurrentTick() once would also cover work not yet flushed."
+  }
+]

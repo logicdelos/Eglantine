@@ -1,0 +1,197 @@
+[
+ {
+  "idx": 0,
+  "title": "CDmaPusher writes a guest-chosen register index into a 0x20-entry array",
+  "verdict": "confirmed",
+  "confidence": 0.9,
+  "trigger": "Guest (any process that can open nvhost-nvdec/nvhost-vic, i.e. a buggy or malicious title/homebrew) submits a command buffer via SubmitCommandBuffer containing a SetClass to a non-Control class, then an Incrementing header with method_offset 0x1f and count 0x40 (or a Mask header with method_offset up to 0xfff, or any header with method_offset >= 0x20). ExecuteCommand is called with method >= 0x20 and stores arg at thi_regs.reg_array[method].",
+  "impact": "Out-of-bounds 4-byte store of a guest-chosen value at a guest-chosen offset (up to ~0x1000+0xFFFF dwords = ~320 KiB) past thi_regs inside the CDmaPusher/Nvdec/Vic object and the heap beyond: host memory corruption or crash. Normal games only use methods < 0x20 so it is not hit in ordinary play.",
+  "evidence": [
+   {
+    "file": "src/video_core/cdma_pusher.cpp",
+    "line": 108,
+    "quote": "        thi_regs.reg_array[method] = arg;"
+   },
+   {
+    "file": "src/video_core/cdma_pusher.cpp",
+    "line": 59,
+    "quote": "                    ExecuteCommand(method_offset, value.raw);"
+   },
+   {
+    "file": "src/video_core/cdma_pusher.cpp",
+    "line": 55,
+    "quote": "                    ExecuteCommand(method_offset + lbs, value.raw);"
+   },
+   {
+    "file": "src/video_core/cdma_pusher.h",
+    "line": 78,
+    "quote": "    static constexpr std::size_t NUM_REGS = 0x20;"
+   }
+  ],
+  "reasoning": "method_offset is a 12-bit field and count is a 16-bit field taken straight from guest command words; the Incrementing loop post-increments method_offset per word and the Mask path adds lbs, with no comparison against ThiRegisters::NUM_REGS anywhere in ProcessCommands or ExecuteCommand. The default branch of the class switch (every class except Control) indexes std::array::operator[] unchecked, and the command words come from guest memory in nvhost_nvdec_common SubmitCommandBuffer. No other layer validates the stream.",
+  "fix_note": "Suggested fix is correct: in ExecuteCommand's default branch, if method >= ThiRegisters::NUM_REGS log and return before the store and before the ThiMethod switch. Skipping the store is safe because real THI only has 0x20 registers; the run counters (count/mask) still advance so stream parsing is unaffected. Clamping the incrementing run itself is unnecessary once the store is guarded."
+ },
+ {
+  "idx": 1,
+  "title": "Nvdec/Vic ProcessMethod index their register arrays with an unchecked 32-bit method",
+  "verdict": "confirmed",
+  "confidence": 0.88,
+  "trigger": "Guest writes THI method_0 (reg 0x10) with an arbitrary u32, e.g. 0x1000 (or 0xFFFFFFF0), then writes THI method_1 (reg 0x11). ExecuteCommand calls ProcessMethod(thi_regs.method_0, arg) which stores into regs.reg_array[method] with no range check (Nvdec: u64[0x178], Vic: u32[0x446]).",
+  "impact": "Out-of-bounds write of a guest-chosen value at a guest-chosen offset; for Nvdec the index is scaled by 8 so offsets up to 32 GiB from the object: host heap corruption or an access violation crash of the emulator.",
+  "evidence": [
+   {
+    "file": "src/video_core/host1x/nvdec.cpp",
+    "line": 38,
+    "quote": "    regs.reg_array[method] = argument;"
+   },
+   {
+    "file": "src/video_core/host1x/vic.cpp",
+    "line": 102,
+    "quote": "    regs.reg_array[method] = arg;"
+   },
+   {
+    "file": "src/video_core/cdma_pusher.cpp",
+    "line": 121,
+    "quote": "            ProcessMethod(thi_regs.method_0, arg);"
+   },
+   {
+    "file": "src/video_core/host1x/nvdec_common.h",
+    "line": 98,
+    "quote": "        std::array<u64, NUM_REGS> reg_array;"
+   },
+   {
+    "file": "src/video_core/host1x/vic.h",
+    "line": 575,
+    "quote": "        std::array<u32, NUM_REGS> reg_array;"
+   }
+  ],
+  "reasoning": "thi_regs.method_0 is a u32_le stored verbatim from the guest argument (the thi_regs store at cdma_pusher.cpp:108 is itself the unchecked index of candidate 0, but method 0x10 is in range so this path is reachable cleanly). ProcessMethod in both devices uses the value as an index before any switch. Only the Vic switch uses method*4 after the store; nothing bounds it. Legit guests write the dword register index of Execute etc., which is in range, so only hostile/buggy streams trigger it.",
+  "fix_note": "Suggested bounds check (method >= NvdecRegisters::NUM_REGS / VicRegisters::NUM_REGS then log and return) is right and cheap. Place it before the store; nothing legitimate writes beyond the arrays since the decoders read only fields inside the structs."
+ },
+ {
+  "idx": 2,
+  "title": "StopDevice destroys Nvdec/Vic members while the base CDmaPusher thread may still be decoding",
+  "verdict": "confirmed_narrow",
+  "confidence": 0.7,
+  "trigger": "Guest submits a command buffer (SubmitCommandBuffer returns immediately after PushEntries) containing an Execute for a large H264/VP9 frame, or several queued lists, and closes the nvdec/vic fd before the CDmaPusher thread has finished (e.g. app stops a video / exits the player without waiting on the syncpoint). OnClose calls StopDevice, which emplaces monostate in devices[fd].",
+  "impact": "Use-after-destroy of Nvdec::regs / decoder variant (or Vic::output_surface/regs) on the pusher thread: crash or memory corruption when stopping video playback; also frame_queue.Close(id) runs while the thread may still call GetFrame/AddFrame. Needs a close with work in flight, otherwise harmless.",
+  "evidence": [
+   {
+    "file": "src/video_core/host1x/host1x.cpp",
+    "line": 45,
+    "quote": "    devices[fd].emplace<std::monostate>();"
+   },
+   {
+    "file": "src/video_core/host1x/nvdec.cpp",
+    "line": 34,
+    "quote": "    host1x.frame_queue.Close(id);"
+   },
+   {
+    "file": "src/video_core/host1x/vic.cpp",
+    "line": 97,
+    "quote": "    host1x.frame_queue.Close(id);"
+   },
+   {
+    "file": "src/video_core/cdma_pusher.cpp",
+    "line": 40,
+    "quote": "                command_cv.wait(l, stop_token, [this]() { return command_lists.size() > 0; });"
+   },
+   {
+    "file": "src/video_core/cdma_pusher.cpp",
+    "line": 59,
+    "quote": "                    ExecuteCommand(method_offset, value.raw);"
+   },
+   {
+    "file": "src/core/hle/service/nvdrv/devices/nvhost_nvdec.cpp",
+    "line": 81,
+    "quote": "    host1x.StopDevice(fd, Tegra::Host1x::ChannelType::NvDec);"
+   }
+  ],
+  "reasoning": "CDmaPusher::~CDmaPusher is = default and the std::jthread is the last member of the base, so request_stop()+join() happen only after ~Nvdec/~Vic bodies and their derived members (regs, decoder, output_surface) are already destroyed. The thread's inner command-list loop does not check the stop token, so a list in progress or a queued list runs to completion against destroyed derived state; only an idle wait on the base's command_cv is safe. Games usually wait for the fence before closing, which is why it is narrow, but nothing enforces it.",
+  "fix_note": "Suggested fix is right: request_stop and join the thread at the start of ~Nvdec and ~Vic (before frame_queue.Close), e.g. via a protected CDmaPusher::StopThread() that the base destructor also calls (idempotent). Risk: the join waits for the in-flight decode (can be long) on the guest service thread, and if the thread is blocked waiting on a syncpoint/frame the join could stall, so also make the inner loop check stop_token."
+ },
+ {
+  "idx": 3,
+  "title": "WaitForSyncOperation has no shutdown path and NotifyShutdown never wakes sync_request_cv",
+  "verdict": "confirmed_narrow",
+  "confidence": 0.6,
+  "trigger": "System::ShutdownMainProcess calls gpu_core->NotifyShutdown() (which request_stop()s and joins the GPU thread) while guest CPU threads are still running; kernel.SuspendEmulation/ShutdownCores come later. A guest thread that, in that window, reads GPU-written cached memory (Memory::HandleRasterizerDownload -> GPU::OnCPURead) queues a sync request, pushes a non-blocking GPUTickCommand that is never executed, and blocks in WaitForSyncOperation forever (same for WaitForIdle, InvalidateRegion with preserve_gpu_writes, GetAppletCaptureBuffer).",
+  "impact": "Shutdown hang: the guest thread never returns, so kernel.ShutdownCores cannot join the core thread and closing/stopping the emulation freezes. Needs a GPU read-back on a guest thread racing the shutdown, so intermittent.",
+  "evidence": [
+   {
+    "file": "src/video_core/gpu.cpp",
+    "line": 154,
+    "quote": "        sync_request_cv.wait(lck, [this, fence] { return CurrentSyncRequestFence() >= fence; });"
+   },
+   {
+    "file": "src/video_core/gpu.cpp",
+    "line": 207,
+    "quote": "        gpu_thread.NotifyShutdown();"
+   },
+   {
+    "file": "src/video_core/gpu.cpp",
+    "line": 365,
+    "quote": "        if (shutting_down.load(std::memory_order_relaxed)) {"
+   },
+   {
+    "file": "src/core/core.cpp",
+    "line": 582,
+    "quote": "            gpu_core->NotifyShutdown();"
+   },
+   {
+    "file": "src/core/core.cpp",
+    "line": 589,
+    "quote": "        kernel.ShutdownCores();"
+   },
+   {
+    "file": "src/core/memory.cpp",
+    "line": 938,
+    "quote": "            current_area = system.GPU().OnCPURead(address, size);"
+   },
+   {
+    "file": "src/video_core/gpu_thread.cpp",
+    "line": 406,
+    "quote": "        thread.join();"
+   }
+  ],
+  "reasoning": "The fence advances only in TickWork on the GPU thread, which is joined in NotifyShutdown; the wait predicate has no stop condition and NotifyShutdown notifies sync_cv, not sync_request_cv (WaitForComposite guards itself with shutting_down but the other waiters do not; the guard also does not cover a wait that began before the flag). is_powered_on is false by then but OnCPURead does not check it. The race window (GPU joined, cores not yet suspended) is real and the memory-read path is hot, but the window is short, hence narrow.",
+  "fix_note": "Suggested fix is right but must cover both sides: make the wait predicate also return when shutting_down, and in NotifyShutdown set shutting_down then lock sync_request_mutex and sync_request_cv.notify_all() (taking the lock avoids a lost wakeup). Callers like OnCPURead then proceed without data being flushed, which is acceptable at shutdown. Note shutting_down is currently set after the join, so move it before gpu_thread.NotifyShutdown() so waiters are released before/while the thread joins."
+ },
+ {
+  "idx": 4,
+  "title": "Non-Ampere semaphore acquire spins forever on the GPU thread with no power-off check",
+  "verdict": "confirmed_narrow",
+  "confidence": 0.6,
+  "trigger": "On a non-Ampere (Switch 1) channel the guest pushes a SemaphoreAcquire method whose semaphore word never becomes equal to the acquire value (guest bug, releaser dropped, or the releasing CPU thread has stopped because emulation is shutting down). ProcessSemaphoreAcquire loops without exit conditions; then ShutdownMainProcess's gpu_core->NotifyShutdown() does request_stop()+join() on that GPU thread.",
+  "impact": "GPU thread pegs a core at 100% for as long as the acquire is unmet, and emulator shutdown hangs in the join (the stop token is never checked inside the loop). Only affects titles/streams that actually reach an unsatisfiable acquire; ordinary Switch 1 games rarely issue SemaphoreAcquire.",
+  "evidence": [
+   {
+    "file": "src/video_core/engines/puller.cpp",
+    "line": 411,
+    "quote": "    while (word != value) {"
+   },
+   {
+    "file": "src/video_core/engines/puller.cpp",
+    "line": 416,
+    "quote": "        // TODO(kemathe73) figure out how to do the acquire_timeout"
+   },
+   {
+    "file": "src/video_core/engines/puller.cpp",
+    "line": 521,
+    "quote": "            ProcessSemaphoreAcquire(dma_pusher);"
+   },
+   {
+    "file": "src/video_core/gpu_thread.cpp",
+    "line": 406,
+    "quote": "        thread.join();"
+   },
+   {
+    "file": "src/core/core.cpp",
+    "line": 582,
+    "quote": "            gpu_core->NotifyShutdown();"
+   }
+  ],
+  "reasoning": "The loop condition is only `word != value`; the body calls ReleaseFences and re-reads the guest word, with no stop token, power check or iteration cap (the TODO admits the timeout is unimplemented). It is called from the GPU thread when !g_nx2_ampere, and ThreadManager::NotifyShutdown joins that thread with no way to interrupt it. This matches upstream yuzu behaviour, so it is a latent pre-existing hang rather than a regression. The Ampere path and the do{...}while(false) in ProcessSemaphoreTriggerMethod do not loop.",
+  "fix_note": "Suggested fix is right in direction: break out when system.IsPoweredOn() is false (Puller has no system handle today; dma_pusher.system is reachable) or when the GPU thread stop is requested, and warn after a timeout. Breaking early on shutdown is harmless. Do not cap iterations while powered on, since some games legitimately wait long; reusing the Ampere PendingAcquire suspend mechanism for non-Ampere is a larger change that could alter ordering semantics."
+ }
+]

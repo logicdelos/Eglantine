@@ -1,0 +1,76 @@
+[
+  {
+    "idx": 1,
+    "title": "Cross-thread write to last_code_addr can leave a stale cached code page after invalidation",
+    "verdict": "confirmed_narrow",
+    "confidence": 0.55,
+    "trigger": "Owner core thread is in MemoryReadCode for page P with last_code_addr != P and is inside (or just past) ReadBlock into cached_code_page. Another thread (kernel InvalidateInstructionCache after remapping or writing code, or gdbstub) writes new bytes to P, then InvalidateCacheRange sets last_code_addr = -1 and queues the range invalidation. The owner then executes last_code_addr = P, publishing the old (or torn) page. After the Jit processes the invalidation the block is recompiled by MemoryReadCode, hits last_code_addr == P and decodes the stale cached page.",
+    "impact": "Stale instructions executed after code was patched or remapped: wrong behaviour or guest crash. The window is tiny and needs a concurrent compile of the same page; the stale page then persists until an ISB, IC op or another invalidation resets last_code_addr.",
+    "evidence": [
+      {
+        "file": "src/core/arm/dynarmic/arm_dynarmic_64.cpp",
+        "line": 68,
+        "quote": "    if (last_code_addr != aligned_vaddr) {"
+      },
+      {
+        "file": "src/core/arm/dynarmic/arm_dynarmic_64.cpp",
+        "line": 70,
+        "quote": "        last_code_addr = aligned_vaddr;"
+      },
+      {
+        "file": "src/core/arm/dynarmic/arm_dynarmic_64.cpp",
+        "line": 545,
+        "quote": "    m_cb->last_code_addr = u64(-1);"
+      },
+      {
+        "file": "src/core/arm/dynarmic/arm_dynarmic_64.cpp",
+        "line": 546,
+        "quote": "    m_jit->InvalidateCacheRange(addr, size);"
+      },
+      {
+        "file": "src/core/hle/kernel/k_page_table_base.cpp",
+        "line": 89,
+        "quote": "                interface->InvalidateCacheRange(GetInteger(addr), size);"
+      }
+    ],
+    "reasoning": "ArmDynarmic64::InvalidateCacheRange is called from other threads (k_page_table_base.cpp InvalidateInstructionCache, debug.cpp) and writes the plain u64 last_code_addr that the owning thread reads and writes in MemoryReadCode, with no ordering between the page read and the tag store. The interleaving read page, external write plus reset, tag store is valid, so the stale cache is real, and it is a formal data race on a non-atomic. Practical exposure is low: it needs code in a page remapped or patched while another core is compiling that same page.",
+    "fix_note": "The suggested fix works if the cross-thread side only sets an atomic flag/generation and the owner consumes it in RunThread/StepThread before m_jit->Run (Run returns on the CacheInvalidation halt before blocks are recompiled after the request). Just making last_code_addr atomic is not enough: the owner's store after ReadBlock still overwrites the reset, so compare a generation counter after ReadBlock. Same pattern exists in arm_dynarmic_32.cpp and jit_context.cpp."
+  },
+  {
+    "idx": 3,
+    "title": "Auto and Unsafe fastmem mode has no address range check; guest addresses near 2^64 wrap onto host memory below the arena",
+    "verdict": "confirmed_narrow",
+    "confidence": 0.6,
+    "trigger": "Default CPU accuracy Auto (or Unsafe with cpuopt_unsafe_fastmem_check) sets fastmem_address_space_bits = 64, so EmitFastmemVAddr returns r13 + vaddr with no check. A guest load/store to a bad pointer such as 0xFFFFFFFFFFFFFFF8 computes r13-8, and one at or above the guest address space size lands past the end of the reservation; if that host page is mapped, the access succeeds instead of faulting into the memory callback path. HostMemory aligns virtual_base up to 2 MiB inside a reservation of size+2 MiB, so small negative offsets often fall in the NOACCESS head of the reservation and fault, but large offsets can reach other host allocations.",
+    "impact": "Guest wild pointers (already a guest bug) can read or corrupt host process memory instead of producing a guest data abort: host crash or silent corruption. Not seen with well-behaved games.",
+    "evidence": [
+      {
+        "file": "src/core/arm/dynarmic/arm_dynarmic_64.cpp",
+        "line": 414,
+        "quote": "        config.fastmem_address_space_bits = 64;"
+      },
+      {
+        "file": "src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.h",
+        "line": 214,
+        "quote": "    if (unused_top_bits == 0) {"
+      },
+      {
+        "file": "src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.h",
+        "line": 215,
+        "quote": "        return r13 + vaddr;"
+      },
+      {
+        "file": "src/common/host_memory.cpp",
+        "line": 203,
+        "quote": "        virtual_base = static_cast<u8*>(pfn_VirtualAlloc2(process, nullptr, virtual_size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0));"
+      },
+      {
+        "file": "src/common/host_memory.cpp",
+        "line": 844,
+        "quote": "            virtual_base = reinterpret_cast<u8*>(Common::AlignUp(uintptr_t(virtual_base), HugePageSize));"
+      }
+    ],
+    "reasoning": "For Auto accuracy MakeJit forces fastmem_address_space_bits = 64, which makes unused_top_bits 0 and returns r13 + vaddr unchecked, regardless of silently_mirror_fastmem. Only addresses that hit NOACCESS or unmapped host pages are caught by the fault handler, so aliasing depends on the host address layout. Valid guest code never produces such addresses, which limits it to guest bugs, anti-tamper probes and corrupt pointers.",
+    "fix_note": "Using the real address-space width (e.g. 39 bits) in Auto restores the range check, at the cost of a test+branch per memory access (the reason Auto drops it). Guard pages below the arena only cover small negative offsets and cannot cover the 64-bit reach, so the guard-region suggestion is incomplete; the realistic options are the masked/range check or accepting the risk for the speed mode."
+  }
+]

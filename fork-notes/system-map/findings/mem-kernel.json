@@ -1,0 +1,74 @@
+[
+  {
+    "title": "RemapPageGroup maps map_pages instead of cur_pages per physical block",
+    "kind": "logic_error",
+    "severity": "medium",
+    "confidence": 0.6,
+    "file": "src/core/hle/kernel/k_page_table_base.cpp",
+    "line": 1753,
+    "quote": "            R_ASSERT(this->Operate(page_list, map_address, map_pages, pg_phys_addr, true,",
+    "explanation": "Inside the loop, cur_pages = min(pg_pages, map_pages) is computed and the cursors are advanced by cur_pages, but the Map operation is issued for map_pages. When the current physical block of the page group is shorter than the virtual range still to map (any group with more than one block, or a block that was partly consumed), Operate(Map) maps pages that lie past the end of the block (other owners' physical pages), and for heap addresses it also opens a reference on each of them (Operate Map calls MemoryManager().Open). The next loop iterations then map the same virtual pages again, so reference counts of the pages end up too high or foreign pages are left mapped. The function is the rollback path of MapMemory/UnmapMemory (call sites at lines 1184 and 1391), so it only runs after an Operate failure; the damage appears only on that rare path.",
+    "suggested_fix": "Pass cur_pages instead of map_pages to Operate (Atmosphere's RemapPageGroup does this).",
+    "how_to_verify": "Read the loop 1738-1762 and compare with Atmosphere KPageTableBase::RemapPageGroup. Dynamic check: build a two-block KPageGroup, force a failure after the unmap in UnmapMemory (e.g. fail the memory block update), and log the (address, num_pages, phys) triples passed to Operate(Map); the first call covers more pages than the first block holds."
+  },
+  {
+    "title": "Freed guest RAM is never decommitted on Windows; dirty granules are re-cleared with memset",
+    "kind": "memory",
+    "severity": "medium",
+    "confidence": 0.55,
+    "file": "src/common/host_memory.cpp",
+    "line": 1011,
+    "quote": "                std::memset(backing_base + offset, 0, clear_end - offset);",
+    "explanation": "KMemoryManager::Close only calls HostMemory::MarkDirty; zeroing is deferred to the next ClearBackingRegion. Only the Linux branch can release the backing (PunchHole via fallocate). On Windows the backing is a SEC_COMMIT section of up to 14 GiB (12 GB layout + 2 GiB graphics server), so the commit charge exists from boot, and a memset of a dirty granule touches it and makes it resident. HintCold on Windows only trims the working set when cold_hint_mode asks for it. Result: once a title has touched guest pages, host RAM for them stays resident or in the page file until exit, and every reuse of a freed region pays a full memset. On a 16 GB machine with a 12 GB layout this can add memory pressure with the host GPU and shader caches.",
+    "suggested_fix": "On Windows, reset whole dirty granules without touching them (e.g. DiscardVirtualMemory or VirtualUnlock+MEM_RESET on the mapped view, or a SEC_RESERVE section committed on demand), and keep memset only for partial granules.",
+    "how_to_verify": "Run a title that allocates and frees a large heap repeatedly (SetHeapSize up then down) and watch the process Private Bytes / working set in Resource Monitor; after the free it does not fall. Compare with a Linux build where PunchHole is used."
+  },
+  {
+    "title": "Unmap operations ignore MakePageGroup failure, so page references can leak",
+    "kind": "robustness",
+    "severity": "low",
+    "confidence": 0.4,
+    "file": "src/core/hle/kernel/k_page_table_base.cpp",
+    "line": 5749,
+    "quote": "        this->MakePageGroup(pages_to_close, virt_addr, num_pages);",
+    "explanation": "MakePageGroup returns ResultOutOfResource when KBlockInfoManager has no free block (AddBlock) and an error when the traversal meets a non-heap or unmapped page. In Operate(Unmap/UnmapPhysical) the result is dropped: only the blocks collected so far are closed by pages_to_close, the mapping is removed anyway (UnmapRegion on the next line), and the remaining pages keep their reference count forever and never return to KPageHeap. The same pattern is in KPageTableBase::Finalize's BlockCallback (line 476), where process exit then leaks the rest of the heap. The trigger is block-info slab exhaustion with a very fragmented heap; the Free blocks in Finalize also take the failure path harmlessly.",
+    "suggested_fix": "Pre-reserve the block infos (or count the blocks) before unmapping, or assert/log on failure so the leak is visible; for the Unmap path close pages block by block while walking instead of building a group.",
+    "how_to_verify": "Shrink the KBlockInfo slab of a process (small system resource size), fragment its heap with many MapPhysicalMemory/UnmapPhysicalMemory calls, then unmap a large range and compare KMemoryManager free page counts before mapping and after process exit."
+  },
+  {
+    "title": "Every KMemoryManager::Impl allocates a reference-count array sized for all of DRAM",
+    "kind": "memory",
+    "severity": "low",
+    "confidence": 0.85,
+    "file": "src/core/hle/kernel/k_memory_manager.cpp",
+    "line": 473,
+    "quote": "        Kernel::Board::Nintendo::Nx::KSystemControl::Init::GetIntendedMemorySize() / PageSize);",
+    "explanation": "Impl::Initialize resizes m_page_reference_counts to total-DRAM pages (14 GiB / 4 KiB, about 3.67 M u16 entries, 7.3 MB) in each Impl, but the array is indexed by the page offset inside that manager's own heap, so size / PageSize entries are enough. With four to five managers (one per pool region) about 30-37 MB of host memory are allocated and zero-filled for nothing; the guest-visible management region that was carved out for these counts is also not what is used.",
+    "suggested_fix": "Resize to size / PageSize (the heap size passed to Initialize).",
+    "how_to_verify": "Add a log of m_page_reference_counts.size() and the manager's heap page count in Impl::Initialize at boot; the first is far larger. Compare process memory after kernel init before and after the change."
+  },
+  {
+    "title": "KDynamicPageManager::Free mixes a host pointer with a kernel virtual address (and is never called)",
+    "kind": "dead_code",
+    "severity": "low",
+    "confidence": 0.7,
+    "file": "src/core/hle/kernel/k_dynamic_page_manager.h",
+    "line": 152,
+    "quote": "            (reinterpret_cast<uint64_t>(pb) - GetInteger(m_aligned_address)) / sizeof(PageBuffer);",
+    "explanation": "Allocate returns pointers into the host std::vector m_backing_memory (GetPointer adds the vector base), but Free subtracts the kernel virtual address m_aligned_address from that host pointer. The bit offset is therefore garbage and SetBit would write out of bounds if Free were ever called. A grep of the kernel directory shows KDynamicSlabHeap and KDynamicResourceManager never call page_allocator->Free, so the function is currently unreachable; it will corrupt memory as soon as someone uses it.",
+    "suggested_fix": "Delete Free, or compute the offset as (pb - GetPointer<PageBuffer>(m_aligned_address)).",
+    "how_to_verify": "grep -rn \"Free(\" near KDynamicPageManager users (k_dynamic_slab_heap.h, k_dynamic_resource_manager.h, k_system_resource.cpp) and confirm no call reaches KDynamicPageManager::Free."
+  },
+  {
+    "title": "KSecureSystemResource reserves guest secure memory it does not use and ignores its page manager init result",
+    "kind": "memory",
+    "severity": "low",
+    "confidence": 0.45,
+    "file": "src/core/hle/kernel/k_system_resource.cpp",
+    "line": 49,
+    "quote": "    m_dynamic_page_manager.Initialize(m_resource_address + rc_size, m_resource_size - rc_size,",
+    "explanation": "Initialize first allocates m_resource_size bytes of guest secure memory via KSystemControl::AllocateSecureMemory, then KDynamicPageManager::Initialize backs the slab heaps with a host std::vector of the same size (m_backing_memory.resize) that it zero-fills page by page. The guest allocation is only used for accounting, so each secure system resource (titles that request a system resource size) costs twice the memory, once in guest DRAM and once in host heap. The Result of Initialize (ResultOutOfMemory when overhead_size >= size) is dropped, so a failure would leave an uninitialised manager that is then used by the three slab heaps.",
+    "suggested_fix": "Check the Result with R_TRY (inside the ON_RESULT_FAILURE scope), and either back the manager with the guest allocation or skip the guest allocation.",
+    "how_to_verify": "Run a title with a non-zero system resource size and compare the guest application pool free pages and the host allocation size of the vector; inspect that the Result at this call site is discarded."
+  }
+]

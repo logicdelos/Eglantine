@@ -1,0 +1,81 @@
+[
+ {
+  "idx": 0,
+  "title": "SimpleStreamer::GetQuery indexes slot_queries without the lock while BuildQuery grows the deque on another thread",
+  "verdict": "confirmed_narrow",
+  "confidence": 0.6,
+  "trigger": "Vulkan sets HAS_ASYNC_CHECK=true so the GPUFencingThread runs query_cache.PopAsyncFlushes (no query_cache lock is held; only texture/buffer mutexes are taken for their own pops). SamplesStreamer::PopUnsyncedQueries calls GetQuery(q) with no lock. Meanwhile the GPU thread, writing a new counter, calls BuildQuery which takes guard and does slot_queries.emplace_back (when old_queries is empty). On MSVC std::deque with elements over 8 bytes holds one element per block, so each push allocates a block and periodically reallocates the block map; the fence thread's operator[] can follow the freed map.",
+  "impact": "Rare crash or wrong query result (reads freed map) only when the in-flight query count grows past a map-doubling step while a flush is being processed; ids are recycled via old_queries so growth stops after warm-up. Otherwise a benign formal data race.",
+  "evidence": [
+   {
+    "file": "src/video_core/query_cache/query_stream.h",
+    "line": 114,
+    "quote": "            return &slot_queries[query_id];"
+   },
+   {
+    "file": "src/video_core/query_cache/query_stream.h",
+    "line": 134,
+    "quote": "        slot_queries.emplace_back(std::forward<Args>(args)...);"
+   },
+   {
+    "file": "src/video_core/query_cache/query_stream.h",
+    "line": 130,
+    "quote": "            new (&slot_queries[new_id]) QueryType(std::forward<Args>(args)...);"
+   },
+   {
+    "file": "src/video_core/renderer_vulkan/vk_query_cache.cpp",
+    "line": 408,
+    "quote": "            auto* query = GetQuery(q);"
+   },
+   {
+    "file": "src/video_core/fence_manager.h",
+    "line": 307,
+    "quote": "                query_cache.PopAsyncFlushes();"
+   },
+   {
+    "file": "src/video_core/renderer_vulkan/vk_fence_manager.h",
+    "line": 52,
+    "quote": "    static constexpr bool HAS_ASYNC_CHECK = true;"
+   }
+  ],
+  "reasoning": "GetQuery has no lock while BuildQuery mutates the deque under guard, and the fence thread reaches GetQuery from PopUnsyncedQueries without guard (flush_guard covers only pending_flush_sets). Existing code in Free takes guard before GetQuery, showing the authors intended it to protect the container. Reachability needs queries being created during a flush, and the dangerous map reallocation happens only a handful of times in the process lifetime.",
+  "fix_note": "Taking guard in GetQuery fixes the container race, but GetQuery is called from many GPU-thread paths that already hold guard (e.g. Free at vk_query_cache.cpp:513 calls GetQuery under guard), and std::mutex is not recursive, so that would deadlock; use a separate shared/spin lock for the container or make the deque access go through a locked accessor that Free does not nest. Returned pointers stay valid since deque elements do not move. Also placement-new in BuildQuery on a reused slot can race with a fence-thread reader of the old query; that needs the same care."
+ },
+ {
+  "idx": 1,
+  "title": "BankPool::GetBank and ReserveBank access a std::deque of banks from the fencing thread and the recording thread with no lock",
+  "verdict": "confirmed_narrow",
+  "confidence": 0.5,
+  "trigger": "GPU thread: SamplesStreamer::ReserveBank calls bank_pool.ReserveBank whose builder emplace_back()s a new SamplesQueryBank when no dead bank is at the front of bank_indices (about once per 256 slots while banks stay referenced). GPUFencingThread at that moment runs SamplesStreamer::PopUnsyncedQueries -> ApplyBanksWideOp/ApplyBankOp -> bank_pool.GetBank(bank_id) with no lock. MSVC deque of large elements has one element per block, so the push reallocates the block map at doublings and the reader can use a freed map.",
+  "impact": "Rare crash or reading a wrong/garbage bank while many sample queries are outstanding; usually benign formal data race. The pool stops growing once dead banks are reused.",
+  "evidence": [
+   {
+    "file": "src/video_core/query_cache/bank_base.h",
+    "line": 96,
+    "quote": "        return bank_pool[index];"
+   },
+   {
+    "file": "src/video_core/query_cache/bank_base.h",
+    "line": 89,
+    "quote": "        builder(bank_pool, new_index);"
+   },
+   {
+    "file": "src/video_core/renderer_vulkan/vk_query_cache.cpp",
+    "line": 432,
+    "quote": "            auto& the_bank = bank_pool.GetBank(bank_id);"
+   },
+   {
+    "file": "src/video_core/renderer_vulkan/vk_query_cache.cpp",
+    "line": 465,
+    "quote": "            bank_pool.ReserveBank([this](std::deque<SamplesQueryBank>& queue, size_t index) {"
+   },
+   {
+    "file": "src/video_core/fence_manager.h",
+    "line": 307,
+    "quote": "                query_cache.PopAsyncFlushes();"
+   }
+  ],
+  "reasoning": "GetBank is a bare operator[] and ReserveBank mutates the deque with no synchronization; ApplyBankOp (vk_query_cache.cpp:432) runs on the fence thread via PopUnsyncedQueries, while ReserveBank runs on the recording thread. flush_guard only protects pending_flush_sets. Growth of the pool is rare, so the harmful interleaving is narrow; the same pool also shares non-atomic fields (Reset() clears current_slot while references is atomic), a separate issue.",
+  "fix_note": "A mutex inside BankPool around GetBank and ReserveBank is simple, but GetBank returns a reference used after unlock, which stays valid because deque elements do not move on push_back; only the index/map access must be protected. Alternative: preallocate bank storage (vector of unique_ptr with fixed capacity) so growth never reallocates. Low cost either way."
+ }
+]

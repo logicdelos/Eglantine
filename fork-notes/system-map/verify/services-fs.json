@@ -1,0 +1,330 @@
+[
+  {
+    "idx": 0,
+    "title": "Cross-directory RenameFile dereferences a missing source",
+    "verdict": "confirmed",
+    "confidence": 0.95,
+    "trigger": "Guest calls fsp IFileSystem::RenameFile with an old path that does not exist and a new path in a different directory (e.g. /a/x -> /b/x). backing->GetFileRelative(src_path) returns nullptr; the parent paths differ so the null check at line 190 (inside the same-parent branch) is skipped and src->GetSize() on line 207 dereferences null.",
+    "impact": "Host crash (access violation) of the whole emulator on a guest FS call that real hardware answers with ResultPathNotFound.",
+    "evidence": [
+      {
+        "file": "src/core/hle/service/filesystem/filesystem.cpp",
+        "line": 207,
+        "quote": "auto c_res = CreateFile(dest_path, src->GetSize());"
+      },
+      {
+        "file": "src/core/hle/service/filesystem/filesystem.cpp",
+        "line": 190,
+        "quote": "if (src == nullptr) {"
+      },
+      {
+        "file": "src/core/hle/service/filesystem/filesystem.cpp",
+        "line": 214,
+        "quote": "ASSERT_MSG(dest->WriteBytes(src->ReadAllBytes()) == src->GetSize(),"
+      },
+      {
+        "file": "src/common/assert.cpp",
+        "line": 17,
+        "quote": "if (Settings::values.use_debug_asserts) {"
+      }
+    ],
+    "reasoning": "The null check is only inside the if (same parent) block; the fall-through 'move by hand' path uses src unconditionally. Reached from FSP RenameFile via Fsa::IFileSystem::DoRenameFile -> backend.RenameFile with guest-supplied paths. The secondary claim is also true: ASSERT_MSG only calls AssertFailSoftImpl, which does nothing unless use_debug_asserts (default false), so a short WriteBytes is ignored and the source is then deleted.",
+    "fix_note": "Suggested fix is right: hoist the src==nullptr check above the parent comparison, and return an error when the copy is short before deleting the source. Nothing in it should break existing callers."
+  },
+  {
+    "idx": 1,
+    "title": "ExtractRomFS loops forever or recurses without bound on truncated or cyclic RomFS metadata",
+    "verdict": "confirmed",
+    "confidence": 0.9,
+    "trigger": "A RomFS whose header is valid (header_size==0x50) but whose directory/file meta table is truncated or has a bad offset, e.g. a truncated dump where ReadBytes returns fewer bytes than requested (or zero). GetEntry returns a value-initialised pair, so child_file/child_dir/sibling are 0, not 0xFFFFFFFF; ProcessDirectory(ctx,0,...) then recurses into child_dir=0 without bound (stack overflow). A sibling chain that points to itself loops forever, adding a directory/file every pass.",
+    "impact": "Crash (stack overflow) or hang with unbounded memory growth when mounting a corrupt/truncated RomFS; huge u64 meta sizes can also throw bad_alloc from ReadBytes.",
+    "evidence": [
+      {
+        "file": "src/core/file_sys/romfs.cpp",
+        "line": 76,
+        "quote": "if (entry_end > size) {"
+      },
+      {
+        "file": "src/core/file_sys/romfs.cpp",
+        "line": 126,
+        "quote": "this_dir_offset = entry.first.sibling;"
+      },
+      {
+        "file": "src/core/file_sys/romfs.cpp",
+        "line": 122,
+        "quote": "ProcessDirectory(ctx, entry.first.child_dir, current);"
+      },
+      {
+        "file": "src/core/file_sys/romfs.cpp",
+        "line": 106,
+        "quote": "this_file_offset = entry.first.sibling;"
+      },
+      {
+        "file": "src/core/file_sys/vfs/vfs.cpp",
+        "line": 179,
+        "quote": "std::vector<u8> out(size);"
+      }
+    ],
+    "reasoning": "GetEntry returns {} (entry fields all 0) when the entry lies outside the table. All loops compare against ROMFS_ENTRY_EMPTY only, with no visited set or entry-count bound, so the zero sentinel never terminates and child_dir=0 re-enters entry 0. VfsFile::ReadBytes allocates out(size) before reading so the u64 meta sizes are unchecked allocations. Needs a corrupt or hostile RomFS, but truncated dumps are an ordinary user scenario.",
+    "fix_note": "Suggested fix is right and sufficient: have GetEntry fail on out-of-range offsets, bound iterations by meta_size/min_entry_size (or track visited offsets), and reject meta sizes above the file size. On failure ExtractRomFS must return nullptr (already a valid return) so callers cope."
+  },
+  {
+    "idx": 2,
+    "title": "IFile::Read passes the guest size, not the buffer size, to the backend",
+    "verdict": "confirmed_narrow",
+    "confidence": 0.9,
+    "trigger": "A guest (buggy or homebrew) calls IFile::Read (or IStorage::Read) with an s64 size/length larger than the HIPC out-buffer it supplies. The scratch buffer is sized from the guest buffer (resize_destructive), but backend->Read is told to read `size` bytes into it, so VfsFile::Read writes past the host heap allocation.",
+    "impact": "Host heap corruption / crash driven by guest arguments; on a short read at EOF the unfilled tail of an uninitialised scratch buffer (make_unique_for_overwrite) is also copied back, leaking stale host bytes into the guest buffer.",
+    "evidence": [
+      {
+        "file": "src/core/hle/service/filesystem/fsp/fs_i_file.cpp",
+        "line": 38,
+        "quote": "backend->Read(reinterpret_cast<size_t*>(out_size.Get()), offset, out_buffer.data(), size));"
+      },
+      {
+        "file": "src/core/file_sys/fsa/fs_i_file.h",
+        "line": 131,
+        "quote": "const auto read_size = backend->Read(static_cast<u8*>(buffer), size, offset);"
+      },
+      {
+        "file": "src/core/hle/service/cmif_serialization.h",
+        "line": 348,
+        "quote": "buffer.resize_destructive(ctx.GetWriteBufferSize(OutBufferIndex));"
+      },
+      {
+        "file": "src/common/scratch_buffer.h",
+        "line": 83,
+        "quote": "buffer = std::make_unique_for_overwrite<T[]>(buffer_capacity);"
+      },
+      {
+        "file": "src/core/hle/service/filesystem/fsp/fs_i_storage.cpp",
+        "line": 72,
+        "quote": "backend->Read(out_bytes.data(), length, offset);"
+      }
+    ],
+    "reasoning": "Nothing between the IPC layer and VfsFile::Read compares size with out_buffer.size(); Fsa::IFile::Read only checks null/offset/overflow. Well-behaved guests pass size == buffer size (real Horizon would fault or error otherwise), so normal titles never hit the overflow; it needs a malformed request. The stale-byte tail on short reads is always present but harmless in practice.",
+    "fix_note": "Clamp size to out_buffer.size() (and reject negative) as suggested; a more faithful behaviour is to return ResultInvalidSize when size > buffer size. For IStorage do the same with length. Zeroing the unread tail is optional and costs a memset per read."
+  },
+  {
+    "idx": 3,
+    "title": "KeyManager::LoadFromFile indexes fixed 0x20-entry keyblob arrays with a 2-hex-digit value",
+    "verdict": "confirmed_narrow",
+    "confidence": 0.9,
+    "trigger": "prod.keys (or a keys file loaded through LoadFromFile) contains a line such as `keyblob_ff = <0x90 bytes hex>` or `encrypted_keyblob_20 = ...`. ValidCryptoRevisionString accepts any two hex digits, strtoul yields 0x20..0xFF, and the store indexes a std::array of 0x20 entries.",
+    "impact": "Out-of-bounds write of 0x90/0xB0 bytes (up to ~40 KB past the array) into KeyManager / adjacent heap memory at startup: crash or silent corruption. A too-short hex value also reads past the end of the string_view (soft assert only).",
+    "evidence": [
+      {
+        "file": "src/core/crypto/key_manager.cpp",
+        "line": 639,
+        "quote": "const auto index = std::strtoul(out[0].substr(8, 2).c_str(), nullptr, 16);"
+      },
+      {
+        "file": "src/core/crypto/key_manager.cpp",
+        "line": 640,
+        "quote": "keyblobs[index] = Common::HexStringToArray<0x90>(out[1]);"
+      },
+      {
+        "file": "src/core/crypto/key_manager.cpp",
+        "line": 647,
+        "quote": "encrypted_keyblobs[index] = Common::HexStringToArray<0xB0>(out[1]);"
+      },
+      {
+        "file": "src/core/crypto/key_manager.h",
+        "line": 313,
+        "quote": "std::array<std::array<u8, 0x90>, 0x20> keyblobs{};"
+      },
+      {
+        "file": "src/common/hex_util.h",
+        "line": 33,
+        "quote": "ASSERT_MSG(Size * 2 <= str.size(), \"Invalid string size\");"
+      }
+    ],
+    "reasoning": "The only validation is that the two index characters are hex digits; no bound against keyblobs.size(). The arrays are 0x20 long, so indices 0x20-0xFF write out of bounds. Dumped keys files from Lockpick only contain 00..1F, so this needs a hand-edited or corrupt keys file, hence narrow.",
+    "fix_note": "Suggested fix is right: skip the line when index >= keyblobs.size() and when out[1].size() < 2*N. Apply the same size check generally to the other HexStringToArray calls in this loop."
+  },
+  {
+    "idx": 4,
+    "title": "NCZBLOCK header allocates up to 8 GiB from an unchecked block count",
+    "verdict": "confirmed_narrow",
+    "confidence": 0.8,
+    "trigger": "A corrupt or crafted .ncz whose NCZBLOCK header has a large positive block count (up to 2^31-1). ParseHeader calls f->ReadBytes(n*4, ...) which allocates std::vector<u8>(n*4) (up to 8 GiB, zero-filled) before reading; the exception from a failed allocation is not caught in ParseHeader/OpenNcz.",
+    "impact": "Either an 8 GiB zeroed allocation (long stall, heavy memory pressure) or an uncaught std::bad_alloc/length_error that terminates the process during game-list scan (IsBlockCompressedNCZ), install or NSP open; no try/catch exists in registered_cache.cpp or submission_package.cpp.",
+    "evidence": [
+      {
+        "file": "src/core/crypto/ncz_decompressor.cpp",
+        "line": 104,
+        "quote": "const auto sizes = f->ReadBytes(static_cast<u64>(n) * 4, block_start + BlockFixed);"
+      },
+      {
+        "file": "src/core/crypto/ncz_decompressor.cpp",
+        "line": 101,
+        "quote": "const s32 n = static_cast<s32>(Le(fixed.data() + 12, 4));"
+      },
+      {
+        "file": "src/core/crypto/ncz_decompressor.cpp",
+        "line": 102,
+        "quote": "if (n <= 0) return std::nullopt;"
+      },
+      {
+        "file": "src/core/crypto/ncz_decompressor.cpp",
+        "line": 395,
+        "quote": "try { body = std::make_unique<BlockReader>(f, *block, ps); }"
+      },
+      {
+        "file": "src/core/file_sys/vfs/vfs.cpp",
+        "line": 179,
+        "quote": "std::vector<u8> out(size);"
+      },
+      {
+        "file": "src/core/file_sys/registered_cache.cpp",
+        "line": 174,
+        "quote": "if (!Core::Crypto::IsBlockCompressedNCZ(entry)) {"
+      }
+    ],
+    "reasoning": "Only n>0 is checked, unlike the section count which is bounded against the file size. The try/catch in OpenNcz covers only the BlockReader constructor, and IsBlockCompressedNCZ calls ParseHeader bare. The file must carry the NCZBLOCK magic plus a garbage count, so only corrupt or hostile files hit it.",
+    "fix_note": "Suggested fix is right: compare n*4 against fsize - block_start - BlockFixed before the read. A try/catch around OpenNcz/IsBlockCompressedNCZ is a reasonable extra; the bound check alone is enough and cheaper."
+  },
+  {
+    "idx": 5,
+    "title": "Fsa::IFile::DoWrite reports success when the write failed or the file is read-only",
+    "verdict": "confirmed_narrow",
+    "confidence": 0.9,
+    "trigger": "Guest writes through IFile::Write to a file whose backend rejects the write (a RomFS/PFS/NUP member, a file opened read-only in RealVfsFile, or a real file on a full disk). backend->Write returns 0 or a short count; DoWrite only ASSERT_MSGs, which is a no-op while use_debug_asserts is false (default), and returns success.",
+    "impact": "Guest believes data was saved when it was not (silent save-data loss on disk full); no crash. Writes to read-only content that real hardware rejects with ResultWriteNotPermitted succeed silently.",
+    "evidence": [
+      {
+        "file": "src/core/file_sys/fsa/fs_i_file.h",
+        "line": 148,
+        "quote": "const std::size_t written = backend->Write(static_cast<const u8*>(buffer), size, offset);"
+      },
+      {
+        "file": "src/core/file_sys/fsa/fs_i_file.h",
+        "line": 150,
+        "quote": "ASSERT_MSG(written == size,"
+      },
+      {
+        "file": "src/core/file_sys/fsa/fs_i_file.h",
+        "line": 71,
+        "quote": "R_RETURN(this->DoWrite(offset, buffer, size, option));"
+      },
+      {
+        "file": "src/core/hle/service/filesystem/filesystem.cpp",
+        "line": 269,
+        "quote": "*out_file = file;"
+      },
+      {
+        "file": "src/common/assert.cpp",
+        "line": 17,
+        "quote": "if (Settings::values.use_debug_asserts) {"
+      }
+    ],
+    "reasoning": "Fsa::IFile::Write has no open mode to check (OpenFile hands back the bare VirtualFile; mode is only used for the AllowAppend wrapper), and DoWrite discards the byte count. Soft assert does nothing by default. Triggers are rare in practice (disk full, or a guest writing to read-only content), so narrow.",
+    "fix_note": "Return an error Result when written != size (and a space/permission code for 0 on a non-writable file). Checking open mode needs the mode plumbed through OpenFile into IFile, which is a larger change; failing on short writes alone is the safe core fix."
+  },
+  {
+    "idx": 6,
+    "title": "NUP zstd members are fully decompressed on every cache miss with no in-flight de-duplication",
+    "verdict": "confirmed_narrow",
+    "confidence": 0.8,
+    "trigger": "Two threads read different offsets of the same NUP zstd member (uncompressed size <= 256 MiB) while it is not in the LRU: both miss in cache->Find, both run Decompress() (a full ZSTD_decompress into a new vector plus a full compressed copy), and Insert drops the second via index.contains. A title whose hot members exceed the 512 MiB cap also thrashes the LRU. On the spill path, attempted is set before DecompressToFile so one transient failure is permanent for that member.",
+    "impact": "Wasted CPU and transient memory (up to uncompressed + compressed size per redundant decompress) and hitches on streamed RomFS of large NUP titles; no wrong data. Spill files are deleted in ~NupSpillFile when the cache dies, so disk growth is bounded by the large members touched.",
+    "evidence": [
+      {
+        "file": "src/core/file_sys/nup_container.cpp",
+        "line": 212,
+        "quote": "std::vector<u8> scratch = Decompress();"
+      },
+      {
+        "file": "src/core/file_sys/nup_container.h",
+        "line": 65,
+        "quote": "if (index.contains(file_index)) {"
+      },
+      {
+        "file": "src/core/file_sys/nup_container.cpp",
+        "line": 246,
+        "quote": "spill->attempted = true;"
+      },
+      {
+        "file": "src/core/file_sys/nup_container.cpp",
+        "line": 331,
+        "quote": "ZSTD_decompress(out.data(), out.size(), compressed.data(), compressed.size());"
+      },
+      {
+        "file": "src/core/file_sys/nup_container.cpp",
+        "line": 167,
+        "quote": "cache_index(cache_index_), cache_enabled(uncompressed_size <= cache->cap / 2) {}"
+      }
+    ],
+    "reasoning": "The code does decompress the whole member on every miss and has no in-flight latch for the in-memory path (the spilled path does serialise on spill->mutex, so only the cached path duplicates work). Overstated: spill files are cleaned in the destructor, so 'grows' is bounded. It is a performance concern in fork-only Switch 2 .nup code, not a correctness bug.",
+    "fix_note": "A per-member in-flight latch (or a per-member mutex around Decompress) is the right small fix. Block-wise zstd needs a format change. Retrying after a failed spill is cheap: reset attempted on failure."
+  },
+  {
+    "idx": 8,
+    "title": "Every read of a loose real file serialises on the global RealVfsFilesystem list_lock across disk I/O",
+    "verdict": "confirmed_narrow",
+    "confidence": 0.85,
+    "trigger": "Two or more threads read from RealVfsFile objects at once (e.g. game NSP/XCI container plus update/DLC files, or a loose RomFS streamed by several guest threads). RefreshReference returns the unique_lock on the filesystem-wide list_lock and RealVfsFile::Read keeps it through Seek and ReadSpan.",
+    "impact": "Disk reads on all RealVfsFiles are serialised behind one mutex, so no I/O overlap across files; modest slowdown/stutter under concurrent streaming, no incorrectness.",
+    "evidence": [
+      {
+        "file": "src/core/file_sys/vfs/vfs_real.cpp",
+        "line": 370,
+        "quote": "auto lk = base.RefreshReference(path, perms, *reference);"
+      },
+      {
+        "file": "src/core/file_sys/vfs/vfs_real.cpp",
+        "line": 374,
+        "quote": "return reference->file->ReadSpan(std::span{data, length});"
+      },
+      {
+        "file": "src/core/file_sys/vfs/vfs_real.cpp",
+        "line": 240,
+        "quote": "std::unique_lock lk{list_lock};"
+      },
+      {
+        "file": "src/core/file_sys/vfs/vfs_real.cpp",
+        "line": 259,
+        "quote": "return lk;"
+      }
+    ],
+    "reasoning": "The lock is returned to the caller and held across the read, exactly as described; it also protects the FILE* from being evicted/closed by EvictSingleReferenceLocked while in use. Reads of the same file must be serialised anyway (shared FILE* with seek+read), so only cross-file concurrency is lost. Upstream yuzu design, low impact in practice on SSDs.",
+    "fix_note": "Suggested fix (pin via refcount, per-file lock for I/O) is right but nontrivial: it must keep eviction from closing a file mid-read. Could break open-file-limit accounting if EvictSingleReferenceLocked ignores the pin."
+  },
+  {
+    "idx": 9,
+    "title": "Solid NCZ install keeps the whole decompressed NCA in memory",
+    "verdict": "confirmed",
+    "confidence": 0.85,
+    "trigger": "Install a solid (non-NCZBLOCK) .ncz via RegisteredCache::InstallEntry -> GetNCAFromNSPForID -> DecompressNCZForInstall. SolidNczFile::DecodeTo appends every decoded chunk to the `data` vector and never frees it; installing a multi-GB NCA holds the full decompressed NCA in memory, and vector growth transiently needs about 2x.",
+    "impact": "Memory use equal to the decompressed NCA size (multiple GB, up to 2x during reallocation) during install; possible uncaught bad_alloc or heavy paging on 16 GB machines.",
+    "evidence": [
+      {
+        "file": "src/core/crypto/ncz_decompressor.cpp",
+        "line": 361,
+        "quote": "data.insert(data.end(), out_buf.begin(), out_buf.begin() + produced);"
+      },
+      {
+        "file": "src/core/crypto/ncz_decompressor.cpp",
+        "line": 374,
+        "quote": "mutable std::vector<u8> data;"
+      },
+      {
+        "file": "src/core/crypto/ncz_decompressor.cpp",
+        "line": 291,
+        "quote": "std::memcpy(out, data.data() + off, len);"
+      },
+      {
+        "file": "src/core/crypto/ncz_decompressor.cpp",
+        "line": 427,
+        "quote": "return OpenNcz(f, name, /*allow_solid=*/true);"
+      },
+      {
+        "file": "src/core/file_sys/registered_cache.cpp",
+        "line": 838,
+        "quote": "file = Core::Crypto::DecompressNCZForInstall("
+      }
+    ],
+    "reasoning": "The data vector is the only storage, indexed by absolute NCA offset, and nothing is ever released; the file object lives until the install finishes. Solid NCZ is only opened on the install path (the play path rejects it), which limits exposure, but nsz produces solid NCZ by default so large installs are realistic.",
+    "fix_note": "A pure sliding window is risky: the NCA constructor and BKTR/section parsing read earlier offsets (header at 0), so dropping data before the last request would break random reads. Decoding to a temporary file (like the NUP spill) or re-decoding on backward seeks is safer."
+  }
+]

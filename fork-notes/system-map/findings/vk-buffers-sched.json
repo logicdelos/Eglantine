@@ -1,0 +1,50 @@
+[
+  {
+    "title": "SimpleStreamer::GetQuery indexes slot_queries without the lock while BuildQuery grows the deque on another thread",
+    "kind": "race",
+    "severity": "medium",
+    "confidence": 0.35,
+    "file": "src/video_core/query_cache/query_stream.h",
+    "line": 114,
+    "quote": "            return &slot_queries[query_id];",
+    "explanation": "BuildQuery does slot_queries.emplace_back under `guard` on the recording thread. GetQuery takes no lock. The fence thread calls GetQuery (SamplesStreamer::PopUnsyncedQueries and the callbacks queued by ReplicateCurrentQueryIfNeeded). A std::deque emplace_back that grows the block map while another thread computes operator[] is a data race; with a large element type each push allocates a block and the map is reallocated every time it doubles, so the reader can follow a freed map pointer. It needs a new query to be created while a flush for older queries is being processed, and it happens only when the query count crosses a map-growth step.",
+    "suggested_fix": "Take `guard` in GetQuery (copying the pointer out is fine because deque elements do not move), or store queries in a container with stable addresses and a pre-sized index (for example std::deque guarded by guard plus a reserved vector of pointers).",
+    "how_to_verify": "Run a title that issues many ZPass queries with the fence thread active under ThreadSanitizer or Application Verifier page heap, or stress-test by calling BuildQuery in a loop on one thread and GetQuery on another."
+  },
+  {
+    "title": "BankPool::GetBank and ReserveBank access a std::deque of banks from the fencing thread and the recording thread with no lock",
+    "kind": "race",
+    "severity": "medium",
+    "confidence": 0.3,
+    "file": "src/video_core/query_cache/bank_base.h",
+    "line": 96,
+    "quote": "        return bank_pool[index];",
+    "explanation": "ReserveBank calls builder(bank_pool, ...) which does emplace_back on the recording thread. SamplesStreamer::PopUnsyncedQueries on the fencing thread calls ApplyBankOp/ApplyBanksWideOp, which call GetBank for each bank of a query without any shared lock (only flush_guard around the pending set pop). A new bank being appended while the fence thread indexes the deque is a data race on the deque's map and size fields. Banks are created rarely (256 queries each), so the window is small.",
+    "suggested_fix": "Guard bank_pool and bank_indices with a mutex inside BankPool, or keep banks in a vector of unique_ptr with a pre-reserved capacity so that growth never moves the index.",
+    "how_to_verify": "Read the callers of GetBank in vk_query_cache.cpp (lines 432, 458, 493, 791, 873) and confirm which run on the fencing thread; reproduce with ThreadSanitizer on a title that opens many sample queries per frame."
+  },
+  {
+    "title": "GetStreamBuffer can pass an inverted region range to AreRegionsActive after a wrap that fell back to a staging buffer",
+    "kind": "robustness",
+    "severity": "low",
+    "confidence": 0.2,
+    "file": "src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp",
+    "line": 154,
+    "quote": "    if (AreRegionsActive(Region(free_iterator) + 1,",
+    "explanation": "When iterator + size reaches the buffer end, the code resets iterator to 0 and sets free_iterator = size, and then returns a staging buffer if regions 0..Region(size) are still active. In that case iterator stays 0 while free_iterator = size. If size equals region_size exactly (allowed by the `size <= region_size` test in Request), Region(free_iterator) + 1 is 2. The next small request computes the end as Region(0 + small) + 1 = 1. std::any_of is then called with begin > end, which walks past the end of sync_ticks. It usually returns true quickly on garbage and takes the staging fallback, so the effect is mostly an out-of-bounds read; it requires an upload of exactly 8 MiB that hits the wrap while the first two regions are busy.",
+    "suggested_fix": "Do not set free_iterator = size on the fallback path (restore the old iterator and free_iterator before returning GetStagingBuffer), or clamp so region_begin <= region_end in AreRegionsActive.",
+    "how_to_verify": "Unit-drive StagingBufferPool with a fake scheduler: request region_size bytes until the wrap with regions 0 and 1 marked active, then request 100 bytes and check the range passed to AreRegionsActive (add an assert for region_begin <= region_end)."
+  },
+  {
+    "title": "MasterSemaphore::Wait spins forever on a tick that was never submitted",
+    "kind": "robustness",
+    "severity": "low",
+    "confidence": 0.2,
+    "file": "src/video_core/renderer_vulkan/vk_master_semaphore.cpp",
+    "line": 111,
+    "quote": "        while (!semaphore.Wait(tick)) {",
+    "explanation": "semaphore.Wait returns false on timeout and the loop retries without limit. If a caller asks for a tick that is still open (current_tick not yet signalled) and does not flush first, the wait never ends. Scheduler::Wait flushes first, and InnerFence::Wait on a non-back thread calls WaitSubmitted first, so normal paths are covered; direct callers such as BufferCacheRuntime::Wait/WaitSubmittedTick or new Nx2 code that skip those guards would hang the thread silently. A real device loss throws instead, so this is only about unsubmitted ticks.",
+    "suggested_fix": "In MasterSemaphore::Wait, check IsSubmitted(tick) and assert or log with a bounded retry count before looping, so a wait on an open tick is reported instead of hanging.",
+    "how_to_verify": "Call MasterSemaphore::Wait(CurrentTick()) from a test thread without a flush and observe that it never returns; then grep for direct master.Wait callers and confirm each flushes or checks IsSubmitted first."
+  }
+]

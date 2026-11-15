@@ -1,0 +1,86 @@
+[
+  {
+    "idx": 0,
+    "title": "Background prebuild is cancelled by a draw that then defers the build itself",
+    "verdict": "confirmed_narrow",
+    "confidence": 0.75,
+    "trigger": "Boot with a populated pipeline cache so a pipeline key sits in deferred_graphics and the VkPipelinePrebuild pool is still running (background_active true). A draw for that key misses graphics_cache, so BuildNewGraphicsPipeline calls TakeBackgroundPipeline; the pipeline is not in background_ready yet, so the key is inserted into background_claimed and nullptr returned. If the 24 ms per-frame build budget is already spent (async shaders on, ShaderBuildBudget on), DeferRuntimeBuild returns true and the draw is skipped as 'build-deferred'. The worker then sees the key in background_claimed before starting (skips) or before publishing (discards its finished pipeline).",
+    "impact": "No wrong image or crash. Wasted background CPU, and the pipeline is built again later on the GPU thread (or via async translation) when a draw next has budget; that is the hitching the prebuild was meant to avoid. Limited to the boot window while the background pool is busy.",
+    "evidence": [
+      {
+        "file": "src/video_core/renderer_vulkan/vk_pipeline_cache.cpp",
+        "line": 2121,
+        "quote": "    if (background_active.load(std::memory_order_acquire)) {"
+      },
+      {
+        "file": "src/video_core/renderer_vulkan/vk_pipeline_cache.cpp",
+        "line": 2122,
+        "quote": "        background_claimed.insert(key);"
+      },
+      {
+        "file": "src/video_core/renderer_vulkan/vk_pipeline_cache.cpp",
+        "line": 2414,
+        "quote": "    std::unique_ptr<GraphicsPipeline> pipeline{TakeBackgroundPipeline(graphics_key)};"
+      },
+      {
+        "file": "src/video_core/renderer_vulkan/vk_pipeline_cache.cpp",
+        "line": 2415,
+        "quote": "    if (!pipeline && DeferRuntimeBuild()) {"
+      },
+      {
+        "file": "src/video_core/renderer_vulkan/vk_pipeline_cache.cpp",
+        "line": 1483,
+        "quote": "                    build = !background_claimed.contains(key);"
+      },
+      {
+        "file": "src/video_core/renderer_vulkan/vk_pipeline_cache.cpp",
+        "line": 1496,
+        "quote": "                if (pipeline && !background_claimed.contains(key)) {"
+      }
+    ],
+    "reasoning": "TakeBackgroundPipeline claims the key unconditionally while background_active, before DeferRuntimeBuild decides whether the GPU thread will actually build. The claim is only meaningful if the GPU thread builds, and the deferred path does not. Defaults make it reachable: use_asynchronous_shaders defaults true, Nx2Perf options are on unless switched off, BackgroundPipelinesEnabled is on unless EDEN_NX2_BACKGROUND_PIPELINES=0. Effect is performance only and only while the prebuild runs, and a later draw still gets a correct pipeline.",
+    "fix_note": "Moving the claim after the DeferRuntimeBuild check is right: split TakeBackgroundPipeline into a lookup (take if ready) and a separate ClaimBackgroundKey(key) called just before the GPU thread actually builds or queues the translation. Side effect to watch: a key left unclaimed while deferred may be built by the worker and the GPU thread concurrently if a later draw proceeds past DeferRuntimeBuild after the worker passed its claim check; the claim at the build point plus the publish-time check already covers that, the result is at worst one duplicate build."
+  },
+  {
+    "idx": 1,
+    "title": "shader_infos[] can point at a ShaderInfo freed by cache invalidation",
+    "verdict": "confirmed_narrow",
+    "confidence": 0.6,
+    "trigger": "A graphics program is bound and cached (RefreshStages stored it in shader_infos[index]). The guest then overwrites that shader's code in place (e.g. reuses a shader pool slot); the write callback runs InvalidateRegion, which marks the entry and RemovePendingShaders erases the ShaderInfo from storage, bumping invalidation_serial but not Dirty::Shaders. The guest rebinds the program with the same offset/address registers, which Maxwell3D drops as a same-value write (SkipSameValueWrites default on) so Dirty::Shaders stays clear. The next draw changes only fixed-function state (e.g. blend), so the graphics key misses; RefreshStages returns last_shaders_valid early and GetGraphicsEnvironments dereferences shader_infos[index], which is freed memory. With a key hit instead, the old pipeline is reused for the rewritten code.",
+    "impact": "Use after free read on the GPU thread (garbage lowered_native shared_ptr copy and size_bytes: crash or a corrupt/rejected shader build) in the key-miss case; stale pipeline (old shader output) in the key-hit case. Needs the guest to rewrite a live shader in place without changing any program register value, so rare. InvalidateRegion also runs on the calling CPU thread via ThreadManager::InvalidateRegion without GPU-thread synchronisation, which adds a data race on shader_infos[] readers.",
+    "evidence": [
+      {
+        "file": "src/video_core/shader_cache.cpp",
+        "line": 140,
+        "quote": "    if (!dirty[VideoCommon::Dirty::Shaders]) {"
+      },
+      {
+        "file": "src/video_core/shader_cache.cpp",
+        "line": 141,
+        "quote": "        return last_shaders_valid;"
+      },
+      {
+        "file": "src/video_core/shader_cache.cpp",
+        "line": 336,
+        "quote": "        env.SetCachedSize(shader_infos[index]->size_bytes);"
+      },
+      {
+        "file": "src/video_core/shader_cache.cpp",
+        "line": 453,
+        "quote": "            std::erase_if(storage, [&removed_shaders](const std::unique_ptr<ShaderInfo>& shader) {"
+      },
+      {
+        "file": "src/video_core/shader_cache.cpp",
+        "line": 93,
+        "quote": "        channel_storage[id].maxwell3d.dirty.flags[VideoCommon::Dirty::Shaders] = true;"
+      },
+      {
+        "file": "src/video_core/engines/maxwell_3d.cpp",
+        "line": 767,
+        "quote": "        if (!SkipSameValueWrites() || regs.reg_array[method] != argument) {"
+      }
+    ],
+    "reasoning": "RefreshStages' early return skips all re-resolution while Dirty::Shaders is clear, and the only places that set it besides register writes are macro.cpp and RefreshDebugRejections (which comments exactly this hazard: 'shader_infos may point at removed programs'). RemovePendingShaders erases the unique_ptr<ShaderInfo> from storage and bumps invalidation_serial, but RefreshStages never compares it at the early out (it only reads it after the dirty check). GetGraphicsEnvironments then reads shader_infos[index] with no check for liveness. The window is real but needs an in-place rewrite plus no register change; the same structure exists in upstream yuzu so it seldom fires in practice.",
+    "fix_note": "Either suggested fix works. Setting Dirty::Shaders on all channels from RemovePendingShaders (as RefreshDebugRejections does) is simplest but must be applied from the thread that owns the dirty flags, since InvalidateRegion can run on a CPU thread; safer is to record the invalidation_serial seen at the last refresh and compare it at the early out on the GPU thread. Cost: one atomic acquire load per draw, and a full re-resolve after any shader invalidation."
+  }
+]

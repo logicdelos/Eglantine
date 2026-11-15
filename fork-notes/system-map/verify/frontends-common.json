@@ -1,0 +1,108 @@
+[
+  {
+    "idx": 0,
+    "title": "Config::WriteToIni truncates the live config file before writing it",
+    "verdict": "confirmed_narrow",
+    "confidence": 0.7,
+    "trigger": "Any Save/SaveAllValues (every BootGame, window close, Save Config) calls WriteToIni, which opens the real ini with \"wb\" (truncate to zero length) and then streams CSimpleIniA::Save into it. If the process is killed, crashes, loses power or the disk fills between the fopen and fclose, the ini on disk is empty or partial. Next start SetUpIni loads it without an error check beyond rc<0, so the user silently gets defaults (game dirs, input mapping).",
+    "impact": "Loss of all settings for the affected ini (global qt-config.ini or a per-game custom ini) after a crash/kill/power loss in the few-ms write window, or a full disk. No effect in normal operation.",
+    "reasoning": "The code opens the destination directly in truncating mode and has no temp file or rename, and on a Save error it only logs, leaving the truncated file. That is a classic non-atomic write. The exposure is limited to the time Save takes (tens of microseconds to a few ms for an ini), plus out-of-disk-space, so real but narrow. The in-memory config is intact, so a later successful save repairs it if the process survives.",
+    "fix_note": "Write to <config_loc>.tmp, fflush/close, then std::filesystem::rename over the target (MSVC's rename replaces an existing file on Windows) is correct. Watch for the rename failing when an antivirus/indexer holds the target open (fall back to logging and keeping the old file), and keep the temp file in the same directory so rename stays atomic.",
+    "evidence": [
+      {
+        "file": "src/frontend_common/config.cpp",
+        "line": 112,
+        "quote": "    fp = _wfopen(Common::UTF8ToUTF16W(config_loc).data(), L\"wb\");"
+      },
+      {
+        "file": "src/frontend_common/config.cpp",
+        "line": 123,
+        "quote": "    const SI_Error rc = config->Save(writer, false);"
+      },
+      {
+        "file": "src/frontend_common/config.cpp",
+        "line": 127,
+        "quote": "    fclose(fp);"
+      }
+    ]
+  },
+  {
+    "idx": 1,
+    "title": "Crash paths never flush the file log, so the last lines before a crash are lost",
+    "verdict": "confirmed",
+    "confidence": 0.75,
+    "trigger": "Run with the default log_flush_line=false and a filter that lets Info/Warning through, log some Info lines, then take an unhandled host exception (e.g. access violation on any thread). Neither the Breakpad ExceptionHandler (constructed with no filter/callback) nor WriteCrashDump nor any other crash path calls Common::Log::Stop()/Flush; Stop is called only from assert.cpp. FileBackend only flushes on Error-or-higher lines, on the size limit, or with log_flush_line, so up to one stdio buffer of the newest lines stays in the CRT FILE buffer and is lost when the process dies.",
+    "impact": "Truncated log after a crash: the final Info/Warning lines (about one 4 KiB CRT buffer) that explain the crash are missing. Diagnostics only; no effect on emulation.",
+    "reasoning": "Grep shows Log::Stop only in assert.cpp, FileBackend::Write flushes only under the conditions listed, and the crash handlers in both frontends do not flush. Normal exit is fine because the IOFile destructor closes the FILE at static destruction, so only abnormal termination loses data. The CLI filter is additionally active only with EDEN_NX2_CRASH_DUMP, but the Qt Breakpad path has the same gap. The default CRT buffer size (4 KiB for files on MSVC) is the standard value rather than something I verified in this repo.",
+    "fix_note": "Calling a flush-only function from the crash handler is reasonable on Windows (SEH filters may take locks, but a FILE lock is held only inside fwrite so a deadlock needs a crash inside logging); for Breakpad pass a FilterCallback that flushes and returns true. Setting log_flush_line=true while a crash handler is installed is simpler but costs an fflush per line. Do not use the logger's mutex from the handler.",
+    "evidence": [
+      {
+        "file": "src/common/logging.cpp",
+        "line": 287,
+        "quote": "        if (Settings::values.log_flush_line.GetValue())"
+      },
+      {
+        "file": "src/common/logging.cpp",
+        "line": 294,
+        "quote": "        if (entry.log_level >= Level::Error || write_limit_exceeded) {"
+      },
+      {
+        "file": "src/common/assert.cpp",
+        "line": 18,
+        "quote": "        Common::Log::Stop();"
+      },
+      {
+        "file": "src/common/logging.cpp",
+        "line": 455,
+        "quote": "void Stop() {"
+      },
+      {
+        "file": "src/yuzu_cmd/yuzu.cpp",
+        "line": 565,
+        "quote": "    SetUnhandledExceptionFilter(WriteCrashDump);"
+      },
+      {
+        "file": "src/yuzu/breakpad.cpp",
+        "line": 71,
+        "quote": "    static google_breakpad::ExceptionHandler eh{dump_path, nullptr, nullptr, nullptr,"
+      }
+    ]
+  },
+  {
+    "idx": 2,
+    "title": "TerminateEmulationThread uses QThread::terminate, skipping ShutdownMainProcess and leaving a half-stopped System for the next boot",
+    "verdict": "confirmed_narrow",
+    "confidence": 0.65,
+    "trigger": "Stop the game so that EmuThread does not return within shutdown_time plus EmuThreadStopTimeoutMs (10 s), e.g. the thread is stuck in System::Run()/Pause() waiting on a core-timing SyncPause or inside ShutdownMainProcess waiting for a guest/kernel thread. OnEmulationStopTimeout or ShutdownGame then calls QThread::terminate() (TerminateThread), so DetachDebugger/ShutdownMainProcess never finish and locks held by that thread are never released. OnEmulationStopped resets the thread and the user boots another game: LoadROM goes to System::Load -> InitializeKernel on the same System with services, gpu_core, audio_core and the old process still present and shutting_down already true.",
+    "impact": "After an already-hung stop, the next boot may hang, crash or run with stale GPU/audio/kernel state; a restart of the application is the only reliable recovery.",
+    "reasoning": "The shutdown work (DetachDebugger, ShutdownMainProcess, which resets services, gpu, audio, kernel) lives only at the tail of EmuThread::run, so a forced terminate necessarily skips it, and nothing on the BootGame/LoadROM path repeats it. LoadROM only calls ShutdownGame, which ends in the same terminate/OnEmulationStopped. The scenario requires the emulation thread to already be hung for 11+ seconds, so it is a failure-recovery weakness, not a normal-use bug.",
+    "fix_note": "Forcing a restart prompt/blocking BootGame after a forced terminate is the safe option; the alternative of running ShutdownMainProcess from the GUI thread after terminate is unsafe because the killed thread may hold the very locks it needs. Blocking boot would need a flag cleared only on process restart; the CLI already has an exit-code restart path to reuse.",
+    "evidence": [
+      {
+        "file": "src/yuzu/main_window.cpp",
+        "line": 2801,
+        "quote": "        QtCommon::emu_thread->terminate();"
+      },
+      {
+        "file": "src/yuzu/main_window.cpp",
+        "line": 2914,
+        "quote": "    TerminateEmulationThread();"
+      },
+      {
+        "file": "src/qt_common/render/emu_thread.cpp",
+        "line": 84,
+        "quote": "    QtCommon::system->ShutdownMainProcess();"
+      },
+      {
+        "file": "src/core/core.cpp",
+        "line": 568,
+        "quote": "    void ShutdownMainProcess() {"
+      },
+      {
+        "file": "src/yuzu/main_window.cpp",
+        "line": 2466,
+        "quote": "        ShutdownGame();"
+      }
+    ]
+  }
+]

@@ -1,0 +1,62 @@
+[
+  {
+    "title": "VertexInputDynamicState driver-version check compares mismatched encodings, so VIDS is always disabled on NVIDIA and Intel Windows",
+    "kind": "logic_error",
+    "severity": "medium",
+    "confidence": 0.85,
+    "file": "src/video_core/vulkan_common/vulkan_device.cpp",
+    "line": 1416,
+    "quote": "        const u32 version = (properties.properties.driverVersion << 3) >> 3;",
+    "explanation": "driverVersion is masked to its low 29 bits (< 0x20000000) and compared with VK_MAKE_API_VERSION(580,119,2,0) (and (27,20,100,0) for Intel Windows). VK_MAKE_API_VERSION puts the variant (580, truncated to 4) in bits 29-31, so the constant is about 0x9DC02000, always larger than the masked value. NVIDIA encodes versions as major<<22|minor<<14|secondary<<6|tertiary and Intel Windows as major<<14|minor, so neither matches this macro. Result: `version < constant` is true for every driver, including 580.119.02 and newer, and VK_EXT_vertex_input_dynamic_state is removed with the 'Disabling broken' warning on the owner's RTX 5070 Ti.",
+    "suggested_fix": "Compare the raw driverVersion against constants built with the vendor's own encoding: NVIDIA (580u<<22)|(119u<<14)|(2u<<6); Intel Windows (27u<<14)|100u (check the minor field layout). Drop the <<3>>3 masking.",
+    "how_to_verify": "Print driverVersion and the constant in the ctor on a current NVIDIA driver (>= 580.119.02); the warning 'Disabling broken VK_EXT_vertex_input_dynamic_state' appears anyway. After the fix the extension stays enabled on that driver."
+  },
+  {
+    "title": "MemoryAllocator::CreateBuffer has no budget-relaxing or OOM fallback while CreateImage and Commit do",
+    "kind": "robustness",
+    "severity": "medium",
+    "confidence": 0.4,
+    "file": "src/video_core/vulkan_common/vulkan_memory_allocator.cpp",
+    "line": 443,
+    "quote": "        vk::Check(vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info));",
+    "explanation": "Buffers are created with VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT and vk::Check throws vk::Exception on failure (the min_alignment overload at line 500 is the same). CreateImage retries without the budget bit and in host memory, so images can fill the heap up to the real limit. When the heap is near its budget, a later buffer-cache, staging or descriptor-buffer allocation fails with VK_ERROR_OUT_OF_DEVICE_MEMORY and the exception propagates; I found no catch in vk_buffer_cache.cpp or vk_staging_buffer_pool.cpp (the only catches are in vk_texture_cache.cpp).",
+    "suggested_fix": "On VK_ERROR_OUT_OF_DEVICE_MEMORY retry without WITHIN_BUDGET (and bump pressure_events), as CreateImage and Commit already do; fall back to host-visible memory for non-critical buffers.",
+    "how_to_verify": "Set EDEN_NX2_VRAM_LIMIT_MIB to a small value (e.g. 2048) and run a texture-heavy title; check whether a vk::Exception from CreateBuffer ends the session. Or inject VK_ERROR_OUT_OF_DEVICE_MEMORY into the first vmaCreateBuffer call after the texture cache has filled the budget."
+  },
+  {
+    "title": "features_1_2/features_1_3 are linked after features2 but overwritten by the next SetNext, so they are never queried",
+    "kind": "dead_code",
+    "severity": "low",
+    "confidence": 0.7,
+    "file": "src/video_core/vulkan_common/vulkan_device.cpp",
+    "line": 1232,
+    "quote": "        *next = &features_1_2;",
+    "explanation": "`next` still points at features2.pNext, so the first FEATURE(...) SetNext replaces this pointer and the Vulkan 1.2/1.3 feature structs are dropped from the chain; the individual feature structs do the querying. Leaving them linked would also dangle once GetSuitability returns and duplicate feature structs (VUID-VkPhysicalDeviceFeatures2-pNext-02830), so the current behaviour is only accidentally safe.",
+    "suggested_fix": "Remove the features_1_2/features_1_3 block.",
+    "how_to_verify": "Read SetNext and step through the chain in a debugger after line 1263, or walk features2.pNext and check that no sType equals VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES."
+  },
+  {
+    "title": "GetDeviceMemoryUsage queries the driver and VMA on every call, twice per frame",
+    "kind": "performance",
+    "severity": "low",
+    "confidence": 0.3,
+    "file": "src/video_core/vulkan_common/vulkan_device.cpp",
+    "line": 1793,
+    "quote": "u64 Device::GetDeviceMemoryUsage() const {",
+    "explanation": "Each call runs vkGetPhysicalDeviceMemoryProperties2 plus vmaGetHeapBudgets (which refreshes the Vulkan budget every 30 allocator operations). The buffer cache (buffer_cache.h around line 171) and the texture cache (texture_cache.h around line 463) both call it each frame, and the buffer cache result is unused for native-tiling (Switch 2) titles.",
+    "suggested_fix": "Skip the call in the buffer cache when the value is unused, or cache the result per frame in Device.",
+    "how_to_verify": "Profile the render thread for vkGetPhysicalDeviceMemoryProperties2 self time per frame; with the call removed for NX2 titles the time should vanish."
+  },
+  {
+    "title": "GetDeviceMemoryUsage passes a memory-budget struct to the driver without checking VK_EXT_memory_budget is enabled",
+    "kind": "robustness",
+    "severity": "low",
+    "confidence": 0.3,
+    "file": "src/video_core/vulkan_common/vulkan_device.cpp",
+    "line": 1796,
+    "quote": "    physical.GetMemoryProperties(&budget);",
+    "explanation": "GetDeviceMemoryBudget (line 1818) returns early without extensions.memory_budget, and line 1857 uses `extensions.memory_budget ? &budget : nullptr`, but GetDeviceMemoryUsage always chains VkPhysicalDeviceMemoryBudgetPropertiesEXT. Without the extension the chained struct is invalid usage and heapUsage stays zero, so usage reads as VMA-only numbers. NVIDIA drivers expose the extension, so the owner is unaffected.",
+    "suggested_fix": "Pass nullptr when !extensions.memory_budget, as line 1857 does.",
+    "how_to_verify": "Run with validation layers on a driver or with the extension masked out and look for a VUID about the pNext struct; read heapUsage after the call."
+  }
+]

@@ -1,0 +1,76 @@
+[
+  {
+    "idx": 1,
+    "title": "Guest IC IVAU only invalidates the issuing core's JIT; other cores keep stale translated blocks",
+    "verdict": "confirmed_narrow",
+    "confidence": 0.7,
+    "trigger": "Guest thread on core A writes code to an address that core B's JIT has already translated, issues dc cvau; ic ivau; dsb; isb on core A, then a thread on core B executes that address. Only core A's Jit gets InvalidateCacheRange queued; core B keeps the old block. The same happens if the writing thread is migrated to core B after the IC. A guest can only do this without a kernel svc if the page is writable and executable at once, which Horizon normally forbids (guest JIT goes through svc MapProcessCodeMemory/SetProcessMemoryPermission, which does broadcast via InvalidateInstructionCache).",
+    "impact": "Self-modifying or guest-JIT code on another core runs stale instructions: wrong behaviour, hang or guest crash. Rare in practice; nothing for ordinary games.",
+    "evidence": [
+      {
+        "file": "src/core/arm/dynarmic/arm_dynarmic_64.cpp",
+        "line": 120,
+        "quote": "        m_parent.InvalidateCacheRange(cache_line_start, ICACHE_LINE_SIZE);"
+      },
+      {
+        "file": "src/core/arm/dynarmic/arm_dynarmic_64.cpp",
+        "line": 126,
+        "quote": "    case Dynarmic::A64::InstructionCacheOperation::InvalidateAllToPoUInnerSharable:"
+      },
+      {
+        "file": "src/core/arm/dynarmic/arm_dynarmic_64.cpp",
+        "line": 128,
+        "quote": "        LOG_DEBUG(Core_ARM, \"Unprocesseed instruction cache operation: {}\", op);"
+      },
+      {
+        "file": "src/core/hle/kernel/k_page_table_base.cpp",
+        "line": 89,
+        "quote": "                interface->InvalidateCacheRange(GetInteger(addr), size);"
+      },
+      {
+        "file": "src/core/arm/debug.cpp",
+        "line": 352,
+        "quote": "            interface->InvalidateCacheRange(address, size);"
+      }
+    ],
+    "reasoning": "InstructionCacheOperationRaised calls m_parent.InvalidateCacheRange, which touches only that ArmDynarmic64's own m_jit; each core owns a separate Jit and block cache. The kernel page-table path and gdbstub loop over all cores, the guest IC path does not, so the description is accurate. IC IALLUIS (inner-shareable all) goes to the default branch and is only logged, so it does nothing even for the local core: a worse variant of the same gap. Reachability is limited because Horizon guests need svc calls to make code executable, and those already broadcast.",
+    "fix_note": "Direction is right: use Core::InvalidateInstructionCacheRange(process, addr, size) for IVAU and loop ClearInstructionCache over all cores for IALLU/IALLUIS (m_cb has the process). Calling other Jits' InvalidateCacheRange from a callback is safe (they only take their own invalidation_mutex and set a halt). Cost: guest JIT loops issue one ic ivau per 64-byte line, so broadcasting each would halt all cores each time; coalesce or only broadcast when other cores have executed that range."
+  },
+  {
+    "idx": 2,
+    "title": "CoreTiming::Advance never removes an expired event whose owner is gone, then spins holding both locks",
+    "verdict": "confirmed_narrow",
+    "confidence": 0.6,
+    "trigger": "Only if an EventType shared_ptr is destroyed while an event for it is still queued (an owner destructor skips UnscheduleEvent). Then Advance sees the head with time <= global_timer, lock() fails, nothing is popped, and the loop condition stays true forever with advance_lock and basic_lock held. I checked the Timing::CreateEvent owners (hid resource_manager, hidbus, vi conductor, glue time workers, nx2_gsv, nx2_audio_device_manager, DeviceSession, cheat engine, freezer, KHardwareTimer, kernel preemption_event): each unschedules in its destructor or is cleared by ClearPendingEvents before being reset, so there is no current trigger.",
+    "impact": "Latent: nothing today. If a future owner forgets to unschedule, the timer thread spins at 100% on one core and every ScheduleEvent/UnscheduleEvent blocks on basic_lock, freezing the whole guest.",
+    "evidence": [
+      {
+        "file": "src/core/core_timing.cpp",
+        "line": 253,
+        "quote": "    while (!event_queue.empty() && event_queue.top().time <= global_timer) {"
+      },
+      {
+        "file": "src/core/core_timing.cpp",
+        "line": 256,
+        "quote": "        if (const auto event_type{evt.type.lock()}) {"
+      },
+      {
+        "file": "src/core/core_timing.cpp",
+        "line": 261,
+        "quote": "                event_queue.pop();"
+      },
+      {
+        "file": "src/core/core.cpp",
+        "line": 594,
+        "quote": "        core_timing.ClearPendingEvents();"
+      },
+      {
+        "file": "src/core/hle/kernel/k_hardware_timer.cpp",
+        "line": 24,
+        "quote": "    m_kernel.System().CoreTiming().UnscheduleEvent(m_event_type);"
+      }
+    ],
+    "reasoning": "The loop pops the head only inside the lock() success branch, and UnscheduleEvent cannot match expired entries either (e.type.lock().get() is null), so an orphaned event stays at the top forever. The mechanical defect is real as described. No code path in the tree creates the orphan (the surveyor admits the same), so this is a robustness gap rather than an active bug.",
+    "fix_note": "Adding an else that pops the head and continues is correct and cheap, and cannot affect live events because it only fires for dead owners. Consider a debug assert/log so the leaked owner is noticed."
+  }
+]

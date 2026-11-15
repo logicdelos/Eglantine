@@ -1,0 +1,110 @@
+[
+  {
+    "title": "ReturnRawSession leaks the creator reference of every raw session, so nx2 sessions are never destroyed",
+    "kind": "memory",
+    "severity": "medium",
+    "confidence": 0.7,
+    "file": "src/core/hle/service/nx2_gsv.h",
+    "line": 144,
+    "quote": "    rb.PushCopyObjects(ctx, *client);",
+    "explanation": "CreateRawSession makes a KSession and returns its KClientSession, which starts with refcount 1 (the creator's). ReturnRawSession then pushes it as a COPY object: WriteToOutgoingCommandBuffer (hle_ipc.cpp:285-291) only adds it to the handle table (refcount 2) and never closes the creator reference. HLERequestContext::AddMoveInterface (hle_ipc.cpp:527) uses AddMoveObject, which does Close after Add (hle_ipc.cpp:298). With the copy path, closing the guest handle leaves refcount 1, so KClientSession::Destroy never runs, the server session never sees OnClientClosed, and the handler object (INx2VideoSession with its nx2:vdec thread and decoder, INx2GpuSession with its ColdHint thread, vi2 timers) is never destroyed. The process also keeps a SessionCountMax slot per session, and CreateRawSession ASSERTs on exhaustion. Trigger: any title that opens and closes nx2 sessions repeatedly, such as one video decoder service per movie.",
+    "suggested_fix": "Push the client session with PushMoveObjects (or call client->Close(kernel) after the handle is added), as AddMoveInterface does.",
+    "how_to_verify": "Play two movies in a Switch 2 title, then check that INx2VideoSession::~INx2VideoSession runs (log or breakpoint) after the guest closes the vdec session, and watch the nx2:vdec thread count in a debugger. With the fix the destructor runs and the thread joins."
+  },
+  {
+    "title": "Flash-watch history never stores the sample, so the median is always 0",
+    "kind": "logic_error",
+    "severity": "low",
+    "confidence": 0.85,
+    "file": "src/core/hle/service/nx2_gsv.h",
+    "line": 2798,
+    "quote": "            std::swap(counts[next], last);",
+    "explanation": "WhiteHistory::Push(white) swaps counts[next] with last and never assigns white to last (or to the slot). All counts and last stay 0 forever, so Median() returns 0 and the spike test `white > 2 * median + 200` reduces to `white > 1500`. The watcher (EDEN_NX2_FLASH_WATCH) therefore saves every bright frame, not just spikes. Debug-only.",
+    "suggested_fix": "Set `last = white;` before the swap (or write counts[next] = white).",
+    "how_to_verify": "Run with EDEN_NX2_FLASH_WATCH set on a scene with a constantly bright mist and check that the log prints median 0 on every flash line."
+  },
+  {
+    "title": "Global sparse-backing handler is shared by all nx2:gpu sessions; destroying any session clears it for the others",
+    "kind": "logic_error",
+    "severity": "low",
+    "confidence": 0.3,
+    "file": "src/core/hle/service/nx2_gsv.h",
+    "line": 376,
+    "quote": "        Tegra::Nx2SetSparseBacking({});",
+    "explanation": "Nx2SetSparseBacking stores a single std::function and the span in globals. A second INx2GpuSession constructor replaces the first session's handler (capturing this), and the destructor of either session resets the handler and span to empty. A still-live session then stops backing lazily-created sparse blocks (GPU writes into them are silently dropped). Today this is masked because sessions are never destroyed (finding 1), and titles probably open one gpu session; fixing finding 1 makes the order of destruction matter.",
+    "suggested_fix": "Key the handler by owner (like Nx2GpuMemoryRegistry::AddListener) or clear it only if it still belongs to this session.",
+    "how_to_verify": "Open nx2:gpu (497) twice, close the first, then GPU-write into a lazily backed region of the second and check that BackSparseWrite is still called."
+  },
+  {
+    "title": "Nx2GpuMemoryRegistry::TrimMappings rebuilds and reallocates the whole mapping vector on every map and unmap",
+    "kind": "performance",
+    "severity": "low",
+    "confidence": 0.3,
+    "file": "src/core/hle/service/nvdrv/devices/nx2_stub_device.h",
+    "line": 276,
+    "quote": "        kept.reserve(mappings.size() + 1);",
+    "explanation": "MapAt (nx2:gpu 101/211) and Unmap (213/102) call TrimMappings under the registry mutex. It allocates a new vector, copies all unaffected mappings and moves it back, O(n) per call even when nothing overlaps. Titles that map and unmap many regions while streaming (211/213 run from the guest service thread) pay a copy proportional to the number of live mappings on each request, and the registry mutex is also held while every nvhost-as-gpu listener runs.",
+    "suggested_fix": "Keep mappings in an ordered map keyed by gpu_address and erase or split only the overlapping nodes.",
+    "how_to_verify": "Use the Nx2JobStats timers for kinds Map and Register with a few thousand live mappings, or microbenchmark MapAt with 10k mappings."
+  },
+  {
+    "title": "INx2NvsrvSession is never instantiated",
+    "kind": "dead_code",
+    "severity": "low",
+    "confidence": 0.9,
+    "file": "src/core/hle/service/nx2_gsv.h",
+    "line": 149,
+    "quote": "class INx2NvsrvSession final : public ServiceFramework<INx2NvsrvSession> {",
+    "explanation": "grep finds INx2NvsrvSession only in its own definition. OpenNvsrvSession builds an Nvidia::NVDRV named nx2:nvsrv instead, so the placeholder class and its comment are dead.",
+    "suggested_fix": "Delete the class.",
+    "how_to_verify": "grep -rn INx2NvsrvSession src returns only nx2_gsv.h:149-151."
+  },
+  {
+    "title": "SubSlotJob template is never instantiated",
+    "kind": "dead_code",
+    "severity": "low",
+    "confidence": 0.9,
+    "file": "src/core/hle/service/nx2_gsv.h",
+    "line": 517,
+    "quote": "    void SubSlotJob(HLERequestContext& ctx) {",
+    "explanation": "The member template INx2GpuSession::SubSlotJob<Slot> is not named in any function table or call; the nx2:gpu table points 211-216 at the dedicated Sub* handlers.",
+    "suggested_fix": "Delete the template.",
+    "how_to_verify": "grep -n SubSlotJob src/core/hle/service/nx2_gsv.h shows only the definition."
+  },
+  {
+    "title": "CreateDecoderImage loops over an unbounded guest-supplied count",
+    "kind": "robustness",
+    "severity": "low",
+    "confidence": 0.3,
+    "file": "src/core/hle/service/nx2_gsv.h",
+    "line": 4245,
+    "quote": "        const u32 count = std::max<u32>(w[18], 1);",
+    "explanation": "In CreateDecoderImage (911, the same expression sits in the 991 handler at 3967 and 4245) count is taken from the request word with no upper bound. The loop inserts count entries into m_objects->images under the mutex and next_image += count can wrap. A malformed or misparsed request (count up to 2^32-1) hangs the service thread and exhausts memory with a bad_alloc. Real titles send small counts, so this only bites on misdecoded requests.",
+    "suggested_fix": "Reject counts above a small limit (the decoder pool size the sdk allows) with an error reply.",
+    "how_to_verify": "Send a 911 request with word 18 = 0x10000000 in a unit test or via the debugger and observe memory growth."
+  },
+  {
+    "title": "SubRegisterMemory stores a wrapped size when last < start",
+    "kind": "robustness",
+    "severity": "low",
+    "confidence": 0.3,
+    "file": "src/core/hle/service/nx2_gsv.h",
+    "line": 511,
+    "quote": "        m_memory[handle] = {start, last - start + 1};",
+    "explanation": "The registry call is guarded by `last > start`, but the m_memory entry is stored unconditionally. If last < start the u64 size wraps to a huge value, which later map jobs (211) and image binds use as the memory extent, so bounds checks against it pass for any offset. last == start gives size 1 but is not registered with the registry.",
+    "suggested_fix": "Return an error (and do not allocate a handle) when last < start; use the same predicate for registry and m_memory.",
+    "how_to_verify": "Issue sub 101 with last < start and then 211 with a large offset; the map is not rejected."
+  },
+  {
+    "title": "PollSyncpts runs as a 2000 Hz CoreTiming event for the whole session and takes the syncpoint manager guard each time",
+    "kind": "performance",
+    "severity": "low",
+    "confidence": 0.25,
+    "file": "src/core/hle/service/nx2_gsv.h",
+    "line": 4354,
+    "quote": "    static constexpr std::chrono::nanoseconds SyncptPollInterval{std::chrono::microseconds{500}};",
+    "explanation": "After AttachSyncptMemory (204) the looping event wakes the CoreTiming thread every 500 us. UpdateSyncptValues runs under SyncpointManager::WithGuestValuesStable (the same guard the GPU thread takes in Increment, and it holds that guard while running actions), and reads up to 192 guest values with Read64 per tick. The cost is small per tick but constant and competes with the GPU thread on the guard. The comment says it is a deliberate wake-up for waits whose syncpoint is never seen.",
+    "suggested_fix": "Skip the guard and the read loop when no syncpoint changed and no new wait bits are armed, or drive the poll from the mirror callback.",
+    "how_to_verify": "Count PollSyncpts calls per second in a title and measure the time spent in the guard with a profiler."
+  }
+]

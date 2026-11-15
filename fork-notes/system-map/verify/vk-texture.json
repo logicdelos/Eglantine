@@ -1,0 +1,88 @@
+[
+ {
+  "idx": 0,
+  "title": "Queued 3D-BC unswizzle task outlives its image",
+  "verdict": "confirmed_narrow",
+  "confidence": 0.8,
+  "trigger": "Enable gpu_unswizzle_enabled (default false). A large single-level BCn 3D image (>= gpu_unswizzle_maxsize, not GpuModified) is uploaded: QueueAsyncUnswizzle sets IsDecoding and pushes a PendingUnswizzle. While the task spans several ticks (4-frame gaps, chunked reads) the guest unmaps or overwrites the range (UnmapMemory, or a JoinImages overlap delete). DeleteImage runs without any check of IsDecoding and without touching unswizzle_queue. The next TickAsyncUnswizzle indexes slot_images[task.image_id] on a freed or recycled slot.",
+  "impact": "Use of a dead/recycled slot: assert or crash in debug, otherwise garbage reads or an AccelerateImageUpload into another image (wrong texture); the deferred staging buffer of an initialized task is never freed (leak); the stale front task also blocks the queue. Nothing visible with the default setting.",
+  "evidence": [
+   {
+    "file": "src/video_core/texture_cache/texture_cache.h",
+    "line": 2879,
+    "quote": "    Image& image = slot_images[task.image_id];"
+   },
+   {
+    "file": "src/video_core/texture_cache/texture_cache.h",
+    "line": 2825,
+    "quote": "    unswizzle_queue.push_back({.image_id = image_id, .info = image.info});"
+   },
+   {
+    "file": "src/video_core/texture_cache/texture_cache.h",
+    "line": 4041,
+    "quote": "            async_decode->cancelled = true;"
+   },
+   {
+    "file": "src/video_core/texture_cache/texture_cache.h",
+    "line": 2146,
+    "quote": "    if (gpu_unswizzle_enabled && IsPixelFormatBCn(image.info.format) &&"
+   }
+  ],
+  "reasoning": "DeleteImage cancels only async_decodes entries (line 4041); grep of texture_cache.h shows unswizzle_queue is touched only in QueueAsyncUnswizzle and TickAsyncUnswizzle. The GC guards with IsDecoding at line 200, but UnmapMemory calls DeleteImage directly, so the flag is no protection there. The feature is off by default, so the defect needs a user-enabled setting plus a mid-stream unmap.",
+  "fix_note": "Suggested fix is right: erase unswizzle_queue entries for the id in DeleteImage, free the staging buffer via FreeDeferredStagingBuffer if task.initialized, and reset current_unswizzle_frame only if the front entry was removed (resetting unconditionally just delays the next task). Alternatively validate the slot/generation in TickAsyncUnswizzle. Neither breaks anything else."
+ },
+ {
+  "idx": 1,
+  "title": "Async decode contexts are destroyed before the decoder thread joins",
+  "verdict": "confirmed_narrow",
+  "confidence": 0.6,
+  "trigger": "Shut down (TextureCache destroyed) while the TextureDecoder thread is inside a queued ConvertImage task. Members are destroyed in reverse declaration order: async_decodes (line 676) is freed first, then texture_decode_worker (line 674), whose jthread member requests stop and joins only afterwards. The running task still writes async_decode->decoded_data, copies and complete through its raw pointer into the freed AsyncDecodeContext.",
+  "impact": "Heap use-after-free on the decoder thread at emulator shutdown: possible crash on exit or heap corruption; no effect during normal play.",
+  "evidence": [
+   {
+    "file": "src/video_core/texture_cache/texture_cache_base.h",
+    "line": 674,
+    "quote": "    Common::ThreadWorker texture_decode_worker{1, \"TextureDecoder\", {},"
+   },
+   {
+    "file": "src/video_core/texture_cache/texture_cache_base.h",
+    "line": 676,
+    "quote": "    std::vector<std::unique_ptr<AsyncDecodeContext>> async_decodes;"
+   },
+   {
+    "file": "src/video_core/texture_cache/texture_cache.h",
+    "line": 2805,
+    "quote": "        async_decode->decoded_data.resize_destructive(out_size);"
+   }
+  ],
+  "reasoning": "Declaration order is as described and TextureCache has no user-declared destructor that stops the worker first (grep for ~TextureCache finds none in texture_cache). StatefulThreadWorker has no destructor either; its jthread vector is destroyed with the worker, after async_decodes is gone. Tasks not yet started are dropped by the stop_token wait, so only a task running at that instant is affected; the window is small but the task lambda captures a raw context pointer.",
+  "fix_note": "Moving async_decodes above texture_decode_worker fixes it (the worker, destroyed first, joins before the contexts die). Safer still: add a destructor or explicit worker stop/join. Nothing else depends on the order."
+ },
+ {
+  "idx": 2,
+  "title": "GC eviction of a GPU-modified image stalls the GPU once per image",
+  "verdict": "confirmed_narrow",
+  "confidence": 0.8,
+  "trigger": "Texture memory reaches expected_memory (high_priority_mode) or critical_memory so the collector may evict downloadable GpuModified images (line 207 skips them otherwise). Each such eviction in Cleanup records a download then calls runtime.Finish(), which is scheduler.Finish (submit and wait). Up to 20-40 iterations per pass, so several render targets evicted in one frame cost several full CPU-GPU round trips on the GPU thread.",
+  "impact": "Frame-time spikes in TickFrame while under memory pressure; no correctness issue.",
+  "evidence": [
+   {
+    "file": "src/video_core/texture_cache/texture_cache.h",
+    "line": 214,
+    "quote": "            runtime.Finish();"
+   },
+   {
+    "file": "src/video_core/texture_cache/texture_cache.h",
+    "line": 207,
+    "quote": "            (!high_priority_mode && must_download)) {"
+   },
+   {
+    "file": "src/video_core/texture_cache/texture_cache.h",
+    "line": 1952,
+    "quote": "        runtime.Finish();"
+   }
+  ],
+  "reasoning": "Finish is inside the per-image lambda, so one wait per downloaded image is certain by reading. It only runs in high-priority/aggressive mode, so it is a pressure-time cost, not steady state. DownloadMemory at line 1952 already batches several images behind one Finish, confirming the batching approach exists.",
+  "fix_note": "Batching is the right fix but must keep a download staging buffer alive per image, do one Finish, then SwizzleImage and UnregisterImage/DeleteImage each, and keep the Tracked/IsDecoding/BadOverlap checks per image. The post-delete accounting (num_iterations, mode flips) depends on total_used_memory after each delete, so it would need restructuring or an approximation."
+ }
+]

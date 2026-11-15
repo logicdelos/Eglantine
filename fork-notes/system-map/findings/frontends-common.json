@@ -1,0 +1,122 @@
+[
+  {
+    "title": "Config::WriteToIni truncates the live config file before writing it",
+    "kind": "robustness",
+    "severity": "medium",
+    "confidence": 0.55,
+    "file": "src/frontend_common/config.cpp",
+    "line": 112,
+    "quote": "    fp = _wfopen(Common::UTF8ToUTF16W(config_loc).data(), L\"wb\");",
+    "explanation": "WriteToIni opens qt-config.ini (and every custom/<title>.ini) with \"wb\", which truncates it at once, then serializes the whole INI with CSimpleIniA::Save. There is no temp file and no rename. A crash, kill, power loss or full disk between the fopen and the end of Save leaves an empty or partial file. On the next start SetUpIni loads it without error and the user silently gets default settings (game dirs, paths, input mapping). The call is made on every BootGame (SaveAllValues, plus a rewrite of the per-game ini in the QtConfig constructor), at close, and from Save Config.",
+    "suggested_fix": "Write to <config_loc>.tmp, fflush and close it, then replace the target with MoveFileExW(MOVEFILE_REPLACE_EXISTING) or std::filesystem::rename. Optionally keep one .bak copy.",
+    "how_to_verify": "Attach a debugger, break inside CSimpleIniA::Save during a save and kill the process; the ini on disk is empty or truncated. Or read WriteToIni and confirm there is no rename step."
+  },
+  {
+    "title": "Crash paths never flush the file log, so the last lines before a crash are lost",
+    "kind": "robustness",
+    "severity": "medium",
+    "confidence": 0.45,
+    "file": "src/yuzu_cmd/yuzu.cpp",
+    "line": 565,
+    "quote": "    SetUnhandledExceptionFilter(WriteCrashDump);",
+    "explanation": "FileBackend writes through a CRT FILE with the default buffer (about 4 KiB) and flushes only on Error-level lines, with log_flush_line, or in Log::Stop. Log::Stop is called only from assert.cpp. The CLI unhandled-exception filter (WriteCrashDump, active only with EDEN_NX2_CRASH_DUMP, otherwise it returns EXCEPTION_CONTINUE_SEARCH), the Qt Breakpad handler and SDL_AppQuit do not flush. A guest-triggered access violation or abort therefore loses up to 4 KiB of the newest Info and Warning lines, which are the ones that explain the crash.",
+    "suggested_fix": "Call a flush-only function (no allocation, no locks) at the start of WriteCrashDump and in the Breakpad callback, or turn log_flush_line on when a crash handler is installed.",
+    "how_to_verify": "Run with log_filter *:Info, log a distinctive Info line, then trigger a null dereference in a guest or host thread (or std::abort). Check whether the line is present in eden_log.txt."
+  },
+  {
+    "title": "TerminateEmulationThread uses QThread::terminate, skipping ShutdownMainProcess and leaving a half-stopped System for the next boot",
+    "kind": "robustness",
+    "severity": "medium",
+    "confidence": 0.4,
+    "file": "src/yuzu/main_window.cpp",
+    "line": 2801,
+    "quote": "        QtCommon::emu_thread->terminate();",
+    "explanation": "When the emulation thread does not stop within EmuThreadStopTimeoutMs, QThread::terminate (TerminateThread on Windows) kills it at an arbitrary point. EmuThread::run then never reaches DetachDebugger and System::ShutdownMainProcess, and the thread may die holding m_should_run_mutex, the GPU context or a kernel lock. OnEmulationStopped resets the thread and the user can boot another game on the same Core::System, which still holds the old process, GPU and audio state and may deadlock on a lock owned by the killed thread.",
+    "suggested_fix": "After a forced terminate, block BootGame and ask for an application restart (the CLI already has an exit-code restart path), or run the missing shutdown work only when it is safe.",
+    "how_to_verify": "Make the emulation thread hang on stop (block it in a debugger), wait for the timeout, then boot another game and watch for a hang or stale state."
+  },
+  {
+    "title": "A failed LoadROM leaves the per-game custom settings active (no RestoreGlobalState)",
+    "kind": "logic_error",
+    "severity": "low",
+    "confidence": 0.35,
+    "file": "src/yuzu/main_window.cpp",
+    "line": 2595,
+    "quote": "    if (!LoadROM(filename, params)) {",
+    "explanation": "BootGame builds per_game_config (which flips every switchable setting to its custom value) and calls ApplySettings before LoadROM. If LoadROM returns false, BootGame returns with only the SCOPE_EXIT that clears boot_in_progress. RestoreGlobalState is called only in OnEmulationStopped (not reached) and in dialog paths. Settings::values stays in the failed game's custom state, so a Configure dialog opened next shows and edits custom values while it believes it edits global ones.",
+    "suggested_fix": "Call Settings::RestoreGlobalState(false) and HIDCore().ReloadInputDevices() on the LoadROM failure return and on any other early return after per_game_config.emplace.",
+    "how_to_verify": "Boot a game that has a custom ini (for example a different docked mode) from a file that fails to load, then check Settings::values.use_docked_mode.UsingGlobal() in a debugger or through the MCP settings tool."
+  },
+  {
+    "title": "FileBackend::Write mutates bytes_written and enabled with no lock from every logging thread",
+    "kind": "race",
+    "severity": "low",
+    "confidence": 0.45,
+    "file": "src/common/logging.cpp",
+    "line": 284,
+    "quote": "        bytes_written += file->WriteSpan(std::span<const char>{message.begin(), message.end()});",
+    "explanation": "Write() is called concurrently by emulation, GPU, service and UI threads. bytes_written (size_t) and enabled (bool) are plain members. The += and the limit check are not atomic, and Flush() from Log::Stop runs against them. The count is only approximate and the 100 MiB cap can be overshot; formally it is a data race. The CRT serialises each fwrite, so lines are not interleaved inside a call.",
+    "suggested_fix": "Make bytes_written a std::atomic<size_t> and enabled a std::atomic<bool> (relaxed), or guard Write with a mutex.",
+    "how_to_verify": "Build with ThreadSanitizer (or use Application Verifier) and log from two threads; the race is reported."
+  },
+  {
+    "title": "A global config save during a per-game session flips the players setting back to global",
+    "kind": "logic_error",
+    "severity": "low",
+    "confidence": 0.35,
+    "file": "src/frontend_common/config.cpp",
+    "line": 585,
+    "quote": "    Settings::values.players.SetGlobal(!IsCustomConfig());",
+    "explanation": "SaveControlValues (and QtConfig::SaveQtControlValues) set players.SetGlobal(true) for a global config and never restore it. Only two sites in main_window.cpp (near 1942 and 2526) save and restore the flag. Other global saves while a game with per-game controller overrides runs (OnSaveConfig, OpenConfigureDialog, the controller-applet reconfigure path) leave players on the global value, so the per-game mapping is dropped at the next ReloadInputDevices or controller change until the game stops.",
+    "suggested_fix": "Save and restore the players flag inside SaveControlValues itself, as configure_input.cpp does around lines 212-228.",
+    "how_to_verify": "Set a per-game player 1 controller type, boot the game, choose Save Config from the menu, then check Settings::values.players.UsingGlobal() and trigger ReloadInputDevices."
+  },
+  {
+    "title": "Every log line is formatted once per backend, and the debugger backend converts to UTF-16 even with no debugger attached",
+    "kind": "performance",
+    "severity": "low",
+    "confidence": 0.4,
+    "file": "src/common/logging.cpp",
+    "line": 345,
+    "quote": "        ::OutputDebugStringW(UTF8ToUTF16W(FormatLogMessage(entry)).c_str());",
+    "explanation": "FmtLogMessageImpl runs on the calling thread (emulation, GPU, service threads). For each message that passes the filter the file backend (line 266), the ring backend when enabled (line 319) and the debugger backend (line 345) each call FormatLogMessage, which builds a new std::string with timestamp, class and file:line. The debugger backend then allocates a wide string and calls OutputDebugStringW, which is a system call even without a debugger. The file backend also runs boost::replace_all per line when censor_username (default true) is set. Log-heavy phases pay this on guest and GPU threads.",
+    "suggested_fix": "Format once into the Entry and share the text between backends; skip DebuggerBackend::Write unless IsDebuggerPresent() (cached for a second or so).",
+    "how_to_verify": "Log one million Info lines from one thread with and without the debugger backend and compare time, or run the sampler (EDEN_NX2_SAMPLE) during a log-heavy boot."
+  },
+  {
+    "title": "StopMcpServer busy-spins the GUI thread while waiting for the server to stop",
+    "kind": "performance",
+    "severity": "low",
+    "confidence": 0.35,
+    "file": "src/yuzu/main_window.cpp",
+    "line": 680,
+    "quote": "        QCoreApplication::processEvents(QEventLoop::AllEvents, 20);",
+    "explanation": "processEvents(AllEvents, 20) returns at once when no event is pending (the 20 is a maximum processing time, not a wait), so the loop keeps a core at 100% until the helper thread finishes Server::Stop. Stop waits for in-flight tool calls, some of which wait for seconds, so the spin can last that long at close or when the MCP setting is toggled.",
+    "suggested_fix": "Sleep 1-5 ms when processEvents handled nothing, or run a QEventLoop that the helper thread quits through QMetaObject::invokeMethod.",
+    "how_to_verify": "Enable MCP, start a long wait_for from a client, close the window and watch the CPU use of the GUI thread."
+  },
+  {
+    "title": "A malformed EDEN_NX2_KEY_SCRIPT throws out of SDL_AppIterate",
+    "kind": "robustness",
+    "severity": "low",
+    "confidence": 0.4,
+    "file": "src/yuzu_cmd/yuzu.cpp",
+    "line": 926,
+    "quote": "                    const int code = std::stoi(item.substr(colon + 1));",
+    "explanation": "RunKeyScript parses the env variable (or an @file) with std::stoi, stoull and stod without a try/catch. An entry such as \"abc:40\" or \"fx:40\" throws std::invalid_argument through the SDL callback and ends the process. This is a debug switch, so the impact is an unexplained abort of a test run.",
+    "suggested_fix": "Wrap the parse in try/catch, log the bad item and skip it.",
+    "how_to_verify": "Run the CLI with EDEN_NX2_KEY_SCRIPT=abc:40 and a game."
+  },
+  {
+    "title": "The CLI ignores a guest-initiated exit",
+    "kind": "logic_error",
+    "severity": "low",
+    "confidence": 0.3,
+    "file": "src/yuzu_cmd/yuzu.cpp",
+    "line": 764,
+    "quote": "    state->system.RegisterExitCallback([] {});",
+    "explanation": "The exit callback is empty, with a comment saying SDL3 handles it. System::Exit() is called by svc ExitProcess and the AM global-state controller, but SDL_AppIterate ends only when the window closes, MCP asks to quit, or a restart is requested. A game that exits normally leaves the CLI running with a frozen window, which hangs unattended runs that wait for the process to end.",
+    "suggested_fix": "Set a flag in the callback and return SDL_APP_SUCCESS from SDL_AppIterate when it is set.",
+    "how_to_verify": "Run a test program that calls exit through the CLI and check whether the process ends."
+  }
+]

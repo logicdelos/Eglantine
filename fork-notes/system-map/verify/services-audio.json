@@ -1,0 +1,298 @@
+[
+  {
+    "idx": 0,
+    "title": "AudioOut/AudioIn: played_sample_count restarts from ~0 after Stop/Start while buffer end_timestamps keep counting, so buffers are never released again",
+    "verdict": "confirmed",
+    "confidence": 0.8,
+    "trigger": "Guest opens an audout session, plays N seconds (end_timestamp of the last appended buffer reaches T frames), calls StopAudioOut then StartAudioOut and keeps appending buffers. System::Start re-runs DeviceSession::Initialize, which finalizes the old stream and acquires a new SinkStream whose played counters are 0; the 5 ms tick then overwrites played_sample_count with ~1200. New buffers get end_timestamp = T + size (GetNextTimestamp reads the previous buffer's end_timestamp, which nothing resets), so IsBufferConsumed needs the new stream to play >= T frames.",
+    "impact": "After a Stop/Start cycle the guest stops receiving released buffers; the sink underruns and plays silence (the played counter only advances for frames actually written, so it can never reach T). Audio output of that session stays dead until it is closed and reopened; GetAudioOutPlayedSampleCount also jumps backwards.",
+    "evidence": [
+      {
+        "file": "src/audio_core/device/device_session.cpp",
+        "line": 134,
+        "quote": "    played_sample_count = stream->GetExpectedPlayedSampleCount();"
+      },
+      {
+        "file": "src/audio_core/device/device_session.cpp",
+        "line": 120,
+        "quote": "    return played_sample_count >= buffer.end_timestamp;"
+      },
+      {
+        "file": "src/audio_core/device/audio_buffers.h",
+        "line": 306,
+        "quote": "        return buffers[index].end_timestamp;"
+      },
+      {
+        "file": "src/audio_core/out/audio_out_system.cpp",
+        "line": 104,
+        "quote": "    session->Initialize(name, sample_format, channel_count, session_id, handle,"
+      },
+      {
+        "file": "src/audio_core/sink/sink_stream.cpp",
+        "line": 249,
+        "quote": "    return std::min<u64>(exp_played_sample_count, max_played_sample_count) + TargetSampleCount * 5;"
+      }
+    ],
+    "reasoning": "Out::System::Stop only force-releases registered buffers and keeps the AudioBuffers ring (end_timestamps are never rewritten; GetReleasedBuffers clears only played_timestamp/samples/tag/size). Start() calls DeviceSession::Initialize, whose `if (stream) Finalize()` closes the old stream and AcquireSinkStream returns a fresh one with min/max_played_sample_count = 0. ThreadFunc then assigns that small value to played_sample_count, while pending end_timestamps continue from the pre-stop total. I found no rebase anywhere, so release stalls for any Stop/Start after more than ~1200 frames played. Only reachable by titles that actually Stop and Start an audout (pause/resume), which is why it is not universal.",
+    "fix_note": "Suggested fix is right in principle. Simplest correct form: keep a per-DeviceSession base (add the old stream's final played count when Initialize replaces a stream) and report base + stream count, so the counter stays monotonic as it does on hardware; resetting end_timestamps instead would break buffers still pending in the ring. Same pattern applies to audin (shared DeviceSession). Care: null sink returns one shared stream whose counters never advance."
+  },
+  {
+    "idx": 1,
+    "title": "aud:u cmd 2 builds a new renderer Manager (and SystemManager) per call; a second one hangs AudioRenderer::Start",
+    "verdict": "confirmed_narrow",
+    "confidence": 0.5,
+    "trigger": "Guest calls aud:u cmd 2 twice (or once while an audren:u manager also has a renderer) and calls OpenAudioRenderer on each returned manager while the first renderer is open. Each IAudioRendererManager owns its own AudioCore::Renderer::Manager with session ids {0,1}, so both renderers get session 0 and share command_buffers[0]; the second Manager's SystemManager::Add runs InitializeUnsafe -> AudioRenderer::Start() while the ADSP thread is already running.",
+    "impact": "Undefined interplay of two host threads on one SPSC mailbox: Start() resets the queues, leaks the live sink streams, and move-assigns main_thread (jthread assignment requests stop and joins the old ADSP thread, which is parked in mailbox.Receive(Direction::DSP) with an empty stop_token). Likely hang of the guest audio-open call (exact hang depends on whether the first SystemManager thread keeps feeding the queue); at minimum both renderers corrupt each other's command buffer slot 0.",
+    "evidence": [
+      {
+        "file": "src/core/hle/service/audio/nx2_audio_user_client.h",
+        "line": 54,
+        "quote": "        rb.PushIpcInterface<IAudioRendererManager>(ctx, system);"
+      },
+      {
+        "file": "src/core/hle/service/audio/audio_renderer_manager.cpp",
+        "line": 26,
+        "quote": "    , impl(std::make_shared<AudioCore::Renderer::Manager>(system_))"
+      },
+      {
+        "file": "src/audio_core/adsp/apps/audio_renderer/audio_renderer.cpp",
+        "line": 36,
+        "quote": "    main_thread = std::jthread([this](std::stop_token stop_token) { Main(stop_token); });"
+      },
+      {
+        "file": "src/audio_core/adsp/apps/audio_renderer/audio_renderer.cpp",
+        "line": 143,
+        "quote": "    if (mailbox.Receive(Direction::DSP) != Message::InitializeOK) {"
+      },
+      {
+        "file": "src/audio_core/renderer/system_manager.cpp",
+        "line": 28,
+        "quote": "        audio_renderer.Start();"
+      }
+    ],
+    "reasoning": "Code facts hold: cmd 2 builds a new IAudioRendererManager (hence Manager and SystemManager) per call, Start() has no already-running guard, and jthread move-assignment joins the old thread. Whether it really hangs is timing dependent (the old thread exits if any message reaches adsp_queue after request_stop, and the first SystemManager thread is continuously sending Render), and the premise needs a title that issues aud:u cmd 2 more than once with live renderers, which I cannot establish from the code. The same two-managers condition exists upstream for two audren:u connections, so it is not unique to the NX2 shim. Marked narrow.",
+    "fix_note": "Caching one IAudioRendererManager in IUserClientSession fixes the per-call duplication, but then the object is shared by several guest sessions (fine since it is stateless apart from impl). Independently make AudioRenderer::Start() return if running, and make the Manager session pool/ADSP singleton shared across managers. Making the ADSP Receive stop-token aware would remove the join hang."
+  },
+  {
+    "idx": 2,
+    "title": "Audio render manager thread spins at full speed whenever no registered renderer is active or the sink never blocks it",
+    "verdict": "confirmed_narrow",
+    "confidence": 0.8,
+    "trigger": "Open a renderer via audren:u (Renderer::Initialize -> AddSystem -> InitializeUnsafe starts the SystemManager thread) and do not call Start yet, or call Stop; or select the Null sink. The host loop then does SendCommandToDsp (inactive system only sets terminate_event, buffer stays 0), Signal, Wait; the ADSP replies at once because index-0 WaitFreeSpace is skipped (buffer == 0) or returns immediately (paused stream), so the two threads ping-pong with no sleep.",
+    "impact": "Two High-priority threads (ADSP pinned to performance cores) burn CPU near a full core each while no renderer is running or with the Null sink; no wrong output. During normal playback pacing exists (WaitFreeSpace waits up to 7 ms when the queue is full).",
+    "evidence": [
+      {
+        "file": "src/audio_core/renderer/system_manager.cpp",
+        "line": 38,
+        "quote": "                audio_renderer.Signal();"
+      },
+      {
+        "file": "src/audio_core/renderer/system_manager.cpp",
+        "line": 39,
+        "quote": "                audio_renderer.Wait();"
+      },
+      {
+        "file": "src/audio_core/adsp/apps/audio_renderer/audio_renderer.cpp",
+        "line": 201,
+        "quote": "                    if (index == 0) {"
+      },
+      {
+        "file": "src/audio_core/sink/sink_stream.h",
+        "line": 238,
+        "quote": "    std::atomic<bool> paused{true};"
+      },
+      {
+        "file": "src/audio_core/sink/sink_stream.cpp",
+        "line": 256,
+        "quote": "        return paused || queued_buffers < max_queue_size;"
+      }
+    ],
+    "reasoning": "The loop has no timed wait and the only pacing is SinkStream::WaitFreeSpace for session index 0 when its command buffer is non-zero. Streams start paused and are only started by the device sink command, and NullSinkStreamImpl never starts, so can_continue is true and the DSP replies immediately. Inactive Systems take the terminate_event branch with buffer 0. The idle-spin window (opened but not started / stopped renderer) is common, but it is bounded to those states, hence narrow; the cost is CPU/power rather than correctness.",
+    "fix_note": "Suggested fix is reasonable: add a timed wait (e.g. cv wait to the next 5 ms deadline) in the SystemManager loop when no system produced a command buffer, or block the thread until a system becomes active. Keep it from delaying the first render after Start (wake on Start). Do not pace purely by wall clock while the sink is running or it will double-pace with WaitFreeSpace."
+  },
+  {
+    "idx": 3,
+    "title": "SinkStream::AppendBuffer publishes the buffer entry before its samples; the audio callback can pop it and read nothing, leaving output unwritten",
+    "verdict": "confirmed_narrow",
+    "confidence": 0.65,
+    "trigger": "Sink stream queue is empty (startup or underrun) when the ADSP/guest thread calls AppendBuffer; the audio callback thread runs ProcessAudioOutAndRender in the microsecond gap after queue.EmplaceWait(buffer) and before samples_buffer.Push(samples), pops the new entry, and calls samples_buffer.Pop for frames_available samples that are not in the ring yet.",
+    "impact": "That callback period gets part of its output left unwritten (stale/uninitialised host buffer contents for cubeb: a click or short noise burst) and the buffer's samples play one callback late, leaving the ring permanently offset from the queue bookkeeping by that count. Rare, only at underrun boundaries.",
+    "evidence": [
+      {
+        "file": "src/audio_core/sink/sink_stream.cpp",
+        "line": 65,
+        "quote": "        queue.EmplaceWait(buffer);"
+      },
+      {
+        "file": "src/audio_core/sink/sink_stream.cpp",
+        "line": 82,
+        "quote": "        samples_buffer.Push(samples);"
+      },
+      {
+        "file": "src/audio_core/sink/sink_stream.cpp",
+        "line": 209,
+        "quote": "        samples_buffer.Pop(&output_buffer[frames_written * frame_size], frames_available * frame_size);"
+      },
+      {
+        "file": "src/common/ring_buffer.h",
+        "line": 70,
+        "quote": "        const std::size_t pop_count = (std::min)(slots_filled, max_slots);"
+      }
+    ],
+    "reasoning": "AppendBuffer takes no lock (the callback holds release_mutex only around TryPop), RingBuffer::Pop clamps to what is available and returns the count, and the return value is ignored in ProcessAudioOutAndRender. So the interleaving is possible as described. In steady state the callback pops the oldest queued entry, whose samples were pushed long ago, so the window only matters when the queue was empty, i.e. at start or underrun. The ring-full truncation half of the claim needs ~0.68 s of queued audio, which max_queue_size and the 0x10000-slot ring make unlikely.",
+    "fix_note": "Pushing samples before enqueueing the SinkBuffer is correct and cheap (a callback then sees samples without an entry, which is harmless). Zero-filling output when Pop returns fewer samples than requested is a reasonable additional guard. Nothing it could break; ordering of the two ops is not relied on elsewhere."
+  },
+  {
+    "idx": 4,
+    "title": "WaitFreeSpace blocks the ADSP thread indefinitely when the sink stops consuming; AudioRenderer::Stop then deadlocks",
+    "verdict": "confirmed_narrow",
+    "confidence": 0.7,
+    "trigger": "Cubeb stream init fails (cubeb_stream_init error leaves stream_backend null and only returns from the constructor) or the output device disappears so the data callback stops. Start() still sets paused=false, the ADSP keeps appending one buffer per 5 ms render, WaitFreeSpace times out after 7 ms each round, queued_buffers climbs past max_queue_size+3 and the ADSP thread enters release_cv.wait(lk, stop_token, can_continue). Nothing pops, so it never returns.",
+    "impact": "Guest audio thread stalls (no more adsp_rendered_event), and closing the renderer or the emulator hangs because AudioRenderer::Stop sends Shutdown and blocks in mailbox.Receive(Host) before request_stop is ever issued, so the jthread stop_token is never signalled.",
+    "evidence": [
+      {
+        "file": "src/audio_core/sink/sink_stream.cpp",
+        "line": 262,
+        "quote": "        release_cv.wait(lk, stop_token, can_continue);"
+      },
+      {
+        "file": "src/audio_core/sink/sink_stream.cpp",
+        "line": 261,
+        "quote": "    if (queued_buffers > max_queue_size + 3) {"
+      },
+      {
+        "file": "src/audio_core/sink/cubeb_sink.cpp",
+        "line": 97,
+        "quote": "            LOG_CRITICAL(Audio_Sink, \"Error initializing cubeb stream, error: {}\", init_error);"
+      },
+      {
+        "file": "src/audio_core/sink/cubeb_sink.cpp",
+        "line": 138,
+        "quote": "        paused = false;"
+      },
+      {
+        "file": "src/audio_core/adsp/apps/audio_renderer/audio_renderer.cpp",
+        "line": 53,
+        "quote": "    if (mailbox.Receive(Direction::Host) != Message::Shutdown) {"
+      },
+      {
+        "file": "src/audio_core/adsp/apps/audio_renderer/audio_renderer.cpp",
+        "line": 57,
+        "quote": "    main_thread.request_stop();"
+      }
+    ],
+    "reasoning": "The unconditional wait uses only the thread's stop_token, and request_stop() in AudioRenderer::Stop() comes after the blocking Receive(Direction::Host) that needs the DSP thread to answer, so it is a genuine deadlock once the condition is reached. The condition needs a dead sink: failed cubeb_stream_init (stream_backend null, Start only logs), device removal, or a never-started SDL stream. Normal playback never gets there, hence narrow. The cubeb state callback is an empty function, so a runtime stream error is not noticed.",
+    "fix_note": "A timed wait alone is not enough: after the timeout the stream still claims to be playing and the queue keeps growing, so mark the stream failed (set paused/drop the queue) or fall back to the Null sink as proposed. Also have AudioRenderer::Stop() request_stop (and SignalPause the streams) before waiting on the Shutdown reply; make cubeb Start() fail (leave paused=true) when stream_backend is null."
+  },
+  {
+    "idx": 5,
+    "title": "Renderer::Initialize discards System::Initialize's error and reports success",
+    "verdict": "confirmed_narrow",
+    "confidence": 0.75,
+    "trigger": "Guest calls OpenAudioRenderer with parameters System::Initialize rejects but OpenAudioRenderer itself does not check: an unsupported revision (when GetWorkBufferSize was not called first), a transfer memory size smaller than GetWorkBufferSize, or too small for the allocator sequence. Renderer::Initialize ignores the Result, sets initialized = true and returns ResultSuccess.",
+    "impact": "OpenAudioRenderer succeeds with a half-initialised System (sample_rate 0, no work buffers); later RequestUpdate fails. The failure shows up late and with a misleading result code instead of at open time. Well-behaved guests that size the transfer memory with GetWorkBufferSize never hit it.",
+    "evidence": [
+      {
+        "file": "src/audio_core/renderer/audio_renderer.cpp",
+        "line": 32,
+        "quote": "    system.Initialize(params, transfer_memory, transfer_memory_size, process_handle,"
+      },
+      {
+        "file": "src/audio_core/renderer/audio_renderer.cpp",
+        "line": 31,
+        "quote": "    initialized = true;"
+      },
+      {
+        "file": "src/audio_core/renderer/system.cpp",
+        "line": 114,
+        "quote": "        return Service::Audio::ResultInvalidRevision;"
+      },
+      {
+        "file": "src/audio_core/renderer/system.cpp",
+        "line": 118,
+        "quote": "        return Service::Audio::ResultInsufficientBuffer;"
+      },
+      {
+        "file": "src/core/hle/service/audio/audio_renderer.cpp",
+        "line": 46,
+        "quote": "    impl->Initialize(params, transfer_memory, transfer_memory_size, process_handle,"
+      }
+    ],
+    "reasoning": "System::Initialize returns Result and its callers never look at it: Renderer::Initialize drops it and IAudioRenderer's constructor drops Renderer::Initialize's result too (constructors cannot fail), and OpenAudioRenderer then returns success. The mismatch is real and also leaves the System registered with the SystemManager while uninitialised (SendCommandToDsp checks `initialized`, so it is skipped rather than crashing). It is narrow because OpenAudioRenderer is normally preceded by a successful GetWorkBufferSize with the same parameters, and the code matches upstream yuzu.",
+    "fix_note": "The suggested fix requires moving the Initialize call out of the IAudioRenderer constructor (e.g. an Initialize step in OpenAudioRenderer before creating the object, or a factory) and on error undoing AddSystem and ReleaseSessionId; simply returning the Result from Renderer::Initialize is not enough because the constructor ignores it. Risk: a title that currently runs with an under-sized buffer would start failing at open."
+  },
+  {
+    "idx": 6,
+    "title": "aud:u cmd 1 builds a new audout Manager per call; the second never gets buffer-release callbacks and destroying either clears the first one's",
+    "verdict": "confirmed_narrow",
+    "confidence": 0.5,
+    "trigger": "Guest calls aud:u cmd 1 twice and keeps both IAudioOutManager objects alive; it opens an IAudioOut on the second. LinkToManager calls AudioManager::SetOutManager, which keeps only the first callback but returns success, so the second Manager marks linked_to_manager = true while never being serviced. Destroying either Manager later calls ClearManager(AudioOutManager), nulling the surviving callback too.",
+    "impact": "Audio-out sessions on the second manager never get buffer release/registration callbacks (guest sees no released buffers, audio stalls); closing one manager session stalls every audout session of the other. Not reachable if the guest uses a single manager session for all OpenAudioOut calls.",
+    "evidence": [
+      {
+        "file": "src/core/hle/service/audio/nx2_audio_user_client.h",
+        "line": 44,
+        "quote": "        rb.PushIpcInterface<IAudioOutManager>(ctx, system);"
+      },
+      {
+        "file": "src/audio_core/audio_manager.cpp",
+        "line": 52,
+        "quote": "        if (buffer_events[index] == nullptr) {"
+      },
+      {
+        "file": "src/audio_core/audio_out_manager.cpp",
+        "line": 48,
+        "quote": "        system.AudioCore().GetAudioManager().ClearManager(Event::Type::AudioOutManager);"
+      },
+      {
+        "file": "src/audio_core/audio_out_manager.cpp",
+        "line": 55,
+        "quote": "        system.AudioCore().GetAudioManager().SetOutManager(std::bind(&Manager::BufferReleaseAndRegister, this));"
+      },
+      {
+        "file": "src/core/hle/service/audio/audio_out_manager.cpp",
+        "line": 21,
+        "quote": "    , impl(std::make_shared<AudioCore::AudioOut::Manager>(system_))"
+      }
+    ],
+    "reasoning": "SetOutManager silently ignores a second registration and still returns ResultSuccess, and ~Manager clears the single slot unconditionally, both exactly as described; each cmd 1 call creates a fresh Manager. The same single-slot design exists for multiple audout:u connections upstream. The trigger needs a guest that fetches the audout manager more than once concurrently, which I cannot verify from code; one extra consequence: IAudioOut holds only a Manager& so a closed manager session also leaves a dangling reference.",
+    "fix_note": "Share one AudioOut::Manager (cache the IAudioOutManager in IUserClientSession, or fetch audout:u from the service manager) as suggested. A more robust fix is for AudioManager to hold a list of callbacks keyed by owner and for ClearManager to remove only the caller's; make SetOutManager return an error when a callback already exists so linked_to_manager is not set wrongly."
+  },
+  {
+    "idx": 7,
+    "title": "Volume is applied up to three times: system volume, device volume and Settings::Volume all carry the same value",
+    "verdict": "confirmed",
+    "confidence": 0.8,
+    "trigger": "Set the emulator volume below 100% (e.g. 50) and play any title (no guest involvement needed: IAudioController's constructor maps the volume to level 8/15 and calls sink.SetDeviceVolume(8/15) while Settings::Volume() is 0.5). A stream created afterwards takes device_volume from the sink (8/15) and AppendBuffer multiplies system_volume (1.0) * device_volume (0.533) * Settings::Volume() (0.5). If the guest later calls audctl SetTargetVolume, SetSystemVolume and SetDeviceVolume are both applied to existing streams too (cubed).",
+    "impact": "Output is quieter than the configured volume: about 0.27 instead of 0.5 at 50% for new streams, and about 0.14 for streams alive when SetTargetVolume runs. At 100% all factors are 1 and nothing is wrong, so it only affects users running below 100%. Also Settings::Volume() between 101% and ~104% maps to a gain below 1.0 because of 0.6 + 20*log10(v).",
+    "evidence": [
+      {
+        "file": "src/core/hle/service/audio/audio_controller.cpp",
+        "line": 112,
+        "quote": "                sink.SetDeviceVolume(vol_f);"
+      },
+      {
+        "file": "src/core/hle/service/audio/audio_controller.cpp",
+        "line": 281,
+        "quote": "        Settings::values.volume.SetValue(static_cast<u8>(std::clamp(ui_volume, 0, 100)));"
+      },
+      {
+        "file": "src/audio_core/sink/sink_stream.cpp",
+        "line": 40,
+        "quote": "    auto const volume = system_volume * device_volume * yuzu_volume;"
+      },
+      {
+        "file": "src/audio_core/sink/sink_stream.cpp",
+        "line": 39,
+        "quote": "        yuzu_volume = 0.6f + 20.0f * std::log10(yuzu_volume);"
+      },
+      {
+        "file": "src/common/settings.cpp",
+        "line": 260,
+        "quote": "    return values.volume.GetValue() / static_cast<f32>(values.volume.GetDefault());"
+      }
+    ],
+    "reasoning": "The product of three factors that all derive from the same setting is visible in AppendBuffer, and both IAudioController paths (constructor and SetTargetVolume) feed the same level into the sink's device volume, while Settings::Volume() already reflects it (SetTargetVolume even writes it back to Settings::values.volume). Whether the double attenuation was intended as an emulation of the Switch volume curve I cannot tell, but it makes the UI slider non-linear and inconsistent with what the percentage shows. The 101-104% dip is plain arithmetic on the cited formula. Also note SinkStream::ReleaseBuffer (mic input) multiplies by system*device volume, tying mic gain to speaker volume.",
+    "fix_note": "Applying the level in one place is right: either audctl updates only Settings::values.volume (and sink volumes stay 1.0), or the audctl-driven device volume is divided out of Settings::Volume(). Dropping the sink calls would change behaviour for guests that use audctl to change volume while the emulator setting stays at its previous value, so decide which side is authoritative. Fix the >100% curve separately (make it continuous at 1.0)."
+  }
+]

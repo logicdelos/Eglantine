@@ -1,0 +1,110 @@
+[
+  {
+    "title": "NPad::ControllerUpdate mutates shared memory and controller state from the input thread without any lock",
+    "kind": "race",
+    "severity": "medium",
+    "confidence": 0.55,
+    "file": "src/hid_core/resources/npad/npad.cpp",
+    "line": 146,
+    "quote": "void NPad::ControllerUpdate(Kernel::KernelCore& kernel, Core::HID::ControllerTriggerType type, std::size_t controller_idx) {",
+    "explanation": "ControllerUpdate is the EmulatedController change callback, so it runs on whichever thread produced the input (the Qt thread for SDL, driver threads for Joy-Con/UDP). It calls UpdateControllerAt -> InitNewlyAddedController / DisconnectNpad, which write the LIFOs and shared-memory fields and flip controller.is_connected, taking neither NPad::mutex nor shared_mutex. NPad::OnUpdate/RequestPadStateUpdate does the same work on the core-timing thread under shared_mutex every 1 ms, so a connect or disconnect can interleave with a LIFO write.",
+    "suggested_fix": "Take std::scoped_lock on *applet_resource_holder.shared_mutex (after NPad::mutex, matching the existing order) at the top of ControllerUpdate, or post the work to the core-timing thread.",
+    "how_to_verify": "Build with TSAN or add a debug owner check in InitNewlyAddedController; connect/disconnect a controller while a game polls it and watch for unsynchronised access."
+  },
+  {
+    "title": "ControllerUpdate returns instead of continuing, so one up-to-date aruid stops updates for all later aruids",
+    "kind": "logic_error",
+    "severity": "medium",
+    "confidence": 0.5,
+    "file": "src/hid_core/resources/npad/npad.cpp",
+    "line": 171,
+    "quote": "            if (is_connected == controller.is_connected) {",
+    "explanation": "Inside the loop over aruid slots, the Connected/Disconnected case does 'return' when this aruid's state already matches the device, and the Battery case does 'return' when the device is disconnected. Both exit the whole function, so aruids with a higher index (a second applet, or the system aruid) are not updated. The neighbouring null-data case correctly uses 'continue'.",
+    "suggested_fix": "Replace those returns (and the controller_idx bounds return) with continue/break as appropriate.",
+    "how_to_verify": "Register two aruids, make the lower slot already match the device state, then connect a pad and check that the higher slot's shared memory connected flag never updates."
+  },
+  {
+    "title": "Joy-Con input thread starts before callbacks are installed",
+    "kind": "race",
+    "severity": "medium",
+    "confidence": 0.4,
+    "file": "src/input_common/drivers/joycon.cpp",
+    "line": 211,
+    "quote": "        handle->SetCallbacks(callbacks);",
+    "explanation": "JoyconDriver::InitializeDevice creates the JoyconPoller and starts the InputThread jthread (joycon_driver.cpp ~line 131). Joycons::Setup only calls SetCallbacks afterwards. If a report arrives in between, OnNewData -> ReadActiveMode calls an empty std::function (callbacks.on_battery_data), which throws std::bad_function_call out of a jthread and terminates the process. SetCallbacks also assigns the std::function members while the thread reads them.",
+    "suggested_fix": "Call SetCallbacks before InitializeDevice starts the thread (poller created in constructor or callbacks passed into InitializeDevice), or guard the callbacks with a mutex and null checks.",
+    "how_to_verify": "Insert a sleep between InitializeDevice and SetCallbacks and connect a Joy-Con; expect std::bad_function_call."
+  },
+  {
+    "title": "UnregisterAppletResourceUserId falls back to aruid slot 0 and tears down another aruid's controllers",
+    "kind": "logic_error",
+    "severity": "low",
+    "confidence": 0.45,
+    "file": "src/hid_core/resources/npad/npad.cpp",
+    "line": 1112,
+    "quote": "        aruid_index = 0;",
+    "explanation": "For an aruid not in the table, GetIndexFromAruid returns >= AruidIndexMax, the code logs an error and uses index 0. It then clears is_active/is_connected and nulls shared_memory for slot 0, which may belong to the running application, so that application stops receiving npad input. Other callers of the same fallback only read; this one writes.",
+    "suggested_fix": "Return early when the aruid index is out of range.",
+    "how_to_verify": "Call UnregisterAppletResourceUserId with an unregistered aruid while a game is running and check that controller_data[0] loses shared_memory."
+  },
+  {
+    "title": "SDL gamepad handle leaked when Joy-Con/Pro driver is preferred",
+    "kind": "memory",
+    "severity": "low",
+    "confidence": 0.55,
+    "file": "src/input_common/drivers/sdl_driver.cpp",
+    "line": 531,
+    "quote": "            SDL_CloseJoystick(sdl_joystick);",
+    "explanation": "InitJoystick opens an SDL_Gamepad (SDL_OpenGamepad) when SDL_IsGamepad is true, then on the 'preferring joycon driver' paths (and the procon path at line 539) closes only the joystick and returns. The gamepad handle is never passed to SDL_CloseGamepad, so the device stays open (and keeps its reference) for the process lifetime, and again for every re-plug. The !sdl_joystick early return has the same leak.",
+    "suggested_fix": "Call SDL_CloseGamepad(sdl_gamecontroller) when non-null before each early return, or open the gamepad only after the driver-preference checks.",
+    "how_to_verify": "Connect a Joy-Con with enable_joycon_driver on, repeat plug/unplug, and watch SDL open-handle counts or use SDL_GetGamepads reference tracking."
+  },
+  {
+    "title": "GetActualVibrationGcErmCommand falls through after the inactive-aruid case",
+    "kind": "logic_error",
+    "severity": "low",
+    "confidence": 0.55,
+    "file": "src/core/hle/service/hid/hid_server.cpp",
+    "line": 1073,
+    "quote": "        *out_gc_erm_command = Core::HID::VibrationGcErmCommand::Stop;",
+    "explanation": "When the aruid is not active the function sets Stop but does not return, unlike GetActualVibrationValue and SendVibrationGcErmCommand which use R_SUCCEED. It then validates the handle (may return an error code to a guest that should have got success) and overwrites the output with the real device command, so an inactive applet can observe the actual rumble command.",
+    "suggested_fix": "Add R_SUCCEED(); after setting Stop.",
+    "how_to_verify": "Call command 211 (GetActualVibrationGcErmCommand) with an inactive aruid and a GC handle whose device has a non-Stop command; expect Stop."
+  },
+  {
+    "title": "EmulatedController state is shared across threads with no state mutex",
+    "kind": "race",
+    "severity": "low",
+    "confidence": 0.4,
+    "file": "src/hid_core/frontend/emulated_controller.cpp",
+    "line": 1875,
+    "quote": "MotionState EmulatedController::GetMotions() const {",
+    "explanation": "controller.motion_state, motion_values, colors_state and battery_state are plain structs written by SetMotion/SetBattery on driver or UI threads and read by NPad::OnUpdate and StatusUpdate on the core-timing thread. StatusUpdate itself calls device->ForceUpdate (which calls SetMotion) from the core thread, so two threads can run MotionInput updates on the same object. Returned structs are copied while being written, giving torn motion values.",
+    "suggested_fix": "Add a mutex around controller state mutation and the getters, or snapshot under a lock.",
+    "how_to_verify": "TSAN with a motion-capable pad and a game that reads six-axis."
+  },
+  {
+    "title": "InputEngine::ResetButtonState / ResetAnalogState iterate controller_list without the lock",
+    "kind": "race",
+    "severity": "low",
+    "confidence": 0.3,
+    "file": "src/input_common/input_engine.cpp",
+    "line": 242,
+    "quote": "    for (const auto& controller : controller_list) {",
+    "explanation": "controller_list is guarded by InputEngine::mutex elsewhere, but these loops do not take it. A driver thread calling PreSetController (device hot-plug, UDP/SDL) while the UI thread calls ReleaseAllKeys or TAS reset can rehash the map during iteration.",
+    "suggested_fix": "Copy the identifiers under the lock, then call SetButton/SetAxis outside it.",
+    "how_to_verify": "Hot-plug a controller while pressing Reset in the TAS UI, under TSAN."
+  },
+  {
+    "title": "JoyconDriver::RequestDeviceAccess copies a possibly null or short serial number",
+    "kind": "robustness",
+    "severity": "low",
+    "confidence": 0.3,
+    "file": "src/input_common/helpers/joycon_driver.cpp",
+    "line": 46,
+    "quote": "    std::memcpy(&handle_serial_number, device_info->serial_number, 15);",
+    "explanation": "serial_number is a wchar_t* that hidapi may leave null, and a shorter string is over-read by memcpy of 15 bytes. A null pointer crashes the scan thread. GetSerialNumber elsewhere checks for null. The same null serial is passed to SDL_hid_open on the line before, which then opens the first device with that VID/PID.",
+    "suggested_fix": "Skip devices with a null serial or copy with bounds (wcsnlen).",
+    "how_to_verify": "Feed a device_info with serial_number == nullptr (unit test with a stubbed hid_enumerate result)."
+  }
+]

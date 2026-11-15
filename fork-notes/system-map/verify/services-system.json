@@ -1,0 +1,120 @@
+[
+ {
+  "idx": 0,
+  "title": "NIFM SetNetworkProfile copies a guest-controlled SSID length into a 33-byte stack buffer",
+  "verdict": "confirmed",
+  "confidence": 0.93,
+  "trigger": "Guest calls nifm IGeneralService::SetNetworkProfile with a NifmNetworkProfileData buffer (>=0x18E bytes) whose wireless_setting_data.ssid_length is e.g. 0xFF. prof.ssid_len = 255 and memcpy copies 255 bytes into the 33-byte prof.ssid.",
+  "impact": "Stack buffer overflow of up to 222 bytes on the service thread (PendingProfile is only 99 bytes, so about 156 bytes land past the struct): stack corruption, crash, or guest-influenced host code execution. Also over-reads the source buffer. Needs a malformed request, normal guests send <= 32.",
+  "evidence": [
+   {
+    "file": "src/core/hle/service/nifm/nifm.cpp",
+    "line": 777,
+    "quote": "    std::memcpy(prof.ssid.data(), np->wireless_setting_data.ssid.data(), prof.ssid_len);"
+   },
+   {
+    "file": "src/core/hle/service/nifm/nifm.cpp",
+    "line": 776,
+    "quote": "    prof.ssid_len = np->wireless_setting_data.ssid_length;"
+   },
+   {
+    "file": "src/core/hle/service/nifm/nifm.cpp",
+    "line": 242,
+    "quote": "    std::array<char, 0x21> ssid{};"
+   }
+  ],
+  "reasoning": "ssid_length is a u8 read straight from the guest buffer and passed as the memcpy length with no clamp; the only check is on buffer size, not on the field. Destination prof is a local PendingProfile with ssid[0x21], ssid_len, passphrase[0x41]. The sibling handler at line 441 shows the author knew the 0x20 limit but did not apply it here.",
+  "fix_note": "Fix is right: reject (ResultInvalidInput) or clamp ssid_len to 0x20 before the memcpy; nothing else depends on larger values since the destination is 0x21 bytes."
+ },
+ {
+  "idx": 1,
+  "title": "BSD Recv/RecvFrom/Send/SendTo pass raw guest flags to Socket methods that only support MSG_DONTWAIT",
+  "verdict": "confirmed",
+  "confidence": 0.85,
+  "trigger": "Guest calls bsd Recv/RecvFrom with flags=MSG_PEEK (0x2), or Send/SendTo with MSG_NOSIGNAL (0x20000), or other bits. RecvImpl/SendImpl pass flags unchanged to Network::Socket::Recv/Send which ASSERT((flags & ~FLAG_MSG_DONTWAIT) == 0) (soft: critical log) and Transfer() then only honours the DONTWAIT bit.",
+  "impact": "MSG_PEEK receives are executed as consuming reads, so the datagram/bytes are removed and the guest's next read misses them (lost data, protocol desync). MSG_NOSIGNAL/other flags are ignored harmlessly, with a critical log line (and a debugger break if use_debug_asserts is enabled; off by default).",
+  "evidence": [
+   {
+    "file": "src/core/hle/service/sockets/bsd.cpp",
+    "line": 2032,
+    "quote": "    return Translate(descriptor->socket->Recv(flags, message));"
+   },
+   {
+    "file": "src/core/internal_network/network.cpp",
+    "line": 1076,
+    "quote": "    ASSERT((flags & ~FLAG_MSG_DONTWAIT) == 0);"
+   },
+   {
+    "file": "src/core/internal_network/network.cpp",
+    "line": 1033,
+    "quote": "    return operation((flags & FLAG_MSG_DONTWAIT) != 0 ? MSG_DONTWAIT : 0);"
+   },
+   {
+    "file": "src/core/hle/service/sockets/bsd.cpp",
+    "line": 2131,
+    "quote": "    if ((flags & ~(FLAG_MSG_PEEK | FLAG_MSG_DONTWAIT | FLAG_MSG_WAITFORONE)) != 0) {"
+   }
+  ],
+  "reasoning": "Handlers Recv/RecvFrom/Send/SendTo pop the u32 flags and forward them untouched through the Work structs to the Impl functions (lines 2032, 2054, 2072, 2091), whereas RecvMMsg/SendMMsg validate flags. Socket::Recv/RecvFrom/Send/SendTo only support DONTWAIT; the ASSERT is soft in default builds (AssertFailSoftImpl does nothing unless use_debug_asserts), so the effect is the logged critical message plus MSG_PEEK silently becoming a consuming read. Socket::RecvMsg already implements PEEK, so the capability exists.",
+  "fix_note": "Better than just EINVAL: route PEEK through Socket::RecvMsg-style native flags (add FLAG_MSG_PEEK support to Recv/RecvFrom) and mask MSG_NOSIGNAL for Send; rejecting NOSIGNAL with EINVAL would break many titles that legitimately pass it."
+ },
+ {
+  "idx": 2,
+  "title": "Plain Recv/Accept/Connect block one of only three bsd server threads on the host",
+  "verdict": "confirmed_narrow",
+  "confidence": 0.65,
+  "trigger": "Three or more guest threads simultaneously call blocking Recv/RecvFrom/Accept/Connect (blocking sockets, no data/peer/connection ready). Each occupies one of the three bsdsocket server threads inside a host recv/accept/connect; a fourth bsd request (including the Send that would wake them) is not serviced until one returns.",
+  "impact": "bsd service hang/stall for the guest network stack (game stuck in online/network code) until a blocked call returns or times out. Requires >=3 concurrently blocked threads, so it is rare; also shared with sfdnsres and other services on the same ServerManager.",
+  "evidence": [
+   {
+    "file": "src/core/hle/service/sockets/bsd.cpp",
+    "line": 1366,
+    "quote": "    work.Execute(this);"
+   },
+   {
+    "file": "src/core/hle/service/sockets/bsd.cpp",
+    "line": 733,
+    "quote": "    std::tie(ret, bsd_errno) = bsd->RecvImpl(fd, flags, message);"
+   },
+   {
+    "file": "src/core/hle/service/sockets/sockets.cpp",
+    "line": 92,
+    "quote": "    server_manager->StartAdditionalHostThreads(\"bsdsocket\", 2);"
+   }
+  ],
+  "reasoning": "ExecuteWork runs Execute then Response inline on the server thread; RecvWork::Execute calls RecvImpl -> Socket::Recv which, on a blocking socket, calls host recv without a DONTWAIT (the DONTWAIT path is only used when the flag is given). Accept and Connect are the same. The server manager has the base thread plus two additional host threads, so three blocked calls starve the service. Select/Poll/RecvMMsg are deferred specifically to avoid this.",
+  "fix_note": "Suggested deferral through the SelectNotifier is the right direction but is invasive (must preserve per-socket ordering and timeouts). A cheaper mitigation is raising the additional thread count for bsdsocket, which only raises the threshold."
+ },
+ {
+  "idx": 3,
+  "title": "IScanRequest destructor closes its events before joining the scan worker that signals them",
+  "verdict": "confirmed_narrow",
+  "confidence": 0.6,
+  "trigger": "Guest does CreateScanRequest, Submit (starts a worker running ScanWifiNetworks(3s)), then closes the IScanRequest session and the readable-event handles it received before the scan ends. ~IScanRequest closes both KEvents, then joins; when the worker finishes, Finish() calls evt_scan_complete->Signal() on the closed (possibly destroyed and slab-recycled) KEvent.",
+  "impact": "Signal on a freed KEvent slab slot: usually a no-op (m_readable_event_destroyed is set) but if the slot was reallocated to another event it spuriously signals that event or touches a half-initialised object. Also the service thread is blocked in join for up to the remaining 3 s. Needs the guest to drop the interface mid-scan; rare.",
+  "evidence": [
+   {
+    "file": "src/core/hle/service/nifm/nifm.cpp",
+    "line": 276,
+    "quote": "        svc_ctx.CloseEvent(evt_scan_complete);"
+   },
+   {
+    "file": "src/core/hle/service/nifm/nifm.cpp",
+    "line": 278,
+    "quote": "        if (worker.joinable())"
+   },
+   {
+    "file": "src/core/hle/service/nifm/nifm.cpp",
+    "line": 352,
+    "quote": "        evt_scan_complete->Signal(system.Kernel());"
+   },
+   {
+    "file": "src/core/hle/kernel/k_event.cpp",
+    "line": 46,
+    "quote": "    R_SUCCEED_IF(m_readable_event_destroyed);"
+   }
+  ],
+  "reasoning": "The destructor body orders CloseEvent before worker.join(), and WorkerThread/Finish dereferences evt_scan_complete unconditionally. The IScanRequest object itself stays valid during the join (members are destroyed after the body), so the only hazard is the KEvent lifetime: while the guest still holds the readable-event handle, the readable event keeps the parent KEvent alive, so the race only bites once the guest has also closed that handle. The join under the service thread is a real but minor stall.",
+  "fix_note": "Fix is right: join first (the worker cannot be cancelled mid-scan, so it still waits up to 3 s) then CloseEvent. To avoid stalling the service thread, detach the wait or make the scan abortable; note Finish() also stores state, which the destructor's earlier Idle store does not prevent."
+ }
+]

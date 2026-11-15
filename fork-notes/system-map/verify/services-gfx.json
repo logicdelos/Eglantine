@@ -1,0 +1,120 @@
+[
+ {
+  "idx": 0,
+  "title": "NvMap::PinHandle never frees anything when SMMU space is exhausted (infinite loop, front() on empty list)",
+  "verdict": "confirmed_narrow",
+  "confidence": 0.8,
+  "trigger": "Guest pins nvmap handles until smmu.Allocate(aligned_up) returns 0 (device address space full or too fragmented). The loop body runs: if unmap_queue is empty, front() on an empty std::list is UB (the LOG_CRITICAL else branch is unreachable); if it is non-empty, UnmapHandle is guarded by handle_description->d_address, which is 0 for a handle that is being newly pinned (d_address is only reset to 0 by UnmapHandle and set after this loop), so nothing is freed and the loop spins forever holding unmap_queue_lock and the handle mutex.",
+  "impact": "Crash/garbage dereference when the queue is empty, otherwise a permanent hang of the HLE nvdrv thread (and any thread needing unmap_queue_lock). Only when the device address space is exhausted, which is rare.",
+  "evidence": [
+   {
+    "file": "src/core/hle/service/nvdrv/core/nvmap.cpp",
+    "line": 214,
+    "quote": "                if (auto freeHandleDesc{unmap_queue.front()}) {"
+   },
+   {
+    "file": "src/core/hle/service/nvdrv/core/nvmap.cpp",
+    "line": 218,
+    "quote": "                    if (handle_description->d_address)"
+   },
+   {
+    "file": "src/core/hle/service/nvdrv/core/nvmap.cpp",
+    "line": 211,
+    "quote": "            while ((address = smmu.Allocate(aligned_up)) == 0) {"
+   }
+  ],
+  "reasoning": "The guard tests the wrong handle: handle_description->d_address is 0 on this path (not in the queue, pins==0, UnmapHandle zeroes it and Map assigns it only after the loop), so UnmapHandle(*freeHandleDesc) is dead and the allocation never succeeds on a retry. front() is called with no empty() check, so the LOG_CRITICAL else is unreachable. The device address space is large, so exhaustion needs heavy pinning or fragmentation; that is why it is narrow, not refuted.",
+  "fix_note": "Suggested fix is right: check unmap_queue.empty() (return 0/error), test freeHandleDesc->d_address, and UnmapHandle already erases the queue entry. Take care to avoid the lock-order inversion (queue lock then other handle's mutex) which can deadlock against UnpinHandle (handle mutex then queue lock); use try_lock or release the pinned handle's mutex."
+ },
+ {
+  "idx": 1,
+  "title": "IocCtrlEventWait writes events[event_id] out of bounds on the early BadParameter return",
+  "verdict": "confirmed",
+  "confidence": 0.9,
+  "trigger": "Guest issues the non-allocation nvhost-ctrl EventWait ioctl (is_allocation=false) with params.value.raw >= 64 (e.g. 0x10000000) and any fence that returns early before must_unmark_fail is cleared: fence.id >= MaxSyncPoints (BadParameter), fence.value == 0, fence already signalled, or UpdateMin signalled. SCOPE_EXIT then executes events[event_id].fails = 0 with event_id up to 2^32-1.",
+  "impact": "Out-of-bounds 4-byte zero write at events + event_id*sizeof(InternalEvent) in host memory: access violation (crash) or heap/object corruption; written without events_mutex. Needs a malformed guest request.",
+  "evidence": [
+   {
+    "file": "src/core/hle/service/nvdrv/devices/nvhost_ctrl.cpp",
+    "line": 101,
+    "quote": "    const u32 event_id = params.value.raw;"
+   },
+   {
+    "file": "src/core/hle/service/nvdrv/devices/nvhost_ctrl.cpp",
+    "line": 110,
+    "quote": "    if (fence_id >= MaxSyncPoints) {"
+   },
+   {
+    "file": "src/core/hle/service/nvdrv/devices/nvhost_ctrl.h",
+    "line": 98,
+    "quote": "    std::array<InternalEvent, MaxNvEvents> events{};"
+   }
+  ],
+  "reasoning": "event_id is copied from guest data before any validation, the scope exit is armed with must_unmark_fail = !is_allocation, and the slot >= MaxNvEvents check only occurs after must_unmark_fail = false. Every early return before that point (not only BadParameter; also the three Success returns) runs the unchecked write. Correctly formed guests pass a valid slot so they are unaffected.",
+  "fix_note": "Suggested fix is right: reject event_id >= MaxNvEvents up front (when !is_allocation) or arm the cleanup only after the slot is validated. Also take NvEventsLock for the write; note the lock is taken later at line 139, so the scope-exit write on early paths is unlocked even for valid slots (benign race on a u32)."
+ },
+ {
+  "idx": 2,
+  "title": "SharedBufferSession::presentation_slot_base is never assigned, so two sessions use the same pool slots",
+  "verdict": "confirmed_narrow",
+  "confidence": 0.7,
+  "trigger": "Two different processes (distinct aruids) call CreateSharedLayerSession on the ManagerDisplayService while both sessions are alive. Both sessions get presentation_slot_base 0 so their producers map to pool slots 3 and 4 of the same shared buffer.",
+  "impact": "Both layers present from/into the same shared-buffer memory: frames overwrite each other (wrong image in the shared layer). Does nothing with a single session; only 2 sessions are supported by the pool, and a third has no slots at all. Normally one session exists.",
+  "evidence": [
+   {
+    "file": "src/core/hle/service/vi/shared_buffer_manager.h",
+    "line": 104,
+    "quote": "    u32 presentation_slot_base = 0;"
+   },
+   {
+    "file": "src/core/hle/service/vi/shared_buffer_manager.cpp",
+    "line": 215,
+    "quote": "    return SharedBufferNumCaptureSlots + slot_base + index;"
+   },
+   {
+    "file": "src/core/hle/service/vi/shared_buffer_manager.cpp",
+    "line": 309,
+    "quote": "        auto [it, was_emplaced] = m_sessions.emplace(aruid, SharedBufferSession{});"
+   },
+   {
+    "file": "src/core/hle/service/vi/shared_buffer_manager.cpp",
+    "line": 281,
+    "quote": "        R_UNLESS(!m_sessions.contains(aruid), VI::ResultPermissionDenied);"
+   }
+  ],
+  "reasoning": "Grep of the vi directory shows presentation_slot_base only read (GetPresentationSlot in CreateSession, dequeue and GetProducerSlot), never written, and CreateSession only rejects a duplicate aruid, with no cap of SharedBufferMaxSessions. The pool is sized for two sessions, so the design intent was a per-session base. In practice a single process (the running title) uses it.",
+  "fix_note": "Suggested fix is right (base = free-slot-index * SharedBufferSlotsPerSession, freed in DestroySession) and should also reject when 2 sessions already exist (return an error) since the pool has no room for a third."
+ },
+ {
+  "idx": 5,
+  "title": "IocCtrlEventWait blocks the HLE thread in an unbounded host wait while holding events_mutex",
+  "verdict": "confirmed_narrow",
+  "confidence": 0.45,
+  "trigger": "Guest cancels (IocCtrlEventSignal increments event.fails) the same nvhost event 3 times, then calls EventWait on that slot (or timeout==0 poll) with a fence value the GPU never reaches, e.g. a fence whose increment is queued behind work that another guest thread has not submitted yet. check_failing then calls StallApplication (suspending guest threads) and WaitHost with no timeout, with events_mutex held.",
+  "impact": "Permanent hang of the nvhost-ctrl service thread, the suspended guest, and every other nvhost-ctrl event ioctl (all wait on events_mutex). Only for fences that never get reached; normal NVN fences are for already-submitted work so the wait ends.",
+  "evidence": [
+   {
+    "file": "src/core/hle/service/nvdrv/devices/nvhost_ctrl.cpp",
+    "line": 156,
+    "quote": "                auto lk = system.StallApplication();"
+   },
+   {
+    "file": "src/video_core/host1x/syncpoint_manager.cpp",
+    "line": 114,
+    "quote": "    wait_cv.wait(lk, pred);"
+   },
+   {
+    "file": "src/core/hle/service/nvdrv/devices/nvhost_ctrl.cpp",
+    "line": 153,
+    "quote": "        if (events[slot].fails > 2) {"
+   },
+   {
+    "file": "src/core/hle/service/nvdrv/devices/nvhost_ctrl.cpp",
+    "line": 302,
+    "quote": "    event.fails++;"
+   }
+  ],
+  "reasoning": "Structurally as described: WaitHost -> Wait does wait_cv.wait(lk, pred) with no timeout, called inside check_failing while `lock = NvEventsLock()` (line 139) is held and the application is stalled (emulation suspended, so no guest thread can make progress that would produce the missing increment). The fails counter is guest-driven (EventSignal), so a trigger exists, but it requires a fence that the GPU genuinely cannot reach, which is a guest/emulation fault case. It appears to be a deliberate wait-for-GPU strategy rather than an accident.",
+  "fix_note": "A bounded wait (e.g. wait_for with a few hundred ms then fall through to the normal Timeout return) and releasing events_mutex before waiting would be safe; unbounded waiting is intentional for latency, so choose a generous bound to avoid reintroducing spurious timeouts."
+ }
+]

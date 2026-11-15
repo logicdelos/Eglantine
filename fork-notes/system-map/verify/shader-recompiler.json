@@ -1,0 +1,49 @@
+[
+  {
+    "idx": 0,
+    "title": "Loop safety counter is initialised once per shader invocation and never reset when a loop is re-entered",
+    "verdict": "confirmed_narrow",
+    "confidence": 0.85,
+    "trigger": "With disable_shader_loop_safety_checks at its default (false), compile a shader containing a Repeat (back-edge) node, e.g. an inner loop of 100 iterations inside an outer loop of 100 iterations, or any single loop running more than 8192 iterations in one invocation. Each Repeat gets its own Private variable initialised to 0x2000 once, decremented at every back-edge and never stored back. After 8193 back-edges of that node in one invocation the new counter is negative, safety_cond is false, and the loop exits early.",
+    "impact": "Silently wrong shader results (truncated loop: wrong pixels, wrong compute output) for shaders whose total back-edge count for one loop node exceeds ~8192 per invocation; shaders with small trip counts are unaffected. Intentional as a hang guard, but the budget leaks across re-entries.",
+    "evidence": [
+      {
+        "file": "src/shader_recompiler/backend/spirv/emit_spirv.cpp",
+        "line": 208,
+        "quote": "            if (!Settings::values.disable_shader_loop_safety_checks) {"
+      },
+      {
+        "file": "src/shader_recompiler/backend/spirv/emit_spirv.cpp",
+        "line": 210,
+        "quote": "                const Id safety_counter{ctx.AddGlobalVariable("
+      },
+      {
+        "file": "src/shader_recompiler/backend/spirv/emit_spirv.cpp",
+        "line": 211,
+        "quote": "                    pointer_type, spv::StorageClass::Private, ctx.Const(0x2000u))};"
+      },
+      {
+        "file": "src/shader_recompiler/backend/spirv/emit_spirv.cpp",
+        "line": 215,
+        "quote": "                const Id old_counter{ctx.OpLoad(ctx.U32[1], safety_counter)};"
+      },
+      {
+        "file": "src/shader_recompiler/backend/spirv/emit_spirv.cpp",
+        "line": 216,
+        "quote": "                const Id new_counter{ctx.OpISub(ctx.U32[1], old_counter, ctx.Const(1u))};"
+      },
+      {
+        "file": "src/shader_recompiler/backend/spirv/emit_spirv.cpp",
+        "line": 217,
+        "quote": "                ctx.OpStore(safety_counter, new_counter);"
+      },
+      {
+        "file": "src/shader_recompiler/backend/spirv/emit_spirv.cpp",
+        "line": 219,
+        "quote": "                const Id safety_cond{"
+      }
+    ],
+    "reasoning": "AddGlobalVariable with initializer ctx.Const(0x2000u) is emitted once per Repeat node at module scope, and the only store to it is the decrement at the back-edge, so nothing resets it on loop entry; the counter is per-invocation because Private variables are per invocation. The condition cond && (new_counter >= 0) therefore forces exit once the cumulative iteration count passes 8192, including across re-entries of an inner loop. The GLSL backend uses the same pattern (loopN declared once, '--loopN<0' at the back-edge). Rarity comes from the 8192 threshold, not from any option.",
+    "fix_note": "Resetting the counter at loop entry (a store of 0x2000 in the block before OpLoopMerge, which is the loop pre-header) fixes the nested case and is straightforward. Trade-off: the worst case then becomes 8192 per entry, so nested loops can run 8192^k iterations before the guard trips, weakening the anti-hang protection (TDR). A less intrusive alternative is a larger budget or one function-wide counter shared by all loops; the setting disable_shader_loop_safety_checks already exists as a workaround."
+  }
+]

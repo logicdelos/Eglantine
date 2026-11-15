@@ -1,0 +1,66 @@
+[
+ {
+  "idx": 0,
+  "title": "RemapPageGroup maps map_pages instead of cur_pages per physical block",
+  "verdict": "confirmed_narrow",
+  "confidence": 0.85,
+  "trigger": "RemapPageGroup is reachable only from ON_RESULT_FAILURE in the two Map/UnmapCodeMemory-style functions after the dst Unmap. It would trigger if a failure returned after the unmap with a multi-block page group (pg_pages < map_pages). In current code the only R_TRY after the unmap is Operate(ChangePermissions), which always R_SUCCEEDs, so the rollback path never runs today.",
+  "impact": "Latent: if ever run with a multi-block group, Operate(Map) maps map_pages from a block holding fewer pages (host mapping past the block, foreign physical pages) and Open()s refcounts on heap pages beyond the block, repeated on later iterations. Currently nothing is observed.",
+  "evidence": [
+   {
+    "file": "src/core/hle/kernel/k_page_table_base.cpp",
+    "line": 1753,
+    "quote": "            R_ASSERT(this->Operate(page_list, map_address, map_pages, pg_phys_addr, true,"
+   },
+   {
+    "file": "src/core/hle/kernel/k_page_table_base.cpp",
+    "line": 1752,
+    "quote": "            const size_t cur_pages = (std::min)(pg_pages, map_pages);"
+   },
+   {
+    "file": "src/core/hle/kernel/k_page_table_base.cpp",
+    "line": 5764,
+    "quote": "            m_system.Kernel().MemoryManager().Open(phys_addr, num_pages);"
+   },
+   {
+    "file": "src/core/hle/kernel/k_page_table_base.cpp",
+    "line": 1191,
+    "quote": "                            OperationType::ChangePermissions, false));"
+   }
+  ],
+  "reasoning": "cur_pages is computed and used to advance cursors but map_pages is passed to Operate, so the code is wrong versus the reference implementation (Atmosphere passes cur_pages). Operate(Map) uses num_pages for MapMemoryRegion size and for MemoryManager().Open. However both callers' failure branches are only entered after Operate(ChangePermissions), which has no failure return in this port, so the function is dead in practice.",
+  "fix_note": "Replace map_pages with cur_pages in the Operate call; one-token, matches upstream, no side effects on the currently-unreachable path."
+ },
+ {
+  "idx": 1,
+  "title": "Freed guest RAM is never decommitted on Windows; dirty granules are re-cleared with memset",
+  "verdict": "confirmed_narrow",
+  "confidence": 0.6,
+  "trigger": "Windows build, title allocates then frees a large heap: KMemoryManager::Close only MarkDirty()s; the next ClearBackingRegion over those granules memsets them (no PunchHole path outside __linux__), touching/committing the pages. HintCold on Windows does nothing unless cold_hint_mode is Always or the system is low on memory.",
+  "impact": "Host working set / pagefile use of touched guest pages stays until exit or a cold-hint trim, and each reuse of a freed range pays a full memset (CPU time, possible page-in of paged-out zeroes). Bounded by the fixed backing size, so not unbounded growth; the commit charge exists from boot with SEC_COMMIT regardless.",
+  "evidence": [
+   {
+    "file": "src/common/host_memory.cpp",
+    "line": 1011,
+    "quote": "                std::memset(backing_base + offset, 0, clear_end - offset);"
+   },
+   {
+    "file": "src/common/host_memory.cpp",
+    "line": 1008,
+    "quote": "            cleared = whole && punch && impl && impl->PunchHole(granule_begin, granule_end - granule_begin);"
+   },
+   {
+    "file": "src/common/host_memory.cpp",
+    "line": 160,
+    "quote": "        backing_handle = pfn_CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_WRITE | FILE_MAP_READ, PAGE_READWRITE, SEC_COMMIT, backing_size, nullptr, nullptr, 0);"
+   },
+   {
+    "file": "src/common/host_memory.cpp",
+    "line": 944,
+    "quote": "    if (!page_out) {"
+   }
+  ],
+  "reasoning": "Code confirms the Windows path has no decommit/discard (no DiscardVirtualMemory/MEM_RESET anywhere in src) and the Linux-only PunchHole is the sole release. The granule was already resident when dirtied, so the memset mostly costs CPU rather than adding new RAM; the 'memory growth' framing is overstated. It is a missing optimisation rather than a correctness bug.",
+  "fix_note": "DiscardVirtualMemory on whole dirty granules of the mapped backing view then clearing the dirty bit is plausible (discarded pages read back as undefined, not guaranteed zero, so it is NOT a valid zero-fill on its own); a correct Windows variant needs section decommit/re-map or VirtualUnlock plus memset fallback. Risk: handing back non-zero pages to the guest."
+ }
+]

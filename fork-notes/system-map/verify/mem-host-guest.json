@@ -1,0 +1,61 @@
+[
+ {
+  "idx": 0,
+  "title": "HostMemory fallback allocation is not checked; commit-limit failure leaves a null backing base",
+  "verdict": "confirmed_narrow",
+  "confidence": 0.8,
+  "trigger": "On Windows, Impl::Init() fails (CreateFileMapping2 SEC_COMMIT of the full intended memory size exceeds the commit limit, or placeholder APIs / 39-bit virtual reserve fail). The ctor falls back to VirtualAlloc(MEM_RESERVE|MEM_COMMIT) of backing_size. If the commit limit was the reason for the failure, this fails too, Allocate returns nullptr and backing_base is stored as null.",
+  "impact": "No clean error: DeviceMemory::GetPointer/GetRawPhysicalAddr/ClearBackingRegion/JIT fastmem math then use a null-based pointer and crash far from the cause. If Init failed for a non-commit reason (missing APIs, virtual reserve failure) the fallback usually succeeds and nothing is seen.",
+  "evidence": [
+   {
+    "file": "src/common/host_memory.cpp",
+    "line": 751,
+    "quote": "        backing_base = static_cast<u8*>(impl->Allocate(backing_size));"
+   },
+   {
+    "file": "src/common/host_memory.cpp",
+    "line": 194,
+    "quote": "        auto* ptr = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);"
+   },
+   {
+    "file": "src/core/device_memory.h",
+    "line": 48,
+    "quote": "        return reinterpret_cast<T*>(buffer.BackingBasePointer() +"
+   }
+  ],
+  "reasoning": "Allocate logs the failure but returns nullptr and the constructor assigns it without a check; nothing downstream (DeviceMemory ctor, HostMemory::BackingBasePointer users) validates it. Only HintCold checks backing_base for null; ClearBackingRegion and DeviceMemory pointer helpers do not. The fallback commits the same amount as the SEC_COMMIT section, so it fails under the same commit-limit condition. Requires a commit-starved host, hence narrow.",
+  "fix_note": "Check the result and fail loudly (LOG_CRITICAL plus throw/abort with the requested size) - correct and harmless. A smaller/lazy (SEC_RESERVE) backing is a larger change; the fixed layout size is assumed everywhere."
+ },
+ {
+  "idx": 2,
+  "title": "BuildTransform mask is wrong for writes that cross a 2 KiB chunk (shift count underflows)",
+  "verdict": "confirmed",
+  "confidence": 0.85,
+  "trigger": "Any CPU write to a rasterizer-cached page whose [addr&0x7FF, +size) range passes the 2 KiB chunk end (page_bits = DEVICE_PAGEBITS-1 = 11). E.g. WriteBlock/ZeroBlock/CopyBlock of a full 4 KiB guest page: HandleRasterizerWrite(addr, 4096) -> Collect(0x10000,4096): minor_address=0, top_bit=(0+4096+63)>>6=64, shift count 32-64 wraps in size_t to 2^64-32, UB; x86 shl uses count mod 32 so the shifts are no-ops, mask=0xFFFFFFFF covering only the first 2 KiB chunk; the chunk at 0x10800 is never recorded.",
+  "impact": "GPU cache invalidation (OnCacheInvalidations via Gather) misses the upper part of the write: stale buffer/texture/shader data for CPU-written memory (flicker, wrong geometry/textures). Actual codegen of the UB shift is compiler-dependent, but the second chunk is never recorded in any case.",
+  "evidence": [
+   {
+    "file": "src/core/gpu_dirty_memory_manager.h",
+    "line": 136,
+    "quote": "        mask <<= (sizeof(T) * 8 - top_bit);"
+   },
+   {
+    "file": "src/core/gpu_dirty_memory_manager.h",
+    "line": 146,
+    "quote": "        const size_t top_bit = (minor_address + size + align_mask) >> align_bits;"
+   },
+   {
+    "file": "src/core/memory.cpp",
+    "line": 979,
+    "quote": "            gpu_dirty_managers[core].Collect(address, size);"
+   },
+   {
+    "file": "src/core/memory.cpp",
+    "line": 352,
+    "quote": "                HandleRasterizerWrite(GetInteger(current_vaddr), copy_amount);"
+   }
+  ],
+  "reasoning": "WalkBlock splits at guest 4 KiB pages, so copy_amount can be up to 4096 and the lambda gets a device address with the in-page offset, and size is passed whole to Collect. Collect/BuildTransform record only one 2 KiB chunk (single u32 mask, one address) and never split by chunk. Any size > 2048 - (addr&0x7FF) overflows top_bit past 32. Tests only use 4/8/128 bytes within a chunk, so this is untested. Small straddling writes (e.g. 16 bytes at 0x7F8) hit the same underflow.",
+  "fix_note": "Suggested fix is right: loop in Collect over chunk boundaries calling BuildTransform on each clipped piece (each piece <= 2 KiB, top_bit <= 32; also special-case top_bit==32 where u32 shifts by 0 are fine). Cost: up to two Collects per 4 KiB write, hot path (atomic CAS); keep the same-chunk fast path."
+ }
+]

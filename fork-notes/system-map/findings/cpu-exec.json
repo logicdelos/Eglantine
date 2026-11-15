@@ -1,0 +1,86 @@
+[
+ {
+  "title": "PerfStats destructor copies an inverted range when fewer than 5 frames were recorded",
+  "kind": "robustness",
+  "severity": "low",
+  "confidence": 0.8,
+  "file": "src/core/perf_stats.cpp",
+  "line": 43,
+  "quote": "    std::copy(perf_history.begin() + IgnoreFrames, perf_history.begin() + current_index,",
+  "explanation": "With record_frame_times on and a non-zero title id, ~PerfStats copies [begin+IgnoreFrames, begin+current_index). IgnoreFrames is 5; if the session ends after fewer than 5 system frames, current_index < 5 and the range is inverted, so std::copy runs past the end iterator (undefined behaviour: a crash or a huge CSV at shutdown). GetMeanFrametime guards the same case (current_index <= IgnoreFrames) but the destructor does not.",
+  "suggested_fix": "Return early (skip the CSV) when current_index <= IgnoreFrames, as GetMeanFrametime does.",
+  "how_to_verify": "Enable record_frame_times, boot a title and stop it before 5 frames are presented (or unit-test PerfStats with current_index 0..4); observe the crash in the destructor."
+ },
+ {
+  "title": "Guest IC IVAU only invalidates the issuing core's JIT; other cores keep stale translated blocks",
+  "kind": "logic_error",
+  "severity": "medium",
+  "confidence": 0.4,
+  "file": "src/core/arm/dynarmic/arm_dynarmic_64.cpp",
+  "line": 120,
+  "quote": "        m_parent.InvalidateCacheRange(cache_line_start, ICACHE_LINE_SIZE);",
+  "explanation": "InstructionCacheOperationRaised calls m_parent.InvalidateCacheRange, which clears only this core's Jit and cached code page. Each core has its own Jit and code cache, and ISB only resets last_code_addr, it does not drop translated blocks. On hardware IC IVAU is broadcast to the inner-shareable domain, so a guest that writes code on one core and runs it on another (guest JIT, self-patching) keeps executing the old translation on the other cores. Kernel page-table operations broadcast (k_page_table_base.cpp InvalidateInstructionCache) and gdbstub does (Core::InvalidateInstructionCacheRange); only the guest cache-op path does not.",
+  "suggested_fix": "On InvalidateByVAToPoU (and IALLU) call Core::InvalidateInstructionCacheRange(m_process, addr, line) so every core's interface is invalidated, instead of only the local one.",
+  "how_to_verify": "Run a guest test that generates code on core A, issues dc cvau/ic ivau/dsb/isb, rewrites the same address, and executes it from a thread pinned to core B; compare with core A. Or log core_index in InvalidateCacheRange and see that only one core is invalidated."
+ },
+ {
+  "title": "CoreTiming::Advance never removes an expired event whose owner is gone, then spins holding both locks",
+  "kind": "robustness",
+  "severity": "medium",
+  "confidence": 0.3,
+  "file": "src/core/core_timing.cpp",
+  "line": 256,
+  "quote": "        if (const auto event_type{evt.type.lock()}) {",
+  "explanation": "The loop at line 253 only pops the head inside the if (evt.type.lock()) branch. If an EventType owner is destroyed without UnscheduleEvent, its weak_ptr is expired but the event stays at the head with time <= global_timer: lock() fails, nothing is popped, the loop condition stays true and Advance spins with advance_lock and basic_lock held, freezing ScheduleEvent, UnscheduleEvent, KHardwareTimer and the whole guest. All creators checked unschedule in their destructors (the kernel preemption event is cleared by ClearPendingEvents before it is reset), so this is latent, but one missed destructor on a new service becomes a hard hang rather than a dropped event.",
+  "suggested_fix": "Add an else branch that pops the event and continues for the expired-weak_ptr case.",
+  "how_to_verify": "In a unit test, create an EventType, schedule it, drop the shared_ptr without UnscheduleEvent, and call Advance after the due time: the call never returns."
+ },
+ {
+  "title": "SuspendEmulation busy-waits on the scheduler lock with no yield",
+  "kind": "performance",
+  "severity": "low",
+  "confidence": 0.4,
+  "file": "src/core/hle/kernel/kernel.cpp",
+  "line": 1271,
+  "quote": "    while (!TryWait()) {",
+  "explanation": "The suspend/resume loop re-runs TryWait, which takes KScopedSchedulerLock on each pass, in a tight loop with an empty body. The UI/pause thread burns a host core and repeatedly takes the global scheduler lock that every emulated core needs to switch threads away, so pause and shutdown can take longer than needed and stall the cores being waited for.",
+  "suggested_fix": "Yield or sleep briefly between passes (std::this_thread::yield or a ~100 us sleep), or wait on a condition signalled when cores go idle.",
+  "how_to_verify": "Pause a running Switch 2 title and profile the UI thread for time in SuspendEmulation / KScopedSchedulerLock; compare pause latency with a yielding loop."
+ },
+ {
+  "title": "CoreTiming::SyncPause spins on an atomic without pause or yield",
+  "kind": "performance",
+  "severity": "low",
+  "confidence": 0.3,
+  "file": "src/core/core_timing.cpp",
+  "line": 135,
+  "quote": "        while (paused_set != is_paused)",
+  "explanation": "The caller spins until the timer thread acknowledges the pause. If the timer thread is inside a long event callback (for example one waiting on the scheduler lock) the caller burns a core for the whole time, and if the callback needs a lock the caller holds, the spin never ends.",
+  "suggested_fix": "Use paused_set.wait(...) or a condition variable instead of a bare spin; document that callers must not hold kernel locks.",
+  "how_to_verify": "Pause while a guest thread holds the scheduler lock in a long SVC and watch UI thread CPU use; or hold a lock the timer callback needs and call SyncPause."
+ },
+ {
+  "title": "KThread::FinishTermination spins without yield until no core runs the thread",
+  "kind": "performance",
+  "severity": "low",
+  "confidence": 0.25,
+  "file": "src/core/hle/kernel/k_thread.cpp",
+  "line": 435,
+  "quote": "                } while (core_thread == this);",
+  "explanation": "The loop re-reads GetSchedulerCurrentThread() until the core no longer shows this thread. If the other core is waiting on a reschedule interrupt or the host OS, the terminating thread's host thread spins at full speed; on a Critical-priority core thread this can starve whatever must run to finish the switch.",
+  "suggested_fix": "Add a pause/yield in the loop body.",
+  "how_to_verify": "Terminate many guest threads at once on a busy system and sample the cores for time in FinishTermination."
+ },
+ {
+  "title": "CoreTiming::timer_resolution_ns is written but never read and is uninitialised",
+  "kind": "dead_code",
+  "severity": "low",
+  "confidence": 0.9,
+  "file": "src/core/core_timing.h",
+  "line": 149,
+  "quote": "    s64 timer_resolution_ns;",
+  "explanation": "The member is assigned in SetTimerResolutionNs (called from qt_common.cpp and yuzu.cpp) and read nowhere in the tree; the host timer thread uses Event::WaitFor and the Windows timer resolution is set elsewhere.",
+  "suggested_fix": "Remove the member and SetTimerResolutionNs, or use it in the host timer thread.",
+  "how_to_verify": "grep -rn timer_resolution_ns src: only the assignment at core_timing.cpp:340 and the declaration appear."
+ }
+]

@@ -1,0 +1,74 @@
+[
+  {
+    "title": "Background prebuild is cancelled by a draw that then defers the build itself",
+    "kind": "performance",
+    "severity": "medium",
+    "confidence": 0.55,
+    "file": "src/video_core/renderer_vulkan/vk_pipeline_cache.cpp",
+    "line": 2122,
+    "quote": "        background_claimed.insert(key);",
+    "explanation": "BuildNewGraphicsPipeline calls TakeBackgroundPipeline before DeferRuntimeBuild. When the background build has not finished, TakeBackgroundPipeline inserts the key into background_claimed and returns null, and DeferRuntimeBuild may then skip the draw (build-deferred) without building anything. The background worker checks background_claimed before it starts and again before it publishes (the 'pipeline && !background_claimed.contains(key)' test in LoadDiskResources), so a queued prebuild is skipped and a running one is thrown away. The same pipeline is then translated again on the GPU thread, or by async translation, in a later frame. This hits exactly the pipelines drawn during the first frames after boot, while the background pool is still running, and the build budget is only 24 ms per frame so many draws defer.",
+    "suggested_fix": "Claim the key only when the GPU thread really starts building it (move the claim after the DeferRuntimeBuild check), or let a deferred draw leave the key unclaimed so the finished background pipeline is still published and taken on a later draw.",
+    "how_to_verify": "Boot a title with a populated cache and EDEN_NX2_BACKGROUND_PIPELINES on; compare the 'Background pipelines done' log (taken by draws / built by the GPU thread first) with and without a patch that moves the claim after DeferRuntimeBuild, and count 'Shader build budget' deferrals."
+  },
+  {
+    "title": "shader_infos[] can point at a ShaderInfo freed by cache invalidation",
+    "kind": "memory",
+    "severity": "medium",
+    "confidence": 0.3,
+    "file": "src/video_core/shader_cache.cpp",
+    "line": 336,
+    "quote": "        env.SetCachedSize(shader_infos[index]->size_bytes);",
+    "explanation": "ShaderCache::RefreshStages returns early (last_shaders_valid) while Dirty::Shaders is clear, and keeps unique_hashes and shader_infos[]. InvalidateRegion/InvalidateRegions/SyncGuestHost call RemovePendingShaders, which erases the ShaderInfo objects from 'storage', but nothing sets Dirty::Shaders (only register writes, a macro and RefreshDebugRejections do). If a guest write to cached shader code invalidates a program and the next draw changes only fixed-function state, the key misses and GetGraphicsEnvironments reads shader_infos[index]->lowered_native and ->size_bytes from freed memory; with a hit, the old pipeline is reused for rewritten code. InvalidateRegion is also reachable from non-GPU threads through the memory callbacks while the GPU thread reads shader_infos without a lock. Narrow window; confidence is low because games rarely rewrite shader memory without rebinding.",
+    "suggested_fix": "Compare invalidation_serial in the RefreshStages early-out (store the serial seen at the last refresh and re-resolve when it moved), or set Dirty::Shaders on every channel from RemovePendingShaders as RefreshDebugRejections already does.",
+    "how_to_verify": "Debug build with ASAN or a poisoned ShaderInfo: bind a shader, force InvalidateRegion over its page, then issue a draw that changes only blend or depth state and see whether GetGraphicsEnvironments reads the freed object."
+  },
+  {
+    "title": "Alpha-to-coverage/alpha-to-one updaters re-run the whole pipeline lookup with is_indexed=false",
+    "kind": "logic_error",
+    "severity": "low",
+    "confidence": 0.4,
+    "file": "src/video_core/renderer_vulkan/vk_rasterizer.cpp",
+    "line": 3849,
+    "quote": "    GraphicsPipeline* const pipeline = pipeline_cache.CurrentGraphicsPipeline();",
+    "explanation": "UpdateDynamicStates already receives the bound pipeline, but UpdateAlphaToCoverageEnable and UpdateAlphaToOneEnable call pipeline_cache.CurrentGraphicsPipeline() again with the default is_indexed=false. That repeats RefreshStages, FixedPipelineState::Refresh and the lookup, and can go through BuiltPipeline/ShouldSkipDepthOnlyGeometry with the non-indexed geometry key for an indexed draw, returning null and so recording alpha-to-coverage off. The dirty flag was already consumed by TouchAlphaToCoverageEnable, so the wrong value stays until the register changes again. From DrawTexture, UpdateDynamicStates(nullptr) makes this the only lookup, run against whatever shaders were last bound, and can start a pipeline build while texture_cache.mutex is held. Triggers when the AlphaToCoverageEnable/AlphaToOneEnable flag is dirty, for example after a channel switch (InvalidateState sets both) and the device reports extended dynamic state 3.",
+    "suggested_fix": "Pass the pipeline pointer from UpdateDynamicStates into both updaters and use pipeline->SupportsAlphaToCoverage()/SupportsAlphaToOne(); treat nullptr (DrawTexture) as disabled without a lookup.",
+    "how_to_verify": "Log in UpdateAlphaToCoverageEnable when CurrentGraphicsPipeline() returns null or a different pointer than the pipeline given to PrepareDraw; trigger with a DrawTexture right after BindChannel."
+  },
+  {
+    "title": "Blend-enable for integer render targets is not refreshed when the render target format changes",
+    "kind": "logic_error",
+    "severity": "low",
+    "confidence": 0.3,
+    "file": "src/video_core/renderer_vulkan/vk_rasterizer.cpp",
+    "line": 3986,
+    "quote": "                is_integer = IsPixelFormatInteger(format);",
+    "explanation": "In the dynamic blend path UpdateBlending turns blending off for integer render-target formats using regs.rt[index].format, but it only runs when Dirty::Blending/ColorMask or the colour-output mask changes. Binding a different render target (Dirty::RenderTargets) does not set Dirty::BlendEnable (it is set only by writes to blend.enable and by InvalidateState). Switching RT0 between a float and an integer format with unchanged blend registers keeps the old VkBool32, so blending stays on for an integer target or off for a float one. The static-pipeline path (FixedPipelineState attachments) has no integer check at all.",
+    "suggested_fix": "Set Dirty::BlendEnable when the render-target formats change (in the texture-cache RT update or in UpdateDynamicStates by comparing a cached integer mask), or fold the integer mask into the colour-output comparison already done in UpdateBlending.",
+    "how_to_verify": "Draw with blend enabled to a float RT, rebind an integer RT without touching blend registers, draw again and read the recorded vkCmdSetColorBlendEnableEXT calls (gpu_log_vulkan_calls)."
+  },
+  {
+    "title": "Disk-replay and boot-load worker lambdas let non-Shader exceptions escape",
+    "kind": "robustness",
+    "severity": "low",
+    "confidence": 0.3,
+    "file": "src/video_core/renderer_vulkan/vk_pipeline_cache.cpp",
+    "line": 1967,
+    "quote": "                        auto built = CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs), nullptr,",
+    "explanation": "CreateGraphicsPipeline only catches Shader::Exception. The disk-replay lambda (and the boot load_graphics worker) call it with no try/catch, and ThreadWorker runs tasks without a handler, so a vk::Exception from layout or descriptor-set-layout creation (out of device memory), std::bad_alloc, or a std::exception from a damaged environment file ends the process. TranslateGraphicsPipeline handles this case; the other worker paths do not. A thrown task also never reaches ready_disk_pipelines, so in_flight_disk_replays would keep that key blocked.",
+    "suggested_fix": "Wrap the worker bodies in try/catch(const std::exception&), log, and push a null pipeline into ready_disk_pipelines so in_flight_disk_replays is released.",
+    "how_to_verify": "Inject a throw (for example truncate a record in vulkan.mythos.bin or force a vk::Exception) in CreateGraphicsPipeline during a disk replay and observe std::terminate."
+  },
+  {
+    "title": "viewport_swizzles in the pipeline key is not part of the channel-switch invalidation set",
+    "kind": "logic_error",
+    "severity": "low",
+    "confidence": 0.25,
+    "file": "src/video_core/renderer_vulkan/vk_state_tracker.cpp",
+    "line": 29,
+    "quote": "    static constexpr int INVALIDATION_FLAGS[]{",
+    "explanation": "graphics_key lives in PipelineCache and is shared by all channels, and FixedPipelineState::Refresh recopies viewport_swizzles only when Dirty::ViewportSwizzles is set in the current channel's flags. MakeInvalidationFlags (applied by InvalidateState in BindChannel) sets VertexInput and Blending but not ViewportSwizzles. After switching to a channel whose flag is clear, the key keeps the previous channel's swizzles, so the lookup can return a pipeline built for different swizzles. Only matters for titles that use more than one 3D channel with different viewport swizzles.",
+    "suggested_fix": "Add Dirty::ViewportSwizzles to INVALIDATION_FLAGS (or always refresh the swizzles after BindToChannel).",
+    "how_to_verify": "Bind two channels with different viewport swizzle registers, draw on each alternately and compare graphics_key.state.viewport_swizzles with the registers at lookup time."
+  }
+]

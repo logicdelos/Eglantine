@@ -1,0 +1,29 @@
+[
+ {
+  "idx": 0,
+  "title": "ReturnRawSession leaks the creator reference of every raw session, so nx2 sessions are never destroyed",
+  "verdict": "confirmed_narrow",
+  "confidence": 0.8,
+  "trigger": "Any guest request answered through ReturnRawSession (nx2 GPU, vi2, syncpt, camera, chat, video-decode sessions); the leak grows only when the guest opens such a session repeatedly, e.g. one video-decode session per movie.",
+  "impact": "Memory and thread growth per reopened session (handler object, its worker thread); none for sessions opened once per boot.",
+  "evidence": [
+   {
+    "file": "src/core/hle/service/nx2_gsv.h",
+    "line": 144,
+    "quote": "    rb.PushCopyObjects(ctx, *client);"
+   },
+   {
+    "file": "src/core/hle/service/hle_ipc.cpp",
+    "line": 288,
+    "quote": "            R_TRY(handle_table.Add(kernel, &handle, object));"
+   },
+   {
+    "file": "src/core/hle/service/hle_ipc.cpp",
+    "line": 298,
+    "quote": "            object->Close(kernel);"
+   }
+  ],
+  "reasoning": "CreateRawSession returns the client end of a new KSession with the creator's reference still held. WriteToOutgoingCommandBuffer adds a handle-table reference for copy objects and closes the creator's reference only for move objects. So after the guest closes its handle one reference remains and the session and its handler are never destroyed. Checked by the parent agent by reading; not run.",
+  "fix_note": "Push the client session as a move object (PushMoveObjects), as AddMoveInterface does. Risk: handlers that were kept alive only by this leak would now be destroyed on close, so their destructors (thread joins, timer unschedules) run for the first time and need a test run with a movie."
+ }
+]

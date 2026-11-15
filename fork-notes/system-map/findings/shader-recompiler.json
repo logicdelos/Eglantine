@@ -1,0 +1,50 @@
+[
+  {
+    "title": "Loop safety counter is initialised once per shader invocation and never reset when a loop is re-entered",
+    "kind": "logic_error",
+    "severity": "medium",
+    "confidence": 0.5,
+    "file": "src/shader_recompiler/backend/spirv/emit_spirv.cpp",
+    "line": 210,
+    "quote": "const Id safety_counter{ctx.AddGlobalVariable(",
+    "explanation": "For every Repeat node the backend creates one Private global initialised to 0x2000 and decrements it on each back-edge. Nothing resets it on loop entry. An inner loop that runs 100 iterations inside an outer loop that runs 100 times consumes 10000 of the 8192 budget, so after 8192 total iterations the safety condition turns false and the inner loop exits early, silently giving wrong results. Default Settings::values.disable_shader_loop_safety_checks is false, so it is on. Affects compute and fragment shaders with nested or repeatedly entered loops of large total trip count.",
+    "suggested_fix": "Reset the counter to 0x2000 on loop entry (store in the block before OpLoopMerge/loop header), or make the counter a Function-scope variable declared per loop and re-initialised at the loop pre-header.",
+    "how_to_verify": "Disassemble a SPIR-V from a shader with a doubly nested loop (inner 100 x outer 100) and check that the counter has no store of 0x2000 inside the outer loop; or run a test compute shader with 10000 total inner iterations and compare the accumulated result with the setting on and off."
+  },
+  {
+    "title": "Native global-memory lookup picks the closest buffer below the address with no upper bound and truncates the offset to 32 bits",
+    "kind": "robustness",
+    "severity": "low",
+    "confidence": 0.3,
+    "file": "src/shader_recompiler/backend/spirv/spirv_emit_context.cpp",
+    "line": 1080,
+    "quote": "const Id ssbo_offset{OpUConvert(U32[1], OpISub(U64, addr, bases[index]))};",
+    "explanation": "When info.native_global_bounds is set, the chosen buffer is the one with the largest base at or below addr; there is no check that addr is inside that buffer (native pointers have no size word). The 64-bit distance is then cut to 32 bits, so an address more than 4 GiB above the closest base aliases a low offset and can read or write inside a valid buffer instead of being out of range. Only reachable if a native shader dereferences an address not in any bound buffer.",
+    "suggested_fix": "Add a distance check (distance < binding size, or at least distance <= 0xffffffff) before taking the buffer, and skip the access otherwise.",
+    "how_to_verify": "Emit SPIR-V for a native program with native_global_bounds and look for an OpULessThan on the distance against anything other than best_distance; craft a test address 2^32 + 16 above a base and observe the access landing at offset 16."
+  },
+  {
+    "title": "BlitConstantsPass has no native-program gate and rewrites any bank-17 reads that match the blit-block heuristic",
+    "kind": "logic_error",
+    "severity": "low",
+    "confidence": 0.2,
+    "file": "src/shader_recompiler/ir_opt/position_pass.cpp",
+    "line": 85,
+    "quote": "void BlitConstantsPass(Environment& env, IR::Program& program) {",
+    "explanation": "The pass is selected only by stage (VertexB or Fragment) and by the shape of the immediate reads from bank 17 (all within [0,0x20), [0x30,0x4c), [0x50,0x60) with at least one non-zero word). It does not check env.IsNativeProgram(). A Switch 1 shader that binds its own uniform buffer at slot 17 and reads only those offsets would have its constants replaced with render-area values. The comment shows the authors already hit this once (Fire Emblem material push constants).",
+    "suggested_fix": "Return early unless env.IsNativeProgram(), if bank-17 blit constants only exist for lowered native programs.",
+    "how_to_verify": "Check whether any Switch 1 title binds a user cbuf at index 17 with reads confined to those offsets; log when the pass fires (reads_nonzero_word) on non-native programs during a play session."
+  },
+  {
+    "title": "EDEN_NATIVE_SHADER_OVERRIDE_DIR blocks the translating thread for up to 30 minutes in 100 ms sleeps",
+    "kind": "robustness",
+    "severity": "low",
+    "confidence": 0.3,
+    "file": "src/video_core/shader_environment.cpp",
+    "line": 628,
+    "quote": "const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes{30};",
+    "explanation": "When the variable is set and a native program fails lowering, the thread running translation (the GPU thread for live draws) polls for an override file for 30 minutes, freezing rendering. It also calls std::filesystem::create_directories and opens files outside any Shader::Exception handling, so a bad directory throws std::filesystem::error, which is not caught by the Shader::Exception handler in CreateGraphicsPipeline. Opt-in debug path only.",
+    "suggested_fix": "Do not wait inline: write the source file, throw the normal rejection, and pick up the override on the next translation attempt.",
+    "how_to_verify": "Set EDEN_NATIVE_SHADER_OVERRIDE_DIR to a valid directory and run a title with an unsupported native opcode; observe the GPU thread stalled with the 'Native shader paused' log line."
+  }
+]

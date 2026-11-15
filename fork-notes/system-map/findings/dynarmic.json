@@ -1,0 +1,74 @@
+[
+ {
+  "title": "Windows unwind info for the JIT code buffer does not match the real run_code prologue",
+  "kind": "robustness",
+  "severity": "low",
+  "confidence": 0.5,
+  "file": "src/dynarmic/src/dynarmic/backend/x64/exception_handler_windows.cpp",
+  "line": 150,
+  "quote": "alloc_large(19, 0xC8);      // +00C  48 81 EC C8 00 00 00        sub     rsp,0C8h",
+  "explanation": "The RUNTIME_FUNCTION unwind data describes a prologue of 'sub rsp,0C8h' with xmm saves at rsp+0B0h and SizeOfProlog 89. The prelude actually emitted by ABI_PushCalleeSaveRegistersAndAdjustStack(code, sizeof(StackLayout)) pushes 8 GPRs and subtracts about 0x4E8 bytes (spill area, 10 xmm saves, shadow space), saving xmm at rsp+1088 and above. Any unwind that crosses a JIT frame (RtlVirtualUnwind, StackWalk64 used by the stall watch and tools/nx2/host_threads.py, a C++ exception thrown from a callback) computes the wrong RSP and returns garbage or truncated stacks. The fastmem SEH path itself does not unwind, so it still works.",
+  "suggested_fix": "Generate the unwind codes from the same FrameInfo (CalculateFrameInfo) that the prologue uses, or register a chained unwind that matches the real push/sub/xmm-save sequence.",
+  "how_to_verify": "Break or suspend a core thread while it is inside JIT code, run StackWalk64 or WinDbg 'k' on it and compare the reported frames to the guest-visible call chain; or compare the emitted run_code prologue bytes with the unwind codes."
+ },
+ {
+  "title": "Cross-thread write to last_code_addr can leave a stale cached code page after invalidation",
+  "kind": "race",
+  "severity": "medium",
+  "confidence": 0.4,
+  "file": "src/core/arm/dynarmic/arm_dynarmic_64.cpp",
+  "line": 545,
+  "quote": "m_cb->last_code_addr = u64(-1);",
+  "explanation": "Kernel InvalidateInstructionCache and core/arm/debug.cpp call ArmDynarmic64::InvalidateCacheRange on every core's interface from the calling thread. It resets the plain u64 last_code_addr that MemoryReadCode on the owning thread reads and writes (read page, then set last_code_addr). If the owner has already read the old page and sets last_code_addr after the invalidating thread reset it, the stale page stays cached, so blocks recompiled after the pending invalidation decode the old instructions. It is also a data race on a non-atomic.",
+  "suggested_fix": "Do not touch m_cb state from other threads: record a 'drop code page' flag that the owning thread consumes in PerformRequestedCacheInvalidation or at the top of Run, or make last_code_addr atomic and invalidate after the jit invalidation is queued.",
+  "how_to_verify": "Stress test: one core executes freshly patched code in a loop while another thread repeatedly rewrites that page and calls InvalidateCacheRange; check that the executed instructions always match the latest bytes. Reading the two accesses shows the unsynchronised pair."
+ },
+ {
+  "title": "ConstantPool is constructed before BlockOfCode::committed_size is initialised",
+  "kind": "robustness",
+  "severity": "low",
+  "confidence": 0.4,
+  "file": "src/dynarmic/src/dynarmic/backend/x64/block_of_code.h",
+  "line": 176,
+  "quote": "ConstantPool constant_pool;",
+  "explanation": "constant_pool is the first data member, committed_size (default member initialiser 0) is declared later (line 184). The ConstantPool constructor calls code.EnsureMemoryCommitted, which reads committed_size while it is still indeterminate, and the member is then set to 0 after the pool exists. If the garbage value is large, no VirtualAlloc commit happens and the constant pool memset in AllocateFromCodeSpace touches PAGE_NOACCESS reserved memory, crashing at startup. In practice Jit::Impl is over 16 MiB (fast dispatch table) so it comes from freshly zeroed pages and the value is 0, which hides the bug.",
+  "suggested_fix": "Declare committed_size before constant_pool, or construct the pool after the allocator state is set up.",
+  "how_to_verify": "Fill the Jit::Impl allocation with a non-zero pattern (placement new over 0xCD memory) before construction and watch for the access violation; or run with MSVC /RTC or an initialisation sanitiser."
+ },
+ {
+  "title": "Auto and Unsafe fastmem mode has no address range check; guest addresses near 2^64 wrap onto host memory below the arena",
+  "kind": "robustness",
+  "severity": "medium",
+  "confidence": 0.25,
+  "file": "src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.h",
+  "line": 215,
+  "quote": "return r13 + vaddr;",
+  "explanation": "With fastmem_address_space_bits = 64 (Auto mode, and Unsafe with cpuopt_unsafe_fastmem_check) and silently_mirror_fastmem = false, EmitFastmemVAddr emits [r13 + vaddr] with no check. A guest pointer such as -8 or -0x1000 (null base plus negative offset, a tagged pointer after a bad untag) becomes r13 - 8, which is host memory just below the fastmem arena. If that is mapped, the access succeeds and silently reads or corrupts host memory instead of faulting into the callback path. Faults are only guaranteed when the wrapped address is unmapped.",
+  "suggested_fix": "Use 48-bit or 39-bit fastmem check in Auto mode, or place guard regions below the arena, or reserve the arena with a large PAGE_NOACCESS guard on both sides.",
+  "how_to_verify": "Run a guest that loads from address 0xFFFFFFFFFFFFFFF8 and inspect the host address accessed (r13 - 8); check what VirtualQuery reports for the page below fastmem_arena."
+ },
+ {
+  "title": "Only 1 MiB of headroom is guaranteed per block; a larger block runs past committed memory",
+  "kind": "robustness",
+  "severity": "low",
+  "confidence": 0.25,
+  "file": "src/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp",
+  "line": 259,
+  "quote": "block_of_code.EnsureMemoryCommitted(MINIMUM_REMAINING_CODESIZE);",
+  "explanation": "Fork lazy commit commits only size_ + 1 MiB (rounded up to 4 MiB steps) before each compile. Xbyak writes are not commit-aware, so a straight-line guest block that emits more host code than the committed margin (a very long unrolled SIMD function, for example) writes into reserve-only memory and faults in C++ code outside the JIT range, which the SEH stub passes on as unhandled. The old fully committed buffer did not have this failure mode. The same 1 MiB constant is the evacuation threshold, so a huge block near the end of the buffer hits ERR_CODE_IS_TOO_BIG.",
+  "suggested_fix": "Commit in a Xbyak grow hook or cap the block length in Translate (instruction limit) so emitted size stays within the margin; or commit the margin per 'emit' based on block cycle count.",
+  "how_to_verify": "Feed a synthetic guest function of 20k consecutive NEON instructions and watch committed_size versus the final size_ in Emit."
+ },
+ {
+  "title": "BlockRangeInformation::InvalidateRanges is a linear scan over every block range per invalidation",
+  "kind": "performance",
+  "severity": "low",
+  "confidence": 0.3,
+  "file": "src/dynarmic/src/dynarmic/backend/block_range_information.cpp",
+  "line": 37,
+  "quote": "std::erase_if(ranges, [&](const Range& range) {",
+  "explanation": "The fork replaced the interval map with a flat vector. Each applied invalidation (IC IVAU on a 64-byte line, kernel code remap, gdbstub) walks all ranges times the number of invalid intervals, with a 512 MiB cache that can hold hundreds of thousands of blocks. Guests that write code and invalidate often (their own JIT, self-modifying loaders) pay this on every halt and re-entry.",
+  "suggested_fix": "Keep ranges sorted by start or use an interval map keyed by page so only overlapping entries are visited.",
+  "how_to_verify": "Count blocks in block_ranges and time PerformRequestedCacheInvalidation under a workload with frequent IC IVAU (Nx2Spikes JitInvalidate events show the rate)."
+ }
+]

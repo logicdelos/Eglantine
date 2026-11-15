@@ -1,0 +1,86 @@
+[
+  {
+    "title": "HostMemory fallback allocation is not checked; commit-limit failure leaves a null backing base",
+    "kind": "robustness",
+    "severity": "medium",
+    "confidence": 0.6,
+    "file": "src/common/host_memory.cpp",
+    "line": 751,
+    "quote": "        backing_base = static_cast<u8*>(impl->Allocate(backing_size));",
+    "explanation": "When Impl::Init() fails (for example CreateFileMapping2 with SEC_COMMIT hits the commit limit on a 16 GB machine), the constructor falls back to VirtualAlloc(MEM_RESERVE|MEM_COMMIT) of the same size. That commits the same amount, so it fails under the same condition; Allocate() logs and returns nullptr, and the result is stored without a check. Every later GetPointer/ClearBackingRegion then dereferences a null-based pointer and crashes far from the cause.",
+    "suggested_fix": "Check the pointer after Allocate and report a clear fatal error (or throw) with the requested size; consider falling back to a smaller or SEC_RESERVE-style backing.",
+    "how_to_verify": "Constrain the commit limit (or set backing size above free commit), start a title, and observe the first access to backing_base crash with a null-based address instead of a clean error."
+  },
+  {
+    "title": "Dirty-write tracker's 'invalid' sentinel test is always true, so the DirtyGatherFast early-out never triggers",
+    "kind": "performance",
+    "severity": "low",
+    "confidence": 0.8,
+    "file": "src/core/gpu_dirty_memory_manager.h",
+    "line": 130,
+    "quote": "        return address < (1ULL << 39);",
+    "explanation": "IsValid is called with TransformAddress::address, a u32. The sentinel is default_transform.address = ~0U = 0xFFFFFFFF, which is far below 1<<39, so IsValid(sentinel) is true. Consequences: Gather()'s fast path (!IsValid(current.address)) never returns early, so every fence takes gather_guard and guard for each core manager; and the first Collect after each Gather pushes a mask-0 junk entry into back_buffer under the lock. Results stay correct (mask 0 yields no ranges), only the intended optimisation is lost.",
+    "suggested_fix": "Compare against the sentinel directly (address != ~0U), or make IsValid take u32 and test address != default_transform.address.",
+    "how_to_verify": "Count lock acquisitions in Gather with Nx2Perf DirtyGatherFast on and no guest writes: it never takes the early return. A unit test calling Gather on a fresh manager and checking back_buffer size after one Collect shows the junk entry."
+  },
+  {
+    "title": "BuildTransform mask is wrong for writes that cross a 2 KiB chunk (shift count underflows)",
+    "kind": "logic_error",
+    "severity": "medium",
+    "confidence": 0.5,
+    "file": "src/core/gpu_dirty_memory_manager.h",
+    "line": 136,
+    "quote": "        mask <<= (sizeof(T) * 8 - top_bit);",
+    "explanation": "Each record covers a 2 KiB chunk with a 32-bit mask of 64-byte units. BuildTransform computes top_bit from minor_address + size without clamping to the chunk. If the write extends past the chunk (any block write over 2 KiB, or smaller block writes that straddle a 2 KiB boundary; HandleRasterizerWrite passes whole per-page copy sizes up to 4 KiB), top_bit exceeds 32, the size_t subtraction wraps and the shift is undefined. On x86 a 32-bit shift uses count mod 32, giving a truncated or empty mask, and the second chunk is never recorded. The GPU then misses part of a CPU write to a cached page (stale buffer/texture data). Existing tests only use sizes of 4, 8 and 128 bytes.",
+    "suggested_fix": "Split the range at 2 KiB chunk boundaries in Collect (loop calling BuildTransform per chunk) and clamp top_bit to 32.",
+    "how_to_verify": "Call Collect(0x10000, 4096) on a GPUDirtyMemoryManager and Gather: expect callbacks covering 0x10000-0x11000; current code covers at most the first chunk (or less). Also Collect(0x107F8, 16)."
+  },
+  {
+    "title": "Failed Init() releases resources and the destructor releases them again",
+    "kind": "robustness",
+    "severity": "low",
+    "confidence": 0.5,
+    "file": "src/common/host_memory.cpp",
+    "line": 168,
+    "quote": "            Release();",
+    "explanation": "The Init() failure paths (lines 168, 175, 182) call Release(), which frees/unmaps/closes backing_base, virtual_base and backing_handle without clearing them. The constructor then does impl.reset(), and ~Impl calls Release() again, repeating VirtualFree, UnmapViewOfFile2 and CloseHandle on stale values. The second CloseHandle of an already closed handle can close an unrelated handle if the value was reused in between, or raise an exception under a debugger.",
+    "suggested_fix": "Null backing_handle, backing_base and virtual_base at the end of Release() (and skip Release when nothing is held).",
+    "how_to_verify": "Force MapViewOfFile3 or the arena VirtualAlloc2 to fail and watch the 'Failed to free ...' critical logs appear twice, with CloseHandle called twice on the same handle value."
+  },
+  {
+    "title": "Partial unmap of a placeholder leaves neighbouring guest memory unmapped while another thread may access it",
+    "kind": "race",
+    "severity": "low",
+    "confidence": 0.35,
+    "file": "src/common/host_memory.cpp",
+    "line": 323,
+    "quote": "            MapView(placeholder_begin, host_offset, unmap_begin - placeholder_begin);",
+    "explanation": "UnmapOnePlaceholder unmaps the whole placeholder view (line 310) and then re-maps the parts to keep (here and at 326). Windows cannot shrink a view in place, so between the two calls the retained neighbours are not mapped in the arena. A guest thread running JIT code on another core touching those pages in that window takes an access violation that dynarmic treats as a guest fault. The comment in the code acknowledges the window.",
+    "suggested_fix": "Avoid partial unmaps of larger views (map arena views at the granularity the kernel unmaps), or suspend guest cores around the operation.",
+    "how_to_verify": "Map a 1 MiB range, unmap its middle 4 KiB while another core spins reading the ends; look for sporadic arena access violations."
+  },
+  {
+    "title": "MemoryManager::IsGranularRange masks a page index instead of the byte offset",
+    "kind": "dead_code",
+    "severity": "low",
+    "confidence": 0.7,
+    "file": "src/video_core/memory_manager.cpp",
+    "line": 1012,
+    "quote": "            const std::size_t page{(page_index & big_page_mask) + size};",
+    "explanation": "page_index is gpu_addr >> big_page_bits, an index; big_page_mask is a byte mask. The offset inside the big page should be gpu_addr & big_page_mask. The function would answer wrongly for ranges crossing a big-page boundary. A grep of src finds no caller (declared at memory_manager.h:141 only), so nothing is affected today.",
+    "suggested_fix": "Delete the unused function, or use (gpu_addr & big_page_mask) if it is kept.",
+    "how_to_verify": "grep -rn IsGranularRange src: only the declaration and definition appear."
+  },
+  {
+    "title": "const GetPointer<T>(GPUVAddr) calls GetPointer<T*> on itself",
+    "kind": "dead_code",
+    "severity": "low",
+    "confidence": 0.5,
+    "file": "src/video_core/memory_manager.h",
+    "line": 105,
+    "quote": "        return GetPointer<T*>(addr);",
+    "explanation": "The const overload forwards with the wrong template argument; if instantiated on a const MemoryManager it recurses with T* then T** and never terminates the instantiation chain, or returns the wrong type. It compiles today only because no caller uses it.",
+    "suggested_fix": "Call the shared implementation with T, or remove the overload.",
+    "how_to_verify": "Add a call to GetPointer<u8>(addr) on a const MemoryManager& and compile."
+  }
+]

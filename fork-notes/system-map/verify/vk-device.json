@@ -1,0 +1,35 @@
+[
+  {
+    "idx": 0,
+    "title": "VertexInputDynamicState driver-version check compares mismatched encodings, so VIDS is always disabled on NVIDIA and Intel Windows",
+    "verdict": "confirmed",
+    "confidence": 0.95,
+    "trigger": "Any NVIDIA proprietary (driver ID NVIDIA_PROPRIETARY) or Intel proprietary Windows device that exposes VK_EXT_vertex_input_dynamic_state, regardless of driver version. In GetSuitability, version = (driverVersion << 3) >> 3 is < 0x20000000. VK_MAKE_API_VERSION(580,119,2,0) = ((580<<29 truncated to 4<<29 = 0x80000000) | 119<<22 | 2<<12) = 0x9DC02000 and VK_MAKE_API_VERSION(27,20,100,0) = (3<<29 | 20<<22 | 100<<12) = 0x65064000, both above 0x1FFFFFFF, so 'version < constant' is always true and the extension plus its feature struct are removed with the 'Disabling broken' warning. The extension flag is set to true for any supported extension earlier in GetSuitability, so the branch is reached.",
+    "impact": "VK_EXT_vertex_input_dynamic_state is never used on the owner's RTX 5070 Ti (or any NVIDIA/Intel Windows driver), even on drivers new enough to be fine: vertex input is baked into pipelines, so more pipeline permutations/compiles and possible shader-compile stutter. No crash; a log warning on every start.",
+    "evidence": [
+      {"file": "src/video_core/vulkan_common/vulkan_device.cpp", "line": 1416, "quote": "        const u32 version = (properties.properties.driverVersion << 3) >> 3;"},
+      {"file": "src/video_core/vulkan_common/vulkan_device.cpp", "line": 1417, "quote": "        if ((driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS && version < VK_MAKE_API_VERSION(27, 20, 100, 0))"},
+      {"file": "src/video_core/vulkan_common/vulkan_device.cpp", "line": 1418, "quote": "        || (driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY && version < VK_MAKE_API_VERSION(580, 119, 02, 0))) {"},
+      {"file": "src/video_core/vulkan_common/vulkan_device.cpp", "line": 1420, "quote": "            RemoveExtensionFeature(extensions.vertex_input_dynamic_state, features.vertex_input_dynamic_state, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);"},
+      {"file": ".cache/cpm/vulkanheaders/v1.4.345/include/vulkan/vulkan_core.h", "line": 62, "quote": "#define VK_MAKE_API_VERSION(variant, major, minor, patch) \\"}
+    ],
+    "reasoning": "VK_MAKE_API_VERSION shifts its first argument (variant) into bits 29-31, so passing 580 or 27 there truncates it to the low 3 bits and sets high bits; the left-hand side is masked to 29 bits, so the comparison can never be false. This does not depend on how the vendor encodes driverVersion. Vendor encodings: NVIDIA proprietary packs driverVersion as major<<22 | minor<<14 | secondary<<6 | tertiary (10/8/8/6 bits; 580.119.02 -> 580,119,2,0; Windows 581.15 -> major 581, minor 15). Intel Windows proprietary packs it as major<<14 | minor (18/14 bits) where major/minor are the LAST TWO fields of the 4-part Windows version, e.g. 27.20.100.9168 reports 100.9168 and 31.0.101.4502 reports 101.4502. So the correct Intel threshold for '27.20.100.0' is (100u << 14), NOT (27u<<14)|100 as the finding's suggestion says. Also note line 2005 prints NVIDIA driverVersion with VK_API_VERSION_* macros, which is a separate cosmetic misdecode.",
+    "fix_note": "Drop the masking and compare the raw driverVersion with vendor-correct constants: NVIDIA: (580u<<22)|(119u<<14)|(2u<<6) (= 0x911DC080); Intel Windows: (100u<<14) (i.e. fourth-from-last field 100, minor 0), not the suggested (27u<<14)|100. Both comparisons are unsigned 32-bit, so no overflow. Risk: enabling VIDS on drivers where it is actually broken is what the check was meant to prevent; the NVIDIA cutoff is already a guess ('unknown when VIDS was first NOT broken'), and Windows NVIDIA branches below 580.119 (e.g. 576.xx) would remain disabled while 581+ enable, so verify on a real driver by printing driverVersion."
+  },
+  {
+    "idx": 1,
+    "title": "MemoryAllocator::CreateBuffer has no budget-relaxing or OOM fallback while CreateImage and Commit do",
+    "verdict": "confirmed_narrow",
+    "confidence": 0.45,
+    "trigger": "Every memory type allowed for the buffer is over its VMA budget (or heap-size limit) at the same time, so vmaCreateBuffer with WITHIN_BUDGET_BIT returns VK_ERROR_OUT_OF_DEVICE_MEMORY and vk::Check throws vk::Exception. Requires exhausting not only device-local heaps but also the host-visible/system heap (requiredFlags is 0 and usage is only an AUTO_PREFER_* hint, so VMA would normally fall back to another heap first), e.g. a very heavy title under system memory pressure or the EDEN_NX2_VRAM_LIMIT_MIB test mode combined with a tight host budget.",
+    "impact": "An uncaught vk::Exception from a buffer-cache, staging or descriptor buffer allocation on the GPU/render path: session aborts (no catch around buffer creation outside vk_texture_cache.cpp, vk_graphics/compute pipeline and a few others). Normal VRAM pressure alone does not trigger it because VMA falls through to host memory types.",
+    "evidence": [
+      {"file": "src/video_core/vulkan_common/vulkan_memory_allocator.cpp", "line": 427, "quote": "        .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | MemoryUsageVmaFlags(usage),"},
+      {"file": "src/video_core/vulkan_common/vulkan_memory_allocator.cpp", "line": 443, "quote": "        vk::Check(vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info));"},
+      {"file": "src/video_core/vulkan_common/vulkan_memory_allocator.cpp", "line": 253, "quote": "    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {"},
+      {"file": "src/video_core/vulkan_common/vulkan_memory_allocator.cpp", "line": 538, "quote": "        ci2.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;"}
+    ],
+    "reasoning": "The asymmetry is real: CreateImage and both Commit overloads retry without the budget bit (and CreateImage then goes to host memory and an unbacked sparse image), while both CreateBuffer overloads throw on the first failure. But the buffer allocation uses requiredFlags=0 with an AUTO_PREFER_* usage and memoryTypeBits=valid_memory_types, so VMA itself tries the remaining memory types before returning an error; that makes the failure require every candidate heap over budget, much rarer than the image case where the images were already filling device-local memory. When it does occur it is fatal because nothing catches it.",
+    "fix_note": "Reasonable and low risk: on VK_ERROR_OUT_OF_DEVICE_MEMORY retry the same call with WITHIN_BUDGET_BIT cleared (increment pressure_events), in both the plain and min_alignment overloads, and the separate-pool path already returns false to fall through. Do not retry silently for buffers the caller needs device-local; a host fallback only costs speed. Could mask real exhaustion until the driver fails instead (then the exception still propagates, which is the correct final outcome)."
+  }
+]
