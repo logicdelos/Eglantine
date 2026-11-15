@@ -87,7 +87,7 @@ LDAPR, LSE atomics (LDADD, LDCLR, LDEOR, LDSET, LDSMAX/MIN, LDUMAX/MIN, SWP, CAS
 ## Hazards and improvement candidates
 
 - Hard-coded unwind info (frame 0xC8, prolog 89) does not match the real prelude frame (8 GPR pushes plus 0x4E8 bytes, xmm saves at `rsp+1088`); stack walks through JIT frames are wrong (finding 1).
-- Cross-thread write to `last_code_addr` can leave a stale code page cached (finding 2).
+- Cross-thread write to `last_code_addr` can leave a stale code page cached (finding 2). Fixed in `970e98e`: other threads bump the atomic `code_generation`, and the owning core compares it before it uses the cached page.
 - `ConstantPool` is constructed before `committed_size` is initialised (finding 3).
 - Auto mode uses 64-bit fastmem with no range check; a wild guest pointer just below 2^64 wraps onto host memory below the arena (finding 4).
 - Invalidation is a linear scan of all block ranges (finding 6).

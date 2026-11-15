@@ -74,6 +74,8 @@ Environment: `EDEN_NX2_TC_LOG`, `EDEN_NX2_TC_MIN_AGE`, `EDEN_NX2_TC_OLD_AGE`, `E
 
 See `findings/vk-texture.json`. Main points: stale `unswizzle_queue` entries after image deletion (only with GPU unswizzle on); decode worker declared before `async_decodes` (shutdown order); one `runtime.Finish()` per evicted GpuModified image in the GC; memory estimate for trimmed ASTC arrays and temporary buffers outside the budget; the always-false immediate-delete test; unbounded sampler cache.
 
+Fixed in `700ab4e` and `2118911`: the stale unswizzle entries (the task of a deleted image is marked cancelled and dropped on the GPU thread) and the wait per evicted image (one `runtime.Finish()` per collection pass). An evicted image with a pending download stays tracked and registered until its bytes are in guest memory; a change to `RunGarbageCollector` must keep that order.
+
 ## Switch 2 (fork) code in this slice
 
 `UsesNativeTiling` thresholds in `TickFrame`; sparse layers and tiles (`InitSparseLayers`, `InitSparseTiles`, `BindZeroBlock`, `BindLayers`, `SparseLayersCap` 384/768 MiB) for huge ASTC terrain arrays; `TrimmedHostInfo` drops top mips above `TrimmedAstcArrayLimit`; `IsOpaqueBc1Astc` and GPU ASTC to BC transcode with reuse pool; feedback shadows; MSAA resolve shadows for tilers; DLSS/FSR stand-ins. Not read in full: DLSS probe code at `texture_cache.h` 1474-1740 and sparse helpers 2334-2552.

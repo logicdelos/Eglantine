@@ -69,7 +69,8 @@ Env: `EDEN_NX2_COLD_HINT`, `EDEN_NX2_NO_REACTIVE`, `EDEN_NX2_READ_TRAPS` (0 disa
 
 ## Hazards and improvement candidates
 
-- Fallback path in the `HostMemory` ctor does not check `Allocate`'s null return.
+- Fallback path in the `HostMemory` ctor does not check `Allocate`'s null return. Fixed in `970e98e`: it stops with a message.
+- `DeviceMemoryManager::ReadBlockSparse` (`f74d90d`) reads a range that has unmapped pages, zero-fills them and logs nothing. It is for callers that expect a partly mapped range. `ReadBlock` and `ReadBlockUnsafe` still report an unmapped page, and now log the caller's host stack once per start address.
 - `Impl::Init` failure paths call `Release()` and then `~Impl` calls it again.
 - Partial unmap of a placeholder leaves a window in which neighbours are unmapped (acknowledged in comments).
 - `GPUDirtyMemoryManager`: the "invalid" sentinel test is always true, and the mask builder is wrong for writes that cross a 2 KiB chunk.

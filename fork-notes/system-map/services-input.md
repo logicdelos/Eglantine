@@ -68,7 +68,7 @@ NX2 note: no `nx2` symbol exists in this slice. The fork additions seen are `Emu
 ## Hazards and improvement candidates
 
 Details are in `findings/services-input.json`.
-- `NPad::ControllerUpdate` runs on the UI thread without locks and races `OnUpdate`; it also uses `return` where `continue` is meant.
+- `NPad::ControllerUpdate` runs on the UI thread without locks and races `OnUpdate`; it also uses `return` where `continue` is meant. Not fixed: taking `shared_mutex` there deadlocks against `DisconnectNpad`, and three other designs failed review. The README section "Not fixed" has the lock order and a design that fits.
 - `JoyconDriver::InitializeDevice` starts the input thread before `Joycons::Setup` calls `SetCallbacks`; an early report calls an empty `std::function`.
 - `NPad::UnregisterAppletResourceUserId` acts on slot 0 for an unknown aruid.
 - SDL gamepad handle leaked when the Joy-Con/Pro-Controller driver is preferred.

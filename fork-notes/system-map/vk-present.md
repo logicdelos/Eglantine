@@ -80,4 +80,6 @@
 
 See `findings/vk-present.json`. In short: a possible endless recreate loop on a zero-size surface; AA pass and applet-layer post chain destroyed without waiting; every pooled frame triggers a full rebuild after a resize; per-frame heap copies in the FxChain/post-process path; `vkDeviceWaitIdle` and teardown without queue synchronisation; present-thread exceptions terminate the process; uninitialised `applet_frame` size.
 
+The anti-aliasing part is fixed in `6d94d18`: `Layer::SetAntiAliasPass` and `RefreshResources` wait for the frames in `resource_ticks` before they replace the pass. The other items are unchanged.
+
 Not findings but worth knowing: `Pass::backbuffer_slot` in `post_process.cpp` is set and never read; the pacing assumes all planned generations were queued although `TryGetRenderFrame` may return fewer; `fsr3_frame_gen.cpp` comments contain garbled characters; the "FSR3" present filter (`fsr3.cpp`) is an FSR1-style EASU/RCAS pass, unrelated to `vk_fsr3_upscaler.cpp`.

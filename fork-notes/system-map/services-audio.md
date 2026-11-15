@@ -75,9 +75,12 @@ See `findings/services-audio.json`. Summary:
 
 - Audio-out restart: `played_sample_count` regresses while `end_timestamp` keeps growing (buffers stop being released).
 - `aud:u` creates a new audren and audout manager per call (hang in `AudioRenderer::Start`, lost release callbacks).
-- Render manager thread has no pacing when no system is active, session 0 is gone, or the Null sink is selected.
+- Render manager thread has no pacing when no system is active, session 0 is gone, or the Null sink is selected. `fd1acac` adds a 5 ms sleep per pass for the first case; the other two still spin.
 - `AppendBuffer` enqueues before it pushes samples, and the callback ignores the pop count.
 - `WaitFreeSpace` has an unbounded wait; shutdown deadlocks if the sink stops.
 - `Renderer::Initialize` swallows `System::Initialize` errors; `SystemManager::Add` races with the render thread.
 - Volume is applied through system, device and UI paths at once.
+- `SetTargetMute` muted the output whichever target it named. Since `fd1acac` only the active target does. Nothing assigns `m_active_target`, so that is always the speaker.
+- The null sink handed one shared stream, with one sample counter, to every caller. Since `fd1acac` each call gets its own.
+- Above 100 % the volume curve began at 0.6, so 101 % was quieter than 100 %. Since `fd1acac` it begins at 1.0.
 - Not filed (low value or unconfirmed): the DSP time limit is never enforced (`max_process_time` is stored but unused, and `render_times_taken` underflows); an invalid command magic leaves `remaining_command_count` non-zero forever and the same list is re-sent; `AppendBuffer` for audio-in returns without queuing (stale microphone data up to 1.4 s in the ring); `HardwareOpus::GetWorkBufferSizeForMultiStream` skips the `IsRunning` check; ADSP Opus code uses `ASSERT` on guest-supplied channel counts; sysmix `Drain` and the SDL callback allocate vectors every tick; `TaskSize` in hwacod uses a 16-byte stride while `Execute` uses 64-byte completions (protocol guess).

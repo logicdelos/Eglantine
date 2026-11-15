@@ -70,8 +70,9 @@
 - Banks and queries are reused only after their references drop to zero and their tick is free. Enforced in `SamplesQueryBank::IsDead`.
 
 ## Hazards and improvement candidates
-- `std::deque` growth on the recording thread races with unlocked indexing on the fencing thread in `BankPool::GetBank` and `SimpleStreamer::GetQuery` (findings 1 and 2).
+- `std::deque` growth on the recording thread races with unlocked indexing on the fencing thread in `BankPool::GetBank` and `SimpleStreamer::GetQuery` (findings 1 and 2). Fixed in `6d94d18` with one mutex for each deque.
 - `StagingBufferPool::GetStreamBuffer` can build an inverted region range after a wrap fallback with an exactly 8 MiB request (finding 3).
 - `MasterSemaphore::Wait` has no timeout for a tick that was never submitted (finding 4).
 - `RunGarbageCollector` compares ticks as signed values, so the early-frame unsigned wrap is harmless (checked, not a defect).
+- `BindHostGraphicsUniformBuffer` syncs a uniform binding of the maximum size 0x10000 although the guest maps only part of the range. This was the source of every `Unmapped Device ReadBlock` line. Since `f74d90d` that one sync reads with `ReadBlockSparse` (`SynchronizeBuffer(..., sparse_source)`); the README has the call stack and the addresses.
 - Not examined: the buffer cache binding paths, `vk_compute_pass`, the primitives streamer and `word_manager` bookkeeping.

@@ -66,7 +66,7 @@
 
 ## Hazards and improvement candidates
 
-- `ReturnRawSession` pushes the client end as a copy object and never closes the creator reference; sessions and their threads are never destroyed (finding 1).
+- `ReturnRawSession` pushes the client end as a copy object and never closes the creator reference; sessions and their threads are never destroyed (finding 1). Not fixed: pushing it as a move object made Fortune's Weave abort at boot with 2162-0001. The README section "Not fixed" lists what must change first.
 - Guest-controlled sizes/counts without caps: 101 range wrap, 911 count, `WriteImage` allocation (findings).
 - `Nx2GpuMemoryRegistry::TrimMappings` rebuilds the whole mapping vector on every map/unmap under the registry mutex.
 - Flash-watch debug history never stores samples.

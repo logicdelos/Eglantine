@@ -74,8 +74,8 @@
 
 ## Hazards and improvement candidates
 
-- Background prebuild and a draw that needs the same pipeline can cancel each other: the draw marks the key claimed even when it then defers.
-- `ShaderInfo` freed by invalidation while `shader_infos[]` and `unique_hashes` are reused without a refresh.
+- Background prebuild and a draw that needs the same pipeline can cancel each other: the draw marks the key claimed even when it then defers. Fixed in `6d94d18`: the key is claimed only when the GPU thread goes on to build.
+- `ShaderInfo` freed by invalidation while `shader_infos[]` and `unique_hashes` are reused without a refresh. Fixed in `6d94d18`: `RefreshStages` compares `invalidation_serial`. `RemovePendingShaders` still frees without setting `Dirty::Shaders`, so any new holder of a `ShaderInfo*` needs the same check.
 - Alpha-to-coverage and alpha-to-one updaters re-run the whole pipeline lookup (with `is_indexed=false`), also from `DrawTexture`.
 - Blend-enable for integer targets depends on render-target formats but only updates on blend register writes.
 - Disk replay and boot workers do not catch non-`Shader::Exception` errors.
