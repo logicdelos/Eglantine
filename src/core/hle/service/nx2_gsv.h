@@ -1573,7 +1573,11 @@ inline Nx2ImageLayout Nx2CalculateImageLayout(const u32* preference) {
     }
     const u64 block_rows = u64{1} << layout.block_height_log2;
     layout.size = layout.pitch * Common::AlignUp(u64{layout.height}, block_rows);
-    layout.alignment = std::max<u64>(64 * block_rows, 0x1000);
+    // 4 KiB, not one block (8 KiB at 128 rows): Star Fox and Xenoblade Chronicles 2 place their
+    // window textures at 4 KiB offsets in their memory, and NativeWindow::Initialize fails on a
+    // misaligned offset, leaving the NVN window without a native window (null call in
+    // NativeWindow::Acquire).
+    layout.alignment = 0x1000;
     return layout;
 }
 
@@ -4038,12 +4042,7 @@ private:
     // size, u64 alignment; the client raises the alignment to at least 4 KiB and rounds the size.
     void CalculateRequirements(HLERequestContext& ctx) {
         const auto* w = ctx.CommandBuffer();
-        auto layout = Nx2CalculateImageLayout(w + 2);
-        // Star Fox's NVN window textures use 4 KiB pool offsets. Reporting the block-linear
-        // layout's 8 KiB alignment makes NativeWindow::Acquire reject those textures.
-        if (system.GetApplicationProcessProgramID() == 0x0400E88025B1A000ULL) {
-            layout.alignment = 0x1000;
-        }
+        const auto layout = Nx2CalculateImageLayout(w + 2);
         LOG_DEBUG(Service, "nx2:gsv 1510 kind={} {}x{} block={} pitch={:#x} format={} -> size={:#x} align={:#x}",
                   w[3], layout.width, layout.height, layout.block_height_log2, layout.pitch, w[8],
                   layout.size, layout.alignment);
