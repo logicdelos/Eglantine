@@ -90,7 +90,7 @@ using VideoCommon::GraphicsEnvironment;
 // translated again at boot and written back under the new one. Bump MIN_COMPATIBLE_CACHE_VERSION
 // too only when the record layout (environment or key serialization) changes, which deletes older
 // caches. 20 changed the environment layout; the keys last changed before it.
-constexpr u32 CACHE_VERSION = 34;
+constexpr u32 CACHE_VERSION = 35;
 static_assert(CACHE_VERSION == VideoCommon::ShaderWarm::WarmCacheVersion,
               "Shader precache files use the pipeline cache version");
 constexpr u32 MIN_COMPATIBLE_CACHE_VERSION = 20;

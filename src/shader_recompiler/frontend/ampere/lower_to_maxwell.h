@@ -710,8 +710,9 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                  (u64{insn.Bits(77, 1)} << 32) | (u64{c.swizzle} << 35) |
                  (u64{precision} << 37) | (u64{c.reg} << 39) | (u64{a.swizzle} << 47));
             if (relu) {
-                // Clamp the rounded binary16 lanes, preserving positive infinity
-                // and canonicalizing either sign of NaN without saturating to one.
+                // Clamp the rounded binary16 lanes like the hardware maximum against zero:
+                // positive infinity stays, a NaN of either sign becomes zero. Networks rely on
+                // that to keep NaNs in never-written tensor padding out of the next layer.
                 save_predicate();
                 for (u32 lane = 0; lane < 2; ++lane) {
                     emit(0x3828000000070000ULL | 251 | (u64{254} << 8) | (u64{lane * 16} << 20));
@@ -724,8 +725,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                     mov_imm(250, 1);
                     emit(0x5c10000000070000ULL | 252 | (u64{252} << 8) | (u64{250} << 20) | (u64{1} << 48));
                     emit(0x5c40000000070000ULL | 251 | (u64{251} << 8) | (u64{252} << 20) | (u64{7} << 48));
-                    mov_imm(250, 0x7fff);
-                    emit(0x5ca0000000070000ULL | 251 | (u64{250} << 8) | (u64{251} << 20) | (u64{6} << 39));
+                    emit(0x5ca0000000070000ULL | 251 | (u64{255} << 8) | (u64{251} << 20) | (u64{6} << 39));
                     if (lane == 0) {
                         emit(base(0x5c98000000000000ULL) | (u64{251} << 20) | (u64{15} << 39));
                     } else {
