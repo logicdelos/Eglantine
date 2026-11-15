@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -39,28 +40,33 @@ public:
 
     SinkStream* AcquireSinkStream(Core::System& system, u32, const std::string&,
                                   StreamType type) override {
-        if (null_sink == nullptr) {
-            null_sink = std::make_unique<NullSinkStreamImpl>(system, type);
-            null_sink->SetDeviceVolume(device_volume);
-        }
-        return null_sink.get();
+        // One stream per acquire like the real sinks: sessions must not share the played sample
+        // count, ring size or system volume.
+        SinkStreamPtr& stream = null_sinks.emplace_back(
+            std::make_unique<NullSinkStreamImpl>(system, type));
+        stream->SetDeviceVolume(device_volume);
+        return stream.get();
     }
 
-    void CloseStream(SinkStream*) override {}
-    void CloseStreams() override {}
+    void CloseStream(SinkStream* stream) override {
+        std::erase_if(null_sinks, [stream](const SinkStreamPtr& s) { return s.get() == stream; });
+    }
+    void CloseStreams() override {
+        null_sinks.clear();
+    }
     f32 GetDeviceVolume() const override {
         return device_volume;
     }
     void SetDeviceVolume(f32 volume) override {
         device_volume = volume;
-        if (null_sink != nullptr) {
-            null_sink->SetDeviceVolume(volume);
+        for (auto& stream : null_sinks) {
+            stream->SetDeviceVolume(volume);
         }
     }
     void SetSystemVolume(f32 volume) override {}
 
 private:
-    SinkStreamPtr null_sink{};
+    std::vector<SinkStreamPtr> null_sinks{};
 };
 
 } // namespace AudioCore::Sink

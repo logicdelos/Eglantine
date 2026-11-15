@@ -273,7 +273,11 @@ Result IAudioController::SetTargetMute(bool is_muted, Set::AudioOutputModeTarget
 
     m_target_muted[idx] = is_muted;
 
-    Settings::values.audio_muted.SetValue(is_muted);
+    // Only the active target drives the level; muting e.g. the headphones while the speaker is
+    // active must not silence the output.
+    if (m_active_target == target) {
+        Settings::values.audio_muted.SetValue(is_muted);
+    }
 
     R_SUCCEED();
 }

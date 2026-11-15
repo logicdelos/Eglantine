@@ -30,13 +30,22 @@ void SystemManager::InitializeUnsafe() {
             Common::SetCurrentThreadName("AudioRenderSystemManager");
             Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
             while (active && !stop_token.stop_requested()) {
+                bool any_active{false};
                 {
                     std::scoped_lock l{mutex1};
-                    for (auto system : systems)
+                    for (auto system : systems) {
                         system->SendCommandToDsp();
+                        any_active |= system->IsActive();
+                    }
                 }
                 audio_renderer.Signal();
                 audio_renderer.Wait();
+                // With no active renderer nothing paces the loop (the sink only blocks the ADSP
+                // while it has a command buffer to render), so wait one audio frame instead of
+                // ping-ponging with the ADSP at full speed.
+                if (!any_active) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
             }
         });
     }
