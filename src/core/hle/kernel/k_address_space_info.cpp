@@ -60,7 +60,14 @@ std::size_t KAddressSpaceInfo::GetAddressSpaceStart(size_t width, KAddressSpaceI
     return GetAddressSpaceInfo(width, type).address;
 }
 
-std::size_t KAddressSpaceInfo::GetAddressSpaceSize(size_t width, KAddressSpaceInfo::Type type) {
+std::size_t KAddressSpaceInfo::GetAddressSpaceSize(size_t width, KAddressSpaceInfo::Type type,
+                                                   bool is_switch2) {
+    // The Switch 2 SDK hands its alias region to its VAMM address allocator, and Xenoblade
+    // Chronicles 2 reserves 60 GiB from it twice (nninitStartup and nnMain): the second
+    // reservation does not fit Switch 1's 64 GiB and the title aborts on its null heap.
+    if (is_switch2 && width == 39 && type == Type::Alias) {
+        return 128_GiB;
+    }
     return GetAddressSpaceInfo(width, type).size;
 }
 
