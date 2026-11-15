@@ -104,11 +104,16 @@ Result System::Start() {
     session->Initialize(name, sample_format, channel_count, session_id, handle,
                         applet_resource_user_id, Sink::StreamType::Out);
     session->SetVolume(volume);
-    session->Start();
-    state = State::Started;
 
     boost::container::static_vector<AudioBuffer, BufferCount> buffers_to_flush{};
     buffers.RegisterBuffers(buffers_to_flush);
+    // Every Start opens a new stream. Without the base its count restarts at zero while buffer
+    // timestamps go on, and no buffer is released until it has played the whole earlier total.
+    session->SetPlayedSampleBase(buffers_to_flush.empty() ? buffers.GetNextTimestamp()
+                                                          : buffers_to_flush.front().start_timestamp);
+    session->Start();
+    state = State::Started;
+
     session->AppendBuffers(FixStaticVectorADL(buffers_to_flush));
     session->SetRingSize(static_cast<u32>(buffers_to_flush.size()));
 
