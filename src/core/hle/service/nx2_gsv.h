@@ -1972,6 +1972,12 @@ private:
             const char* value = std::getenv("EDEN_NX2_PRESENT_QUEUE");
             return value == nullptr || value[0] != '0';
         }();
+        // With the present queue, Fortune's Weave's dialogue scenes draw their 3D background
+        // black; blocking pacing as before keeps it.
+        constexpr u64 FortunesWeaveProgramId = 0x04007EF01F8AE000ULL;
+        if (Settings::GetCurrentProgramID() == FortunesWeaveProgramId) {
+            return false;
+        }
         // Single core: CoreTiming counts guest ticks, not wall time, so the release timer would
         // not pace in real time, and DoSpeedLimiting (skipped with the queue) is the only limiter.
         return enabled && Settings::values.use_multi_core.GetValue();
