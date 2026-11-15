@@ -379,12 +379,25 @@ inline void Nx2ClearSemaphoreRegions() {
 using Nx2SparseBackingHandler = std::function<void(u64 gpu_address, u64 size, const u8* data)>;
 inline std::recursive_mutex g_nx2_sparse_backing_mutex;
 inline Nx2SparseBackingHandler g_nx2_sparse_backing;
+inline const void* g_nx2_sparse_backing_owner{};
 inline std::atomic<u64> g_nx2_sparse_low{~u64{0}};
 inline std::atomic<u64> g_nx2_sparse_high{0};
 
-inline void Nx2SetSparseBacking(Nx2SparseBackingHandler handler) {
+inline void Nx2SetSparseBacking(const void* owner, Nx2SparseBackingHandler handler) {
     std::scoped_lock lk{g_nx2_sparse_backing_mutex};
+    g_nx2_sparse_backing_owner = owner;
     g_nx2_sparse_backing = std::move(handler);
+    g_nx2_sparse_low.store(~u64{0});
+    g_nx2_sparse_high.store(0);
+}
+
+inline void Nx2ClearSparseBacking(const void* owner) {
+    std::scoped_lock lk{g_nx2_sparse_backing_mutex};
+    if (g_nx2_sparse_backing_owner != owner) {
+        return;
+    }
+    g_nx2_sparse_backing = {};
+    g_nx2_sparse_backing_owner = nullptr;
     g_nx2_sparse_low.store(~u64{0});
     g_nx2_sparse_high.store(0);
 }

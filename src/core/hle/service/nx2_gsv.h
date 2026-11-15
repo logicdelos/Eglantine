@@ -27,6 +27,7 @@
 #include <optional>
 #include <memory>
 #include <mutex>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -93,6 +94,16 @@ namespace Service {
 /// LOCAL TEST (Zelda): steady-clock time of the last decoded video frame (PaceToVblank).
 inline std::atomic<s64> g_nx2_video_last_frame_ns{0};
 
+class INx2GpuSession;
+class INx2GraphicsSystemSession;
+
+// Keep only these handlers until ServerManager tears down their registered server sessions.
+template <class T>
+inline constexpr bool Nx2RetainRawSession =
+    std::is_same_v<T, INx2GpuSession> || // GPU mappings/backing can outlive every guest session handle.
+    std::is_same_v<T, INx2GraphicsSystemSession> || // Native objects and the guest mirror outlive boot.
+    std::is_same_v<T, Nvidia::NVDRV>; // Closing the last nvdrv session unregisters shared GPU mappings.
+
 // Creates a session served by `iface` and returns its client end. Unlike PushIpcInterface this
 // works from a domain too, for callers that want a raw session handle.
 template <class T>
@@ -108,7 +119,19 @@ inline Kernel::KClientSession* CreateRawSession(Core::System& system, HLERequest
 
     auto manager =
         std::make_shared<SessionRequestManager>(kernel, ctx.GetManager()->GetServerManager());
-    manager->SetSessionHandler(std::move(iface));
+    if constexpr (Nx2RetainRawSession<T>) {
+        // The registered server owns this creator-reference lease, released at server teardown.
+        auto* const handler = iface.get();
+        manager->SetSessionHandler(std::shared_ptr<T>{
+            handler, [iface = std::move(iface), client = &session->GetClientSession(),
+                      &kernel](T*) mutable {
+                client->Close(kernel);
+                iface.reset();
+            }});
+    } else {
+        manager->SetSessionHandler(std::move(iface));
+    }
+    // RegisterSession takes the server endpoint's initial reference; do not close it here.
     ctx.GetManager()->GetServerManager().RegisterSession(&session->GetServerSession(), manager);
     return &session->GetClientSession();
 }
@@ -139,10 +162,23 @@ inline void TipcHandshake(HLERequestContext& ctx, std::string_view session) {
 // Replies with success and a copied handle to a new session served by `iface`.
 template <class T>
 inline void ReturnRawSession(Core::System& system, HLERequestContext& ctx, std::shared_ptr<T> iface) {
-    auto* client = CreateRawSession(system, ctx, std::move(iface));
+    auto& kernel = system.Kernel();
+    auto& handles = ctx.GetThread().GetOwnerProcess()->GetHandleTable();
+    Kernel::Handle handle{};
+    const Result result = handles.Reserve(kernel, &handle);
+    if (R_SUCCEEDED(result)) {
+        auto* const client = CreateRawSession(system, ctx, std::move(iface));
+        handles.Register(kernel, handle, client);
+        if constexpr (!Nx2RetainRawSession<T>) {
+            // Register opened the guest's reference before we release the creator's.
+            client->Close(kernel);
+        }
+    }
     IPC::ResponseBuilder rb{ctx, 2, 1, 0};
-    rb.Push(ResultSuccess);
-    rb.PushCopyObjects(ctx, *client);
+    rb.Push(result);
+    // Pretranslated COPY handle: keep the wire descriptor/layout, including from a CMIF domain.
+    // Do not enqueue it for translation again (which would create a second guest reference).
+    ctx.CommandBuffer()[3] = handle;
 }
 
 // Placeholder for the Switch 2 NVIDIA driver server (nn::nvsrv). It has no handlers, so every
@@ -366,15 +402,19 @@ public:
         });
         if (LazySparseRegions()) {
             Tegra::Nx2SetSparseBacking(
-                [this](u64 gpu_address, u64 size, const u8* data) {
+                this, [this](u64 gpu_address, u64 size, const u8* data) {
                     BackSparseWrite(gpu_address, size, data);
                 });
         }
     }
 
     ~INx2GpuSession() override {
-        // Waits for a backing the GPU thread may be doing.
-        Tegra::Nx2SetSparseBacking({});
+        m_cold_hint_thread.request_stop();
+        if (m_cold_hint_thread.joinable()) {
+            m_cold_hint_thread.join();
+        }
+        // Wait for our in-flight backing callback, without clearing a newer session's handler.
+        Tegra::Nx2ClearSparseBacking(this);
         for (auto* event : m_events) {
             if (event != nullptr) {
                 m_context.CloseEvent(event);
@@ -585,19 +625,20 @@ private:
     // console's graphics server completes unmap jobs behind the submitted work.
     void SignalAfterGpu(u32 slot, bool release_memory = false) {
         auto* const event = EventFor(slot);
-        system.GPU().RunInOrder([this, event, release_memory] {
+        auto self = std::static_pointer_cast<INx2GpuSession>(shared_from_this());
+        system.GPU().RunInOrder([self = std::move(self), event, release_memory] {
             if (release_memory) {
-                system.GPU().Renderer().ReadRasterizer()->SignalFence(
-                    [this, event] { event->Signal(system.Kernel()); }, true);
+                self->system.GPU().Renderer().ReadRasterizer()->SignalFence(
+                    [self, event] { event->Signal(self->system.Kernel()); }, true);
             } else {
-                event->Signal(system.Kernel());
+                event->Signal(self->system.Kernel());
             }
         });
     }
 
     void QueueBackingRelease(std::shared_ptr<std::atomic<bool>> done) {
-        system.GPU().RunInOrder([this, done] {
-            system.GPU().Renderer().ReadRasterizer()->SignalFence(
+        system.GPU().RunInOrder([&gpu = system.GPU(), done] {
+            gpu.Renderer().ReadRasterizer()->SignalFence(
                 [done] { done->store(true, std::memory_order_release); }, true);
         });
     }
@@ -1779,7 +1820,8 @@ public:
         if (m_release_timer) {
             system.CoreTiming().UnscheduleEvent(m_release_timer);
             auto& syncpoints = system.Host1x().GetSyncpointManager();
-            while (syncpoints.GetGuestSyncpointValue(m_release_syncpoint) != m_release_value) {
+            while (static_cast<s32>(m_release_value -
+                                    syncpoints.GetGuestSyncpointValue(m_release_syncpoint)) > 0) {
                 syncpoints.IncrementGuest(m_release_syncpoint);
             }
             NvdrvSyncpoints().FreeSyncpoint(m_release_syncpoint);
@@ -3002,6 +3044,10 @@ public:
             m_context.CloseEvent(m_event);
         }
         if (m_syncpoint != NoSyncpoint) {
+            {
+                std::scoped_lock lk{m_mutex};
+                CompleteHandedFences();
+            }
             NvdrvSyncpoints().FreeSyncpoint(m_syncpoint);
         }
     }
