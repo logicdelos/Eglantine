@@ -2110,7 +2110,7 @@ void PipelineCache::EvictUnusedPipelines() {
 }
 
 std::unique_ptr<GraphicsPipeline> PipelineCache::TakeBackgroundPipeline(
-    const GraphicsPipelineCacheKey& key) {
+    const GraphicsPipelineCacheKey& key, bool claim_if_missing) {
     std::scoped_lock lock{background_mutex};
     if (const auto it = background_ready.find(key); it != background_ready.end()) {
         auto pipeline = std::move(it->second);
@@ -2118,7 +2118,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::TakeBackgroundPipeline(
         ++background_taken;
         return pipeline;
     }
-    if (background_active.load(std::memory_order_acquire)) {
+    if (claim_if_missing && background_active.load(std::memory_order_acquire)) {
         background_claimed.insert(key);
     }
     return nullptr;
@@ -2426,11 +2426,16 @@ bool PipelineCache::BuildNewGraphicsPipeline(bool is_indexed) {
         AdoptTranslatedGraphicsPipelines();
         return graphics_cache.contains(graphics_key);
     }
-    std::unique_ptr<GraphicsPipeline> pipeline{TakeBackgroundPipeline(graphics_key)};
-    if (!pipeline && DeferRuntimeBuild()) {
-        RecordSkippedGeometry(is_indexed, nullptr);
-        graphics_miss = "build-deferred";
-        return false;
+    // Claim the key only once the GPU thread is going to build it. A draw that defers leaves the
+    // background build alone, so a later draw can still take the finished pipeline.
+    std::unique_ptr<GraphicsPipeline> pipeline{TakeBackgroundPipeline(graphics_key, false)};
+    if (!pipeline) {
+        if (DeferRuntimeBuild()) {
+            RecordSkippedGeometry(is_indexed, nullptr);
+            graphics_miss = "build-deferred";
+            return false;
+        }
+        pipeline = TakeBackgroundPipeline(graphics_key, true);
     }
     ReportNewPipelineKey(graphics_key);
     if (!pipeline && CanTranslateAsynchronously()) {

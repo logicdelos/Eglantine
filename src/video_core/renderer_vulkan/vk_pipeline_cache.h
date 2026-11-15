@@ -395,7 +395,10 @@ private:
     /// Cached graphics pipelines boot skipped (not in used_pipelines) are built on background
     /// threads once the game runs, so a draw that needs one finds it built instead of translating
     /// it on the GPU thread. EDEN_NX2_BACKGROUND_PIPELINES=0 turns it off.
-    std::unique_ptr<GraphicsPipeline> TakeBackgroundPipeline(const GraphicsPipelineCacheKey& key);
+    /// With claim_if_missing, a miss marks the key as built by the GPU thread, which skips or drops
+    /// its background build; pass it only when the GPU thread really builds the pipeline.
+    std::unique_ptr<GraphicsPipeline> TakeBackgroundPipeline(const GraphicsPipelineCacheKey& key,
+                                                             bool claim_if_missing);
     void StopBackgroundPipelines();
     std::mutex background_mutex;
     /// Built and not yet asked for by a draw.

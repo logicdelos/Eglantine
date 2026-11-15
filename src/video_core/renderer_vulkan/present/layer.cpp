@@ -220,9 +220,9 @@ void Layer::RefreshResources(const Device& device, const Tegra::FramebufferConfi
     raw_width = framebuffer.width;
     raw_height = framebuffer.height;
     pixel_format = framebuffer.pixel_format;
-    anti_alias.emplace<std::monostate>();
-
+    // Waits for earlier frames, which may still use the anti-aliasing pass, so it goes after.
     ReleaseRawImages();
+    anti_alias.emplace<std::monostate>();
     CreateStagingBuffer(device, framebuffer);
     CreateRawImages(device, framebuffer);
 }
@@ -232,6 +232,13 @@ void Layer::SetAntiAliasPass(const Device& device) {
         return;
 
     anti_alias_setting = filters.get_anti_aliasing();
+
+    // Earlier frames may still use the pass about to be replaced.
+    if (!std::holds_alternative<std::monostate>(anti_alias)) {
+        for (const u64 tick : resource_ticks) {
+            scheduler.Wait(tick);
+        }
+    }
 
     const VkExtent2D render_area{
         .width = Settings::values.resolution_info.ScaleUp(raw_width),

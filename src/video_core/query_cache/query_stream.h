@@ -7,6 +7,7 @@
 #pragma once
 
 #include <deque>
+#include <mutex>
 #include <optional>
 #include <vector>
 
@@ -110,6 +111,9 @@ public:
 
 protected:
     virtual QueryType* GetQuery(size_t query_id) override {
+        // The fence thread gets queries while BuildQuery grows the deque. This can't take `guard`:
+        // Free holds it when it calls here.
+        std::scoped_lock lk(slots_guard);
         if (query_id < slot_queries.size()) {
             return &slot_queries[query_id];
         }
@@ -131,7 +135,10 @@ protected:
             return new_id;
         }
         size_t new_id = slot_queries.size();
-        slot_queries.emplace_back(std::forward<Args>(args)...);
+        {
+            std::scoped_lock slots_lk(slots_guard);
+            slot_queries.emplace_back(std::forward<Args>(args)...);
+        }
         return new_id;
     }
 
@@ -145,6 +152,8 @@ protected:
     }
 
     std::mutex guard;
+    /// Held while slot_queries grows or is indexed from another thread. Taken after `guard`.
+    std::mutex slots_guard;
     std::deque<QueryType> slot_queries;
     std::deque<size_t> old_queries;
 };

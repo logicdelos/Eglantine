@@ -137,7 +137,10 @@ u64 ShaderCache::MeshStateHash() const {
 
 bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
     auto& dirty{maxwell3d->dirty.flags};
-    if (!dirty[VideoCommon::Dirty::Shaders]) {
+    // An invalidation frees ShaderInfos without touching the dirty flag, so shader_infos may
+    // dangle: resolve again whenever the serial moved since the last refresh.
+    if (!dirty[VideoCommon::Dirty::Shaders] &&
+        refreshed_invalidation_serial == invalidation_serial.load(std::memory_order_acquire)) {
         return last_shaders_valid;
     }
     dirty[VideoCommon::Dirty::Shaders] = false;
@@ -148,6 +151,7 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
     const size_t memory_id = gpu_memory->GetID();
     const u64 map_serial = gpu_memory->GetMapSerial();
     const u64 inv_serial = invalidation_serial.load(std::memory_order_acquire);
+    refreshed_invalidation_serial = inv_serial;
     // Read before anything is resolved: a program dropped meanwhile moved it on.
     const u64 code_epoch = Tegra::g_nx2_code_epoch.load(std::memory_order_acquire);
     nx2_resolved_epoch = 0;

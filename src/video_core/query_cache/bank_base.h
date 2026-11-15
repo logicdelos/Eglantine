@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <deque>
+#include <mutex>
 #include <utility>
 
 #include "common/common_types.h"
@@ -68,6 +69,8 @@ public:
 template <typename BankType>
 class BankPool {
 private:
+    /// The fence thread gets banks while the recording thread adds them to the deque.
+    std::mutex pool_guard;
     std::deque<BankType> bank_pool;
     std::deque<size_t> bank_indices;
 
@@ -78,6 +81,7 @@ public:
     // Reserve a bank from the pool and return its index
     template <typename Func>
     size_t ReserveBank(Func&& builder) {
+        std::scoped_lock lk(pool_guard);
         if (!bank_indices.empty() && bank_pool[bank_indices.front()].IsDead()) {
             size_t new_index = bank_indices.front();
             bank_indices.pop_front();
@@ -93,6 +97,7 @@ public:
 
     // Get a reference to a bank using its index
     BankType& GetBank(size_t index) {
+        std::scoped_lock lk(pool_guard);
         return bank_pool[index];
     }
 
