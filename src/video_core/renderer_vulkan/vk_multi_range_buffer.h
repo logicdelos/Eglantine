@@ -46,6 +46,10 @@ class MultiRangeBufferCache final {
 public:
     static constexpr VkDeviceSize DEFAULT_BLOCK_SIZE = 64 * 1024;
     static constexpr size_t MAX_RETIRED = 256;
+    /// Frames an entry may go unbound before TickFrame releases its buffers. A game that binds
+    /// multi-range storage at ever new addresses left one entry per address behind (Kirby and the
+    /// Forgotten Land, Fallen-Star Beach: 468 gathered buffers of 8 MiB after eight minutes).
+    static constexpr u64 MAX_UNUSED_FRAMES = 60;
 
     explicit MultiRangeBufferCache(const Device& device);
 
@@ -82,6 +86,7 @@ private:
         VkDeviceSize size{};
         u64 geometry{};
         u64 content{};
+        u64 last_used{};
         bool dirty{true};
     };
 
@@ -105,6 +110,7 @@ private:
     boost::container::static_vector<Retired, MAX_RETIRED> retired;
     u32 sparse_memory_type_bits{};
     VkBufferUsageFlags sparse_usage{};
+    u64 frame{};
 };
 
 } // namespace Vulkan
