@@ -156,8 +156,10 @@ public:
             return false;
         }
 
-        // Allocate backing file map
-        backing_handle = pfn_CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_WRITE | FILE_MAP_READ, PAGE_READWRITE, SEC_COMMIT, backing_size, nullptr, nullptr, 0);
+        // Allocate backing file map. Reserved, not committed: see Commit.
+        const char* const precommit = std::getenv("EDEN_NX2_RAM_PRECOMMIT");
+        lazy_commit = precommit == nullptr || precommit[0] == '\0' || precommit[0] == '0';
+        backing_handle = pfn_CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_WRITE | FILE_MAP_READ, PAGE_READWRITE, lazy_commit ? SEC_RESERVE : SEC_COMMIT, backing_size, nullptr, nullptr, 0);
         if (!backing_handle) {
             LOG_CRITICAL(HW_Memory, "Failed to allocate {} MiB of backing memory", backing_size >> 20);
             return false;
@@ -176,6 +178,27 @@ public:
             LOG_CRITICAL(HW_Memory, "Failed to map {} MiB of virtual memory", backing_size >> 20);
             return false;
         }
+        if (lazy_commit) {
+            committed_chunks = std::make_unique<std::atomic<bool>[]>(Common::DivCeil(backing_size, CommitChunkSize));
+            Impl* expected = nullptr;
+            if (commit_owner.compare_exchange_strong(expected, this)) {
+                fault_handler = AddVectoredExceptionHandler(1, &CommitOnFault);
+                if (!fault_handler) {
+                    commit_owner.store(nullptr, std::memory_order_release);
+                }
+            }
+            if (!fault_handler) {
+                // No handler for this instance (another one has it): commit it all now.
+                lazy_commit = false;
+                if (!VirtualAlloc(backing_base, backing_size, MEM_COMMIT, PAGE_READWRITE)) {
+                    Release();
+                    LOG_CRITICAL(HW_Memory, "Failed to commit {} MiB of backing memory", backing_size >> 20);
+                    return false;
+                }
+            }
+        }
+        LOG_INFO(HW_Memory, "Guest RAM: {} MiB of backing memory, {}", backing_size >> 20,
+                 lazy_commit ? "committed as it is used" : "committed now");
         // Allocate virtual address placeholder
         virtual_base = static_cast<u8*>(pfn_VirtualAlloc2(process, nullptr, virtual_size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0));
         if (!virtual_base) {
@@ -198,7 +221,41 @@ public:
         return ptr;
     }
 
+    /// Gives [host_offset, host_offset + length) of the backing real memory. The section is only
+    /// reserved: committed in full it charged its whole size against the system commit limit at
+    /// boot (14 GiB for a Switch 2 title that uses a third of it), and a PC near that limit then
+    /// fails allocations everywhere. Windows can't decommit pages of a section, so this only
+    /// grows. Memory the kernel hands out and memory mapped for the guest is committed here;
+    /// anything else read or written through backing_base is committed by CommitOnFault.
+    bool Commit(size_t host_offset, size_t length) noexcept {
+        if (!lazy_commit || length == 0) {
+            return true;
+        }
+        const size_t last = (host_offset + length - 1) >> CommitChunkShift;
+        for (size_t chunk = host_offset >> CommitChunkShift; chunk <= last;) {
+            if (committed_chunks[chunk].load(std::memory_order_acquire)) {
+                ++chunk;
+                continue;
+            }
+            size_t run_end = chunk + 1;
+            while (run_end <= last && !committed_chunks[run_end].load(std::memory_order_acquire)) {
+                ++run_end;
+            }
+            const size_t begin = chunk << CommitChunkShift;
+            const size_t end = (std::min)(run_end << CommitChunkShift, backing_size);
+            if (!VirtualAlloc(backing_base + begin, end - begin, MEM_COMMIT, PAGE_READWRITE)) {
+                LOG_CRITICAL(HW_Memory, "Out of memory: Windows refused {} MiB more guest RAM, error {} (close other programs or raise the page file limit)", (end - begin) >> 20, GetLastError());
+                return false;
+            }
+            for (; chunk < run_end; ++chunk) {
+                committed_chunks[chunk].store(true, std::memory_order_release);
+            }
+        }
+        return true;
+    }
+
     void Map(size_t virtual_offset, size_t host_offset, size_t length, MemoryPermission perms) {
+        Commit(host_offset, length);
         std::unique_lock lock{placeholder_mutex};
         if (!IsNiechePlaceholder(virtual_offset, length)) {
             Split(virtual_offset, length);
@@ -255,8 +312,45 @@ public:
     u8* virtual_base{};
 
 private:
+    static constexpr size_t CommitChunkShift = 21; ///< Backing is committed 2 MiB at a time
+    static constexpr size_t CommitChunkSize = size_t{1} << CommitChunkShift;
+
+    /// First read or write of backing memory nobody committed: emulator code using
+    /// backing_base directly (kernel slabs, memory manager metadata, shared buffers).
+    static LONG CALLBACK CommitOnFault(EXCEPTION_POINTERS* info) noexcept {
+        const EXCEPTION_RECORD& record = *info->ExceptionRecord;
+        // ExceptionInformation: [0] 0 read, 1 write, 8 execute; [1] the address.
+        if (record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record.NumberParameters < 2 ||
+            record.ExceptionInformation[0] > 1) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        Impl* const self = commit_owner.load(std::memory_order_acquire);
+        if (self == nullptr) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        const size_t offset = record.ExceptionInformation[1] - reinterpret_cast<uintptr_t>(self->backing_base);
+        if (offset >= self->backing_size) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        // Not Commit: another thread may have set this chunk's flag between the fault and here,
+        // and committing twice is harmless. No logging either, the faulting thread may hold the
+        // log's lock.
+        const size_t begin = Common::AlignDown(offset, CommitChunkSize);
+        const size_t size = (std::min)(CommitChunkSize, self->backing_size - begin);
+        if (!VirtualAlloc(self->backing_base + begin, size, MEM_COMMIT, PAGE_READWRITE)) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        self->committed_chunks[offset >> CommitChunkShift].store(true, std::memory_order_release);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
     /// Release all resources in the object
     void Release() {
+        if (fault_handler) {
+            RemoveVectoredExceptionHandler(fault_handler);
+            fault_handler = nullptr;
+            commit_owner.store(nullptr, std::memory_order_release);
+        }
         if (!placeholders.empty()) {
             for (const auto& placeholder : placeholders) {
                 if (!pfn_UnmapViewOfFile2(process, virtual_base + placeholder.lower(),
@@ -401,6 +495,11 @@ private:
 
     HANDLE process{};        ///< Current process handle
     HANDLE backing_handle{}; ///< File based backing memory
+
+    bool lazy_commit{};      ///< Backing is committed as it is used, not all at once
+    void* fault_handler{};   ///< CommitOnFault's registration
+    std::unique_ptr<std::atomic<bool>[]> committed_chunks; ///< Per CommitChunkSize of backing
+    static inline std::atomic<Impl*> commit_owner{}; ///< The instance CommitOnFault serves
 
     DynamicLibrary kernelbase_dll;
     PFN_CreateFileMapping2 pfn_CreateFileMapping2{};
@@ -1028,6 +1127,11 @@ void HostMemory::MarkUsed(size_t physical_offset, size_t length) {
             granules[index].fetch_or(GranuleUsed, std::memory_order_release);
         }
     }
+#ifdef _WIN32
+    if (impl) {
+        impl->Commit(physical_offset, length);
+    }
+#endif
 }
 
 void HostMemory::MarkDirty(size_t physical_offset, size_t length) {

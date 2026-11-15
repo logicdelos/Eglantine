@@ -32,6 +32,25 @@ scope for this pass.
     NSO's .text (clang + llvm-objdump from VS 2022's LLVM).
   - Under cdb, stop only on second-chance AVs (`sxd -c2 "..." av`): dynarmic fastmem uses
     first-chance access violations.
+  - MinGW Clang builds write `eden-cli.pdb` / `eglantine.pdb` next to the executables
+    (`MINGW_PDB`, on by default): function names and file:line for dbghelp, WinDbg, minidumps,
+    `EDEN_NX2_SAMPLE` and the two entries below. Keep each .pdb beside its .exe when copying a
+    build.
+  - `py -I tools/nx2/host_threads.py [<pid>|<process name>] [--seconds 1] [--out report.txt]`
+    lists every host thread of a running (or hung) emulator: name, CPU use now and in total,
+    priority and call stack. It runs outside the emulator, so it works on a frozen one.
+  - Stall watch: when a running guest presents no frame for `EDEN_NX2_STALL_SECONDS` (default 60,
+    0 = off) the emulator writes every thread's call stack to `stall_<date>_<time>.txt` in the
+    log directory, at most three times a run.
+  - Guest RAM on Windows is reserved at boot and committed as the kernel allocates or maps it
+    (`HostMemory::Impl::Commit`), 2 MiB at a time; `EDEN_NX2_RAM_PRECOMMIT=1` commits all of it at
+    boot as before. Measured 40 s into Fire Emblem: Fortune's Weave and Xenoblade Chronicles 2:
+    9848 MiB committed of 14336, the same range in both. Fortune's Weave maps 9.4 GiB in one
+    `MapPhysicalMemory` call at boot and unmaps it again (`EDEN_NX2_MEM_TRACE`), and Windows
+    can't decommit pages of a section, so that much stays charged. Emulator code that touches
+    other backing memory faults once per 2 MiB
+    (`CommitOnFault`): more first-chance access violations under a debugger, see the cdb note
+    above.
 
 ## Titles
 
