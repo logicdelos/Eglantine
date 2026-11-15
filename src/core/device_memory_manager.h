@@ -123,6 +123,9 @@ public:
 
     void ReadBlock(DAddr address, void* dest_pointer, size_t size);
     void ReadBlockUnsafe(DAddr address, void* dest_pointer, size_t size);
+    /// ReadBlockUnsafe for a range that is an upper limit rather than a size (a uniform bank):
+    /// pages with no mapping read as zero and are not reported.
+    void ReadBlockSparse(DAddr address, void* dest_pointer, size_t size);
     void WriteBlock(DAddr address, const void* src_pointer, size_t size);
     void WriteBlockUnsafe(DAddr address, const void* src_pointer, size_t size);
 

@@ -793,7 +793,9 @@ private:
         }
     }
 
-    bool SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 size);
+    /// sparse_source: the range is an upper limit, so pages with no mapping in it are expected
+    /// (read as zero, not reported).
+    bool SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 size, bool sparse_source = false);
 
     [[nodiscard]] static bool BindMemoEnabled();
     [[nodiscard]] bool BindMemoHit(const BindMemo& memo, Buffer& buffer, BufferId buffer_id,
@@ -804,12 +806,13 @@ private:
     void BindMemoNoteUsage(BindMemo& memo);
 
     void UploadMemory(Buffer& buffer, u64 total_size_bytes, u64 largest_copy,
-                      std::span<BufferCopy> copies);
+                      std::span<BufferCopy> copies, bool sparse_source);
 
     void ImmediateUploadMemory(Buffer& buffer, u64 largest_copy,
-                               std::span<const BufferCopy> copies);
+                               std::span<const BufferCopy> copies, bool sparse_source);
 
-    void MappedUploadMemory(Buffer& buffer, u64 total_size_bytes, std::span<BufferCopy> copies);
+    void MappedUploadMemory(Buffer& buffer, u64 total_size_bytes, std::span<BufferCopy> copies,
+                            bool sparse_source);
 
     void DownloadBufferMemory(Buffer& buffer_id);
 

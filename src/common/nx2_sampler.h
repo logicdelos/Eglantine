@@ -33,4 +33,8 @@ void NotePresent();
 void NoteGuestFrame();
 void SetGuestRunning(bool running);
 
+/// Call stack of the calling thread, one "\n  module+0xoffset function (file:line)" per frame,
+/// leaving out `skip` callers (empty off Windows). Slow: for error paths that report once.
+std::string CurrentStack(unsigned skip = 0);
+
 } // namespace Nx2Sampler

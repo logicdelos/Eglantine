@@ -176,11 +176,16 @@ std::string ModuleOffset(DWORD64 address) {
     return fmt::format("{}+{:#x}", base != nullptr ? base + 1 : path, offset);
 }
 
+// dbghelp is one engine per process and not thread safe: a Symbolizer holds this for its lifetime.
+std::mutex symbol_mutex;
+
 struct Symbolizer {
     using SymInitializeFn = BOOL(WINAPI*)(HANDLE, PCSTR, BOOL);
     using SymSetOptionsFn = DWORD(WINAPI*)(DWORD);
     using SymFromAddrFn = BOOL(WINAPI*)(HANDLE, DWORD64, PDWORD64, PSYMBOL_INFO);
     using SymGetLineFn = BOOL(WINAPI*)(HANDLE, DWORD64, PDWORD, PIMAGEHLP_LINE64);
+
+    std::scoped_lock<std::mutex> lock{symbol_mutex};
 
     Symbolizer() {
         const HMODULE dbghelp = LoadLibraryA("dbghelp.dll");
@@ -199,7 +204,9 @@ struct Symbolizer {
             return;
         }
         set_options(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
-        if (!initialize(GetCurrentProcess(), nullptr, TRUE)) {
+        // A process initialises dbghelp once; a later Symbolizer finds it initialised.
+        if (!initialize(GetCurrentProcess(), nullptr, TRUE) &&
+            GetLastError() != ERROR_INVALID_PARAMETER) {
             from_address = nullptr;
         }
     }
@@ -566,6 +573,18 @@ void SetGuestRunning(bool running) {
     });
 }
 
+std::string CurrentStack(unsigned skip) {
+    void* frames[MaxDepth];
+    const USHORT count = RtlCaptureStackBackTrace(skip + 1, MaxDepth, frames, nullptr);
+    Symbolizer symbolizer;
+    std::string text;
+    for (USHORT i = 0; i < count; ++i) {
+        text += "\n  ";
+        text += symbolizer.Where(reinterpret_cast<DWORD64>(frames[i]));
+    }
+    return text;
+}
+
 } // namespace Nx2Sampler
 
 #else
@@ -578,6 +597,9 @@ std::string Sample(const char*, double, const std::string&) {
 void NotePresent() {}
 void NoteGuestFrame() {}
 void SetGuestRunning(bool) {}
+std::string CurrentStack(unsigned) {
+    return {};
+}
 } // namespace Nx2Sampler
 
 #endif

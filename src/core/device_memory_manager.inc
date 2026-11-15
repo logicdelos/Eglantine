@@ -23,6 +23,7 @@
 #include "common/assert.h"
 #include "common/div_ceil.h"
 #include "common/logging.h"
+#include "common/nx2_sampler.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/device_memory.h"
@@ -521,10 +522,14 @@ void DeviceMemoryManager<Traits>::ReadBlock(DAddr address, void* dest_pointer, s
         [&](size_t copy_amount, DAddr current_vaddr) {
             static std::atomic<u32> reported{};
             if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+                // The stack once per read: the address alone does not say which cache read it.
+                static std::atomic<DAddr> last_start{~DAddr{}};
                 LOG_ERROR(
                     HW_Memory,
-                    "Unmapped Device ReadBlock @ {:#016x} (start address = {:#016x}, size = {})",
-                    current_vaddr, address, size);
+                    "Unmapped Device ReadBlock @ {:#016x} (start address = {:#016x}, size = {}){}",
+                    current_vaddr, address, size,
+                    last_start.exchange(address) != address ? Nx2Sampler::CurrentStack()
+                                                            : std::string{});
             }
             std::memset(dest_pointer, 0, copy_amount);
         },
@@ -586,13 +591,30 @@ void DeviceMemoryManager<Traits>::ReadBlockUnsafe(DAddr address, void* dest_poin
         [&](size_t copy_amount, DAddr current_vaddr) {
             static std::atomic<u32> reported{};
             if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+                // The stack once per read: the address alone does not say which cache read it.
+                static std::atomic<DAddr> last_start{~DAddr{}};
                 LOG_ERROR(
                     HW_Memory,
-                    "Unmapped Device ReadBlock @ {:#016x} (start address = {:#016x}, size = {})",
-                    current_vaddr, address, size);
+                    "Unmapped Device ReadBlock @ {:#016x} (start address = {:#016x}, size = {}){}",
+                    current_vaddr, address, size,
+                    last_start.exchange(address) != address ? Nx2Sampler::CurrentStack()
+                                                            : std::string{});
             }
             std::memset(dest_pointer, 0, copy_amount);
         },
+        [&](size_t copy_amount, const u8* const src_ptr) {
+            std::memcpy(dest_pointer, src_ptr, copy_amount);
+        },
+        [&](const std::size_t copy_amount) {
+            dest_pointer = static_cast<u8*>(dest_pointer) + copy_amount;
+        });
+}
+
+template <typename Traits>
+void DeviceMemoryManager<Traits>::ReadBlockSparse(DAddr address, void* dest_pointer, size_t size) {
+    WalkBlock(
+        address, size,
+        [&](size_t copy_amount, DAddr) { std::memset(dest_pointer, 0, copy_amount); },
         [&](size_t copy_amount, const u8* const src_ptr) {
             std::memcpy(dest_pointer, src_ptr, copy_amount);
         },
