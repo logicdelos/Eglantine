@@ -16,6 +16,7 @@
 #include "common/fs/fs.h"
 #include "common/logging.h"
 #include "common/adpf.h"
+#include "common/nx2_sampler.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "common/string_util.h"
@@ -346,6 +347,7 @@ struct System::Impl {
         kernel.SuspendEmulation(false);
         core_timing.SyncPause(false);
         is_paused.store(false, std::memory_order_relaxed);
+        Nx2Sampler::SetGuestRunning(true);
     }
 
     void Pause() {
@@ -354,6 +356,7 @@ struct System::Impl {
         core_timing.SyncPause(true);
         kernel.SuspendEmulation(true);
         is_paused.store(true, std::memory_order_relaxed);
+        Nx2Sampler::SetGuestRunning(false);
     }
 
     bool IsPaused() const {
@@ -563,6 +566,7 @@ struct System::Impl {
     }
 
     void ShutdownMainProcess() {
+        Nx2Sampler::SetGuestRunning(false);
         VideoCommon::Nx2Spikes::SetGuestThreadSource({});
         debug_service.reset();
         SetShuttingDown(true);

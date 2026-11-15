@@ -15,7 +15,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <map>
+#include <mutex>
 #include <set>
 #include <string>
 #include <thread>
@@ -23,6 +25,10 @@
 #include <vector>
 
 #include <fmt/format.h>
+
+#include "common/fs/path_util.h"
+#include "common/logging.h"
+#include "common/thread.h"
 
 #include <windows.h>
 // windows.h first: the other two use its types.
@@ -155,10 +161,26 @@ unsigned Walk(CONTEXT context, std::array<DWORD64, MaxDepth>& frames) {
     return depth;
 }
 
+/// "module+0xoffset" of a code address ("?+0xaddress" outside every module: JIT code).
+std::string ModuleOffset(DWORD64 address) {
+    HMODULE module{};
+    char path[MAX_PATH] = "?";
+    DWORD64 offset = address;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR>(address), &module)) {
+        GetModuleFileNameA(module, path, sizeof(path));
+        offset = address - reinterpret_cast<DWORD64>(module);
+    }
+    const char* base = std::strrchr(path, '\\');
+    return fmt::format("{}+{:#x}", base != nullptr ? base + 1 : path, offset);
+}
+
 struct Symbolizer {
     using SymInitializeFn = BOOL(WINAPI*)(HANDLE, PCSTR, BOOL);
     using SymSetOptionsFn = DWORD(WINAPI*)(DWORD);
     using SymFromAddrFn = BOOL(WINAPI*)(HANDLE, DWORD64, PDWORD64, PSYMBOL_INFO);
+    using SymGetLineFn = BOOL(WINAPI*)(HANDLE, DWORD64, PDWORD, PIMAGEHLP_LINE64);
 
     Symbolizer() {
         const HMODULE dbghelp = LoadLibraryA("dbghelp.dll");
@@ -170,11 +192,13 @@ struct Symbolizer {
         const auto initialize =
             reinterpret_cast<SymInitializeFn>(GetProcAddress(dbghelp, "SymInitialize"));
         from_address = reinterpret_cast<SymFromAddrFn>(GetProcAddress(dbghelp, "SymFromAddr"));
+        line_from_address =
+            reinterpret_cast<SymGetLineFn>(GetProcAddress(dbghelp, "SymGetLineFromAddr64"));
         if (set_options == nullptr || initialize == nullptr || from_address == nullptr) {
             from_address = nullptr;
             return;
         }
-        set_options(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+        set_options(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
         if (!initialize(GetCurrentProcess(), nullptr, TRUE)) {
             from_address = nullptr;
         }
@@ -210,7 +234,21 @@ struct Symbolizer {
         return it->second;
     }
 
+    /// One line of a stack listing: "module+0xoffset function (file:line)".
+    std::string Where(DWORD64 address) {
+        std::string text = fmt::format("{} {}", ModuleOffset(address), Name(address));
+        IMAGEHLP_LINE64 line{};
+        line.SizeOfStruct = sizeof(line);
+        DWORD column{};
+        if (from_address != nullptr && line_from_address != nullptr &&
+            line_from_address(GetCurrentProcess(), address, &column, &line)) {
+            text += fmt::format(" ({}:{})", line.FileName, line.LineNumber);
+        }
+        return text;
+    }
+
     SymFromAddrFn from_address{};
+    SymGetLineFn line_from_address{};
     std::unordered_map<DWORD64, std::string> cache;
 };
 
@@ -272,20 +310,8 @@ std::string Report(const std::vector<Target>& targets, const std::vector<Sample>
         std::sort(hot.rbegin(), hot.rend());
         text += "-- self by instruction (module+offset)\n";
         for (size_t i = 0; i < (std::min<size_t>)(hot.size(), 60); ++i) {
-            const DWORD64 address = hot[i].second;
-            HMODULE module{};
-            char module_path[MAX_PATH] = "?";
-            DWORD64 offset = address;
-            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                   reinterpret_cast<LPCSTR>(address), &module)) {
-                GetModuleFileNameA(module, module_path, sizeof(module_path));
-                offset = address - reinterpret_cast<DWORD64>(module);
-            }
-            const char* base = std::strrchr(module_path, '\\');
-            text += fmt::format("{:6} {}+{:#x} {}\n", hot[i].first,
-                                base != nullptr ? base + 1 : module_path, offset,
-                                symbolizer.Name(address));
+            text += fmt::format("{:6} {} {}\n", hot[i].first, ModuleOffset(hot[i].second),
+                                symbolizer.Name(hot[i].second));
         }
         print("self <- caller", self_caller, 50);
         print("inclusive (on the stack)", inclusive, 90);
@@ -410,6 +436,86 @@ std::string SampleThreads(const std::vector<std::string>& patterns, double secon
     return text;
 }
 
+std::string Stacks() {
+    const std::vector<Target> targets = FindThreads({"*"});
+    // Sized before any thread is paused: see Walk.
+    std::vector<Sample> samples(targets.size());
+    for (unsigned i = 0; i < targets.size(); ++i) {
+        const HANDLE handle = targets[i].handle;
+        samples[i].depth = 0;
+        if (SuspendThread(handle) == static_cast<DWORD>(-1)) {
+            continue;
+        }
+        CONTEXT context{};
+        context.ContextFlags = CONTEXT_FULL;
+        if (GetThreadContext(handle, &context)) {
+            samples[i].depth = Walk(context, samples[i].frames);
+        }
+        ResumeThread(handle);
+    }
+    Symbolizer symbolizer;
+    // Threads at the same place (a pool of idle workers) are listed together.
+    std::map<std::string, std::string> threads_by_stack;
+    for (unsigned i = 0; i < targets.size(); ++i) {
+        std::string stack;
+        for (unsigned frame = 0; frame < samples[i].depth; ++frame) {
+            stack += fmt::format("     {}\n", symbolizer.Where(samples[i].frames[frame]));
+        }
+        FILETIME created{}, exited{}, kernel{}, user{};
+        GetThreadTimes(targets[i].handle, &created, &exited, &kernel, &user);
+        const auto ticks = [](const FILETIME& time) {
+            return (static_cast<u64>(time.dwHighDateTime) << 32) | time.dwLowDateTime;
+        };
+        threads_by_stack[stack] +=
+            fmt::format("== \"{}\" thread {}, {:.1f} s of CPU\n", targets[i].name,
+                        GetThreadId(targets[i].handle),
+                        static_cast<double>(ticks(kernel) + ticks(user)) / 1e7);
+        CloseHandle(targets[i].handle);
+    }
+    std::string text = fmt::format("{} threads\n\n", targets.size());
+    for (const auto& [stack, threads] : threads_by_stack) {
+        text += threads + stack + "\n";
+    }
+    return text;
+}
+
+std::atomic<u64> guest_frames{};
+std::atomic_bool guest_running{};
+
+void WatchStalls(unsigned limit_seconds) {
+    Common::SetCurrentThreadName("StallWatch");
+    u64 seen = 0;
+    // Counted in one second polls, not clock time: a sleeping PC is not a stalled guest.
+    unsigned idle_seconds = 0;
+    for (unsigned reports = 0; reports < 3;) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        const u64 frames = guest_frames.load(std::memory_order_relaxed);
+        if (frames != seen || !guest_running.load(std::memory_order_relaxed)) {
+            seen = frames;
+            idle_seconds = 0;
+            continue;
+        }
+        if (++idle_seconds != limit_seconds) {
+            continue;
+        }
+        ++reports;
+        char stamp[32]{};
+        const std::time_t now = std::time(nullptr);
+        std::strftime(stamp, sizeof(stamp), "%Y-%m-%d_%H-%M-%S", std::localtime(&now));
+        const std::string path = fmt::format(
+            "{}/stall_{}.txt", Common::FS::GetEdenPathString(Common::FS::EdenPath::LogDir), stamp);
+        const std::string text =
+            fmt::format("No guest frame for {} s (after {} frames).\n", limit_seconds, frames) +
+            Stacks();
+        if (std::FILE* const file = std::fopen(path.c_str(), "w")) {
+            std::fwrite(text.data(), 1, text.size(), file);
+            std::fclose(file);
+        }
+        LOG_CRITICAL(Common, "No guest frame for {} s, every thread's call stack is in {}",
+                     limit_seconds, path);
+    }
+}
+
 } // Anonymous namespace
 
 std::string Sample(const char* names, double seconds, const std::string& out) {
@@ -442,6 +548,24 @@ void StartFromEnvironment() {
     }}.detach();
 }
 
+void NoteGuestFrame() {
+    guest_frames.fetch_add(1, std::memory_order_relaxed);
+}
+
+void SetGuestRunning(bool running) {
+    guest_running.store(running, std::memory_order_relaxed);
+    static std::once_flag started;
+    if (!running) {
+        return;
+    }
+    std::call_once(started, [] {
+        const double limit = EnvSeconds("EDEN_NX2_STALL_SECONDS", 60.0);
+        if (limit >= 1.0) {
+            std::thread{WatchStalls, static_cast<unsigned>(limit)}.detach();
+        }
+    });
+}
+
 } // namespace Nx2Sampler
 
 #else
@@ -452,6 +576,8 @@ std::string Sample(const char*, double, const std::string&) {
     return "the sampler is Windows only";
 }
 void NotePresent() {}
+void NoteGuestFrame() {}
+void SetGuestRunning(bool) {}
 } // namespace Nx2Sampler
 
 #endif

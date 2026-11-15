@@ -16,6 +16,7 @@
 #include "common/fs/file.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
+#include "common/nx2_sampler.h"
 #include "common/settings.h"
 #include "core/perf_stats.h"
 
@@ -81,6 +82,7 @@ void PerfStats::EndSystemFrame() {
 
     previous_frame_length = frame_end - previous_frame_end;
     previous_frame_end = frame_end;
+    Nx2Sampler::NoteGuestFrame();
 }
 
 void PerfStats::EndGameFrame() {

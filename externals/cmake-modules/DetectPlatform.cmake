@@ -94,6 +94,17 @@ endfunction()
 # Saves linking time
 if (MINGW)
     set(MINGW_FLAGS "-Wl,--strip-all -Wl,--gc-sections")
+    # Clang: function names and line numbers go to a .pdb next to each executable, which is
+    # what dbghelp, WinDbg, the nx2 sampler and tools/nx2/host_threads.py read. The
+    # executable itself stays stripped. File names are stored relative to the source tree.
+    option(MINGW_PDB "Write a .pdb next to each MinGW Clang executable" ON)
+    if (CXX_CLANG AND MINGW_PDB)
+        string(APPEND MINGW_FLAGS " -Wl,--pdb=")
+        foreach(lang C CXX)
+            set(CMAKE_${lang}_FLAGS_RELEASE
+                "${CMAKE_${lang}_FLAGS_RELEASE} -gcodeview -gline-tables-only -fdebug-prefix-map=${CMAKE_SOURCE_DIR}/=")
+        endforeach()
+    endif()
     set(CMAKE_EXE_LINKER_FLAGS_RELEASE
         "${CMAKE_EXE_LINKER_FLAGS_RELEASE} ${MINGW_FLAGS}")
 endif()

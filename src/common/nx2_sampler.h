@@ -25,4 +25,12 @@ std::string Sample(const char* names, double seconds, const std::string& out);
 /// Records a guest present while sampling, so `out`.timeline can place samples in frames.
 void NotePresent();
 
+/// Stall watch. The core reports every frame the guest presents and whether the guest is
+/// running (not paused, not stopped). When a running guest presents nothing for
+/// EDEN_NX2_STALL_SECONDS (default 60, 0 turns the watch off), the name, CPU time and call
+/// stack of every thread go to stall_<date>_<time>.txt in the log directory (Windows only):
+/// once per stall, three times a run at most.
+void NoteGuestFrame();
+void SetGuestRunning(bool running);
+
 } // namespace Nx2Sampler
