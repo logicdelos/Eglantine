@@ -389,6 +389,16 @@ struct Values {
                                                            Specialization::Percentage,
                                                        true,
                                                        true};
+    // Sharpening strength of the BUF window adapting filter; 100 is the formula as tuned.
+    SwitchableSetting<int, true> buf_strength{linkage,
+                                              100,
+                                              0,
+                                              200,
+                                              "buf_strength",
+                                              Category::Renderer,
+                                              Specialization::Scalar | Specialization::Percentage,
+                                              true,
+                                              true};
     // NVIDIA DLSS (through NVIDIA Streamline) in place of a game's DLSS.
     SwitchableSetting<bool> nvidia_dlss{linkage, false, "nvidia_dlss", Category::Renderer};
     SwitchableSetting<DlssQuality> nvidia_dlss_quality{linkage,

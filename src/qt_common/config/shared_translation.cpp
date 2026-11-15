@@ -157,6 +157,10 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Strength of RCAS (AMD's contrast-adaptive sharpening) on the upscaler used in place "
               "of a game's DLSS (AMD FSR 3.1); 0% turns it off.\nAlso sets the sharpening "
               "of the AMD FSR 1 and SGSR window adapting filters."));
+    INSERT(Settings, buf_strength, tr("BUF Strength:"),
+           tr("Strength of the sharpening in the BasicUpscaler Formula (BUF) window adapting "
+              "filter.\n100% is the formula as tuned; 0% leaves only its upscaling kernel.\n"
+              "Only applies while the window is larger than the game's image."));
     INSERT(Settings, nvidia_dlss,
            tr("Use NVIDIA DLSS in place of a game's DLSS or anti-aliasing"),
            tr("Uses NVIDIA DLSS on GeForce RTX cards in place of a Switch 2 game's own DLSS, "

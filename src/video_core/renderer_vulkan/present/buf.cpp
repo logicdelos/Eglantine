@@ -4,6 +4,7 @@
 #include <array>
 
 #include "common/common_types.h"
+#include "common/settings.h"
 #include "video_core/fsr.h"
 #include "video_core/host_shaders/vulkan_buf_frag_spv.h"
 #include "video_core/host_shaders/vulkan_fidelityfx_fsr_vert_spv.h"
@@ -22,9 +23,6 @@ struct PushConstants {
     std::array<f32, 4> params;
 };
 static_assert(sizeof(PushConstants) == 80);
-
-// 1 is the formula as tuned.
-constexpr f32 BufStrength = 1.0f;
 } // Anonymous namespace
 
 BUF::BUF(const Device& device, MemoryAllocator& memory_allocator, size_t image_count,
@@ -156,7 +154,9 @@ VkImageView BUF::Draw(const Device& device, Scheduler& scheduler, size_t image_i
                             push.easu_con.data() + 8, push.easu_con.data() + 12, viewport_width,
                             viewport_height, input_width, input_height, output_width,
                             output_height, viewport_x, viewport_y);
-    push.params = {BufStrength, output_width, output_height, 0.0f};
+    // 100% is the formula as tuned.
+    const f32 strength = static_cast<f32>(Settings::values.buf_strength.GetValue()) / 100.0f;
+    push.params = {strength, output_width, output_height, 0.0f};
 
     UploadImages(scheduler);
     UpdateDescriptorSet(device, source_image_view, image_index);

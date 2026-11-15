@@ -2522,6 +2522,8 @@ private:
     // EDEN_NX2_FRAME_CAPTURE=<dir>: every 120th present, save what the renderer shows as
     // nx2-frame-<n>.tga in <dir> (lets hidden test runs check the output; idea from changes.patch).
     // With EDEN_NX2_DIAG_DIR a draw-list capture also saves the next present as capture-<n>.tga there.
+    // EDEN_NX2_CAPTURE_SIZE=<width>x<height> sets the size of both (default 1280x720); the window
+    // adapting filter only shows in a capture larger than the game's image.
     void CaptureFrame() {
         static const char* const directory = std::getenv("EDEN_NX2_FRAME_CAPTURE");
         if (m_capture_pending->load()) {
@@ -2567,7 +2569,16 @@ private:
         if (path.empty() || m_capture_pending->exchange(true)) {
             return;
         }
-        const auto layout = Layout::DefaultFrameLayout(1280, 720);
+        static const auto capture_size = []() -> std::pair<u32, u32> {
+            unsigned width = 0, height = 0;
+            const char* const text = std::getenv("EDEN_NX2_CAPTURE_SIZE");
+            if (text != nullptr && std::sscanf(text, "%ux%u", &width, &height) == 2 &&
+                width >= 16 && height >= 16 && width <= 7680 && height <= 4320) {
+                return {width, height};
+            }
+            return {1280, 720};
+        }();
+        const auto layout = Layout::DefaultFrameLayout(capture_size.first, capture_size.second);
         auto pixels = std::make_shared<std::vector<u8>>(layout.width * layout.height * 4);
         auto pending = m_capture_pending; // the screenshot callback can outlive the session
         system.GPU().Renderer().RequestScreenshot(
