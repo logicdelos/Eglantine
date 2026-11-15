@@ -22,8 +22,10 @@
 
 #include "common/fs/path_util.h"
 #include "common/logging.h"
+#include "common/settings.h"
 #include "common/swap.h"
 #include "core/file_sys/vfs/vfs_offset.h"
+#include "core/file_sys/common_funcs.h"
 
 namespace FileSys {
 namespace {
@@ -139,6 +141,7 @@ static_assert(sizeof(TlvHeader) == TlvHeaderSize);
 
 enum MetaType : u16 {
     MetaNpdm = 0x0001,
+    MetaNacp = 0x0002,
     MetaIcon = 0x0003,
     MetaDisplayVersion = 0x0004,
     MetaTitleName = 0x0005,
@@ -621,6 +624,13 @@ bool NupContainer::ParseMeta(PackageInfo& package) {
         case MetaNpdm:
             package.npdm.assign(payload, payload + header.size);
             break;
+        case MetaNacp:
+            // Raw NACP carries edition launch metadata and legacy save/DLC ownership.
+            if (header.size != 0x4000) {
+                return false;
+            }
+            package.nacp.assign(payload, payload + header.size);
+            break;
         case MetaIcon:
             package.icon.assign(payload, payload + header.size);
             break;
@@ -704,6 +714,67 @@ std::optional<std::size_t> NupContainer::FindBestUpdatePackage() const {
         }
     }
     return best;
+}
+
+bool IsAddonDisabled(u64 title_id, std::string_view key) {
+    const auto it = Settings::values.disabled_addons.find(title_id);
+    return it != Settings::values.disabled_addons.end() &&
+           std::find(it->second.begin(), it->second.end(), key) != it->second.end();
+}
+
+std::vector<std::size_t> NupContainer::FindAddonPackages(u64 program_id) const {
+    std::map<u64, std::size_t> selected;
+    for (std::size_t i = 0; i < packages.size(); ++i) {
+        const auto& package = packages[i];
+        const u64 title_id = WithPlatformOf(package.title_id, program_id);
+        if (package.kind != PackageKind::Addon ||
+            GetBaseTitleID(title_id) != GetBaseTitleID(program_id) ||
+            title_id < GetAOCBaseTitleID(program_id) || package.romfs_dir == NoDir) {
+            continue;
+        }
+        const auto it = selected.find(package.title_id);
+        if (it == selected.end() || package.version > packages[it->second].version) {
+            selected[package.title_id] = i;
+        }
+    }
+    std::vector<std::size_t> indices;
+    for (const auto& entry : selected) {
+        indices.push_back(entry.second);
+    }
+    return indices;
+}
+
+std::vector<std::pair<u64, VirtualDir>> NupContainer::GetAddonRomFS(u64 program_id) {
+    std::vector<std::pair<u64, VirtualDir>> entries;
+    for (const auto index : FindAddonPackages(program_id)) {
+        const auto title_id = WithPlatformOf(packages[index].title_id, program_id);
+        if (auto romfs = GetRomFSDir(index)) {
+            LOG_INFO(Loader, "NUP add-on content {:016X} (v{}) mounted", title_id,
+                     packages[index].version);
+            entries.emplace_back(title_id, std::move(romfs));
+        }
+    }
+    return entries;
+}
+
+std::vector<std::pair<u64, VirtualDir>> NupContainer::GetSiblingProgramRomFS() {
+    std::vector<std::pair<u64, VirtualDir>> entries;
+    // The first base package is the application itself; further ones are its other programs.
+    const auto main = FindBasePackage();
+    if (!main) {
+        return entries;
+    }
+    const u64 application = GetBaseTitleID(packages[*main].title_id);
+    for (std::size_t i = *main + 1; i < packages.size(); ++i) {
+        if (packages[i].kind != PackageKind::Base ||
+            GetBaseTitleID(packages[i].title_id) != application) {
+            continue;
+        }
+        if (auto romfs = GetRomFSDir(i)) {
+            entries.emplace_back(packages[i].title_id, std::move(romfs));
+        }
+    }
+    return entries;
 }
 
 VirtualFile NupContainer::OpenFile(std::size_t file_index) {

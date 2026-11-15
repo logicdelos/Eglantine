@@ -12,6 +12,7 @@
 #include "common/logging.h"
 #include "common/string_util.h"
 #include "core/core.h"
+#include "core/file_sys/common_funcs.h"
 #include "core/file_sys/nup_container.h"
 #include "core/file_sys/control_metadata.h"
 #include "core/file_sys/patch_manager.h"
@@ -55,6 +56,10 @@ void CopyDeveloperToEntry(FileSys::LanguageEntry& entry, std::string_view develo
 
 std::unique_ptr<FileSys::NACP> BuildNacp(const NupContainer::PackageInfo& base,
                                          const std::string& version) {
+    if (!base.nacp.empty()) {
+        return std::make_unique<FileSys::NACP>(
+            std::make_shared<FileSys::VectorVfsFile>(base.nacp, "control.nacp"));
+    }
     const std::string& effective_title =
         !base.title_name.empty() ? base.title_name : base.source_dump;
     if (effective_title.empty() && base.localized_titles.empty() && base.publisher.empty() &&
@@ -171,18 +176,6 @@ AppLoader_NUP::AppLoader_NUP(FileSys::VirtualFile file_)
                 program.localized_icons.front().second, "icon.dat");
         }
     }
-
-    const auto addon_count = std::count_if(nup->GetPackages().begin(), nup->GetPackages().end(),
-                                           [](const auto& package) {
-                                               return package.kind ==
-                                                      NupContainer::PackageKind::Addon;
-                                           });
-    if (addon_count > 0) {
-        LOG_WARNING(Loader,
-                    "NUP container has {} add-on content package(s); AoC mounting is not "
-                    "supported yet",
-                    addon_count);
-    }
 }
 
 AppLoader_NUP::~AppLoader_NUP() = default;
@@ -206,6 +199,23 @@ AppLoader::LoadResult AppLoader_NUP::Load(Kernel::KProcess& process, Core::Syste
     if (result.first != ResultStatus::Success) {
         return result;
     }
+
+    // The secondary ExeFS loader resets loose content. Publish the NUP entries only
+    // after it succeeds, before the guest can enumerate or open add-on content.
+    // Switch 2 edition programs can retain their Switch 1 application's DLC IDs.
+    const u64 addon_application_id = nacp_file && nacp_file->GetDLCBaseTitleId() != 0
+                                         ? FileSys::GetBaseTitleID(nacp_file->GetDLCBaseTitleId())
+                                         : base_title_id;
+    std::vector<FileSys::BootContent> boot_content;
+    if (!FileSys::IsAddonDisabled(base_title_id, "DLC")) {
+        for (auto& [id, romfs] : nup->GetAddonRomFS(addon_application_id)) {
+            boot_content.push_back({id, FileSys::ContentRecordType::Data, std::move(romfs)});
+        }
+    }
+    for (auto& [id, romfs] : nup->GetSiblingProgramRomFS()) {
+        boot_content.push_back({id, FileSys::ContentRecordType::Program, std::move(romfs)});
+    }
+    FileSys::SetBootContent(std::move(boot_content));
 
     system.GetFileSystemController().RegisterProcess(
         process.GetProcessId(), base_title_id,

@@ -15,6 +15,8 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <unordered_map>
 #include <vector>
 
@@ -97,6 +99,8 @@ struct NupDecompressCache {
  * Per-package meta TLVs carry NPDM bytes, title names (default + localized),
  * icons and a display version. All integers little-endian.
  */
+bool IsAddonDisabled(u64 title_id, std::string_view key);
+
 class NupContainer {
 public:
     static constexpr std::array<u8, 4> HeaderMagic{'N', 'U', 'P', 0x01};
@@ -120,6 +124,7 @@ public:
         u32 meta_size{};
 
         std::vector<u8> npdm;
+        std::vector<u8> nacp;
         std::string title_name;
         std::string publisher;
         std::string source_dump;
@@ -155,6 +160,9 @@ public:
     std::optional<std::size_t> FindBasePackage() const;
     /// Highest version among Update packages, if any.
     std::optional<std::size_t> FindBestUpdatePackage() const;
+    /// Highest-version Addon package for each DLC title ID belonging to `program_id`, mapped to
+    /// `program_id`'s platform byte.
+    std::vector<std::size_t> FindAddonPackages(u64 program_id) const;
 
     /// Opens a member file by node index; raw extents are zero-copy views into
     /// the container, zstd extents are lazily decompressed, cached in memory
@@ -164,6 +172,11 @@ public:
     VirtualDir GetExeFSDir(std::size_t package_index);
     VirtualDir GetRomFSDir(std::size_t package_index);
     VirtualDir GetPackageDir(std::size_t package_index);
+
+    /// RomFS trees of the selected Addon packages for `program_id`, keyed by mapped title ID.
+    std::vector<std::pair<u64, VirtualDir>> GetAddonRomFS(u64 program_id);
+    /// RomFS trees of additional Base packages (multi-program or Switch 1 sibling).
+    std::vector<std::pair<u64, VirtualDir>> GetSiblingProgramRomFS();
 
     /// Stream-hashes every member file against its stored SHA-256.
     Loader::ResultStatus VerifyIntegrity(

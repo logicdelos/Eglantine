@@ -8,6 +8,8 @@
 
 #include <mutex>
 #include <memory>
+#include <utility>
+#include <vector>
 
 #include "common/common_types.h"
 #include "core/file_sys/vfs/vfs_types.h"
@@ -36,6 +38,18 @@ enum class StorageId : u8 {
     NandUser = 4,
     SdCard = 5,
 };
+
+/// Loose RomFS trees published by the active loader (add-on packages, sibling programs).
+/// Only one boot is active at a time; each load replaces the previous table.
+struct BootContent {
+    u64 title_id{};
+    ContentRecordType type{};
+    VirtualDir romfs;
+};
+
+void SetBootContent(std::vector<BootContent> entries);
+[[nodiscard]] std::vector<u64> ListBootContent(ContentRecordType type);
+[[nodiscard]] VirtualFile OpenBootContent(u64 title_id, ContentRecordType type);
 
 /// File system interface to the RomFS archive
 class RomFSFactory {

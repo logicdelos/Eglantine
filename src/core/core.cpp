@@ -467,6 +467,8 @@ struct System::Impl {
 
         const auto file = GetGameFileFromPath(virtual_filesystem, filepath);
 
+        FileSys::SetBootContent({});
+
         // Create the application process
         Loader::ResultStatus load_result{};
         std::vector<u8> control;
@@ -587,6 +589,7 @@ struct System::Impl {
         cheat_engine.reset();
         core_timing.ClearPendingEvents();
         app_loader.reset();
+        FileSys::SetBootContent({});
         audio_core.reset();
         gpu_core.reset();
         host1x_core.reset();
