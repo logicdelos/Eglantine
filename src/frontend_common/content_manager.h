@@ -230,8 +230,13 @@ inline InstallResult InstallNCA(FileSys::VfsFilesystem& vfs, const std::string& 
                 dest->Resize(0);
                 return false;
             }
-            const auto read = src->Read(buffer.data(), buffer.size(), i);
-            dest->Write(buffer.data(), read, i);
+            // Fail the install on a short read or write instead of leaving a truncated NCA behind.
+            const auto expected = std::min<std::size_t>(buffer.size(), src->GetSize() - i);
+            if (src->Read(buffer.data(), expected, i) != expected ||
+                dest->Write(buffer.data(), expected, i) != expected) {
+                dest->Resize(0);
+                return false;
+            }
         }
         return true;
     };
