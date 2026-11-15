@@ -100,7 +100,7 @@ NvResult nvhost_ctrl::IocCtrlEventWait(IocCtrlEventWaitParams& params, bool is_a
     bool must_unmark_fail = !is_allocation;
     const u32 event_id = params.value.raw;
     SCOPE_EXIT {
-        if (must_unmark_fail) {
+        if (must_unmark_fail && event_id < MaxNvEvents) {
             events[event_id].fails = 0;
         }
     };

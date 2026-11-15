@@ -35,6 +35,10 @@ Nvdec::~Nvdec() {
 }
 
 void Nvdec::ProcessMethod(u32 method, u32 argument) {
+    if (method >= NvdecCommon::NvdecRegisters::NUM_REGS) {
+        LOG_ERROR(HW_GPU, "Nvdec {} method {:#x} out of range", id, method);
+        return;
+    }
     regs.reg_array[method] = argument;
 
     switch (method) {

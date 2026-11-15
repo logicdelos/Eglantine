@@ -105,6 +105,10 @@ void CDmaPusher::ExecuteCommand(u32 method, u32 arg) {
         host_processor.ProcessMethod(host1x, Host1x::Control::Method(method), arg);
         break;
     default:
+        if (method >= ThiRegisters::NUM_REGS) {
+            LOG_ERROR(HW_GPU, "Class {} method {:#x} out of range", u32(current_class), method);
+            break;
+        }
         thi_regs.reg_array[method] = arg;
         switch (static_cast<ThiMethod>(method)) {
         case ThiMethod::IncSyncpt: {

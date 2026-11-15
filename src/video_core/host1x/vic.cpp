@@ -99,6 +99,10 @@ Vic::~Vic() noexcept {
 
 void Vic::ProcessMethod(u32 method, u32 arg) noexcept {
     LOG_TRACE(HW_GPU, "Vic {} method {:#x}", id, u32(method));
+    if (method >= VicRegisters::NUM_REGS) {
+        LOG_ERROR(HW_GPU, "Vic {} method {:#x} out of range", id, method);
+        return;
+    }
     regs.reg_array[method] = arg;
     switch (Method(method * sizeof(u32))) {
     case Method::Execute:

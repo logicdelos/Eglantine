@@ -773,7 +773,8 @@ void IGeneralService::SetNetworkProfile(HLERequestContext& ctx) {
     const auto* np = reinterpret_cast<const NifmNetworkProfileData*>(data.data());
 
     PendingProfile prof{};
-    prof.ssid_len = np->wireless_setting_data.ssid_length;
+    prof.ssid_len = static_cast<u8>((std::min<size_t>)(np->wireless_setting_data.ssid_length,
+                                                       prof.ssid.size()));
     std::memcpy(prof.ssid.data(), np->wireless_setting_data.ssid.data(), prof.ssid_len);
     std::memcpy(prof.passphrase.data(), np->wireless_setting_data.passphrase.data(),
                 sizeof(prof.passphrase));

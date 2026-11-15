@@ -203,6 +203,9 @@ Result VfsDirectoryServiceWrapper::RenameFile(const std::string& src_path_,
         return ResultSuccess;
     }
 
+    if (src == nullptr) {
+        return FileSys::ResultPathNotFound;
+    }
     // Move by hand -- TODO(DarkLordZach): Optimize
     auto c_res = CreateFile(dest_path, src->GetSize());
     if (c_res != ResultSuccess)
