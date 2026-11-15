@@ -202,6 +202,19 @@ public:
             return ReadSpilled(data, length, offset);
         }
 
+        std::shared_ptr<std::mutex> member_lock;
+        {
+            std::scoped_lock lock{cache->mutex};
+            if (const auto* cached = cache->Find(cache_index)) {
+                std::memcpy(data, cached->data() + offset, length);
+                return length;
+            }
+            member_lock = cache->GetDecompressLock(cache_index);
+        }
+
+        // Miss: only one thread decompresses a given member; the others wait here and then hit
+        // the cache instead of repeating a full decompress that Insert would discard.
+        std::scoped_lock member{*member_lock};
         {
             std::scoped_lock lock{cache->mutex};
             if (const auto* cached = cache->Find(cache_index)) {
@@ -210,7 +223,7 @@ public:
             }
         }
 
-        // Miss: decompress without holding the lock, then publish and copy.
+        // Decompress without holding the cache lock, then publish and copy.
         std::vector<u8> scratch = Decompress();
         if (scratch.empty()) {
             return 0;

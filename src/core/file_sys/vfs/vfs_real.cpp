@@ -367,14 +367,39 @@ bool RealVfsFile::IsReadable() const {
 }
 
 std::size_t RealVfsFile::Read(u8* data, std::size_t length, std::size_t offset) const {
-    auto lk = base.RefreshReference(path, perms, *reference);
-    if (!reference->file || !reference->file->Seek(static_cast<s64>(offset))) {
+    if (ModeFlagsToFileAccessMode(perms) != FS::FileAccessMode::Read) {
+        // A file that may be written keeps the original behaviour: the list lock covers the whole
+        // access, so a write buffered in the FILE* is never left behind by an eviction.
+        auto lk = base.RefreshReference(path, perms, *reference);
+        if (!reference->file || !reference->file->Seek(static_cast<s64>(offset))) {
+            return 0;
+        }
+        return reference->file->ReadSpan(std::span{data, length});
+    }
+
+    // Read-only file: take our own handle under the list lock (so eviction cannot close it under
+    // us), then do the disk I/O holding only this file's lock.
+    std::shared_ptr<FS::IOFile> file;
+    {
+        auto lk = base.RefreshReference(path, perms, *reference);
+        file = reference->file;
+    }
+    if (!file) {
         return 0;
     }
-    return reference->file->ReadSpan(std::span{data, length});
+    std::scoped_lock io{reference->io_mutex};
+    if (!file->Seek(static_cast<s64>(offset))) {
+        return 0;
+    }
+    return file->ReadSpan(std::span{data, length});
 }
 
 std::size_t RealVfsFile::Write(const u8* data, std::size_t length, std::size_t offset) {
+    if (ModeFlagsToFileAccessMode(perms) == FS::FileAccessMode::Read) {
+        // The FILE* is read-only, so the write would fail anyway; bail out before the Seek, which
+        // would race with Read's seek+read on the shared FILE* now that Read drops the list lock.
+        return 0;
+    }
     size.reset();
     auto lk = base.RefreshReference(path, perms, *reference);
     if (!reference->file || !reference->file->Seek(static_cast<s64>(offset))) {

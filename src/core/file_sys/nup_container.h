@@ -51,6 +51,7 @@ struct NupDecompressCache {
     std::size_t cap{DefaultCap};
     std::filesystem::path spill_dir;
     std::unordered_map<std::size_t, std::shared_ptr<NupSpillFile>> spills;
+    std::unordered_map<std::size_t, std::shared_ptr<std::mutex>> decompress_locks;
 
     std::vector<u8>* Find(std::size_t file_index) {
         const auto it = index.find(file_index);
@@ -85,6 +86,15 @@ struct NupDecompressCache {
             spill = std::make_shared<NupSpillFile>();
         }
         return spill;
+    }
+
+    /// One mutex per member so concurrent misses on the same member decompress it only once.
+    std::shared_ptr<std::mutex> GetDecompressLock(std::size_t file_index) {
+        auto& lock = decompress_locks[file_index];
+        if (!lock) {
+            lock = std::make_shared<std::mutex>();
+        }
+        return lock;
     }
 };
 

@@ -4,16 +4,23 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <span>
 #include <string>
+#include <system_error>
 #include <vector>
+
+#include <fmt/format.h>
 
 #include <zstd.h>
 
 #include "common/common_types.h"
+#include "common/fs/file.h"
+#include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/zstd_compression.h"
 #include "core/crypto/aes_util.h"
@@ -252,8 +259,9 @@ private:
     u64 nca_size{};
 };
 
-// Solid NCZ: one zstd stream over the whole body. Decoded incrementally into memory, up to the
-// requested offset, so sequential install reads are O(n) instead of O(n^2).
+// Solid NCZ: one zstd stream over the whole body. Decoded incrementally into a temporary file, up
+// to the requested offset, so sequential install reads are O(n) instead of O(n^2) and the
+// decoded NCA (several GB) is never held in memory.
 class SolidNczFile final : public FileSys::VfsFile {
 public:
     SolidNczFile(std::string name_, FileSys::VirtualFile source_,
@@ -261,12 +269,21 @@ public:
         : name{std::move(name_)}, source{std::move(source_)}, sections{std::move(sections_)},
           payload_start{payload_start_} {
         const auto raw_header = source->ReadBytes(HeaderSize, 0);
-        data.assign(raw_header.begin(), raw_header.end());
-        frontier = HeaderSize;
+        if (raw_header.size() == HeaderSize && OpenSpill() &&
+            spill.WriteSpan(std::span<const u8>{raw_header}) == HeaderSize) {
+            frontier = HeaderSize;
+        } else {
+            spill.Close();
+        }
     }
 
     ~SolidNczFile() override {
         if (stream != nullptr) ZSTD_freeDStream(stream);
+        spill.Close();
+        if (!spill_path.empty()) {
+            std::error_code ec;
+            std::filesystem::remove(spill_path, ec);
+        }
     }
 
     std::string GetName() const override { return name; }
@@ -283,19 +300,36 @@ public:
 
     std::size_t Read(u8* out, std::size_t len, std::size_t off) const override {
         std::scoped_lock lock{mutex};
+        if (!spill.IsOpen()) return 0;
         const u64 nca_size = GetSize();
         if (off >= nca_size) return 0;
         len = static_cast<std::size_t>(std::min<u64>(len, nca_size - off));
         const u64 needed = off + len;
         if (needed > frontier && !DecodeTo(needed)) return 0;
-        std::memcpy(out, data.data() + off, len);
-        return len;
+        if (!spill.Seek(static_cast<s64>(off))) return 0;
+        return spill.ReadSpan(std::span{out, len}) == len ? len : 0;
     }
 
     std::size_t Write(const u8*, std::size_t, std::size_t) override { return 0; }
     bool Rename(std::string_view) override { return false; }
+    bool IsReady() const { return spill.IsOpen(); }
 
 private:
+    bool OpenSpill() {
+        const auto dir = Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) / "ncz";
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        std::random_device random;
+        spill_path = dir / fmt::format("{:08x}{:08x}.tmp", random(), random());
+        {
+            // "Write" creates and truncates; it cannot be read back, so reopen read-write.
+            Common::FS::IOFile create{spill_path, Common::FS::FileAccessMode::Write};
+            if (!create.IsOpen()) return false;
+        }
+        spill.Open(spill_path, Common::FS::FileAccessMode::ReadWrite);
+        return spill.IsOpen();
+    }
+
     bool DecodeTo(u64 needed) const {
         if (stream == nullptr) {
             stream = ZSTD_createDStream();
@@ -358,7 +392,11 @@ private:
                     cipher->SetIV(iv);
                     cipher->Transcode(out_buf.data(), produced, out_buf.data(), Op::Encrypt);
                 }
-                data.insert(data.end(), out_buf.begin(), out_buf.begin() + produced);
+                if (!spill.Seek(static_cast<s64>(pos)) ||
+                    spill.WriteSpan(std::span<const u8>{out_buf.data(), produced}) != produced) {
+                    LOG_ERROR(Crypto, "Solid NCZ: cannot write the temporary file");
+                    return false;
+                }
                 pos += produced;
                 frontier = pos;
             }
@@ -371,7 +409,10 @@ private:
     const std::vector<Section> sections;
     const u64 payload_start;
     mutable std::mutex mutex;
-    mutable std::vector<u8> data;
+    // Decoded NCA bytes, indexed by absolute NCA offset, kept on disk so memory stays bounded
+    // while random reads (NCA section parsing) and the later sequential copy both still work.
+    Common::FS::IOFile spill;
+    std::filesystem::path spill_path;
     mutable ZSTD_DStream* stream = nullptr;
     mutable u64 read_pos = 0;
     mutable u64 frontier = 0;
@@ -402,7 +443,13 @@ FileSys::VirtualFile OpenNcz(const FileSys::VirtualFile& f, std::string_view nam
     }
 
     if (allow_solid) {
-        return std::make_shared<SolidNczFile>(std::string{name}, f, std::move(sections), ps);
+        auto solid = std::make_shared<SolidNczFile>(std::string{name}, f, std::move(sections), ps);
+        if (!solid->IsReady()) {
+            // Fail the open rather than hand the installer a file that reads as empty.
+            LOG_ERROR(Crypto, "Solid NCZ {}: cannot create the temporary decode file", name);
+            return nullptr;
+        }
+        return solid;
     }
 
     LOG_DEBUG(Crypto, "Solid NCZ {} skipped (only NCZBLOCK is supported for play)", name);
