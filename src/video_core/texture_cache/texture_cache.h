@@ -201,8 +201,47 @@ void TextureCache<P>::RunGarbageCollector() {
         }();
         num_iterations = aggressive_mode ? 40 : (high_priority_mode ? 20 : normal_iterations);
     };
+    // Images the GPU wrote are copied back to guest memory before they are deleted. The copies of
+    // a whole pass are recorded first and the GPU is waited for once, not once per image (a run
+    // under memory pressure deletes up to 60). Such an image stays tracked and registered until
+    // its bytes are in guest memory, so a guest write in between still faults and waits for the
+    // cache. The buffers are deferred ones, so no later request can be handed one of them before
+    // it is read.
+    struct Eviction {
+        ImageId image_id;
+        AsyncBuffer map;
+        bool immediate_delete;
+    };
+    std::vector<Eviction> evictions;
+    // What deleting the recorded images will take off total_used_memory.
+    u64 deferred_bytes = 0;
+    const auto Remove = [this](ImageId image_id, bool immediate_delete) {
+        auto& image = slot_images[image_id];
+        if (True(image.flags & ImageFlagBits::Tracked)) {
+            UntrackImage(image, image_id);
+        }
+        UnregisterImage(image_id);
+        DeleteImage(image_id, immediate_delete);
+    };
+    const auto FinishEvictions = [this, &evictions, &deferred_bytes, &Remove] {
+        if (evictions.empty()) {
+            return;
+        }
+        runtime.Finish();
+        for (Eviction& eviction : evictions) {
+            const auto& image = slot_images[eviction.image_id];
+            const auto copies = FullDownloadCopies(image.info);
+            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies,
+                         eviction.map.mapped_span, swizzle_data_buffer);
+            runtime.FreeDeferredStagingBuffer(eviction.map);
+            Remove(eviction.image_id, eviction.immediate_delete);
+        }
+        evictions.clear();
+        deferred_bytes = 0;
+    };
     const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode,
-                          &evict_old_costly](ImageId image_id) {
+                          &evict_old_costly, &evictions, &deferred_bytes, &Remove,
+                          &FinishEvictions](ImageId image_id) {
         if (num_iterations == 0) {
             return true;
         }
@@ -218,25 +257,28 @@ void TextureCache<P>::RunGarbageCollector() {
             (!high_priority_mode && must_download)) {
             return false;
         }
+        // Deleted at once, not after the GPU has run the commands that use it.
+        const bool immediate_delete = image.scale_tick > frame_tick + 5;
+        ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
         if (must_download) {
-            auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
+            auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes, true);
             const auto copies = FullDownloadCopies(image.info);
             image.DownloadMemory(map, copies);
-            runtime.Finish();
-            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span,
-                         swizzle_data_buffer);
+            deferred_bytes += ImageMemoryBytes(image) +
+                              (image.HasScaled() ? GetScaledImageSizeBytes(image) : 0);
+            evictions.push_back({image_id, std::move(map), immediate_delete});
+            if (immediate_delete) {
+                FinishEvictions();
+            }
             ++gc_download_deletes;
+        } else {
+            Remove(image_id, immediate_delete);
         }
-        if (True(image.flags & ImageFlagBits::Tracked)) {
-            UntrackImage(image, image_id);
-        }
-        ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
-        UnregisterImage(image_id);
-        DeleteImage(image_id, image.scale_tick > frame_tick + 5);
-        if (aggressive_mode && total_used_memory < critical_memory) {
+        const u64 used_memory = total_used_memory - (std::min)(total_used_memory, deferred_bytes);
+        if (aggressive_mode && used_memory < critical_memory) {
             num_iterations >>= 2;
             aggressive_mode = false;
-        } else if (high_priority_mode && total_used_memory < expected_memory) {
+        } else if (high_priority_mode && used_memory < expected_memory) {
             num_iterations >>= 1;
             high_priority_mode = false;
         }
@@ -328,11 +370,14 @@ void TextureCache<P>::RunGarbageCollector() {
         evict_old_costly = true;
         lru_cache.ForEachItemBelow(frame_tick - old_age, Cleanup);
         evict_old_costly = false;
+        FinishEvictions();
     }
     Collect();
+    FinishEvictions();
     if (total_used_memory >= critical_memory) {
         Configure(true);
         Collect();
+        FinishEvictions();
     }
 }
 
@@ -2984,6 +3029,15 @@ void TextureCache<P>::TickAsyncDecode() {
 
 template <class P>
 void TextureCache<P>::TickAsyncUnswizzle() {
+    // Tasks of deleted images never touch their slot, which may be gone or reused. Free the
+    // deferred staging buffer of one that had started, on this (the GPU) thread.
+    while (!unswizzle_queue.empty() && unswizzle_queue.front().cancelled) {
+        PendingUnswizzle& dead = unswizzle_queue.front();
+        if (dead.initialized) {
+            runtime.FreeDeferredStagingBuffer(dead.staging_buffer);
+        }
+        unswizzle_queue.pop_front();
+    }
     if (unswizzle_queue.empty()) {
         return;
     }
@@ -4282,6 +4336,14 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     for (auto& async_decode : async_decodes) {
         if (async_decode->image_id == image_id) {
             async_decode->cancelled = true;
+        }
+    }
+    // A queued 3D unswizzle indexes this slot every tick. Only mark it dead here: DeleteImage can
+    // run off the GPU thread (guest unmap), and the staging pool is not safe to touch from there.
+    // TickAsyncUnswizzle frees its buffer and drops it.
+    for (PendingUnswizzle& task : unswizzle_queue) {
+        if (task.image_id == image_id) {
+            task.cancelled = true;
         }
     }
     if (image.HasScaled()) {
