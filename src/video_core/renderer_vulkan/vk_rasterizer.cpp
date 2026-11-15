@@ -2210,6 +2210,9 @@ bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheT
 }
 
 VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64 size) {
+    // Guest cores ask this on reads of cached pages, and the GPU thread holds both caches' locks
+    // through each draw. Pages no image was ever registered on, and Switch 2 pages the GPU never
+    // wrote, get the clean area the caches would return without a look under their locks.
     std::optional<VideoCore::RasterizerDownloadArea> texture_area;
     // EDEN_NX2_FLUSH_AREA_STATS=1 (diagnostic): how guest reads of trapped pages resolve and how
     // long they wait for the texture cache lock.
@@ -2219,7 +2222,7 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
     }();
     const auto lock_begin = flush_stats ? std::chrono::steady_clock::now()
                                         : std::chrono::steady_clock::time_point{};
-    {
+    if (texture_cache.page_filter.Any(addr, size)) {
         std::scoped_lock lock{texture_cache.mutex};
         const auto locked = flush_stats ? std::chrono::steady_clock::now()
                                         : std::chrono::steady_clock::time_point{};
@@ -2246,7 +2249,9 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
         buffer_cache.ForgetReadTraps(addr, size);
         return *texture_area;
     }
-    if (buffer_cache.FlushesOnCpuRead()) {
+    if (buffer_cache.FlushesOnCpuRead() &&
+        (!Tegra::g_nx2_ampere.load(std::memory_order_relaxed) ||
+         Tegra::Nx2MayBeGpuWritten(addr, size))) {
         std::scoped_lock lock{buffer_cache.mutex};
         auto area = buffer_cache.GetFlushArea(addr, size);
         if (area) {

@@ -512,6 +512,11 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
         const DAddr diff = base_address - *cpu_src_address;
         const DAddr new_base_address = *cpu_dest_address + diff;
         tmp_intervals.push_back({new_base_address, size});
+        // Before QueueGpuWrite arms read traps: guest reads skip this cache's lock on pages
+        // without the mark (RasterizerVulkan::GetFlushArea).
+        if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
+            Tegra::Nx2MarkGpuWritten(new_base_address, size);
+        }
         QueueGpuWrite(new_base_address, size);
     };
     gpu_modified_ranges.ForEachInRange(*cpu_src_address, amount, mirror);
@@ -525,7 +530,6 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
                                   {BufferDependencyTrace::Producer::Other, 0, frame_tick});
         }
         if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
-            Tegra::Nx2MarkGpuWritten(pair.first, pair.second);
             Nx2NoteListWrite(buffer_b, pair.first, pair.second);
         }
     }
@@ -2581,9 +2585,15 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
     MarkVertexBuffersStale(device_addr, size);
     last_synced_count = 0;
     gpu_modified_ranges.Add(device_addr, size);
-    QueueGpuWrite(device_addr, size);
-    if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
+    const bool ampere = Tegra::g_nx2_ampere.load(std::memory_order_relaxed);
+    if (ampere) {
+        // Before QueueGpuWrite arms read traps: guest reads skip this cache's lock on pages
+        // without the mark (RasterizerVulkan::GetFlushArea), and the arm is what ends a core's
+        // read area.
         Tegra::Nx2MarkGpuWritten(device_addr, size);
+    }
+    QueueGpuWrite(device_addr, size);
+    if (ampere) {
         Nx2NoteListWrite(buffer_id, device_addr, size);
     }
 }

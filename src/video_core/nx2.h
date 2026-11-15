@@ -309,6 +309,28 @@ inline void Nx2ClearAsyncReports() {
     return (g_nx2_gpu_written_pages[page / 64].load(std::memory_order_relaxed) >> (page % 64)) & 1;
 }
 
+/// Whether the GPU may have written any device page of [device_address, device_address + size).
+/// Addresses past the map count as written.
+[[nodiscard]] inline bool Nx2MayBeGpuWritten(u64 device_address, u64 size) {
+    if (size == 0) {
+        return false;
+    }
+    const u64 last = (device_address + size - 1) >> Nx2WrittenPageBits;
+    if (last >= g_nx2_gpu_written_pages.size() * 64) {
+        return true;
+    }
+    for (u64 page = device_address >> Nx2WrittenPageBits; page <= last;) {
+        const u64 first_bit = page % 64;
+        const u64 bits = std::min<u64>(64 - first_bit, last - page + 1);
+        const u64 mask = (bits == 64 ? ~u64{0} : (u64{1} << bits) - 1) << first_bit;
+        if ((g_nx2_gpu_written_pages[page / 64].load(std::memory_order_relaxed) & mask) != 0) {
+            return true;
+        }
+        page += bits;
+    }
+    return false;
+}
+
 // NVN2 queues order their command lists with GPU acquires on one word per queue, at the queue's
 // offset in the first page of a two-page GPU-accessible region. The word holds the queue's
 // channel syncpoint value: each of a list's increments is an engine semaphore release at
