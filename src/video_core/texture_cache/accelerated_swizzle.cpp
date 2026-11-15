@@ -40,7 +40,7 @@ BlockLinearSwizzle2DParams MakeBlockLinearSwizzle2DParams(const SwizzleParameter
         .x_shift = GOB_SIZE_SHIFT + block.height + block.depth,
         .block_height = block.height,
         .block_height_mask = (1U << block.height) - 1,
-        .native_tiling = info.native_tiling,
+        .native_tiling = info.native_tiling && !info.maxwell_gobs,
     };
 }
 
@@ -67,7 +67,7 @@ BlockLinearSwizzle3DParams MakeBlockLinearSwizzle3DParams(const SwizzleParameter
         .block_height_mask = (1U << block.height) - 1,
         .block_depth = block.depth,
         .block_depth_mask = (1U << block.depth) - 1,
-        .native_tiling = info.native_tiling,
+        .native_tiling = info.native_tiling && !info.maxwell_gobs,
     };
 }
 
