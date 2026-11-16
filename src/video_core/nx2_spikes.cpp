@@ -644,6 +644,24 @@ void StartFromEnvironment() {
 
 } // Anonymous namespace
 
+// Used by the attribution recorder (nx2_attribution.cpp): its counter deltas are the event counts,
+// and a session turns counting on like a recording does.
+namespace Detail {
+void ReadEventCounts(std::array<u64, static_cast<size_t>(Event::Count)>& counts);
+void SetAttributionCounting(bool on);
+
+void ReadEventCounts(std::array<u64, static_cast<size_t>(Event::Count)>& counts) {
+    const EventTotals totals = ReadEvents();
+    for (size_t i = 0; i < counts.size(); ++i) {
+        counts[i] = totals.count[i];
+    }
+}
+
+void SetAttributionCounting(bool on) {
+    g_counting.fetch_add(on ? 1 : -1, std::memory_order_relaxed);
+}
+} // namespace Detail
+
 bool Enabled() {
     return g_enabled.load(std::memory_order_relaxed);
 }
