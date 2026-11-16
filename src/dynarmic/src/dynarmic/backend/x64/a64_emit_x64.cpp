@@ -15,6 +15,7 @@
 #include <fmt/ostream.h>
 #include "common/assert.h"
 #include "common/common_types.h"
+#include "common/nx2_sampler.h"
 #include "dynarmic/ir/terminal.h"
 #include "dynarmic/mcl/integer_of_size.hpp"
 #include <boost/container/static_vector.hpp>
@@ -64,6 +65,9 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
     GenFastmemFallbacks();
     GenTerminalHandlers();
     code.PreludeComplete();
+    if (Nx2Sampler::GuestTracking()) {
+        Nx2Sampler::NoteJitCode(code.getCode(), code.GetTotalCodeSize());
+    }
     ClearFastDispatchTable();
 
     if (conf.fastmem_pointer.has_value()) {
@@ -166,6 +170,9 @@ finish_this_inst:
     block_ranges.AddRange(range, descriptor);
 
     auto bdesc = RegisterBlock(descriptor, entrypoint, size);
+    if (Nx2Sampler::GuestTracking()) {
+        Nx2Sampler::NoteJitBlock(entrypoint, size, descriptor.PC());
+    }
     code.DisableWriting();
     shared_labels.clear();
     return bdesc;
@@ -173,6 +180,10 @@ finish_this_inst:
 
 void A64EmitX64::ClearCache() {
     EmitX64::ClearCache();
+    if (Nx2Sampler::GuestTracking()) {
+        const u8* const begin = static_cast<const u8*>(code.GetCodeBegin());
+        Nx2Sampler::NoteJitClear(begin, code.getCode<const u8*>() + code.GetTotalCodeSize() - begin);
+    }
     block_ranges.ClearCache();
     ClearFastDispatchTable();
     fastmem_patch_info.clear();

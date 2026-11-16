@@ -6,7 +6,11 @@
 
 #pragma once
 
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <string>
+#include <vector>
 
 namespace Nx2Sampler {
 
@@ -16,7 +20,35 @@ namespace Nx2Sampler {
 // thread is paused about 1000 times a second and its call stack recorded; the counts per
 // function (where the thread is, and everything on its stack) go to EDEN_NX2_SAMPLE_OUT
 // (default nx2_samples.txt). <out>.timeline lists every sample and present with its QPC time.
+// JIT samples are also split by guest block, module and region (see g_track_guest), and
+// CPUCore threads get a "cpu split:" line.
 void StartFromEnvironment();
+
+/// Guest attribution of JIT samples. Set from EDEN_NX2_SAMPLE (or EDEN_NX2_SAMPLE_GUEST=1) before
+/// the first JIT exists; EDEN_NX2_SAMPLE_GUEST=0 turns it off while sampling. While it is set
+/// the JIT reports each code cache, each block it emits and each cache clear, and the report maps
+/// a sampled host address back to the guest block (module+offset) that ran. Unset: no JIT cost.
+inline std::atomic_bool g_track_guest{};
+[[nodiscard]] inline bool GuestTracking() noexcept {
+    return g_track_guest.load(std::memory_order_relaxed);
+}
+
+/// The JIT's code cache [begin, begin+size): blocks and the dispatcher / thunks live in it.
+void NoteJitCode(const void* begin, std::size_t size);
+/// A block of guest code starting at `guest_pc` was emitted at [host, host+size).
+void NoteJitBlock(const void* host, std::size_t size, std::uint64_t guest_pc);
+/// The code cache [begin, begin+size) was cleared: its blocks are gone, the space is reused.
+void NoteJitClear(const void* begin, std::size_t size);
+
+struct GuestModule {
+    std::string name;
+    std::uint64_t base;
+    std::uint64_t end;
+};
+
+/// The loaded guest modules, taken by the core on a JIT thread while the process is alive. The
+/// report only uses this copy; it never reads the loader, the process or guest memory.
+void SetGuestModules(std::vector<GuestModule> modules);
 
 /// Samples the named threads for `seconds` now (blocking), writes the report to `out` (and
 /// the folded stacks to `out`.folded) and returns the report.

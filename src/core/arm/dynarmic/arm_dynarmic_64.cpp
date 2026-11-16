@@ -7,20 +7,26 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
+#include <iterator>
 #include <mutex>
 #include <thread>
+#include <vector>
 #if defined(_M_X64) || defined(__x86_64__)
 #include <immintrin.h>
 #endif
 #include "common/cpu_features.h"
+#include "common/nx2_sampler.h"
 #include "common/settings.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
+#include "core/core.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/loader/loader.h"
 #include "dynarmic/interface/A64/config.h"
 #include "dynarmic/interface/jit_stats.h"
 #include "video_core/nx2_spikes.h"
@@ -434,7 +440,33 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     m_jit.emplace(config);
 }
 
+// Hands the sampler the loaded modules, once per process. Called from a core thread that is about
+// to run guest code, so the process and loader are alive; the sampler's report uses only this copy.
+static void SnapshotGuestModules(System& system) {
+    static std::atomic<const Kernel::KProcess*> snapshot_of{};
+    Kernel::KProcess* const process = system.ApplicationProcess();
+    if (process == nullptr || snapshot_of.exchange(process) == process) {
+        return;
+    }
+    Loader::AppLoader::Modules loaded;
+    if (system.GetAppLoader().ReadNSOModules(loaded) != Loader::ResultStatus::Success) {
+        return;
+    }
+    const auto& page_table = process->GetPageTable().GetBasePageTable();
+    const VAddr code_end = GetInteger(page_table.GetCodeRegionStart()) + page_table.GetCodeRegionSize();
+    std::vector<Nx2Sampler::GuestModule> modules;
+    for (auto it = loaded.begin(); it != loaded.end(); ++it) {
+        const auto next = std::next(it);
+        const VAddr end = next != loaded.end() ? next->first : (std::max<VAddr>)(code_end, it->first + 256_MiB);
+        modules.push_back({it->second, it->first, end});
+    }
+    Nx2Sampler::SetGuestModules(std::move(modules));
+}
+
 HaltReason ArmDynarmic64::RunThread(Kernel::KThread* thread) {
+    if (Nx2Sampler::GuestTracking()) [[unlikely]] {
+        SnapshotGuestModules(m_system);
+    }
     m_jit->ClearExclusiveState();
     return TranslateHaltReason(m_jit->Run());
 }
