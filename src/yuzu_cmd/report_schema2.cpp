@@ -376,6 +376,25 @@ std::string CacheJson(const Envelope::CacheReport& report) {
     return Dump(json);
 }
 
+std::string SessionJson(const RunControl::SessionInfo& session) {
+    Json rejected = Json::object();
+    rejected["malformed"] = session.rejected.malformed;
+    rejected["missing_credentials"] = session.rejected.missing_credentials;
+    rejected["title_mismatch"] = session.rejected.title_mismatch;
+    rejected["nonce_mismatch"] = session.rejected.nonce_mismatch;
+    rejected["refused"] = session.rejected.refused;
+    Json manifest = Json::object();
+    manifest["entries"] = session.manifest.entries;
+    manifest["over_cap"] = session.manifest.over_cap;
+    manifest["duration_ns"] = session.manifest.duration_ns;
+    Json json = Json::object();
+    json["title_id"] = Hex(session.title_id, 16);
+    json["nonce"] = session.nonce != 0 ? Json(Hex(session.nonce, 16)) : Json(nullptr);
+    json["markers_rejected"] = std::move(rejected);
+    json["content_manifest"] = std::move(manifest);
+    return Dump(json);
+}
+
 bool WriteMembers(std::ostream& out, const MembersInput& input) {
     Spikes::AttributionSnapshot snapshot = input.snapshot;
 
@@ -392,7 +411,11 @@ bool WriteMembers(std::ostream& out, const MembersInput& input) {
     snapshot.complete = snapshot.complete && input.run_complete && !input.spool_failed &&
                         lines.has_value() && *lines == snapshot.long_frames;
 
-    out << ",\n  \"startup\": " << StartupJson(snapshot);
+    // The session is a member of startup, spliced in before its closing brace.
+    std::string startup = StartupJson(snapshot);
+    startup.pop_back();
+    startup += ",\"session\":" + SessionJson(input.session) + "}";
+    out << ",\n  \"startup\": " << startup;
     out << ",\n  \"first_120s\": " << First120sJson(snapshot);
     out << ",\n  \"cache\": " << CacheJson(input.cache);
     out << ",\n  \"attribution\": " << AttributionJsonHead(snapshot);

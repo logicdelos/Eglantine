@@ -34,15 +34,27 @@ constexpr std::string_view MarkerResultName(Spikes::MarkerResult result) noexcep
 } // Anonymous namespace
 
 void HandleMarkerLine(std::string_view line) {
-    const std::optional<Spikes::InteractiveMarker> marker =
-        ParseMarkerLine(line, Spikes::NowNs());
-    if (!marker) {
-        LOG_WARNING(Frontend, "Nx2Startup interactive result=malformed (ignored)");
+    const MarkerClassification classification = DispatchMarkerLine(line, Spikes::NowNs());
+    switch (classification.parse) {
+    case MarkerParse::NotMarker:
+        return;
+    case MarkerParse::Valid:
+        break;
+    case MarkerParse::Malformed:
+    case MarkerParse::MissingCredentials:
+    case MarkerParse::TitleMismatch:
+    case MarkerParse::NonceMismatch:
+        LOG_WARNING(Frontend, "Nx2Startup interactive result=rejected reason={}",
+                    MarkerParseName(classification.parse));
         return;
     }
-    const Spikes::MarkerResult result = Spikes::MarkInteractive(*marker);
+    const Spikes::InteractiveMarker& marker = classification.marker;
+    const Spikes::MarkerResult result = Spikes::MarkInteractive(marker);
+    if (result != Spikes::MarkerResult::Accepted) {
+        CountRefusedMarker();
+    }
     LOG_INFO(Frontend, "Nx2Startup interactive scene={} check={} origin={} result={}",
-             marker->scene_id, marker->scene_check_passed ? "pass" : "fail", marker->origin,
+             marker.scene_id, marker.scene_check_passed ? "pass" : "fail", marker.origin,
              MarkerResultName(result));
 }
 

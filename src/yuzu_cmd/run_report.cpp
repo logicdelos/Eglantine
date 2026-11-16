@@ -315,6 +315,7 @@ struct ReportParts {
     std::string base;
     Spikes::AttributionSnapshot snapshot;
     VideoCommon::CacheEnvelope::CacheReport cache;
+    RunControl::SessionInfo session;
 };
 
 ReportParts Document(State& state, Common::RunOutcome::Reason reason, int code,
@@ -369,6 +370,7 @@ ReportParts Document(State& state, Common::RunOutcome::Reason reason, int code,
     parts.base.resize(parts.base.size() - 2); // the newline and brace that close the object
     parts.snapshot = Spikes::ReadAttributionSnapshot();
     parts.cache = VideoCommon::CacheEnvelope::ReadCacheReport();
+    parts.session = RunControl::ReadSession();
     return parts;
 }
 
@@ -408,6 +410,7 @@ bool WriteReportFile(State& state, const ReportParts& parts, bool shutdown_compl
         const Schema2::MembersInput members{
             .snapshot = parts.snapshot,
             .cache = parts.cache,
+            .session = parts.session,
             .spool = spool.is_open() ? &spool : nullptr,
             .run_complete = shutdown_complete,
             .spool_failed = state.spool_failed || (!state.spool_path.empty() && !spool.is_open()),

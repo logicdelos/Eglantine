@@ -25,7 +25,7 @@ void EmuThread::run() {
     auto& gpu = QtCommon::system->GPU();
     auto stop_token = m_stop_source.get_token();
 
-    // Attribution (EGLANTINE_ATTRIBUTION=0 turns it off) runs for the life of this thread.
+    // Attribution (EDEN_NX2_ATTRIBUTION=0 turns it off) runs for the life of this thread.
     const bool attribution =
         RunControl::AttributionRequested() && VideoCommon::Nx2Spikes::BeginSession({});
     if (attribution) {

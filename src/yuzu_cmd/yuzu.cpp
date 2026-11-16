@@ -486,6 +486,14 @@ static bool BuildWarm(Core::System& system, int argc, char** argv) {
                    progress.done, progress.total);
         std::fflush(stdout);
     };
+    // The identity of the title being built, not of whatever stamped the process before: the
+    // game file and the add-on option are all an offline build sees (it has no update, DLC or
+    // mods), and it is the content stamp the later launch compares.
+    RunControl::HostIdentitySource identity_source;
+    identity_source.title_id = title_id;
+    identity_source.game_path = std::filesystem::path{Common::FS::ToU8String(argv[2])};
+    identity_source.warm_addons = RunControl::WarmAddonsOption();
+    VideoCommon::CacheEnvelope::SetHostIdentity(RunControl::AssembleHostIdentity(identity_source));
     const auto result = ShaderWarm::BuildWarmFilesWith(
         system, Common::FS::ToU8String(argv[2]), title_id, options, on_progress, {});
     // The error can hold a Windows path: escape it so the summary stays valid JSON.
@@ -527,7 +535,7 @@ static bool BuildWarm(Core::System& system, int argc, char** argv) {
 extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     // The first thing: the creation time of the process is mapped onto the attribution clock.
     const std::optional<RunControl::ProcessCreation> process_created =
-        RunControl::CaptureProcessCreation();
+        RunControl::AttributionRequested() ? RunControl::CaptureProcessCreation() : std::nullopt;
     Nx2Sampler::StartFromEnvironment();
     // SDL calls SDL_AppIterate back to back by default, which kept a host core at 100% polling
     // input; 240 Hz is plenty for input and the key script.
@@ -929,8 +937,9 @@ double Nx2KeyClockSeconds(); // emu_window_sdl3.cpp
 // control (tools/nx2/lab_ctl.py press). One entry per line: "<code>" press, "-<code>" release,
 // "<code> <milliseconds>" press and release after that long, "gpu low|high", or "quit" (orderly
 // shutdown, so the reports written at shutdown reach the log). Codes are SDL scancodes.
-// "interactive <scene_id> <pass|fail> [<origin>]": the lab saw the reference scene respond; the
-// time of the line's reading is the interactive marker of the run (yuzu_cmd/run_control.h).
+// "interactive <scene_id> <pass|fail> <title16hex> <nonce16hex> [<origin>]": the lab saw the
+// reference scene respond; title and nonce are those of <dir>/session.txt, and the time of the
+// line's reading is the interactive marker of the run (yuzu_cmd/run_control.h).
 static void RunLiveKeys(InputCommon::InputSubsystem& input_subsystem, Core::System& system) {
     static const std::filesystem::path file = [] {
         const char* dir = std::getenv("EDEN_NX2_DIAG_DIR");
@@ -963,7 +972,8 @@ static void RunLiveKeys(InputCommon::InputSubsystem& input_subsystem, Core::Syst
     std::ifstream in{taken};
     std::string line;
     while (std::getline(in, line)) {
-        if (line.starts_with(RunControl::MarkerKeyword)) {
+        // Leading blanks and a CR (a file written on Windows) must not hide a marker.
+        if (RunControl::IsMarkerLine(line)) {
             RunControl::HandleMarkerLine(line);
             continue;
         }
