@@ -303,6 +303,17 @@ inline constexpr std::array<std::string_view, static_cast<size_t>(Event::Count)>
 using WorkId = u64;
 [[nodiscard]] WorkId NewWorkId();
 
+/// Kinds of derived work ids, for waits and the spans they wait for that share an identity both
+/// sides already know instead of a stored NewWorkId.
+enum class WorkKind : u64 { GraphicsPipelineBuild = 1, ComputePipelineBuild = 2, Submission = 3 };
+
+/// A WorkId computed from an identity both sides know (pipeline key hash, submission tick). The
+/// kind sits in the top 3 bits, so it never equals 0 and never meets a NewWorkId value (NewWorkId
+/// counts up from 1 and stays below 2^61).
+[[nodiscard]] constexpr WorkId DerivedWorkId(WorkKind kind, u64 identity) noexcept {
+    return (static_cast<u64>(kind) << 61) | (identity & ((u64{1} << 61) - 1));
+}
+
 /// Names one span for EndSpan and LinkWait. Valid until the session ends; a token of an earlier
 /// session generation is ignored.
 struct SpanToken {
@@ -514,6 +525,11 @@ private:
 /// (QualifiesAsHostPresent), 0 otherwise; a non-qualifying attempt is only counted (and keeps
 /// the interval open, it never ends or starts one).
 u64 OnHostPresent(const FrameBoundary& boundary);
+
+/// ORs UnknownReason bits into the frame that is open now (counted against its unknown time and
+/// reported in unknown_reasons); a no-op without a session or an open frame. Used where a cause
+/// cannot be measured, for example MissingGpuTimestamp for GPU work without timestamp queries.
+void NoteUnknownReason(u32 unknown_reason_bits);
 
 /// A cold-start phase of the frontend (the startup.phases list of the report).
 enum class BootPhase : u8 {
