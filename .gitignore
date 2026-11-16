@@ -6,6 +6,7 @@
 
 # Build directory
 /[Bb]uild*/
+/build-*.log
 doc-build/
 out/
 !/src/audio_core/out/
