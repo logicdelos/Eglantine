@@ -278,9 +278,25 @@ public:
     void Unmap(size_t virtual_offset, size_t length) {
         std::scoped_lock lock{placeholder_mutex};
 
+        // Odd while views are being taken apart and put back, see Protect.
+        if (ProtectWithoutLockEnabled()) {
+            unmap_generation.fetch_add(1, std::memory_order_seq_cst);
+        }
         // Unmap until there are no more placeholders
         while (UnmapOnePlaceholder(virtual_offset, length)) {
         }
+        if (ProtectWithoutLockEnabled()) {
+            unmap_generation.fetch_add(1, std::memory_order_seq_cst);
+        }
+    }
+
+    /// EDEN_NX2_PROTECT_NO_LOCK=1, read once.
+    static bool ProtectWithoutLockEnabled() {
+        static const bool enabled = [] {
+            const char* const value = std::getenv("EDEN_NX2_PROTECT_NO_LOCK");
+            return value != nullptr && value[0] == '1';
+        }();
+        return enabled;
     }
 
     void Protect(size_t virtual_offset, size_t length, bool read, bool write, bool execute) {
@@ -296,6 +312,32 @@ public:
         }
         const size_t virtual_end = virtual_offset + length;
 
+        // EDEN_NX2_PROTECT_NO_LOCK=1: try the whole range without the lock first. Nearly every
+        // call protects a range inside one mapped view, which VirtualProtect does whole. It
+        // refuses a range that reaches a placeholder or a second view (one Map or Unmap is making
+        // or taking apart, or a range across views): those take the lock below, which gives the
+        // whole range the same flags. Map and Unmap hold the lock across their kernel calls,
+        // which slow down when a game maps memory in bulk (zone changes): write-trap protections,
+        // thousands a second, then queued behind them.
+        //
+        // A partial Unmap takes the whole view away and maps the parts that stay again as
+        // read-write, so a protection applied meanwhile to one of those parts would be lost
+        // although VirtualProtect succeeded. Unmap makes unmap_generation odd for as long as it
+        // works: an attempt only counts when the generation was even before it and the same after
+        // it, otherwise the protection is applied again under the lock, after the Unmap, as it
+        // would have been without the switch. Nothing outside this class orders Protect against
+        // Map or Unmap (Memory::UnmapRegion and Memory::RasterizerMarkRegionCached share no lock).
+        if (ProtectWithoutLockEnabled()) {
+            const u32 before = unmap_generation.load(std::memory_order_seq_cst);
+            if ((before & 1) == 0) {
+                DWORD old_flags{};
+                if (VirtualProtect(virtual_base + virtual_offset, length, new_flags, &old_flags) &&
+                    unmap_generation.load(std::memory_order_seq_cst) == before) {
+                    return;
+                }
+            }
+        }
+
         std::scoped_lock lock{placeholder_mutex};
         auto [it, end] = placeholders.equal_range({virtual_offset, virtual_end});
         while (it != end) {
@@ -308,6 +350,8 @@ public:
             ++it;
         }
     }
+
+    std::atomic<u32> unmap_generation{}; ///< Even: no Unmap is working (EDEN_NX2_PROTECT_NO_LOCK)
 
     /// Backing offset the view page at virtual_offset maps, or nullopt when it is not mapped.
     std::optional<size_t> BackingOffset(size_t virtual_offset) {
