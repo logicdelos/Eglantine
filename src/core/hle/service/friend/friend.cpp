@@ -669,6 +669,7 @@ private:
     }
 
     void OpenStubObject(HLERequestContext& ctx) {
+        CountPlaceholderReply(ctx, "OpenStubObject");
         static constexpr std::array<const char*, 2> names{
             "nx2:chat:IVirtualCameraShimScopedObject",
             "nx2:chat:IUserSelectiveTalkShimScopedObject",

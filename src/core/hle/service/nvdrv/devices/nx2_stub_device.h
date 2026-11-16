@@ -19,6 +19,7 @@
 
 #include "common/logging.h"
 #include "core/hle/service/nvdrv/devices/nvdevice.h"
+#include "core/hle/service/unimplemented_registry.h"
 
 namespace Service::Nvidia::Devices {
 
@@ -28,6 +29,7 @@ inline std::atomic<bool> g_nx2_driver{false};
 
 inline NvResult Nx2UnknownIoctl(const char* device, Ioctl command, std::span<const u8> input,
                                 std::span<u8> output) {
+    RecordPlaceholderReply(device, command.raw, false, "Nx2UnknownIoctl");
     LOG_WARNING(Service_NVDRV, "(STUBBED) Switch 2 {} ioctl={:08X} group={:01X} command={:02X} in={:#x}",
                 device, command.raw, command.group, command.cmd, input.size());
     std::fill(output.begin(), output.end(), u8{0});
@@ -317,6 +319,7 @@ public:
     }
 
     void OnOpen(NvCore::SessionId session_id, DeviceFD fd) override {
+        RecordPlaceholderReply(name, 0, false, "nx2_stub_device::OnOpen");
         LOG_WARNING(Service_NVDRV, "(STUBBED) {} opened as fd {}", name, fd);
     }
     void OnClose(DeviceFD fd) override {}
@@ -324,6 +327,7 @@ public:
 private:
     NvResult Stub(DeviceFD fd, Ioctl command, std::span<const u8> input, std::span<u8> output,
                   std::span<u8> inline_output) {
+        RecordPlaceholderReply(name, command.raw, false, "nx2_stub_device::Stub");
         LOG_WARNING(Service_NVDRV, "(STUBBED) {} fd={} ioctl={:08X} group={:01X} command={:02X} in={:#x}",
                     name, fd, command.raw, command.group, command.cmd, input.size());
         // Echo the input (in/out ioctls keep their fields), zero the rest.

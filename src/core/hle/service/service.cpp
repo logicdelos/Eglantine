@@ -82,19 +82,135 @@ void PushStubZeroes(IPC::ResponseBuilder& rb) {
     }
 }
 
+/// Backing store of the placeholder-reply census. One row per (service, command, TIPC/HIPC, reply
+/// helper); calls come from every service thread, so the counters sit behind one mutex. Strings
+/// are copied on a row's first call only, the lookup of an existing row allocates nothing.
+struct PlaceholderView {
+    std::string_view service;
+    u32 command;
+    bool tipc;
+    std::string_view helper;
+};
+
+struct PlaceholderKey {
+    std::string service;
+    u32 command;
+    bool tipc;
+    std::string helper;
+};
+
+PlaceholderView ViewOf(const PlaceholderKey& key) {
+    return {key.service, key.command, key.tipc, key.helper};
+}
+
+PlaceholderView ViewOf(const PlaceholderView& view) {
+    return view;
+}
+
+struct PlaceholderLess {
+    using is_transparent = void;
+    template <typename A, typename B>
+    bool operator()(const A& a, const B& b) const {
+        const auto x = ViewOf(a);
+        const auto y = ViewOf(b);
+        return std::tie(x.service, x.command, x.tipc, x.helper) <
+               std::tie(y.service, y.command, y.tipc, y.helper);
+    }
+};
+
+struct PlaceholderCount {
+    u64 count{};
+    std::string name; ///< Handler name from the service's table, empty if it has none.
+};
+
+struct PlaceholderRegistry {
+    std::mutex mutex;
+    std::map<PlaceholderKey, PlaceholderCount, PlaceholderLess> rows;
+};
+
+PlaceholderRegistry& PlaceholderRows() {
+    static PlaceholderRegistry registry;
+    return registry;
+}
+
+/// Counts one placeholder reply; name_of() is only called when the row is new. True on a row's
+/// first call.
+template <typename NameFn>
+bool CountPlaceholder(const PlaceholderView& view, NameFn&& name_of) {
+    auto& registry = PlaceholderRows();
+    std::scoped_lock lk{registry.mutex};
+    if (const auto it = registry.rows.find(view); it != registry.rows.end()) {
+        ++it->second.count;
+        return false;
+    }
+    const std::string_view name = name_of();
+    registry.rows.emplace(PlaceholderKey{std::string{view.service}, view.command, view.tipc,
+                                         std::string{view.helper}},
+                          PlaceholderCount{1, std::string{name}});
+    return true;
+}
+
+void LogPlaceholderReplyCounts() {
+    constexpr size_t MaxEntries = 60;
+    struct Row {
+        PlaceholderKey key;
+        PlaceholderCount value;
+    };
+    std::vector<Row> rows;
+    {
+        auto& registry = PlaceholderRows();
+        std::scoped_lock lk{registry.mutex};
+        rows.reserve(registry.rows.size());
+        for (const auto& [key, value] : registry.rows) {
+            rows.push_back({key, value});
+        }
+    }
+    if (rows.empty()) {
+        LOG_INFO(Service, "Placeholder replies at shutdown: none");
+        return;
+    }
+    std::ranges::stable_sort(rows, [](const Row& a, const Row& b) { return a.value.count > b.value.count; });
+    const size_t shown = (std::min)(rows.size(), MaxEntries);
+    std::string text;
+    for (size_t i = 0; i < shown; ++i) {
+        const auto& [key, value] = rows[i];
+        fmt::format_to(std::back_inserter(text), "{}{}::{}{}{}{} x{} ({}{})", i == 0 ? "" : ", ",
+                       key.service, key.command, value.name.empty() ? "" : "[", value.name,
+                       value.name.empty() ? "" : "]", value.count, key.helper,
+                       key.tipc ? ", tipc" : "");
+    }
+    if (shown < rows.size()) {
+        fmt::format_to(std::back_inserter(text), ", +{} more", rows.size() - shown);
+    }
+    LOG_INFO(Service, "Placeholder replies at shutdown: {}", text);
+}
+
 } // namespace
 
-bool ServiceFrameworkBase::StubAllowed(HLERequestContext& ctx) {
+bool RecordPlaceholderReply(std::string_view service, u32 command, bool tipc,
+                            std::string_view helper, std::string_view name) {
+    return CountPlaceholder(PlaceholderView{service, command, tipc, helper}, [&] { return name; });
+}
+
+bool ServiceFrameworkBase::CountPlaceholderReply(HLERequestContext& ctx, const char* helper) {
+    const u32 command = ctx.GetCommand();
+    const bool tipc = ctx.IsTipc();
+    return CountPlaceholder(PlaceholderView{service_name, command, tipc, helper}, [&] {
+        const auto& table = tipc ? handlers_tipc : handlers;
+        const auto it = table.find(command);
+        return it == table.end() || it->second.name == nullptr ? std::string_view{}
+                                                               : std::string_view{it->second.name};
+    });
+}
+
+bool ServiceFrameworkBase::StubAllowed(HLERequestContext& ctx, const char* helper) {
     static const bool env_auto_stub = std::getenv("EDEN_NX2_AUTO_STUB") != nullptr;
     const auto* const caller = ctx.GetThread().GetOwnerProcess();
     if (Settings::values.use_auto_stub || env_auto_stub ||
         std::string_view{service_name}.starts_with(Nx2StubPrefix) ||
         (caller != nullptr && caller->IsSwitch2())) {
-        // Logged once per command: these are still unimplemented.
-        static std::mutex mutex;
-        static std::set<std::pair<std::string_view, u32>> logged;
-        std::scoped_lock lk{mutex};
-        if (logged.emplace(service_name, ctx.GetCommand()).second) {
+        // Every reply is counted for the shutdown census; the log line comes once per row.
+        if (CountPlaceholderReply(ctx, helper)) {
             LOG_WARNING(Service, "(STUBBED) {}::{} (placeholder reply)", service_name, ctx.GetCommand());
         }
         return true;
@@ -106,7 +222,7 @@ bool ServiceFrameworkBase::StubAllowed(HLERequestContext& ctx) {
 }
 
 void ServiceFrameworkBase::StubReplyZeroed(HLERequestContext& ctx) {
-    if (!StubAllowed(ctx)) {
+    if (!StubAllowed(ctx, "StubReplyZeroed")) {
         return;
     }
     IPC::ResponseBuilder rb{ctx, 2 + StubZeroedWords};
@@ -115,7 +231,7 @@ void ServiceFrameworkBase::StubReplyZeroed(HLERequestContext& ctx) {
 }
 
 void ServiceFrameworkBase::StubReplyEvent(HLERequestContext& ctx) {
-    if (!StubAllowed(ctx)) {
+    if (!StubAllowed(ctx, "StubReplyEvent")) {
         return;
     }
     if (!stub_event) {
@@ -129,7 +245,7 @@ void ServiceFrameworkBase::StubReplyEvent(HLERequestContext& ctx) {
 }
 
 void ServiceFrameworkBase::StubReplyInterface(HLERequestContext& ctx) {
-    if (!StubAllowed(ctx)) {
+    if (!StubAllowed(ctx, "StubReplyInterface")) {
         return;
     }
     ReturnNx2StubInterface(system, ctx, service_name);
@@ -450,6 +566,8 @@ void LogUnimplementedCommandCounts() {
     constexpr size_t MaxEntries = 60;
     auto records = GetUnimplementedCommands();
     if (records.empty()) {
+        LOG_INFO(Service, "Unimplemented command call counts at shutdown: none called");
+        LogPlaceholderReplyCounts();
         return;
     }
     std::ranges::stable_sort(records, [](const auto& a, const auto& b) { return a.count > b.count; });
@@ -476,6 +594,7 @@ void LogUnimplementedCommandCounts() {
         text.pop_back();
         LOG_INFO(Service, "  {}:{}", service, text);
     }
+    LogPlaceholderReplyCounts();
 }
 
 } // namespace Service

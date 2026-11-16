@@ -71,6 +71,7 @@ Result IApplicationProxy::GetGraphicsScalingParametersFunctions(
 }
 
 void IApplicationProxy::GetNx2Interface(HLERequestContext& ctx) {
+    CountPlaceholderReply(ctx, "GetNx2Interface");
     ReturnNx2StubInterface(system, ctx, "IApplicationProxy");
 }
 

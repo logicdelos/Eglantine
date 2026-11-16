@@ -145,6 +145,7 @@ NvResult nvhost_ctrl_gpu::Ioctl3(DeviceFD fd, Ioctl command, std::span<const u8>
     if (nx2_caller) {
         // Switch 2 NvRm uses ioctls Switch 1 never had; answer them with a zeroed success so
         // device setup can continue, and log each one.
+        RecordPlaceholderReply("nvhost-ctrl-gpu", command.raw, false, "Nx2UnknownIoctl");
         LOG_WARNING(Service_NVDRV, "(STUBBED) Switch 2 ioctl={:08X} group={:01X} command={:01X}",
                     command.raw, command.group, command.cmd);
         std::fill(output.begin(), output.end(), u8{0});

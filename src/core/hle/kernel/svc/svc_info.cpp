@@ -17,8 +17,14 @@
 #include "core/hle/kernel/svc.h"
 #include "core/hle/kernel/svc_results.h"
 #include "core/hle/kernel/svc_version.h"
+#include "core/hle/service/unimplemented_registry.h"
 
 namespace Kernel::Svc {
+
+/// Counts a made-up GetInfo answer for the "Placeholder replies at shutdown" line.
+static void CountPlaceholderInfo(InfoType type, std::string_view name) {
+    Service::RecordPlaceholderReply("svc", u32(type), false, "GetInfo", name);
+}
 
 /// Gets system/memory information for the current process
 Result GetInfo(Core::System& system, u64* result, InfoType info_id_type, Handle handle, u64 info_sub_id) {
@@ -88,6 +94,9 @@ Result GetInfo(Core::System& system, u64* result, InfoType info_id_type, Handle 
                           : half;
             LOG_WARNING(Kernel_SVC, "(STUBBED) Switch 2 InfoType {}, returning {:#x}",
                         static_cast<u32>(info_id_type), *result);
+            CountPlaceholderInfo(info_id_type, info_id_type == InfoType::Nx2RegionAddress
+                                                   ? "RemoteRegionAddress"
+                                                   : "RemoteRegionSize");
             R_SUCCEED();
         }
         case InfoType::Nx2RemoteMemorySize:
@@ -104,6 +113,7 @@ Result GetInfo(Core::System& system, u64* result, InfoType info_id_type, Handle 
             // VAMM maps one granule up front. 4 KiB matches what Switch 1 kernels use.
             *result = Core::Memory::YUZU_PAGESIZE;
             LOG_WARNING(Kernel_SVC, "(STUBBED) Switch 2 InfoType 33, returning {:#x}", *result);
+            CountPlaceholderInfo(info_id_type, "Nx2VammSize");
             R_SUCCEED();
         case InfoType::AslrRegionAddress:
             *result = GetInteger(process->GetPageTable().GetAliasCodeRegionStart());
@@ -253,6 +263,9 @@ Result GetInfo(Core::System& system, u64* result, InfoType info_id_type, Handle 
     case InfoType::Unknown38: {
         LOG_WARNING(Kernel_SVC, "(STUBBED) called, info_id={:#x}, info_sub_id={:#x}, handle={:#08x}",
                     info_id, info_sub_id, handle);
+        CountPlaceholderInfo(info_id_type, info_id_type == InfoType::ShadowStackRegionAddress
+                                               ? "ShadowStackRegionAddress"
+                                               : "ShadowStackRegionSize");
         *result = 0;
         R_SUCCEED();
     }

@@ -96,9 +96,15 @@ protected:
     void StubReplyEvent(HLERequestContext& ctx);
     void StubReplyInterface(HLERequestContext& ctx);
 
+    /// Counts one placeholder reply of this service in the shutdown census (see
+    /// LogUnimplementedCommandCounts), for handlers that answer a title with made-up data. helper
+    /// names the reply routine and must be a string literal. True on the first call of a row.
+    bool CountPlaceholderReply(HLERequestContext& ctx, const char* helper);
+
 private:
-    /// False (after reporting the command as unimplemented) for callers the stubs don't serve.
-    bool StubAllowed(HLERequestContext& ctx);
+    /// False (after reporting the command as unimplemented) for callers the stubs don't serve;
+    /// otherwise counts the reply under helper.
+    bool StubAllowed(HLERequestContext& ctx, const char* helper);
 
     /// Event handed out by StubReplyEvent, created on first use.
     Kernel::KEvent* stub_event{};

@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "common/common_types.h"
@@ -44,7 +45,16 @@ inline std::atomic<UnimplementedHook> g_unimplemented_hook{nullptr};
 std::vector<UnimplementedCommandRecord> GetUnimplementedCommands();
 /// Drops all records (thread-safe), so the next call of each command counts as first seen again.
 void ClearUnimplementedCommands();
-/// Logs the per-command call counts (busiest first, at most 60 commands) once. Called at shutdown.
+/// Logs the per-command call counts (busiest first, at most 60 commands) once, then the placeholder
+/// reply counts (RecordPlaceholderReply, StubReply*) on a second line. Called at shutdown.
 void LogUnimplementedCommandCounts();
+
+/// Counts one reply the emulator made up for a title (a placeholder, not an implementation) for the
+/// shutdown census, keyed by service, command, TIPC/HIPC and helper (a string naming the routine).
+/// Thread-safe, allocation-free after a row's first call. Handlers of a ServiceFramework use
+/// CountPlaceholderReply instead. name is the command's handler name, if known. True on the first
+/// call of a row.
+bool RecordPlaceholderReply(std::string_view service, u32 command, bool tipc,
+                            std::string_view helper, std::string_view name = {});
 
 } // namespace Service

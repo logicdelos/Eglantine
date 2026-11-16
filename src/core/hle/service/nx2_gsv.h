@@ -237,6 +237,7 @@ private:
     }
 
     void GetCount(HLERequestContext& ctx) {
+        CountPlaceholderReply(ctx, "SyncptGetCount");
         LOG_WARNING(Service, "(STUBBED) nx2:syncpt TIPC 1, returning 32");
         TipcReplyWords(ctx, {32});
     }
@@ -252,6 +253,7 @@ private:
     }
 
     void GetSlotEvent(HLERequestContext& ctx) {
+        CountPlaceholderReply(ctx, "SyncptGetSlotEvent");
         const u32 slot = ctx.CommandBuffer()[2];
         LOG_WARNING(Service, "(STUBBED) nx2:syncpt TIPC 22 slot={:#x}, returning an event", slot);
         auto*& event = m_events[slot];
@@ -439,11 +441,13 @@ private:
     }
 
     void GetIdRange(HLERequestContext& ctx) {
+        CountPlaceholderReply(ctx, "GpuGetIdRange");
         LOG_WARNING(Service, "(STUBBED) nx2:gpu TIPC 11, returning [0, {}]", NumIds - 1);
         TipcReplyWords(ctx, {0, NumIds - 1});
     }
 
     void GetIdEvent(HLERequestContext& ctx) {
+        CountPlaceholderReply(ctx, "GpuGetIdEvent");
         const u32 id = ctx.CommandBuffer()[2];
         LOG_WARNING(Service, "(STUBBED) nx2:gpu TIPC 12 id={}", id);
         IPC::ResponseBuilder rb{ctx, 2, 1, 0};
@@ -452,6 +456,7 @@ private:
     }
 
     void Start(HLERequestContext& ctx) {
+        CountPlaceholderReply(ctx, "GpuStart");
         const u32 id = ctx.CommandBuffer()[2];
         LOG_WARNING(Service, "(STUBBED) nx2:gpu TIPC 21 id={}, signalling completion", id);
         EventFor(id)->Signal(system.Kernel());
@@ -460,6 +465,7 @@ private:
     }
 
     void GetCount33(HLERequestContext& ctx) {
+        CountPlaceholderReply(ctx, "GpuGetCount33");
         LOG_WARNING(Service, "(STUBBED) nx2:gpu TIPC 33 [2]={:#x}, returning 1", ctx.CommandBuffer()[2]);
         TipcReplyWords(ctx, {1});
     }
@@ -469,6 +475,7 @@ private:
     // (nn::gpu::sdk::util::ExecuteVirtualMachineAllocSpace). NVN reserves fixed VA from 0x8000000
     // up to 512 GiB, so report the same range NvRm gives AllocAsEx: [0x8000000, 0xC000000000).
     void GetVaRange(HLERequestContext& ctx) {
+        CountPlaceholderReply(ctx, "GpuGetVaRange");
         LOG_WARNING(Service, "(STUBBED) nx2:gpu TIPC 203 [2]={:#x}", ctx.CommandBuffer()[2]);
         constexpr u64 kind = 1;
         constexpr u64 start = 0x8000000ULL;
@@ -482,6 +489,7 @@ private:
     // two u64s each, stored as the partition's min/max. The user value works whether it is read
     // as (start, size) or (min, max). Title 4 never needed the gsv partition, so it stays empty.
     void GetUserPartition(HLERequestContext& ctx) {
+        CountPlaceholderReply(ctx, "GpuGetUserPartition");
         LOG_WARNING(Service, "(STUBBED) nx2:gpu TIPC 201 [2]={:#x}", ctx.CommandBuffer()[2]);
         constexpr u64 first = 0x8000000ULL;
         constexpr u64 second = 0xC000000000ULL - first;
@@ -492,6 +500,7 @@ private:
     // An empty partition is min = ~0, max = 0 (min > max). Fire Emblem: Fortune's Weave's SDK
     // reads (0, 0) as a one-byte partition at address 0 and aborts in nn::gpu::sdk.
     void GetGsvPartition(HLERequestContext& ctx) {
+        CountPlaceholderReply(ctx, "GpuGetGsvPartition");
         LOG_WARNING(Service, "(STUBBED) nx2:gpu TIPC 202 [2]={:#x}, empty", ctx.CommandBuffer()[2]);
         TipcReplyWords(ctx, {~0U, ~0U, 0, 0});
     }
@@ -557,6 +566,7 @@ private:
     // Jobs that complete through a job-slot event (word Slot of the request), like 211.
     template <size_t Slot>
     void SubSlotJob(HLERequestContext& ctx) {
+        CountPlaceholderReply(ctx, "GpuSubSlotJob");
         const auto* w = ctx.CommandBuffer();
         LOG_DEBUG(Service, "(STUBBED) nx2:gpu {} words {:08x} slot={}", ctx.GetCommand(),
                  fmt::join(std::span<const u32>{w + 2, 18}, " "), w[Slot]);
@@ -1645,11 +1655,13 @@ public:
 
 private:
     void GetEventId(HLERequestContext& ctx) {
+        CountPlaceholderReply(ctx, "ChatGsvGetEventId");
         LOG_WARNING(Service, "(STUBBED) nx2:chat:gsv TIPC 1, returning id 0");
         TipcReplyWords(ctx, {0});
     }
 
     void GetEvent(HLERequestContext& ctx) {
+        CountPlaceholderReply(ctx, "ChatGsvGetEvent");
         const u32 id = ctx.CommandBuffer()[2];
         LOG_WARNING(Service, "(STUBBED) nx2:chat:gsv TIPC 11 id={}, returning an event", id);
         auto*& event = m_events[id];
@@ -1681,6 +1693,7 @@ public:
 
 private:
     void Stub(HLERequestContext& ctx) {
+        CountPlaceholderReply(ctx, "CameraStub");
         const u32 command = ctx.GetCommand();
         if (m_logged.insert(command).second) {
             LOG_WARNING(Service, "(STUBBED) nx2:camera TIPC {} [2]={:#x} [3]={:#x}, returning success",
@@ -2768,6 +2781,7 @@ private:
     }
 
     void ReturnOne(HLERequestContext& ctx) {
+        CountPlaceholderReply(ctx, "Vi2ReturnOne");
         LOG_WARNING(Service, "(STUBBED) nx2:vi2 TIPC {}, returning 1", ctx.GetCommand());
         TipcReplyWords(ctx, {1});
     }
@@ -2797,11 +2811,13 @@ private:
 
     // Must be < 8; nn::vi::detail::LayerHistory creates 7 timestamp recorders per layer.
     void GetTimestampRecorderCount(HLERequestContext& ctx) {
+        CountPlaceholderReply(ctx, "Vi2GetTimestampRecorderCount");
         LOG_WARNING(Service, "(STUBBED) nx2:vi2 TIPC 5, returning 7");
         TipcReplyWords(ctx, {7});
     }
 
     void ReturnEvent(HLERequestContext& ctx) {
+        CountPlaceholderReply(ctx, "Vi2ReturnEvent");
         LOG_WARNING(Service, "(STUBBED) nx2:vi2 TIPC {} [2]={:#x} [3]={:#x}, returning an event",
                     ctx.GetCommand(), ctx.CommandBuffer()[2], ctx.CommandBuffer()[3]);
         auto* event = m_context.CreateEvent(fmt::format("nx2:vi2:Event{}", m_events.size()));
@@ -3920,6 +3936,7 @@ private:
     }
 
     void Stub(HLERequestContext& ctx) {
+        CountPlaceholderReply(ctx, "GsvStub");
         const auto* cmd_buf = ctx.CommandBuffer();
         LOG_WARNING(Service, "(STUBBED) nx2:gsv TIPC {} [2]={:#x} [3]={:#x} [4]={:#x} [5]={:#x}",
                     ctx.GetCommand(), cmd_buf[2], cmd_buf[3], cmd_buf[4], cmd_buf[5]);
