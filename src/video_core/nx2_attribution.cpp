@@ -67,6 +67,7 @@ constexpr size_t MaxThreads = 32;
 constexpr size_t MaxPhases = 64;
 constexpr size_t MaxQueueItems = 4096;
 constexpr size_t MaxPendingLinks = 4096;
+constexpr size_t MaxPendingEnds = 4096;
 constexpr size_t MaxLossEpisodes = 1024;
 constexpr size_t MaxCumulative = 32768;
 constexpr size_t MaxWaitChain = 6;
@@ -118,16 +119,18 @@ struct ThreadBuf {
     alignas(64) std::atomic<u32> busy{};
     std::atomic<u32> open_count{};
     std::atomic<u64> lost{};
-    std::mutex loss_mutex; ///< Only the overflow path and the consumer's take take it
-    bool loss_any{};
-    u64 loss_begin{};
-    u64 loss_end{};
+    // Overflow range [min, max] of the events this thread could not record. Only the owning thread
+    // writes it (compare-exchange, no lock); the consumer takes it with exchange.
+    std::atomic<u64> loss_min{OpenEnd};
+    std::atomic<u64> loss_max{0};
 };
 
 /// One item for the consumer: a host present or an accepted marker.
 struct Item {
     bool marker{};
     u64 id{};
+    u64 prev_id{}; ///< The qualifying present before this one (0 for the first), dropped or not
+    u64 prev_ts{};
     u64 guest_frame_id{};
     u64 ts{};
     u32 root{}; ///< Registration id of the presenting thread
@@ -164,6 +167,15 @@ struct PendingLink {
     u32 attempts{};
 };
 
+/// A cross-thread End whose Begin has not been ingested yet.
+struct PendingEnd {
+    u32 owner{};
+    u64 seq{};
+    u64 end_ns{};
+    u64 amount{};
+    u32 flags{};
+};
+
 struct Leaf {
     u64 t0{};
     u64 t1{};
@@ -173,6 +185,11 @@ struct Leaf {
     u32 thread{};
     u64 span_end{};
 };
+
+/// What one retained span costs against SessionConfig::buffer_bytes: its record (a vector may hold
+/// twice what it uses) and the resolver's copies of it while a frame is decomposed (leaves and the
+/// sweep events), so rings plus history stay inside the one budget.
+constexpr size_t HistoryBytesPerSpan = 2 * sizeof(SpanRec) + 2 * sizeof(Leaf) + 48;
 
 struct Decomp {
     CauseTimes cause{};
@@ -489,6 +506,8 @@ struct Session {
     std::mutex queue_mutex;
     std::condition_variable queue_cv;
     std::deque<Item> queue;
+    u64 last_actual_ts{}; ///< Under queue_mutex: the last qualifying present, kept or dropped
+    u64 last_actual_id{};
     bool stop{};
     std::atomic<bool> abandon{};
     std::thread consumer;
@@ -506,6 +525,7 @@ struct Session {
     // Consumer-owned
     std::array<ThreadState, MaxThreads> states;
     std::vector<PendingLink> pending_links;
+    std::vector<PendingEnd> pending_ends;
     std::vector<std::pair<u64, u64>> losses;
     size_t history{};
     size_t history_cap{};
@@ -532,6 +552,10 @@ struct Session {
     void DrainAll();
     void DrainThread(u32 id, ThreadBuf& buf);
     void ApplyLinks();
+    bool CloseSpan(const PendingEnd& end);
+    void ApplyEnds();
+    void DropPendingEnds();
+    void SkipLostInterval(u64 until);
     void TakeLosses();
     void AddLoss(u64 begin, u64 end);
     void Quiesce();
@@ -617,14 +641,13 @@ bool Push(ThreadBuf& t, const RingEvent& event, u64 reserve) {
 
 void NoteLoss(ThreadBuf& t, u64 begin, u64 end) {
     t.lost.fetch_add(1, std::memory_order_relaxed);
-    std::scoped_lock lock{t.loss_mutex};
-    if (!t.loss_any) {
-        t.loss_any = true;
-        t.loss_begin = begin;
-        t.loss_end = end;
-    } else {
-        t.loss_begin = std::min(t.loss_begin, begin);
-        t.loss_end = std::max(t.loss_end, end);
+    u64 current = t.loss_min.load(std::memory_order_relaxed);
+    while (begin < current &&
+           !t.loss_min.compare_exchange_weak(current, begin, std::memory_order_relaxed)) {
+    }
+    current = t.loss_max.load(std::memory_order_relaxed);
+    while (end > current &&
+           !t.loss_max.compare_exchange_weak(current, end, std::memory_order_relaxed)) {
     }
 }
 
@@ -679,6 +702,7 @@ void Session::ConsumerMain() {
             finalized = true;
             Quiesce();
             DrainAll();
+            DropPendingEnds(); // their begins never came: counted, not hidden
             MarkOpenIncomplete();
         } else {
             DrainAll();
@@ -722,10 +746,11 @@ void Session::TakeLosses() {
     const u32 count = thread_count.load(std::memory_order_acquire);
     for (u32 i = 0; i < count; ++i) {
         ThreadBuf& buf = *threads[i];
-        std::scoped_lock lock{buf.loss_mutex};
-        if (buf.loss_any) {
-            buf.loss_any = false;
-            AddLoss(buf.loss_begin, buf.loss_end);
+        const u64 low = buf.loss_min.exchange(OpenEnd, std::memory_order_relaxed);
+        const u64 high = buf.loss_max.exchange(0, std::memory_order_relaxed);
+        if (low != OpenEnd || high != 0) {
+            const u64 begin = low != OpenEnd ? low : high;
+            AddLoss(begin, std::max(begin, high));
         }
     }
     const u64 lost = TotalLost();
@@ -759,6 +784,39 @@ SpanRec* Session::FindSpan(u32 owner, u64 seq) {
     return nullptr;
 }
 
+bool Session::CloseSpan(const PendingEnd& end) {
+    if (end.owner < 1 || end.owner > thread_count.load(std::memory_order_acquire)) {
+        return false;
+    }
+    ThreadState& owner = states[end.owner - 1];
+    const auto it = std::find_if(owner.open.begin(), owner.open.end(),
+                                 [&](const SpanRec& r) { return r.seq == end.seq; });
+    if (it == owner.open.end()) {
+        return false;
+    }
+    SpanRec rec = *it;
+    owner.open.erase(it);
+    rec.open = false;
+    rec.end_ns = std::max(end.end_ns, rec.begin_ns);
+    rec.amount += end.amount;
+    rec.flags |= end.flags;
+    if (last_resolved_ts != 0 && rec.end_ns <= last_resolved_ts) {
+        lost_consumer.fetch_add(1, std::memory_order_relaxed); // charged to its frame as open
+    }
+    owner.closed.push_back(rec);
+    return true;
+}
+
+/// Retries the ends whose Begin sits in a ring that was drained later than the ender's.
+void Session::ApplyEnds() {
+    std::erase_if(pending_ends, [this](const PendingEnd& end) { return CloseSpan(end); });
+}
+
+void Session::DropPendingEnds() {
+    lost_consumer.fetch_add(pending_ends.size(), std::memory_order_relaxed);
+    pending_ends.clear();
+}
+
 void Session::DrainThread(u32 id, ThreadBuf& buf) {
     ThreadState& state = states[id - 1];
     const u64 head = buf.head.load(std::memory_order_relaxed);
@@ -784,25 +842,20 @@ void Session::DrainThread(u32 id, ThreadBuf& buf) {
             break;
         }
         case EventType::End: {
-            if (event.owner < 1 || event.owner > thread_count.load(std::memory_order_acquire)) {
+            const PendingEnd end{event.owner, event.seq, event.end_ns, event.amount, event.flags};
+            if (CloseSpan(end)) {
                 break;
             }
-            ThreadState& owner = states[event.owner - 1];
-            const auto it = std::find_if(owner.open.begin(), owner.open.end(),
-                                         [&](const SpanRec& r) { return r.seq == event.seq; });
-            if (it == owner.open.end()) {
-                break;
+            // A Begin of this very ring is always ingested before its End, so a miss there is a
+            // Begin the history refused (counted already). Another registration's Begin may only
+            // be drained after this ring: keep the end until it arrives.
+            if (event.owner != id) {
+                if (pending_ends.size() >= MaxPendingEnds) {
+                    pending_ends.erase(pending_ends.begin());
+                    lost_consumer.fetch_add(1, std::memory_order_relaxed);
+                }
+                pending_ends.push_back(end);
             }
-            SpanRec rec = *it;
-            owner.open.erase(it);
-            rec.open = false;
-            rec.end_ns = std::max(event.end_ns, rec.begin_ns);
-            rec.amount += event.amount;
-            rec.flags |= event.flags;
-            if (last_resolved_ts != 0 && rec.end_ns <= last_resolved_ts) {
-                lost_consumer.fetch_add(1, std::memory_order_relaxed); // charged to its frame as open
-            }
-            owner.closed.push_back(rec);
             break;
         }
         case EventType::Closed: {
@@ -865,6 +918,7 @@ void Session::DrainAll() {
     for (u32 i = 0; i < count; ++i) {
         DrainThread(i + 1, *threads[i]);
     }
+    ApplyEnds();
     ApplyLinks();
     TakeLosses();
 }
@@ -968,24 +1022,34 @@ void Session::ResolveBoundary(const Item& item) {
     seen_unregistered = unregistered;
 
     if (!have_prev) {
+        // The first present anchors the intervals; its time was published with it. If its own
+        // item was dropped, this item is a later one and is resolved below like any other.
+        const u64 first = first_present_ns.load(std::memory_order_acquire);
         have_prev = true;
-        anchor = item.ts;
-        prev_ts = item.ts;
-        prev_id = item.id;
+        anchor = first;
+        prev_ts = first;
+        prev_id = 1;
         prev_counters = item.counters;
-        last_resolved_ts = item.ts;
+        last_resolved_ts = first;
         last_root = item.root;
-        cum.push_back({item.ts, {}, true});
-        ResolveStartup(item.ts);
-        Prune();
-        return;
+        cum.push_back({first, {}, true});
+        ResolveStartup(first);
+        if (item.id == 1) {
+            Prune();
+            return;
+        }
     }
 
-    const u64 s = prev_ts;
-    const u64 e = std::max(item.ts, s);
+    // An interval is (the present before this one, this one) as the presenting thread saw them,
+    // kept or dropped from the queue: dropped boundaries never merge two intervals into one.
+    const u64 s = item.prev_ts;
+    const u64 e = item.ts;
     const u64 dur = e - s;
     const bool is_long = dur > config.threshold_ns;
-    const bool gap = item.id != prev_id + 1;
+    const bool gap = item.prev_id != prev_id;
+    if (gap) {
+        SkipLostInterval(s);
+    }
     const bool degraded = timeout || unregistered_new || gap;
 
     Decomp d;
@@ -1102,8 +1166,36 @@ void Session::ResolveBoundary(const Item& item) {
     Prune();
 }
 
+/// Presents between the last resolved one and `until` were dropped from the queue (counted in
+/// lost_events): that time is not a frame. It is unattributed, and never a long frame.
+void Session::SkipLostInterval(u64 until) {
+    AddLoss(prev_ts, until);
+    if (!interactive_done) {
+        cum_causes[CauseIdx(Cause::Unknown)] += Sub(until, prev_ts);
+        cum_complete = false;
+        if (cum.size() < MaxCumulative) {
+            cum.push_back({until, cum_causes, false});
+        }
+    }
+    last_resolved_ts = until;
+    std::scoped_lock lock{stats_mutex};
+    FirstWindow& w = snap.first_120s;
+    const u64 since = Sub(until, anchor);
+    if (since <= FirstWindowNs) {
+        w.elapsed_ns = since;
+        w.complete = w.complete || since == FirstWindowNs;
+    } else if (!w.complete) {
+        w.complete = true;
+        w.elapsed_ns = FirstWindowNs;
+    }
+}
+
 void Session::ResolveMarker(const Item& item) {
-    if (!have_prev || interactive_done) {
+    if (!have_prev) {
+        lost_consumer.fetch_add(1, std::memory_order_relaxed); // its present was never resolved
+        return;
+    }
+    if (interactive_done) {
         return;
     }
     const u64 m = item.ts;
@@ -1144,7 +1236,7 @@ AttributionSnapshot Session::Snapshot() {
     std::scoped_lock lock{stats_mutex};
     AttributionSnapshot result = snap;
     const bool finished = ended.load(std::memory_order_acquire);
-    result.enabled = !finished;
+    result.enabled = true; // a session was recorded; AttributionEnabled() says if it still runs
     result.threshold_ns = config.threshold_ns;
     result.lost_events = TotalLost();
     result.sink_write_errors = sink_errors.load(std::memory_order_relaxed);
@@ -1184,9 +1276,12 @@ bool BeginSession(const SessionConfig& config) {
     s->generation = ++g_generation;
     s->config = config;
     s->start_ns = NowNs();
-    const size_t per_thread = config.buffer_bytes / MaxThreads / sizeof(RingEvent);
+    // One budget: half for the rings (allocated by the threads that register), half for the
+    // retained history and the resolver's copies of it. A ring never holds less than four events.
+    const size_t ring_budget = config.buffer_bytes / 2;
+    const size_t per_thread = ring_budget / MaxThreads / sizeof(RingEvent);
     s->ring_capacity = std::bit_floor(std::max<size_t>(per_thread, 4));
-    s->history_cap = std::max<size_t>(config.buffer_bytes / sizeof(SpanRec), 64);
+    s->history_cap = std::max<size_t>((config.buffer_bytes - ring_budget) / HistoryBytesPerSpan, 64);
     s->process_created_ns.store(g_pending_created.exchange(0), std::memory_order_relaxed);
     s->process_created_uncertainty_ns.store(g_pending_uncertainty.exchange(0),
                                             std::memory_order_relaxed);
@@ -1361,19 +1456,27 @@ u64 OnHostPresent(const FrameBoundary& boundary) {
     }
     const ThreadBuf* t = ThisThread(*s, "present");
     Item item;
-    item.id = s->next_present.fetch_add(1, std::memory_order_relaxed);
     item.guest_frame_id = boundary.guest_frame_id;
-    item.ts = boundary.timestamp_ns;
     item.root = t != nullptr ? t->id : 0;
     item.result = boundary.result;
     item.reasons = s->pending_reasons.exchange(0, std::memory_order_relaxed);
     Detail::ReadEventCounts(item.counters);
-    u64 expected = 0;
-    s->first_present_ns.compare_exchange_strong(expected, item.ts, std::memory_order_acq_rel);
-    s->last_present_ns.store(item.ts, std::memory_order_relaxed);
     bool queued = false;
     {
+        // The id, the link to the present before it and the publication of the first present are
+        // one step, in queue order, whether the item is kept or dropped (a marker is admitted under
+        // the same lock, so it can never be queued before the first present).
         std::scoped_lock lock{s->queue_mutex};
+        item.id = s->next_present.fetch_add(1, std::memory_order_relaxed);
+        item.prev_id = s->last_actual_id;
+        item.prev_ts = s->last_actual_ts;
+        item.ts = std::max(boundary.timestamp_ns, s->last_actual_ts);
+        s->last_actual_id = item.id;
+        s->last_actual_ts = item.ts;
+        if (s->first_present_ns.load(std::memory_order_relaxed) == 0) {
+            s->first_present_ns.store(item.ts, std::memory_order_release);
+        }
+        s->last_present_ns.store(item.ts, std::memory_order_relaxed);
         if (s->queue.size() < MaxQueueItems) {
             s->queue.push_back(item);
             queued = true;
@@ -1440,28 +1543,29 @@ MarkerResult MarkInteractive(const InteractiveMarker& marker) {
     if (s == nullptr) {
         return MarkerResult::NoSession;
     }
-    if (s->marker_accepted.load(std::memory_order_acquire)) {
-        return MarkerResult::Duplicate;
-    }
-    const u64 first = s->first_present_ns.load(std::memory_order_acquire);
-    if (first == 0 || marker.marker_ns < first || marker.marker_ns > NowNs()) {
-        return MarkerResult::Backdated;
-    }
-    if (s->marker_accepted.exchange(true, std::memory_order_acq_rel)) {
-        return MarkerResult::Duplicate;
-    }
-    {
-        std::scoped_lock lock{s->stats_mutex};
-        s->snap.interactive = marker;
-        s->snap.interactive_status = IntervalStatus::Incomplete; // until it is resolved
-    }
-    Item item;
-    item.marker = true;
-    item.ts = marker.marker_ns;
+    const u64 now = NowNs();
     bool queued = false;
     {
+        // Validated and queued under the lock that publishes the first present, so a marker is
+        // always behind the first present's item.
         std::scoped_lock lock{s->queue_mutex};
+        if (s->marker_accepted.load(std::memory_order_relaxed)) {
+            return MarkerResult::Duplicate;
+        }
+        const u64 first = s->first_present_ns.load(std::memory_order_relaxed);
+        if (first == 0 || marker.marker_ns < first || marker.marker_ns > now) {
+            return MarkerResult::Backdated;
+        }
+        s->marker_accepted.store(true, std::memory_order_relaxed);
+        {
+            std::scoped_lock stats{s->stats_mutex};
+            s->snap.interactive = marker;
+            s->snap.interactive_status = IntervalStatus::Incomplete; // until it is resolved
+        }
         if (s->queue.size() < MaxQueueItems) {
+            Item item;
+            item.marker = true;
+            item.ts = marker.marker_ns;
             s->queue.push_back(item);
             queued = true;
         }
