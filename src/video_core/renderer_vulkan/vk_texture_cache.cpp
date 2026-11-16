@@ -5244,6 +5244,14 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
                 MakeStorageView(device.GetLogical(), level, *pending.image, DecodeFormat));
         }
     }
+    // With EDEN_NX2_ASTC_ONE_SUBMIT=1 the decode image is only read by the encode that follows,
+    // and the decode's closing barrier (compute write -> compute/graphics read) already orders
+    // the two, so the decode needs no submit of its own: decode and encode go in the same one.
+    // Off by default: the decode is followed by a submit, as before. Read once.
+    static const bool one_submit = [] {
+        const char* value = std::getenv("EDEN_NX2_ASTC_ONE_SUBMIT");
+        return value != nullptr && value[0] == '1';
+    }();
     astc_decoder_pass->AssembleInto(
         info, 0, image.guest_size_bytes,
         ASTCDecoderPass::Target{
@@ -5251,7 +5259,7 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
             .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
             .initialized = false,
             .level_view = [&pending](s32 level) { return *pending.views[level]; },
-            .wait = true,
+            .wait = !one_submit,
         },
         map, swizzles);
 
