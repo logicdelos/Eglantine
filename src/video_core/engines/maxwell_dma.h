@@ -15,6 +15,7 @@
 #include "common/common_types.h"
 #include "common/scratch_buffer.h"
 #include "video_core/engines/engine_interface.h"
+#include "video_core/nx2_method_census.h"
 
 namespace Core {
 class System;
@@ -104,8 +105,12 @@ public:
         u32 upper;
         u32 lower;
 
-        constexpr operator GPUVAddr() const noexcept {
-            return (static_cast<GPUVAddr>(upper & 0xff) << 32) | lower;
+        // UPPER is 16:0 in clc7b5.h (EDEN_NX2_CLASS_FIXES, a1); the old mask was 7:0.
+        operator GPUVAddr() const noexcept {
+            static const u32 mask = VideoCommon::Nx2Census::FixOn(VideoCommon::Nx2Census::Fix::A1)
+                                        ? 0x1ffffU
+                                        : 0xffU;
+            return (static_cast<GPUVAddr>(upper & mask) << 32) | lower;
         }
     };
 
@@ -149,6 +154,7 @@ public:
             NONE = 0,
             RELEASE_ONE_WORD_SEMAPHORE = 1,
             RELEASE_FOUR_WORD_SEMAPHORE = 2,
+            RELEASE_CONDITIONAL_INTR_SEMAPHORE = 3,
         };
 
         enum class InterruptType : u32 {
@@ -204,6 +210,7 @@ public:
         BitField<18, 1, SemaphoreReductionSign> semaphore_reduction_sign;
         BitField<19, 1, u32> reduction_enable;
         BitField<20, 1, BypassL2> bypass_l2;
+        BitField<27, 1, u32> semaphore_payload_size; ///< 0 one word, 1 two words
     };
     static_assert(sizeof(LaunchDMA) == 4);
 

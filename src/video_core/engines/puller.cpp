@@ -9,8 +9,10 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <array>
 #include <optional>
 #include <unordered_map>
+#include <utility>
 
 #include "common/assert.h"
 #include "common/logging.h"
@@ -29,7 +31,9 @@
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
+#include "video_core/native_qmd.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_method_census.h"
 #include "video_core/rasterizer_interface.h"
 
 namespace Tegra::Engines {
@@ -213,6 +217,39 @@ void ReleaseFences(DmaPusher& dma_pusher) {
     VideoCommon::GpuSplit::Get().Run(
         [rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); },
         VideoCommon::DrainSite::FenceRelease);
+}
+
+namespace Census = VideoCommon::Nx2Census;
+
+// Ampere host MEM_OP_D (clc76f.h): OPERATION is 31:27 and MEM_OP_B only holds the target
+// address. The invalidates map onto InvalidateGPUCache; MEMBAR, the flushes, the compression tag
+// clean, the pending read wait and the access counter clear have nothing in the caches to drop.
+void MemOpD(DmaPusher& dma_pusher, u32 argument) {
+    const u32 operation = argument >> 27;
+    Census::NoteMemOp(operation);
+    if (!Census::FixOn(Census::Fix::H4)) {
+        return;
+    }
+    switch (operation) {
+    case 0x09: // MMU_TLB_INVALIDATE
+    case 0x0a: // MMU_TLB_INVALIDATE_TARGETED
+    case 0x0d: // L2_PEERMEM_INVALIDATE
+    case 0x0e: // L2_SYSMEM_INVALIDATE
+        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->InvalidateGPUCache(); },
+               VideoCommon::GpuSplit::Effect::None);
+        break;
+    default:
+        break;
+    }
+}
+
+// A puller method nothing implements is logged on its first write only (EDEN_NX2_CLASS_FIXES, h5).
+bool LogUnimplemented(u32 method) {
+    static u64 logged{};
+    const u64 bit = u64{1} << (method & 63);
+    const bool first = (logged & bit) == 0;
+    logged |= bit;
+    return first || !Census::FixOn(Census::Fix::H5);
 }
 
 } // Anonymous namespace
@@ -455,7 +492,8 @@ void Puller::ProcessFenceActionMethod(DmaPusher& dma_pusher) {
 }
 
 void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
-    const auto semaphoreOperationMask = 0xF;
+    // OPERATION is 4:0 on the host class (clc76f.h); bit 4 is REDUCTION (EDEN_NX2_CLASS_FIXES, h3).
+    const auto semaphoreOperationMask = Census::FixOn(Census::Fix::H3) ? 0x1F : 0xF;
     const auto op = GpuSemaphoreOperation(regs.semaphore_trigger & semaphoreOperationMask);
     // EDEN_NX2_SEM_WATCH=<gpu address>: log every release/acquire on the 16 bytes there.
     static const GPUVAddr watch = [] {
@@ -469,6 +507,10 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                  static_cast<u32>(op),
                  regs.semaphore_address.SemaphoreAddress(), regs.semaphore_sequence,
                  dma_pusher.memory_manager.Read<u32>(regs.semaphore_address.SemaphoreAddress()));
+    }
+    if (op == GpuSemaphoreOperation::Reduction) {
+        ProcessSemaphoreReduction(dma_pusher);
+        return;
     }
     if (op == GpuSemaphoreOperation::WriteLong) {
         const GPUVAddr sequence_address{regs.semaphore_address.SemaphoreAddress()};
@@ -768,17 +810,28 @@ void Puller::ProcessSemaphoreAcquire(DmaPusher& dma_pusher) {
 }
 
 // Ampere SEM_EXECUTE (method 0x1B): operation in bits 2:0 on the semaphore at
-// SEM_ADDR_HI:SEM_ADDR_LO (methods 0x18/0x17) with payload SEM_PAYLOAD_LO (0x19).
+// SEM_ADDR_HI:SEM_ADDR_LO (methods 0x18/0x17) with payload SEM_PAYLOAD_LO (0x19). A 32-bit release
+// with bit 25 (RELEASE_TIMESTAMP) writes the 16-byte payload + GPU timestamp structure through the
+// query cache (the release's own fence operation writes the timestamp). A 64-bit release (bit 24)
+// stays a 4-byte one: the query streamer has no 64-bit payload (the census reports it as partial).
+// EDEN_NX2_SEM_EXECUTE=legacy: every release is the old 4-byte one.
 void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
+    VideoCommon::Nx2Census::NoteSemExecute(argument);
     const GPUVAddr address = (GPUVAddr{regs.reg_array[0x18] & 0x1FFFFFF} << 32) |
                              (regs.reg_array[0x17] & ~3U);
     const u32 payload = regs.reg_array[0x19];
     const u32 operation = argument & 7;
     if (operation == 1) { // RELEASE
-        OnBackRelease(dma_pusher, address, [rasterizer = dma_pusher.rasterizer, address, payload] {
-            rasterizer->Query(address, VideoCommon::QueryType::Payload,
-                              VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
-        });
+        auto properties = VideoCommon::QueryPropertiesFlags::IsAFence;
+        if ((argument & ((1U << 24) | (1U << 25))) == (1U << 25) &&
+            !VideoCommon::Nx2Census::SemExecuteLegacy()) {
+            properties |= VideoCommon::QueryPropertiesFlags::HasTimeout;
+        }
+        OnBackRelease(dma_pusher, address,
+                      [rasterizer = dma_pusher.rasterizer, address, properties, payload] {
+                          rasterizer->Query(address, VideoCommon::QueryType::Payload, properties,
+                                            payload, 0);
+                      });
         return;
     }
     // Acquires: check once after flushing pending fences; never block the GPU thread on them.
@@ -845,7 +898,9 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
         break;
     }
     case BufferMethods::NonStallInterrupt: {
-        LOG_ERROR(HW_GPU, "Special puller engine method NonStallInterrupt not implemented");
+        if (LogUnimplemented(method_call.method)) {
+            LOG_ERROR(HW_GPU, "Special puller engine method NonStallInterrupt not implemented");
+        }
         break;
     }
     case BufferMethods::MemOpA: {
@@ -853,14 +908,22 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
         break;
     }
     case BufferMethods::MemOpB: {
-        // Implement this better.
-        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->InvalidateGPUCache(); },
-               VideoCommon::GpuSplit::Effect::None);
+        // Implement this better. On Ampere (c76f) MEM_OP_B is the target address word and
+        // MEM_OP_D does the work (EDEN_NX2_CLASS_FIXES, h4); the older classes act on B.
+        if (!g_nx2_ampere || !Census::FixOn(Census::Fix::H4)) {
+            OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->InvalidateGPUCache(); },
+                   VideoCommon::GpuSplit::Effect::None);
+        }
         break;
     }
-    case BufferMethods::MemOpC:
+    case BufferMethods::MemOpC: {
+        LOG_TRACE(HW_GPU, "Memory Operation C");
+        break;
+    }
     case BufferMethods::MemOpD: {
-        LOG_TRACE(HW_GPU, "Memory Operation C,D");
+        if (g_nx2_ampere) {
+            MemOpD(dma_pusher, method_call.argument);
+        }
         break;
     }
     case BufferMethods::SemaphoreAcquire: {
@@ -880,10 +943,21 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
     }
     case BufferMethods::Yield: {
         // TODO(Kmather73): Research and implement this method.
-        LOG_ERROR(HW_GPU, "Special puller engine method Yield not implemented");
+        if (LogUnimplemented(method_call.method)) {
+            LOG_ERROR(HW_GPU, "Special puller engine method Yield not implemented");
+        }
         break;
     }
     default:
+        // On Ampere 0x17..0x19 are SEM_ADDR_LO/HI and SEM_PAYLOAD_LO, which SEM_EXECUTE reads from
+        // the register file (stored above); only the other methods are unimplemented (h5).
+        if (g_nx2_ampere && method_call.method >= 0x17 && method_call.method <= 0x19 &&
+            Census::FixOn(Census::Fix::H5)) {
+            break;
+        }
+        if (!LogUnimplemented(method_call.method)) {
+            break;
+        }
         LOG_ERROR(HW_GPU, "Special puller engine method {:X} not implemented", method);
         if (static bool dumped = false; g_nx2_ampere && !dumped) {
             dumped = true;

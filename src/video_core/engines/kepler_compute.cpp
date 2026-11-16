@@ -28,6 +28,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_diag.h"
+#include "video_core/nx2_method_census.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2.h"
@@ -170,13 +171,16 @@ void KeplerCompute::ProcessNativeReportSemaphore(u32 argument) {
     }
     if ((argument >> 3) & 1) {
         const u32 reduction = (argument >> 9) & 7;
+        // REDUCTION_FORMAT 18:17: UNSIGNED_32 0, SIGNED_32 1 (EDEN_NX2_CLASS_FIXES, c4).
+        const bool is_signed = VideoCommon::Nx2Census::FixOn(VideoCommon::Nx2Census::Fix::C4) &&
+                               ((argument >> 17) & 3) == 1;
         rasterizer->SignalFence(
-            [this, address, payload, reduction,
-             issued = IssueRelease(memory_manager, address, reduction, false, payload)] {
+            [this, address, payload, reduction, is_signed,
+             issued = IssueRelease(memory_manager, address, reduction, is_signed, payload)] {
                 u32 value{};
                 SettleRelease(issued, [&] {
-                    value = ReduceSemaphore(reduction, false, memory_manager.Read<u32>(address),
-                                            payload);
+                    value = ReduceSemaphore(reduction, is_signed,
+                                            memory_manager.Read<u32>(address), payload);
                     memory_manager.Write<u32>(address, value);
                 });
                 if (const auto device = memory_manager.GpuToCpuAddress(address)) {
@@ -239,6 +243,8 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
         const u32 dram0_before = (*native_macro->native_interpreter.active_dram)[0x27];
         const u32 start = native_macro_positions[entry];
         const auto emit = [&](u32 address, u32 value) {
+            VideoCommon::Nx2Census::NoteMethod(VideoCommon::Nx2Census::Engine::Compute, address,
+                                               value, VideoCommon::Nx2Census::Source::Macro);
             static u32 diagnostic_writes{};
             static const bool log_emits = std::getenv("EDEN_NX2_SEM_WATCH_EMITS") != nullptr;
             if (watched && log_emits) LOG_INFO(HW_GPU, "Semaphore watch: compute macro emit {:#x} = {:#x}", address, value);
@@ -400,7 +406,11 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
             VideoCommon::TraceNativeQuery(9, memory_manager.GetID(), qmd_address,
                 memory_manager.GpuToCpuAddress(qmd_address).value_or(0), method, argument, 0);
         }
-        if (method == 0xae || (method == 0xaf && !(argument & 2)) ||
+        if (method == 0xae) {
+            VideoCommon::Nx2Census::NoteClass(VideoCommon::Nx2Census::Class::C1_SEND_PCAS_B);
+            return true;
+        }
+        if ((method == 0xaf && !(argument & 2)) ||
             (method == 0xb0 && ((argument & 15) == 0 || (argument & 15) == 1))) return true;
         static const bool qmd_diagnostics = std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS") != nullptr;
         if ((argument & 15) == 12 && qmd_diagnostics) {
@@ -560,6 +570,10 @@ void KeplerCompute::CallMethod(Core::System& system, u32 method, u32 method_argu
     }
 
     regs.reg_array[method] = method_argument;
+    // LAUNCH_DMA COMPLETION_TYPE 5:4 = RELEASE_SEMAPHORE (clc7c0.h) is not implemented.
+    if (method == KEPLER_COMPUTE_REG_INDEX(exec_upload) && ((method_argument >> 4) & 3) == 2) {
+        VideoCommon::Nx2Census::NoteClass(VideoCommon::Nx2Census::Class::C5_I2M_RELEASE_SEMAPHORE);
+    }
 
     switch (method) {
     case KEPLER_COMPUTE_REG_INDEX(exec_upload): {
@@ -643,8 +657,17 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
     launch_description.block_dim_y.Assign(qmd[19] & 0xffff);
     launch_description.block_dim_z.Assign(qmd[19] >> 16);
     launch_description.const_buffer_enable_mask.Assign(qmd[20] & 0xff);
-    launch_description.local_pos_alloc.Assign(qmd[23] & 0xffffff);
-    launch_description.local_crs_alloc.Assign(qmd[50] & 0xffffff);
+    // SAMPLER_INDEX (clc7c0qmd.h V03_00 word 11 bit 30): 1 = samplers indexed with the texture
+    // header index (linked_tsc) (EDEN_NX2_CLASS_FIXES, c2).
+    if (VideoCommon::Nx2Census::FixOn(VideoCommon::Nx2Census::Fix::C2)) {
+        launch_description.linked_tsc.Assign((qmd[11] >> 30) & 1);
+    }
+    // The local memory sizes are 24 bits in every QMD version (EDEN_NX2_CLASS_FIXES, l1).
+    const u32 local_mask = VideoCommon::Nx2Census::FixOn(VideoCommon::Nx2Census::Fix::L1)
+                               ? 0xffffffU
+                               : 0xfffffU;
+    launch_description.local_pos_alloc.Assign(qmd[23] & local_mask);
+    launch_description.local_crs_alloc.Assign(qmd[50] & local_mask);
     regs.code_loc.address_low = qmd[48];
     regs.code_loc.address_high = qmd[49] & 0x1ffff;
     for (u32 slot = 0; slot < NumConstBuffers; ++slot) {
@@ -879,6 +902,28 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
     }
 
     const bool emulates_tensor = EmulatesNativeTensorPrograms();
+    // A DLSS network pass whose matrix multiply can't run while the network is replaced anyway
+    // (resolution scaling, NVIDIA DLSS, failed checks) is expected, not a failed dispatch: the
+    // replacement upscale draws the output. At 2x/4x its first evaluation logged 10 errors.
+    // EDEN_NX2_COMPUTE_SCALE=legacy reports them as failed dispatches again.
+    static const bool legacy_scale = [] {
+        const char* value = std::getenv("EDEN_NX2_COMPUTE_SCALE");
+        return value != nullptr && std::string_view{value} == "legacy";
+    }();
+    const auto replaced_network_pass = [&](bool matrix_multiply) {
+        if (legacy_scale || !dlss_chain.active || !matrix_multiply ||
+            (dlss_chain.failure == VideoCore::GameDlssReason::None &&
+             GameDlssBlocker() == VideoCore::GameDlssReason::None)) {
+            return false;
+        }
+        static bool logged{};
+        if (!std::exchange(logged, true)) {
+            LOG_INFO(HW_GPU, "Game DLSS network: matrix-multiply passes can't run while it is replaced "
+                             "(first: {:#x}); not failed dispatches (EDEN_NX2_COMPUTE_SCALE=legacy "
+                             "reports them)", program);
+        }
+        return true;
+    };
     // Programs the debug server rejected failed here too: retry them once it restores any.
     if (const u64 epoch = VideoCore::Nx2Debug::UnrejectEpoch(); epoch != seen_unreject_epoch) {
         seen_unreject_epoch = epoch;
@@ -891,7 +936,8 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
         diag_note("failed", rejected->second.message);
         if (dlss_chain.active) {
             ++dlss_chain.rejected;
-            return output_pass ? FinishDlssEvaluation() : false;
+            return output_pass ? FinishDlssEvaluation()
+                               : replaced_network_pass(rejected->second.matrix_multiply);
         }
         if (rejected->second.matrix_multiply && rejected->second.upscale_failures < 2) {
             if (UpscaleInsteadOfNativeProgram()) {
@@ -905,18 +951,24 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
         return false;
     }
     bool dispatched = true;
+    bool replaced = false;
     try {
         rasterizer->DispatchCompute();
         diag_note("ok");
     } catch (const Shader::Exception& error) {
         diag_note("failed", error.what());
-        static std::unordered_set<std::string> logged;
-        if (logged.insert(error.what()).second) {
-            LOG_ERROR(HW_GPU, "Native compute shader rejected: {}", error.what());
-        }
-        dispatched = false;
         const bool matrix_multiply =
             std::string_view{error.what()}.find("matrix multiply") != std::string_view::npos;
+        static std::unordered_set<std::string> logged;
+        if (logged.insert(error.what()).second) {
+            if (matrix_multiply) {
+                // Expected while tensor emulation is off: the upscale below stands in.
+                LOG_INFO(HW_GPU, "Native compute shader rejected: {}", error.what());
+            } else {
+                LOG_ERROR(HW_GPU, "Native compute shader rejected: {}", error.what());
+            }
+        }
+        dispatched = false;
         auto& rejected = rejected_compute_programs[program];
         rejected.message = error.what();
         rejected.emulates_tensor = emulates_tensor;
@@ -924,6 +976,7 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
         rejected.upscale_failures = 0;
         if (dlss_chain.active) {
             ++dlss_chain.rejected;
+            replaced = replaced_network_pass(matrix_multiply);
         } else if (matrix_multiply) {
             DescribeNativeResources(qmd);
             if (CopySceneForStarFoxCutsceneNetwork()) {
@@ -944,7 +997,7 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
     if (output_pass) {
         return FinishDlssEvaluation() || dispatched;
     }
-    return dispatched;
+    return dispatched || replaced;
 }
 
 namespace {
@@ -1988,6 +2041,11 @@ void KeplerCompute::ProcessLaunch() {
     const GPUVAddr launch_desc_loc = regs.launch_desc_loc.Address();
     memory_manager.ReadBlockUnsafe(launch_desc_loc, &launch_description,
                                    LaunchParams::NUM_LAUNCH_PARAMETERS * sizeof(u32));
+    if (!VideoCommon::Nx2Census::FixOn(VideoCommon::Nx2Census::Fix::L1)) {
+        // The old 20-bit local memory fields (EDEN_NX2_CLASS_FIXES, l1).
+        launch_description.local_pos_alloc.Assign(launch_description.local_pos_alloc.Value() & 0xfffffU);
+        launch_description.local_crs_alloc.Assign(launch_description.local_crs_alloc.Value() & 0xfffffU);
+    }
     rasterizer->DispatchCompute();
 }
 
@@ -2205,6 +2263,8 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
         return address < fs.registers.size() ? fs.registers[address] : 0U;
     };
     const auto emit = [&](u32 address, u32 value) {
+        VideoCommon::Nx2Census::NoteMethod(VideoCommon::Nx2Census::Engine::Compute, address, value,
+                                           VideoCommon::Nx2Census::Source::Macro);
         if (address >= 0xe00) {
             return false;
         }

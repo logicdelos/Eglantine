@@ -120,6 +120,7 @@ add_library(video_core STATIC
     nx2_debug_control.h
     nx2_diag.h
     nx2_gpu_latency.h
+    nx2_method_census.h
     nx2_profile.h
     nx2_spikes.cpp
     nx2_spikes.h

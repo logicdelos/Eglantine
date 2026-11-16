@@ -189,9 +189,14 @@ public:
         return puller.CanResumeAcquire(*this);
     }
 
+    /// Row of the Nx2 method census (video_core/nx2_method_census.h) for an engine; nullptr when
+    /// the census does not cover it.
+    static const u8* CensusSlotsFor(Engines::EngineTypes type);
+
     void BindSubchannel(Engines::EngineInterface* engine, u32 subchannel_id, Engines::EngineTypes engine_type) {
         subchannels[subchannel_id] = engine;
         subchannel_type[subchannel_id] = engine_type;
+        census_slots[subchannel_id] = CensusSlotsFor(engine_type);
     }
 
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
@@ -298,6 +303,7 @@ public:
 
     std::array<Engines::EngineInterface*, max_subchannels> subchannels{};
     std::array<Engines::EngineTypes, max_subchannels> subchannel_type;
+    std::array<const u8*, max_subchannels> census_slots{}; ///< CensusSlotsFor, set at bind
 
     Engines::Puller puller;
     std::mutex sync_mutex;

@@ -229,7 +229,7 @@ public:
         std::array<ConstBufferConfig, NumConstBuffers> const_buffer_config;
 
         union {
-            BitField<0, 20, u32> local_pos_alloc;
+            BitField<0, 24, u32> local_pos_alloc;
             BitField<27, 5, u32> barrier_alloc;
         };
 
@@ -239,7 +239,7 @@ public:
         };
 
         union {
-            BitField<0, 20, u32> local_crs_alloc;
+            BitField<0, 24, u32> local_crs_alloc;
             BitField<24, 5, u32> sass_version;
         };
 

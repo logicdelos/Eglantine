@@ -29,6 +29,7 @@
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_method_census.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/rasterizer_interface.h"
@@ -2057,6 +2058,9 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                     continue;
                 }
                 // The DMA read's own write goes to the back as before; the read doesn't happen.
+                VideoCommon::Nx2Census::NoteMethod(VideoCommon::Nx2Census::Engine::Maxwell3D,
+                                                   write.method, write.value,
+                                                   VideoCommon::Nx2Census::Source::Macro);
                 FrontWrite(split, fs, write.method, write.value, true, true);
             }
             for (size_t i = 0; i < dma_plan->num_ram_writes; ++i) {
@@ -2106,6 +2110,8 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
             return fs.regs[address];
         };
         const auto front_emit = [&](u32 address, u32 value) {
+            VideoCommon::Nx2Census::NoteMethod(VideoCommon::Nx2Census::Engine::Maxwell3D, address,
+                                               value, VideoCommon::Nx2Census::Source::Macro);
             if (trace) [[unlikely]] {
                 trace_line += fmt::format(" {:#x}={:#x}", address, value);
             }

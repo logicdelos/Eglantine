@@ -41,6 +41,7 @@
 #include "common/bit_field.h"
 #include "common/logging.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/nx2_method_census.h"
 #include "video_core/nx2_profile.h"
 
 namespace Tegra {
@@ -1397,6 +1398,9 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
         // A method write of the macro (also what a remembered call replays).
         bool read_memory = false;
         const auto emit = [&](u32 address, u32 value) {
+                VideoCommon::Nx2Census::NoteMethod(VideoCommon::Nx2Census::Engine::Maxwell3D,
+                                                   address, value,
+                                                   VideoCommon::Nx2Census::Source::Macro);
                 if (address >= 0xe00) return false;
                 if (address == 0x556) {
                     // SET_RENDER_ENABLE_OVERRIDE: 0 use the render-enable condition, 1 always,

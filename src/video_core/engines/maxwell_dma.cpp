@@ -7,6 +7,7 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <utility>
 #include <cstdlib>
 #include "common/algorithm.h"
 #include "common/assert.h"
@@ -97,6 +98,25 @@ void MaxwellDMA::Launch() {
     // TODO(Subv): Perform more research and implement all features of this engine.
     const LaunchDMA& launch = regs.launch_dma;
     ASSERT(launch.interrupt_type == LaunchDMA::InterruptType::NONE);
+
+    // LAUNCH_DMA.DATA_TRANSFER_TYPE NONE only runs the semaphore/interrupt part (clc7b5.h); the
+    // copy used to run again with whatever the registers held (EDEN_NX2_CLASS_FIXES, h1).
+    namespace Census = VideoCommon::Nx2Census;
+    if (launch.data_transfer_type == LaunchDMA::DataTransferType::NONE) [[unlikely]] {
+        Census::NoteClass(Census::Class::H1_NONE_LAUNCH);
+        if (Census::FixOn(Census::Fix::H1)) {
+            ReleaseSemaphore();
+            return;
+        }
+    }
+    if (launch.remap_enable != 0) [[unlikely]] {
+        // Only the CONST_A destination of the single-line path is a remap (and component size
+        // THREE asserts there); the other paths only use the components for the pixel size.
+        if (regs.remap_const.dst_x != RemapConst::Swizzle::CONST_A ||
+            regs.remap_const.component_size_minus_one == 2) {
+            Census::NoteClass(Census::Class::D2_DMA_REMAP_UNSUPPORTED);
+        }
+    }
 
     if (launch.multi_line_enable) {
         const bool is_src_pitch = launch.src_memory_layout == LaunchDMA::MemoryLayout::PITCH;
@@ -392,22 +412,36 @@ void MaxwellDMA::ReleaseSemaphore() {
     const GPUVAddr address = regs.semaphore.address;
     const u32 payload = regs.semaphore.payload;
     VideoCommon::QueryPropertiesFlags flags{VideoCommon::QueryPropertiesFlags::IsAFence};
+    namespace Census = VideoCommon::Nx2Census;
     switch (type) {
     case LaunchDMA::SemaphoreType::NONE:
+        return;
+    case LaunchDMA::SemaphoreType::RELEASE_CONDITIONAL_INTR_SEMAPHORE:
+        Census::NoteClass(Census::Class::D1_DMA_SEMAPHORE_TYPE_3);
+        if (!Census::FixOn(Census::Fix::D1)) {
+            ASSERT_MSG(false, "Unknown semaphore type: {}", static_cast<u32>(type.Value()));
+            return;
+        }
+        // clc7b5.h only names the type: [INFERENCE] it is the one word release plus an
+        // interrupt, which has no meaning here.
+        if (static bool logged = false; !std::exchange(logged, true)) {
+            LOG_WARNING(HW_GPU, "Nx2 DMA semaphore type 3 (RELEASE_CONDITIONAL_INTR_SEMAPHORE) "
+                                "released as one word");
+        }
         break;
-    case LaunchDMA::SemaphoreType::RELEASE_ONE_WORD_SEMAPHORE: {
-        rasterizer->Query(address, VideoCommon::QueryType::Payload, flags, payload, 0);
-        break;
-    }
-    case LaunchDMA::SemaphoreType::RELEASE_FOUR_WORD_SEMAPHORE: {
-        rasterizer->Query(address, VideoCommon::QueryType::Payload,
-                          flags | VideoCommon::QueryPropertiesFlags::HasTimeout, payload, 0);
-        break;
-    }
     default:
-        ASSERT_MSG(false, "Unknown semaphore type: {}", static_cast<u32>(type.Value()));
         break;
     }
+    if (regs.launch_dma.semaphore_payload_size != 0) {
+        Census::NoteClass(Census::Class::D1_DMA_TWO_WORD_PAYLOAD);
+    }
+    if (regs.launch_dma.reduction_enable != 0) {
+        Census::NoteClass(Census::Class::D1_DMA_SEMAPHORE_REDUCTION);
+    }
+    if (type == LaunchDMA::SemaphoreType::RELEASE_FOUR_WORD_SEMAPHORE) {
+        flags = flags | VideoCommon::QueryPropertiesFlags::HasTimeout;
+    }
+    rasterizer->Query(address, VideoCommon::QueryType::Payload, flags, payload, 0);
 }
 
 } // namespace Tegra::Engines

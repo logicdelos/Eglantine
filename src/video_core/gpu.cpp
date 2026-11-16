@@ -44,6 +44,7 @@
 #include "video_core/host1x/syncpoint_manager.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_method_census.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_spikes.h"
 #include "video_core/renderer_base.h"
@@ -227,6 +228,7 @@ struct GPU::Impl {
         // The GPU thread is joined first: a waiter released below may return and destroy what its
         // sync request captured, so no request may still run after that.
         gpu_thread.NotifyShutdown();
+        VideoCommon::Nx2Census::Report();
         {
             std::scoped_lock lk{sync_mutex};
             shutting_down.store(true, std::memory_order::relaxed);

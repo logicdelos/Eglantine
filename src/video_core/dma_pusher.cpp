@@ -29,6 +29,7 @@
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_method_census.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/rasterizer_interface.h"
 
@@ -427,6 +428,18 @@ static const u32 g_semaphore_watch = [] {
 // EDEN_NX2_PB_CHECK also keeps the last parsed entries, for DumpCurrentEntry.
 static const bool g_record_parsed_entries = std::getenv("EDEN_NX2_PB_CHECK") != nullptr;
 
+// Nx2 method census row of an engine (video_core/nx2_method_census.h).
+const u8* DmaPusher::CensusSlotsFor(Engines::EngineTypes type) {
+    switch (type) {
+    case Engines::EngineTypes::Maxwell3D:
+        return VideoCommon::Nx2Census::Slots(VideoCommon::Nx2Census::Engine::Maxwell3D);
+    case Engines::EngineTypes::KeplerCompute:
+        return VideoCommon::Nx2Census::Slots(VideoCommon::Nx2Census::Engine::Compute);
+    default:
+        return nullptr;
+    }
+}
+
 size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset) {
     for (size_t index = 0; index < commands.size();) {
         // Data word of methods command
@@ -469,6 +482,9 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
                         for (u32 i = 0; i < batch_count; ++i) {
                             subchannel->method_sink.emplace_back(dma_state.method + i, commands[index + i].argument);
                         }
+                        VideoCommon::Nx2Census::NoteHostWords(
+                            census_slots[dma_state.subchannel], dma_state.method,
+                            &commands[index].argument, batch_count, true);
                         dma_state.method += batch_count;
                         dma_state.method_count -= batch_count;
                         index += batch_count;
@@ -552,6 +568,8 @@ bool DmaPusher::FrontRun(std::span<const CommandHeader> commands, size_t word_of
         VerifyFrontRun(*maxwell3d, commands, word_offset, index);
         return true;
     }
+    VideoCommon::Nx2Census::NoteHostWords(census_slots[dma_state.subchannel], method,
+                                          &commands[index].argument, count, true);
     maxwell3d->FrontCallMethodRun(system, split, method, &commands[index].argument, count, true,
                                   count);
     dma_state.dma_word_offset = u64((word_offset + index + count - 1) * sizeof(u32));
@@ -701,6 +719,8 @@ void DmaPusher::CallMethod(u32 argument) {
             ReportUnboundSubchannel();
             return;
         }
+        VideoCommon::Nx2Census::NoteHostWords(census_slots[dma_state.subchannel], dma_state.method,
+                                              &argument, 1, true);
         // Compute dispatches and DMA copies write the command lists ReadGpuWrittenCommands reads.
         const auto engine_type = subchannel_type[dma_state.subchannel];
         const bool writer = IsMemoryWriter(*subchannel, engine_type, dma_state.method);
@@ -765,6 +785,8 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
             ReportUnboundSubchannel();
             return;
         }
+        VideoCommon::Nx2Census::NoteHostWords(census_slots[dma_state.subchannel], dma_state.method,
+                                              base_start, num_methods, !dma_state.non_incrementing);
         // Compute dispatches and DMA copies write the command lists ReadGpuWrittenCommands reads.
         const auto engine_type = subchannel_type[dma_state.subchannel];
         const bool writer = IsMemoryWriter(*subchannel, engine_type, dma_state.method);

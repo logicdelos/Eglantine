@@ -161,6 +161,7 @@ private:
     void ProcessSemaphoreRelease(DmaPusher& dma_pusher);
     void ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher);
     void ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument);
+    void ProcessSemaphoreReduction(DmaPusher& dma_pusher);
     /// CanResumeAcquire's check of the pending acquire.
     [[nodiscard]] bool PollAcquire(DmaPusher& dma_pusher);
     [[nodiscard]] bool ExecuteMethodOnEngine(DmaPusher& dma_pusher, u32 method);
@@ -176,6 +177,7 @@ private:
         WriteLong = 0x2,
         AcquireGequal = 0x4,
         AcquireMask = 0x8,
+        Reduction = 0x10,
     };
 
 #define ASSERT_REG_POSITION(field_name, position)                                                  \

@@ -14,6 +14,7 @@
 #include <unordered_map>
 
 #include "video_core/nx2_perf.h"
+#include "video_core/nx2_method_census.h"
 
 namespace Tegra {
 
@@ -63,6 +64,8 @@ public:
     template <typename Read, typename Release, typename Dispatch>
     std::string_view Signal(Address address, Word argument, Read read, Release release, Dispatch dispatch) {
         struct Pending { Address address; Word action; Word count; };
+        namespace Census = VideoCommon::Nx2Census;
+        using Census::NoteClass;
         std::string_view error;
         std::array<Pending, 256> pending;
         if (!nx2_perf || VideoCommon::Nx2Perf::Verify()) pending = {};
@@ -84,6 +87,12 @@ public:
                     if (!read(request.address, state.descriptor)) return "unmapped QMD";
                     just_loaded = true;
                     const auto& qmd = state.descriptor;
+                    // C6: counted when a QMD is loaded; the checks below reject these.
+                    if (const Word version = qmd[18] & 0xff; version != 0x30) {
+                        if ((version >> 4) == 2) NoteClass(Census::Class::C6_QMD_V02);
+                    } else if (qmd[4] & 0x100) {
+                        NoteClass(Census::Class::C6_IS_QUEUE);
+                    }
                     if ((qmd[18] & 0xff) != 0x30 || (qmd[4] & 0x100)) return "unsupported QMD version or queue";
                     if constexpr (std::is_same_v<Dispatch, RejectShaderDispatch>) {
                         if (qmd[12] && (qmd[13] & 0xffff) && (qmd[14] & 0xffff))
@@ -109,6 +118,15 @@ public:
             } else if (request.action == 0 || request.action == 1) {
                 continue;
             } else {
+                switch (request.action) { // PCAS actions of clc7c0.h the scheduler has no part for
+                case 6: NoteClass(Census::Class::C1_PCAS_ACTION_6); break;
+                case 8: NoteClass(Census::Class::C1_PCAS_ACTION_8); break;
+                case 9: NoteClass(Census::Class::C1_PCAS_ACTION_9); break;
+                case 10: NoteClass(Census::Class::C1_PCAS_ACTION_10); break;
+                case 11: NoteClass(Census::Class::C1_PCAS_ACTION_11); break;
+                case 13: NoteClass(Census::Class::C1_PCAS_ACTION_13); break;
+                default: break;
+                }
                 return "unsupported PCAS action";
             }
             if (!state.loaded || !state.scheduled || state.completed || state.dependencies > 0) continue;
@@ -128,6 +146,9 @@ public:
                 const Word base = ReleaseSlots[slot];
                 const Word flags = qmd[base + 1];
                 if (!(flags & (1U << 23))) continue;
+                if (flags & (1U << 29)) NoteClass(Census::Class::C3_QMD_RELEASE_PAYLOAD64B);
+                if ((flags >> 30) == 2) NoteClass(Census::Class::C3_QMD_RELEASE_TWO_WORDS);
+                if ((flags >> 27) & 3) NoteClass(Census::Class::C3_QMD_RELEASE_TRAP_TYPE);
                 // Skip only this slot: the others are what other queues and the CPU wait on.
                 if (!IsDecodableRelease(flags)) {
                     if (skipped_release) skipped_release(request.address, slot, std::span<const Word, 4>{&qmd[base], 4});
@@ -143,7 +164,10 @@ public:
                 if (count == pending.size()) return "QMD chain limit";
                 pending[count++] = {Address{qmd[15]} << 8, action == 4 ? 7U : action == 3 ? 3U : 2U, 1};
             }
-            if (qmd[16] & (1U << 5)) return "second dependent QMD unsupported";
+            if (qmd[16] & (1U << 5)) {
+                NoteClass(Census::Class::C6_DEPENDENT_QMD1);
+                return "second dependent QMD unsupported";
+            }
         }
         return error;
     }
