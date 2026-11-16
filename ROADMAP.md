@@ -30,11 +30,11 @@ Status: in progress.
 
 **Significant change:** the fork's own fixes on top of upstream build `daily-20261116`.
 
-- Xenoblade Chronicles 2: corner noise removed (an upscaling step now turns invalid values into zero).
-- Fire Emblem: Fortune's Weave: presentation pacing, add-on content packages mounted from the game container.
+- Xenoblade Chronicles 2: the game no longer aborts at boot (a larger alias region, 4 KiB window buffer alignment, add-on content packages mounted from the game container); the title screen colours, textures and font are decoded correctly; corner noise is removed (an upscaling step now turns invalid values into zero).
+- Fire Emblem: Fortune's Weave: dialogue scenes no longer draw a black 3D background with the present queue on (a likely fix, not confirmed in the game); a scene that stayed at about 23.5 fps with GPU accuracy High and Sync Memory Operations on now measures 30.0 fps on the tested laptop.
 - Four waits that could hang the emulator for ever are now bounded; the log is flushed on a crash.
 - Audio: sample count kept across stop and start, volume applied once, idle pacing.
-- Memory: guest memory committed as it is used on Windows; failed image creation at high resolution scales no longer ends the session.
+- Memory: guest memory committed as it is used on Windows; a failed image creation at high resolution scales should no longer end the session (a likely fix for a crash seen in Fire Emblem: Fortune's Weave at 4x, not confirmed).
 - A log line every 10 seconds that names what currently limits the frame rate.
 
 Done when: both tested games boot to their reference scenes on a clean build.
