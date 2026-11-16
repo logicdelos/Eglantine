@@ -36,6 +36,8 @@ struct LaunchParams {
     bool mcp_enable = false;
     std::optional<u16> mcp_port{};
     bool mcp_allow_writes = false;
+    // --control <name>: a replying control channel on a local pipe or socket (SDL frontend).
+    std::optional<std::string> control_name{};
     // --pack-nup <dump> [<out.nup>]: packs a loose dump instead of booting a game (eden-cli).
     std::optional<std::string> pack_nup_source{};
     // --unpack-nup <file.nup> [<out_dir>]: extracts a NUP back into a loose dump.

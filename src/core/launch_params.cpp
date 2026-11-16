@@ -92,6 +92,7 @@ static struct option kLongOptions[] = {
     {"null-render", no_argument, 0, 'n'},
     {"singlecore", no_argument, 0, 's'},
     {"filter", no_argument, 0, 'x'},
+    {"control", required_argument, 0, 0x120},
     {"mcp", no_argument, 0, 'M'},
     {"mcp-port", required_argument, 0, 'P'},
     {"mcp-allow-writes", no_argument, 0, 'W'},
@@ -224,6 +225,7 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
 
     int option_index = 0;
 
+
     // The first problem with the automation options is the one reported (see LaunchParams).
     const auto fail = [&p](std::string message) {
         if (p.parse_error.empty()) {
@@ -276,6 +278,25 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
             case 'W':
                 p.mcp_allow_writes = true;
                 break;
+            case 0x120: {
+                // The name becomes part of a pipe name or a socket file name.
+                const std::string name{optarg};
+                bool valid = !name.empty() && name.size() <= 64 && std::isalnum(static_cast<unsigned char>(name[0])) != 0 &&
+                             static_cast<unsigned char>(name[0]) < 0x80;
+                for (const char c : name) {
+                    valid = valid && ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
+                                      (c >= 'A' && c <= 'Z') || c == '.' || c == '_' || c == '-');
+                }
+                if (p.control_name) {
+                    fail("--control was given more than once");
+                } else if (!valid) {
+                    fail("--control needs a name of 1 to 64 letters, digits, '.', '_' or '-', "
+                         "starting with a letter or digit");
+                } else {
+                    p.control_name = name;
+                }
+                break;
+            }
             case 'N':
                 p.pack_nup_source = std::string(optarg);
                 break;

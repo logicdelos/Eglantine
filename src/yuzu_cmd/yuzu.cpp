@@ -68,6 +68,7 @@
 #include "video_core/shader_notify.h"
 #include "video_core/shader_warm/shader_warm_builder.h"
 #include "yuzu_cmd/cli_settings.h"
+#include "yuzu_cmd/control_commands.h"
 #include "yuzu_cmd/run_report.h"
 #include "yuzu_cmd/user_dir.h"
 #include "yuzu_cmd/version_info.h"
@@ -204,6 +205,8 @@ struct SdlState {
     InputCommon::InputSubsystem input_subsystem{};
     std::unique_ptr<EmuWindow_SDL3> emu_window;
     bool network_initialized{};
+    // Control channel (only with --control): destroyed before the system shuts down.
+    std::unique_ptr<Control::Commands> control;
 #ifdef YUZU_ENABLE_MCP
     // Built-in MCP server (only with --mcp): destroyed before the system shuts down.
     std::unique_ptr<CliMcpHost> mcp_host;
@@ -717,6 +720,25 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         return SDL_APP_FAILURE;
     }
 
+    if (lp.control_name) {
+        // Opened before the game loads, so a supervisor can connect and watch it start.
+        state->control = std::make_unique<Control::Commands>(
+            state->system, state->input_subsystem, [] {
+                live_quit_requested = true;
+                Common::RunOutcome::Request(Common::RunOutcome::Reason::Requested,
+                                            "stop requested through the control channel");
+            });
+        if (const std::string error = state->control->Start(*lp.control_name); !error.empty()) {
+            LOG_CRITICAL(Frontend, "Control channel: {}", error);
+            std::fprintf(stderr, "Control channel: %s\n", error.c_str());
+            startup_reason = Common::RunOutcome::Reason::StartupError;
+            startup_detail = "control channel: " + error;
+            Common::RunOutcome::Request(Common::RunOutcome::Reason::StartupError, startup_detail);
+            state->control.reset();
+            return SDL_APP_FAILURE;
+        }
+    }
+
     state->network_initialized = Network::Init();
     if (!state->network_initialized) {
         LOG_CRITICAL(Network, "Failed to initialize room networking");
@@ -1097,6 +1119,9 @@ extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
         return SDL_APP_SUCCESS;
     }
     RunKeyScript(state->input_subsystem, state->system);
+    if (state->control) {
+        state->control->Poll();
+    }
 #ifdef YUZU_ENABLE_MCP
     if (state->mcp_host) {
         state->mcp_host->DrainMainThread();
@@ -1166,6 +1191,7 @@ extern "C" void SDL_AppQuit(void *appstate, SDL_AppResult result) {
         // grace period covers the teardown, and a deadline reached meanwhile does not rename it.
         RecordFallbackReason(result);
     }
+    state->control.reset(); // joins the channel thread before the system goes away
 #ifdef YUZU_ENABLE_MCP
     state->mcp_server.reset(); // stops serving before the system goes away
     state->mcp_host.reset();

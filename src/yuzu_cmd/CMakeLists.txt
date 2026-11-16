@@ -36,6 +36,16 @@ add_executable(yuzu-cmd
     emu_window/emu_window_sdl3_vk.h
     cli_settings.cpp
     cli_settings.h
+    control_channel.cpp
+    control_channel.h
+    control_commands.cpp
+    control_commands.h
+    control_file.cpp
+    control_file.h
+    control_transport.cpp
+    control_transport.h
+    frame_capture.cpp
+    frame_capture.h
     run_report.cpp
     run_report.h
     sdl_config.cpp

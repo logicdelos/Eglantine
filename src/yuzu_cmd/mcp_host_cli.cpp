@@ -8,7 +8,6 @@
 #include <future>
 #include <memory>
 
-#include "common/stb.h"
 #include "core/core.h"
 #include "core/frontend/framebuffer_layout.h"
 #include "core/perf_stats.h"
@@ -19,6 +18,7 @@
 #include "video_core/gpu.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
+#include "yuzu_cmd/frame_capture.h"
 #include "yuzu_cmd/mcp_host_cli.h"
 
 CliMcpHost::CliMcpHost(Core::System& system_, InputCommon::InputSubsystem& input_)
@@ -134,49 +134,18 @@ std::string CliMcpHost::WithTas(bool require_game,
 /// Asks the renderer for a 16:9 BGRA frame `width` wide and waits up to `timeout` for it.
 std::optional<Mcp::Frame> CliMcpHost::CaptureFrame(u32 width, std::chrono::milliseconds timeout,
                                                    std::string& error) {
-    if (!system.IsPoweredOn()) {
-        error = "no game is running";
+    auto pending = FrameCapture::Begin(system, width, error);
+    if (!pending) {
         return std::nullopt;
     }
-    auto& renderer = system.Renderer();
-    if (renderer.IsScreenshotPending()) {
-        error = "another screenshot is in progress; retry";
-        return std::nullopt;
-    }
-    width = std::clamp<u32>(width, 160, 3840);
-    const u32 height = width * 9 / 16;
-    // Shared with the renderer's callback, which may run after we time out.
-    struct Capture {
-        Mcp::Frame frame;
-        std::promise<bool> done;
-    };
-    auto capture = std::make_shared<Capture>();
-    capture->frame = {.width = width, .height = height};
-    capture->frame.bgra.resize(size_t{width} * height * 4);
-    auto future = capture->done.get_future();
-    renderer.RequestScreenshot(
-        capture->frame.bgra.data(),
-        [capture](bool invert_y) {
-            if (invert_y) {
-                auto& f = capture->frame;
-                std::vector<u8> row(size_t{f.width} * 4);
-                for (u32 y = 0; y < f.height / 2; ++y) {
-                    u8* a = f.bgra.data() + size_t{y} * f.width * 4;
-                    u8* b = f.bgra.data() + size_t{f.height - 1 - y} * f.width * 4;
-                    std::memcpy(row.data(), a, row.size());
-                    std::memcpy(a, b, row.size());
-                    std::memcpy(b, row.data(), row.size());
-                }
-            }
-            capture->done.set_value(true);
-        },
-        Layout::DefaultFrameLayout(width, height));
-    if (future.wait_for(timeout) != std::future_status::ready) {
+    auto frame = pending->Wait(timeout, error);
+    if (!frame) {
         error = "timed out waiting for a frame (paused, loading, or a hidden/null window: "
                 "screenshot_raw works without one)";
         return std::nullopt;
     }
-    return capture->frame;
+    return Mcp::Frame{.width = frame->width, .height = frame->height,
+                      .bgra = std::move(frame->bgra)};
 }
 
 /// Captures a frame and encodes it as an opaque RGBA PNG.
@@ -187,17 +156,5 @@ std::optional<std::vector<u8>> CliMcpHost::CaptureScreenshotPng(u32 max_width,
     if (!frame) {
         return std::nullopt;
     }
-    for (size_t i = 0; i + 3 < frame->bgra.size(); i += 4) {
-        std::swap(frame->bgra[i], frame->bgra[i + 2]); // BGRA -> RGBA
-        frame->bgra[i + 3] = 255;
-    }
-    std::vector<u8> png;
-    stbi_write_png_to_func(
-        [](void* context, void* data, int size) {
-            auto* out = static_cast<std::vector<u8>*>(context);
-            out->insert(out->end(), static_cast<u8*>(data), static_cast<u8*>(data) + size);
-        },
-        &png, static_cast<int>(frame->width), static_cast<int>(frame->height), 4,
-        frame->bgra.data(), static_cast<int>(frame->width * 4));
-    return png;
+    return FrameCapture::EncodePng(frame->width, frame->height, std::move(frame->bgra));
 }
