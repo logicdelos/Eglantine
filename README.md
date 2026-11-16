@@ -33,7 +33,7 @@ Frame-rate figures in this repository always come with the scene, settings, hard
 - It tracks upstream daily builds; each release names the upstream build it is based on.
 - It carries its own fixes for the two tested games and for stability, listed per release in [FORK_CHANGELOG.md](FORK_CHANGELOG.md).
 - It ports selected fixes from other Eglantine forks, each credited to its author in the commit and in the release notes.
-- It adds tools for measuring: a log line that names what limits the frame rate, and command-line runs that end by themselves and write a result file.
+- It adds a log line that names what limits the frame rate. Command-line runs that end by themselves and write a result file are planned; see the [roadmap](ROADMAP.md).
 - Long term, it adds a fast graphics path beside the existing one. See the [roadmap](ROADMAP.md).
 
 Everything else behaves as upstream does. The [user handbook](https://github.com/Eglantine-Community/docs/blob/38e8d2a962a6137731e67fc8e89163691a4521cd/content/user/README.mdx) applies unchanged.
