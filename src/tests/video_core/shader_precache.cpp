@@ -15,6 +15,7 @@
 #include <fmt/format.h>
 
 #include "shader_recompiler/exception.h"
+#include "video_core/cache_envelope.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/shader_environment.h"
 #include "video_core/shader_warm/shader_archives.h"
@@ -24,6 +25,7 @@
 namespace {
 
 namespace ShaderWarm = VideoCommon::ShaderWarm;
+namespace CE = VideoCommon::CacheEnvelope;
 
 struct TempDir {
     std::filesystem::path path;
@@ -42,6 +44,48 @@ struct TempDir {
 void WriteBytes(const std::filesystem::path& file, std::string_view bytes) {
     std::ofstream out(file, std::ios::binary | std::ios::trunc);
     out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+}
+
+CE::HostIdentity TestHost() {
+    CE::HostIdentity host;
+    host.build_id = 0xb01d;
+    host.title_id = 0x0100aabbccddeeffULL;
+    host.game_version = 3;
+    host.content_stamp = 0xc0ffee;
+    return host;
+}
+
+/// Sets the host identity the caches and the precache file are stamped with, and clears it again.
+struct HostGuard {
+    explicit HostGuard(const CE::HostIdentity& host) {
+        CE::SetHostIdentity(host);
+    }
+    ~HostGuard() {
+        CE::SetHostIdentity(CE::HostIdentity{});
+    }
+    HostGuard(const HostGuard&) = delete;
+    HostGuard& operator=(const HostGuard&) = delete;
+};
+
+std::vector<u8> OneComputeEntry() {
+    ShaderWarm::LoweredCode lowered;
+    lowered.code.resize(16 * sizeof(u64));
+    ShaderWarm::ComputeKey key{};
+    return ShaderWarm::ComputeEntry(lowered, {{1, 1, 1}, 0, 0}, key);
+}
+
+/// A precache file as the builder leaves it: one compute record in an envelope for `identity`,
+/// and the count file with `builder` as the builder version.
+void WriteWarmFile(const std::filesystem::path& warm, const CE::CacheIdentity& identity,
+                   u32 builder = ShaderWarm::WarmBuilderVersion) {
+    auto writer = CE::EnvelopeWriter::Create(warm, identity, CE::MaxWarmBytes);
+    REQUIRE(writer);
+    CE::RecordMeta meta;
+    meta.kind = CE::RecordKind::Compute;
+    REQUIRE(writer->Append(meta, OneComputeEntry()) == CE::AppendResult::Ok);
+    REQUIRE(writer->Commit());
+    WriteBytes(ShaderWarm::WarmCountPath(warm),
+               fmt::format("1 {} {}\n", std::filesystem::file_size(warm), builder));
 }
 
 } // Anonymous namespace
@@ -72,6 +116,32 @@ TEST_CASE("ShaderPrecache: the marker matches only the same file and driver", "[
     REQUIRE_FALSE(marker->Matches(*ShaderWarm::CurrentWarmStamp(warm, 12, 0x1234, 0x2206, 53)));
 }
 
+TEST_CASE("ShaderPrecache: the marker carries the content stamp and an old marker is not one",
+          "[video_core]") {
+    TempDir dir;
+    const auto warm = dir.path / "warm-compute.bin";
+    WriteBytes(warm, "precache");
+    auto host = TestHost();
+    {
+        const HostGuard guard{host};
+        const auto stamp = ShaderWarm::CurrentWarmStamp(warm, 12, 1, 2, 3);
+        REQUIRE(stamp.has_value());
+        REQUIRE(stamp->content_stamp == host.content_stamp);
+        REQUIRE(ShaderWarm::WriteWarmMarker(warm, *stamp));
+        const auto marker = ShaderWarm::ReadWarmMarker(warm);
+        REQUIRE(marker.has_value());
+        REQUIRE(marker->content_stamp == host.content_stamp);
+        REQUIRE(marker->Matches(*ShaderWarm::CurrentWarmStamp(warm, 12, 1, 2, 3)));
+        // Another executable or content set is another precache, though the file is the same.
+        host.content_stamp += 1;
+        CE::SetHostIdentity(host);
+        REQUIRE_FALSE(marker->Matches(*ShaderWarm::CurrentWarmStamp(warm, 12, 1, 2, 3)));
+    }
+    // A marker from before the stamp existed has six fields and is not read.
+    WriteBytes(ShaderWarm::WarmMarkerPath(warm), "8 1234 12 1 2 3\n");
+    REQUIRE_FALSE(ShaderWarm::ReadWarmMarker(warm).has_value());
+}
+
 TEST_CASE("ShaderPrecache: the entry count belongs to a file of one size", "[video_core]") {
     TempDir dir;
     const auto warm = dir.path / "warm-compute.bin";
@@ -97,21 +167,18 @@ TEST_CASE("ShaderPrecache: a compute entry reads back like a pipeline cache entr
     ShaderWarm::ComputeKey key_bytes{};
     const auto entry = ShaderWarm::ComputeEntry(lowered, control, key_bytes);
 
-    TempDir dir;
-    const auto file = dir.path / "entry.bin";
-    WriteBytes(file, std::string_view{reinterpret_cast<const char*>(entry.data()), entry.size()});
-
-    std::ifstream in(file, std::ios::binary);
-    in.exceptions(std::ifstream::failbit);
-    u32 num_envs{};
-    in.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
-    REQUIRE(num_envs == 1);
-    VideoCommon::FileEnvironment env;
-    env.Deserialize(in);
+    const auto entry_view = std::span<const u8>(entry);
+    VideoCommon::PipelineRecord record;
+    REQUIRE(VideoCommon::DecodePipelineRecord(entry_view, false, record) == CE::RejectReason::None);
+    REQUIRE(record.is_compute);
+    REQUIRE(record.envs.size() == 1);
+    VideoCommon::FileEnvironment& env = record.envs.front();
     Vulkan::ComputePipelineCacheKey key{};
     static_assert(sizeof(key) == sizeof(key_bytes));
-    in.read(reinterpret_cast<char*>(&key), sizeof(key));
-    REQUIRE(in.tellg() == static_cast<std::streamoff>(entry.size()));
+    REQUIRE(record.key.size() == sizeof(key));
+    std::memcpy(&key, record.key.data(), sizeof(key));
+    // The key is the 24 bytes the entry reports: hash, shared memory, workgroup.
+    REQUIRE(std::memcmp(record.key.data(), key_bytes.data(), sizeof(key)) == 0);
 
     REQUIRE(env.ShaderStage() == Shader::Stage::Compute);
     REQUIRE(env.WorkgroupSize() == control.workgroup);
@@ -140,38 +207,91 @@ TEST_CASE("ShaderPrecache: a program naming no texture bank reads bank 0", "[vid
     ShaderWarm::ComputeKey key{};
     const auto entry = ShaderWarm::ComputeEntry(lowered, {{1, 1, 1}, 0, 0}, key);
     u32 texture_bound{};
-    // num_envs, then six u64 counts and local memory before the texture bank.
-    std::memcpy(&texture_bound, entry.data() + 4 + 6 * 8 + 4, sizeof(texture_bound));
+    // env_count, env_length, then six u64 counts and local memory before the texture bank.
+    std::memcpy(&texture_bound, entry.data() + 4 + 4 + 6 * 8 + 4, sizeof(texture_bound));
     REQUIRE(texture_bound == 0);
 }
 
-TEST_CASE("ShaderPrecache: a file from an older builder or cache version is stale",
+TEST_CASE("ShaderPrecache: a file from an older builder, cache version, build, title or content is "
+          "stale",
           "[video_core]") {
     TempDir dir;
     const auto warm = dir.path / "warm-compute.bin";
-    REQUIRE(ShaderWarm::WarmFilesStale(warm).has_value());
+    const auto host = TestHost();
+    const HostGuard guard{host};
+    const auto reason = [](CE::RejectReason rejection) {
+        return fmt::format("cache file rejected ({})", CE::RejectReasonName(rejection));
+    };
+    REQUIRE(ShaderWarm::WarmFilesStale(warm) == "none built yet");
 
-    std::string header = "yuzucach";
-    const u32 version = ShaderWarm::WarmCacheVersion;
-    header.append(reinterpret_cast<const char*>(&version), sizeof(version));
-    WriteBytes(warm, header);
+    const auto current = ShaderWarm::WarmFileIdentity(host, ShaderWarm::WarmAddonsEnabled());
+    WriteWarmFile(warm, current);
     const auto count = ShaderWarm::WarmCountPath(warm);
-    // Count files written before the builder version was recorded have two fields.
-    WriteBytes(count, "0 12\n");
-    REQUIRE(ShaderWarm::WarmFilesStale(warm).has_value());
-    WriteBytes(count, fmt::format("0 12 {}\n", ShaderWarm::WarmBuilderVersion - 1));
-    REQUIRE(ShaderWarm::WarmFilesStale(warm).has_value());
-    WriteBytes(count, fmt::format("0 12 {}\n", ShaderWarm::WarmBuilderVersion));
     REQUIRE_FALSE(ShaderWarm::WarmFilesStale(warm).has_value());
 
-    WriteBytes(count, fmt::format("0 13 {}\n", ShaderWarm::WarmBuilderVersion));
-    REQUIRE(ShaderWarm::WarmFilesStale(warm).has_value());
-    const u32 old_version = ShaderWarm::WarmCacheVersion - 1;
-    std::string old_header = "yuzucach";
-    old_header.append(reinterpret_cast<const char*>(&old_version), sizeof(old_version));
-    WriteBytes(warm, old_header);
-    WriteBytes(count, fmt::format("0 12 {}\n", ShaderWarm::WarmBuilderVersion));
-    REQUIRE(ShaderWarm::WarmFilesStale(warm).has_value());
+    // Another build, title or content set, or add-ons on the other side of the switch.
+    auto other = host;
+    other.build_id += 1;
+    CE::SetHostIdentity(other);
+    REQUIRE(ShaderWarm::WarmFilesStale(warm) == reason(CE::RejectReason::BuildId));
+    other = host;
+    other.title_id += 1;
+    CE::SetHostIdentity(other);
+    REQUIRE(ShaderWarm::WarmFilesStale(warm) == reason(CE::RejectReason::Title));
+    other = host;
+    other.game_version += 1;
+    CE::SetHostIdentity(other);
+    REQUIRE(ShaderWarm::WarmFilesStale(warm) == reason(CE::RejectReason::GameVersion));
+    other = host;
+    other.content_stamp += 1;
+    CE::SetHostIdentity(other);
+    REQUIRE(ShaderWarm::WarmFilesStale(warm) == reason(CE::RejectReason::Content));
+    CE::SetHostIdentity(host);
+    REQUIRE_FALSE(ShaderWarm::WarmFilesStale(warm).has_value());
+    WriteWarmFile(warm, ShaderWarm::WarmFileIdentity(host, !ShaderWarm::WarmAddonsEnabled()));
+    REQUIRE(ShaderWarm::WarmFilesStale(warm) == reason(CE::RejectReason::Content));
+
+    // A file of another cache version.
+    auto old_version = current;
+    old_version.shader_format_version -= 1;
+    WriteWarmFile(warm, old_version);
+    REQUIRE(ShaderWarm::WarmFilesStale(warm) == "built for another cache version");
+
+    // The count file: builder version and size.
+    WriteWarmFile(warm, current, ShaderWarm::WarmBuilderVersion - 1);
+    REQUIRE(ShaderWarm::WarmFilesStale(warm) == "built by an older version");
+    WriteBytes(count, fmt::format("1 {}\n", std::filesystem::file_size(warm)));
+    REQUIRE(ShaderWarm::WarmFilesStale(warm) == "built by an older version");
+    WriteWarmFile(warm, current);
+    REQUIRE_FALSE(ShaderWarm::WarmFilesStale(warm).has_value());
+    WriteBytes(count, fmt::format("1 {} {}\n", std::filesystem::file_size(warm) + 1,
+                                  ShaderWarm::WarmBuilderVersion));
+    REQUIRE(ShaderWarm::WarmFilesStale(warm) == "changed since it was built");
+
+    // A file cut short by a crash is not an envelope.
+    WriteWarmFile(warm, current);
+    std::filesystem::resize_file(warm, std::filesystem::file_size(warm) - 1);
+    REQUIRE(ShaderWarm::WarmFilesStale(warm) == reason(CE::RejectReason::Truncated));
+}
+
+TEST_CASE("ShaderPrecache: a precache file in the old format is set aside once", "[video_core]") {
+    TempDir dir;
+    const auto warm = dir.path / "warm-compute.bin";
+    const auto backup = std::filesystem::path(warm).concat(".legacy.bak");
+    const HostGuard guard{TestHost()};
+    std::string old_file = "yuzucach";
+    const u32 version = ShaderWarm::WarmCacheVersion;
+    old_file.append(reinterpret_cast<const char*>(&version), sizeof(version));
+    old_file.append("entries");
+    WriteBytes(warm, old_file);
+    WriteBytes(ShaderWarm::WarmCountPath(warm),
+               fmt::format("0 {} {}\n", old_file.size(), ShaderWarm::WarmBuilderVersion));
+    REQUIRE(ShaderWarm::WarmFilesStale(warm) == "built in the old file format");
+    REQUIRE_FALSE(std::filesystem::exists(warm));
+    REQUIRE(std::filesystem::file_size(backup) == old_file.size());
+    // Nothing is left to reject, so nothing is backed up twice.
+    REQUIRE(ShaderWarm::WarmFilesStale(warm) == "none built yet");
+    REQUIRE(std::filesystem::exists(backup));
 }
 
 TEST_CASE("ShaderPrecache: every container the archive walker reads is discovered",
@@ -224,4 +344,26 @@ TEST_CASE("ShaderPrecache: programs that cannot be lowered are refused", "[video
     const std::array<u8, 16> no_exit{};
     REQUIRE(ShaderWarm::LowerProgram(no_exit, lowered).has_value());
     REQUIRE(lowered.code.empty());
+}
+
+TEST_CASE("ShaderPrecache: the old cache file reader refuses a record without environments",
+          "[video_core]") {
+    TempDir dir;
+    const auto file = dir.path / "pipelines.bin";
+    const u32 version = 9;
+    for (const u32 envs : {0U, static_cast<u32>(CE::MaxEnvsPerRecord) + 1, 0xffffffffU}) {
+        INFO(envs);
+        std::string bytes = "yuzucach";
+        bytes.append(reinterpret_cast<const char*>(&version), sizeof(version));
+        bytes.append(reinterpret_cast<const char*>(&envs), sizeof(envs));
+        bytes.append(64, '\0');
+        WriteBytes(file, bytes);
+        size_t loaded = 0;
+        VideoCommon::LoadPipelines(
+            {}, file, version, [&](std::ifstream&, VideoCommon::FileEnvironment) { ++loaded; },
+            [&](std::ifstream&, std::vector<VideoCommon::FileEnvironment>) { ++loaded; });
+        REQUIRE(loaded == 0);
+        // The file is deleted as broken: it was neither read nor allocated for.
+        REQUIRE_FALSE(std::filesystem::exists(file));
+    }
 }
