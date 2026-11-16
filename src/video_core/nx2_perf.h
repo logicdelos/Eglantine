@@ -98,9 +98,6 @@ enum class Opt : unsigned {
     /// Async shaders: reserve half the per-frame shader build budget for G-buffer draws and the
     /// highest-priority deferred keys from the previous frame (G-buffer first, then by draw count)
     BuildOrderPriority,
-    /// Async shaders: keep FileEnvironments of graphics pipelines skipped at boot and replay their
-    /// translation and compilation on background workers on first skippable use
-    ReplayDiskRecordings,
     /// A Switch 2 semaphore acquire that an already issued release (its guest write still
     /// delayed by the fence behavior) will meet continues at once instead of waiting for the
     /// host GPU (Tegra::Nx2IssuedReleases in nx2.h)
@@ -155,7 +152,7 @@ inline constexpr std::array<std::string_view, static_cast<size_t>(Opt::Count)> o
     "submit_while_waited", "pipeline_keep_preloaded", "bank_once_per_frame", "dirty_gather_fast",
     "handle_page_cache", "dma_forward", "draw_begin_coalesce", "pending_wake", "diag_draw_lite",
     "shader_build_budget", "compute_rebuild_async", "compute_preload_variants", "stale_target_skip",
-    "geometry_consistency", "build_order_priority", "replay_disk_recordings", "acquire_issued",
+    "geometry_consistency", "build_order_priority", "acquire_issued",
     "image_admission", "gp_sync_host", "worker_budget", "vram_budget_reported", "vram_priority",
     "query_landed", "dma_read_settle", "uniform_shadow_lean", "compute_unoptimized_slow",
     "compute_boot_deferred", "descriptor_handle_memo", "semaphore_fence_lean",

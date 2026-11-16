@@ -143,7 +143,7 @@ SkipCounts TakeSkips() {
     return taken;
 }
 
-// "14 draws skipped (disk-replay-async 10, geometry-consistency 4; last 10 s)", then, when there
+// "14 draws skipped (async-translation 10, geometry-consistency 4; last 10 s)", then, when there
 // were any, ", 2 dispatches skipped (compute-no-pipeline 2)". The reasons are in enum order.
 std::string FormatSkips(const SkipCounts& counts, const char* when) {
     u64 draws{};
@@ -381,8 +381,6 @@ const char* SkipReasonName(SkipReason reason) noexcept {
     switch (reason) {
     case SkipReason::StageRejected:
         return "stage-rejected";
-    case SkipReason::DiskReplayAsync:
-        return "disk-replay-async";
     case SkipReason::AsyncTranslation:
         return "async-translation";
     case SkipReason::BuildDeferred:

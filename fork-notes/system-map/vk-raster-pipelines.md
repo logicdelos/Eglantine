@@ -59,7 +59,7 @@
 ## Settings and switches
 
 - `Settings::values`: `use_asynchronous_shaders`, `use_vulkan_driver_pipeline_cache`, `dyna_state`, `vertex_input_dynamic_state`, `use_squashed_iterated_blend`, `dump_guest_shaders`, `gpu_log_shader_dumps`, `renderer_debug`, `CurrentProgramIsSwitch2()`.
-- `VideoCommon::Nx2Perf::Opt`: `PipelineFastCache`, `ComputeRebuildAsync`, `ComputePreloadVariants`, `ShaderBuildBudget`, `BuildOrderPriority`, `StaleTargetSkip`, `GeometryConsistency`, `PipelineRetention`, `PipelineKeepPreloaded`, `ReplayDiskRecordings`, `MacroReadWriterSet`.
+- `VideoCommon::Nx2Perf::Opt`: `PipelineFastCache`, `ComputeRebuildAsync`, `ComputePreloadVariants`, `ShaderBuildBudget`, `BuildOrderPriority`, `StaleTargetSkip`, `GeometryConsistency`, `PipelineRetention`, `PipelineKeepPreloaded`, `MacroReadWriterSet`.
 - Environment: `EDEN_NX2_ASYNC_TRANSLATION`, `_PARALLEL_STAGES`, `_ASYNC_TRANSLATION_WAIT_MS`, `_ASYNC_TRANSLATION_FRAME_MS`, `_TRANSLATION_THREADS`, `EDEN_NX2_SHADER_BUDGET_MS`, `EDEN_NX2_BACKGROUND_PIPELINES`, `_BACKGROUND_PIPELINE_THREADS`, `EDEN_NX2_PRELOAD_ALL_PIPELINES`, `EDEN_NX2_PIPELINE_DIFF`, mesh options (`EDEN_NX2_MESH_EMULATION_DUMP`, `_PROBE`, `EDEN_NX2_NO_MESH`), tracing (`EDEN_NX2_TRACE_VS`, `EDEN_NX2_RT_TRACE`, `EDEN_NX2_FRAME_DUMP`, `EDEN_NATIVE_DRAW_CAPTURE`), `EGLANTINE_EXPERIMENTAL_STATIC_VERTEX_REPACK`, `EGLANTINE_TEST_VERTEX_REPACK`, `EGLANTINE_SYNC_FIX`, `EGLANTINE_AMD_FRAGMENT_SHUFFLE`.
 - On the owner's NVIDIA driver `use_vulkan_pipeline_cache` is off (the driver caches pipelines itself), so only the Eglantine record file is used.
 

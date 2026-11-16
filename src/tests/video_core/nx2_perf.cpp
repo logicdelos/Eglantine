@@ -79,8 +79,6 @@ TEST_CASE("stale_target_skip: on by default", "[nx2_perf]") {
 TEST_CASE("geometry_consistency and build_order_priority: on by default", "[nx2_perf]") {
     REQUIRE(opt_names[Index(Opt::GeometryConsistency)] == "geometry_consistency");
     REQUIRE(opt_names[Index(Opt::BuildOrderPriority)] == "build_order_priority");
-    REQUIRE(opt_names[Index(Opt::ReplayDiskRecordings)] == "replay_disk_recordings");
     REQUIRE(!IsOff(DefaultOffMask(), Index(Opt::GeometryConsistency)));
     REQUIRE(!IsOff(DefaultOffMask(), Index(Opt::BuildOrderPriority)));
-    REQUIRE(!IsOff(DefaultOffMask(), Index(Opt::ReplayDiskRecordings)));
 }

@@ -399,32 +399,20 @@ void SerializePipeline(const Key& key, const Envs& envs, const std::filesystem::
                       with_mesh_state);
 }
 
-/// A cache file written by an older version whose records the current reader still parses: its
-/// records, raw, to write the file again under the current version once they are translated.
-struct CacheUpgrade {
-    u32 from_version{};
-    std::vector<std::string> records;
-    std::vector<bool> is_compute;
-};
-
-/// Loads the records of a pipeline cache file. A file from min_compatible_version up to the
-/// expected version is loaded too when `upgrade` is given (its records are kept there); older or
-/// broken files are deleted.
+/// The legacy cache file format (magic number, version, raw records): written and read only by
+/// the OpenGL renderer. The Vulkan renderer persists through the envelope codec below and calls
+/// neither SerializePipeline nor LoadPipelines.
+///
+/// Loads the records of a legacy pipeline cache file. A file of another version is renamed to
+/// <name>.v<old>; a broken file is deleted.
 void LoadPipelines(
     std::stop_token stop_loading, const std::filesystem::path& filename, u32 expected_cache_version,
     Common::UniqueFunction<void, std::ifstream&, FileEnvironment> load_compute,
     Common::UniqueFunction<void, std::ifstream&, std::vector<FileEnvironment>> load_graphics,
-    bool with_mesh_state = false, u32 min_compatible_version = 0, CacheUpgrade* upgrade = nullptr);
+    bool with_mesh_state = false);
 
-/// Writes a cache file again from upgraded records under `cache_version`, through a temporary file
-/// (the old one is kept as <name>.v<old>.bak until the new one is in place).
-void RewritePipelines(const std::filesystem::path& filename, u32 cache_version, u32 old_version,
-                      std::span<const std::string* const> records);
-
-/// The envelope record codec (slice C implements it in shader_environment.cpp, slice D calls it;
-/// the envelope itself is in video_core/cache_envelope.h and its grammar defines the payload).
-/// Replaces SerializePipeline, LoadPipelines and RewritePipelines, which stay declared only until
-/// the pipeline cache and the tests have moved to it and are then deleted by slice A.
+/// The envelope record codec: the Vulkan pipeline cache persists through it (the envelope itself
+/// is in video_core/cache_envelope.h and its grammar defines the payload).
 
 /// A decoded record: the environments (1 to CacheEnvelope::MaxEnvsPerRecord, every nested count
 /// and length validated against the bytes that remain before anything is allocated) and the key

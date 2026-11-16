@@ -96,7 +96,6 @@ void NoteSubmissionWait(std::chrono::steady_clock::duration time);
 enum class SkipReason : u8 {
     Unknown,             ///< "no-pipeline": a null return that set no reason
     StageRejected,       ///< "stage-rejected": a shader stage could not be resolved
-    DiskReplayAsync,     ///< "disk-replay-async": the disk record's build is still running
     AsyncTranslation,    ///< "async-translation": queued translation not done in time
     BuildDeferred,       ///< "build-deferred": over the per-frame build budget
     AsyncBuild,          ///< "async-build": pipeline built asynchronously, not ready yet
