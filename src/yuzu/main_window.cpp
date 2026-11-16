@@ -1961,6 +1961,7 @@ void MainWindow::ConnectMenuEvents() {
     connect_menu(ui->action_Stop, &MainWindow::OnStopGame);
     connect_menu(ui->action_Open_Mods_Page, &MainWindow::OnOpenModsPage);
     connect_menu(ui->action_Open_UserHandbook, &MainWindow::OnOpenUserHandbook);
+    connect_menu(ui->action_Report_Bug, &MainWindow::OnReportBug);
     connect_menu(ui->action_Restart, &MainWindow::OnRestartGame);
     connect_menu(ui->action_Configure, &MainWindow::OnConfigure);
     connect_menu(ui->action_Configure_Current_Game, &MainWindow::OnConfigurePerGame);
@@ -2374,7 +2375,8 @@ bool MainWindow::LoadROM(const QString& filename, Service::AM::FrontendAppletPar
                     tr("Error while loading ROM! %1", "%1 signifies a numeric error code.")
                         .arg(QString::fromStdString(error_code));
                 const auto description =
-                    tr("%1<br>Please redump your files or ask on Discord/Stoat for help.",
+                    tr("%1<br>Please redump your files. If the error stays, use Help > Report a "
+                       "Bug.",
                        "%1 signifies an error string.")
                         .arg(QString::fromStdString(
                             GetResultStatusString(static_cast<Loader::ResultStatus>(error_id))));
@@ -3876,6 +3878,10 @@ void MainWindow::OnOpenModsPage() {
 void MainWindow::OnOpenUserHandbook() {
     OpenURL(QUrl(QStringLiteral(
         "https://git.eden-emu.dev/eden-emu/eden/src/branch/master/docs/user/README.md")));
+}
+
+void MainWindow::OnReportBug() {
+    OpenURL(QUrl(QStringLiteral("https://github.com/logicdelos/Eglantine/issues")));
 }
 
 void MainWindow::ToggleFullscreen() {

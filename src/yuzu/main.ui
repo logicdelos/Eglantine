@@ -232,7 +232,7 @@
     <property name="title">
      <string>&amp;Help</string>
     </property>
-    <addaction name="action_Report_Compatibility"/>
+    <addaction name="action_Report_Bug"/>
     <addaction name="action_Open_Mods_Page"/>
     <addaction name="action_Open_UserHandbook"/>
     <addaction name="separator"/>
@@ -407,6 +407,11 @@
   <action name="action_Open_Mods_Page">
    <property name="text">
     <string>Open &amp;Mods Page</string>
+   </property>
+  </action>
+  <action name="action_Report_Bug">
+   <property name="text">
+    <string>Report a &amp;Bug</string>
    </property>
   </action>
   <action name="action_Check_For_Updates">
