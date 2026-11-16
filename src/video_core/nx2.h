@@ -10,6 +10,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -616,6 +617,45 @@ inline u64 Nx2QueueSyncpointWord(u64 address) {
     return 0;
 }
 
+namespace Nx2SemaphoreFenceLean {
+inline std::atomic<u32> pending{};
+// GPU-front-thread statistics; bounded to the most recent 4096 completed suspensions.
+inline struct {
+    u64 unmet{}, suspended{}, blocked{}, samples{};
+    std::array<u64, 4096> suspend_us{};
+} stats;
+
+inline void NoteResume(std::chrono::steady_clock::time_point since) {
+    const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - since)
+                        .count();
+    stats.suspend_us[stats.samples % stats.suspend_us.size()] = static_cast<u64>(us);
+    ++stats.samples;
+}
+
+inline void Report() {
+    if (stats.unmet == 0) {
+        return;
+    }
+    const size_t count = static_cast<size_t>(std::min<u64>(stats.samples, stats.suspend_us.size()));
+    u64 median_us{};
+    if (count != 0) {
+        const auto end = stats.suspend_us.begin() + static_cast<std::ptrdiff_t>(count);
+        auto middle = stats.suspend_us.begin() + static_cast<std::ptrdiff_t>(count / 2);
+        std::nth_element(stats.suspend_us.begin(), middle, end);
+        median_us = *middle;
+        if (count % 2 == 0) {
+            median_us = (*std::max_element(stats.suspend_us.begin(), middle) + median_us) / 2;
+        }
+    }
+    LOG_INFO(HW_GPU,
+             "Nx2Perf semaphore_fence_lean: {} acquires unmet, {} suspended, {} blocked (old path), "
+             "median suspend {} us",
+             stats.unmet, stats.suspended, stats.blocked, median_us);
+    stats = {};
+}
+} // namespace Nx2SemaphoreFenceLean
+
 /// pending_wake: the GPU thread's 1 ms sleep while a channel waits on an acquire ends at once
 /// when a command is queued or a release latches a waiter. The timeout bounds a missed wake.
 namespace Nx2PendingWake {
@@ -624,6 +664,10 @@ enum Reason : u32 { ByPush = 1, ByLatch = 2 };
 inline bool On() {
     static const bool on = VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::PendingWake);
     return on;
+}
+
+inline bool Needed() {
+    return On() || Nx2SemaphoreFenceLean::pending.load(std::memory_order_acquire) != 0;
 }
 
 inline Common::Event wake_event;
@@ -723,7 +767,7 @@ public:
                 }
             }
         }
-        if (latched && Nx2PendingWake::On()) {
+        if (latched && Nx2PendingWake::Needed()) {
             Nx2PendingWake::last_latch_ns.store(Nx2PendingWake::NowNs(), std::memory_order_relaxed);
             Nx2PendingWake::Wake(Nx2PendingWake::latch_seq, Nx2PendingWake::ByLatch);
         }
@@ -760,6 +804,17 @@ public:
 
     [[nodiscard]] bool Any() const {
         return count.load(std::memory_order_acquire) != 0;
+    }
+
+    /// Exact-address reports only; reductions and overlapping timestamp words do not qualify.
+    [[nodiscard]] bool HasPendingReport(u64 device_address) {
+        if (count.load(std::memory_order_acquire) == 0) {
+            return false;
+        }
+        std::scoped_lock lk{mutex};
+        return std::ranges::any_of(releases, [device_address](const Release& r) {
+            return r.address == device_address && r.reduction == PlainWrite;
+        });
     }
 
     /// A release that stores `value`. `wide`: a four-word report (value and time stamp).

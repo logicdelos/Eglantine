@@ -10,8 +10,10 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <memory>
 #include <optional>
 #include <vector>
 #include "common/bit_field.h"
@@ -49,6 +51,8 @@ namespace Tegra::Engines {
 
 class Puller final {
 public:
+    ~Puller();
+
     struct MethodCall {
         u32 method{};
         u32 argument{};
@@ -86,12 +90,16 @@ public:
         std::chrono::steady_clock::time_point since;
         std::chrono::steady_clock::time_point last_fences; ///< When it last released fences
         bool reported;
+        bool fence_lean{};
 
         [[nodiscard]] bool Matches(u32 current) const;
     };
 
     [[nodiscard]] bool HasPendingAcquire() const {
         return pending_acquire.has_value();
+    }
+    [[nodiscard]] bool HasCpuDependentAcquire() const {
+        return pending_acquire && !pending_acquire->fence_lean;
     }
     [[nodiscard]] bool CanResumeAcquire(DmaPusher& dma_pusher);
     /// Clears the pending acquire once it is met; false while the channel has to keep waiting.
@@ -158,6 +166,7 @@ private:
     [[nodiscard]] bool ExecuteMethodOnEngine(DmaPusher& dma_pusher, u32 method);
 
     std::optional<PendingAcquire> pending_acquire;
+    std::shared_ptr<std::atomic<bool>> acquire_fence_ready;
 
     /// Mapping of command subchannels to their bound engine ids
     std::array<EngineID, 8> bound_engines{};

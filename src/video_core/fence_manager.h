@@ -29,6 +29,7 @@
 #include "video_core/gpu.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/syncpoint_manager.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/rasterizer_interface.h"
 
@@ -146,6 +147,10 @@ public:
             TryReleasePendingFences<true>();
         } else {
             if (!force) {
+                // A suspended acquire needs the deferred tick submitted, not a host wait.
+                if (Nx2Perf::On(Nx2Perf::Opt::SemaphoreFenceLean)) {
+                    SubmitDeferred();
+                }
                 return;
             }
             std::mutex wait_mutex;

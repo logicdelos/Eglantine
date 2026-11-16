@@ -223,7 +223,7 @@ public:
 
     [[nodiscard]] bool IsAsync() const;
 
-    /// Whether a channel is suspended on a semaphore acquire (callable from any thread).
+    /// Whether a channel waits on a CPU/untracked semaphore producer (callable from any thread).
     [[nodiscard]] bool HasSuspendedChannels() const;
 
     [[nodiscard]] bool UseNvdec() const;

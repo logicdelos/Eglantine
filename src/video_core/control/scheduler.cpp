@@ -36,6 +36,13 @@ void Scheduler::BindChannel(GPU& gpu, s32 bind_id) {
     gpu.BindChannel(bind_id);
 }
 
+void Scheduler::PublishPendingState() {
+    any_pending.store(!pending_channels.empty(), std::memory_order_release);
+    any_cpu_pending.store(std::ranges::any_of(pending_channels, [](const auto& state) {
+        return state->payload->dma_pusher.HasCpuDependentAcquire();
+    }), std::memory_order_release);
+}
+
 void Scheduler::Push(GPU& gpu, s32 channel, CommandList&& entries) {
     std::shared_ptr<ChannelState> channel_state;
     {
@@ -53,7 +60,7 @@ void Scheduler::Push(GPU& gpu, s32 channel, CommandList&& entries) {
         std::find(pending_channels.begin(), pending_channels.end(), channel_state) ==
             pending_channels.end()) {
         pending_channels.push_back(channel_state);
-        any_pending.store(true, std::memory_order_release);
+        PublishPendingState();
     }
     if (!pending_channels.empty()) {
         ResumePending(gpu);
@@ -71,6 +78,7 @@ bool Scheduler::ResumePending(GPU& gpu) {
             // pending: resuming it again counted as progress forever and the GPU thread never
             // reached its stop request (closing the game hung).
             if (!dma_pusher.system.IsPoweredOn()) {
+                PublishPendingState();
                 return any_moved;
             }
             if (!dma_pusher.HasPendingAcquire() || !dma_pusher.CanResumeAcquire()) {
@@ -93,7 +101,7 @@ bool Scheduler::ResumePending(GPU& gpu) {
     std::erase_if(pending_channels, [](const auto& state) {
         return !state->payload->dma_pusher.HasPendingAcquire();
     });
-    any_pending.store(!pending_channels.empty(), std::memory_order_release);
+    PublishPendingState();
     return any_moved;
 }
 

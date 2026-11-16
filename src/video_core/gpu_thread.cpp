@@ -146,7 +146,11 @@ void PendingWakeSleep(PendingWakeStats& stats, u64 push_seen, u64 latch_seen) {
     }
     Wake::front_sleeping.store(false, std::memory_order_seq_cst);
     // Verify checks the resumes the next polls make.
-    Wake::verify_resume = reason != 0 && VideoCommon::Nx2Perf::Verify();
+    Wake::verify_resume = reason != 0 && Wake::On() && VideoCommon::Nx2Perf::Verify();
+
+    if (!Wake::On()) {
+        return;
+    }
 
     const bool by_push = (reason & Wake::ByPush) != 0;
     const bool by_latch = !by_push && (reason & Wake::ByLatch) != 0;
@@ -195,11 +199,12 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
             Profile::Report();
             split.MaybeStart(system);
             if (scheduler.HasPendingChannels()) {
+                const bool pending_events = Tegra::Nx2PendingWake::Needed();
                 // pending_wake: the sleep below ends early on what comes after these.
                 u64 push_seen{};
                 u64 latch_seen{};
                 s64 latch_ns_seen{};
-                if (pending_wake) [[unlikely]] {
+                if (pending_events) [[unlikely]] {
                     namespace Wake = Tegra::Nx2PendingWake;
                     push_seen = Wake::push_seq.load(std::memory_order_seq_cst);
                     latch_seen = Wake::latch_seq.load(std::memory_order_seq_cst);
@@ -240,7 +245,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                         }
 #endif
                         std::this_thread::yield();
-                    } else if (pending_wake) [[unlikely]] {
+                    } else if (pending_events) [[unlikely]] {
                         PendingWakeSleep(pending_wake_stats, push_seen, latch_seen);
                     } else {
                         std::this_thread::sleep_for(std::chrono::milliseconds{1});
@@ -344,6 +349,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
             }
             SignalCommand(state, next.fence, next.block);
         }
+        Tegra::Nx2SemaphoreFenceLean::Report();
     });
 }
 
@@ -393,7 +399,7 @@ u64 ThreadManager::PushCommand(CommandData&& command_data, bool block, bool is_a
     std::unique_lock lk(state.write_lock);
     const u64 fence{++state.last_fence};
     state.queue.EmplaceWait(std::move(command_data), fence, block);
-    if (Tegra::Nx2PendingWake::On()) [[unlikely]] {
+    if (Tegra::Nx2PendingWake::Needed()) [[unlikely]] {
         Tegra::Nx2PendingWake::Wake(Tegra::Nx2PendingWake::push_seq, Tegra::Nx2PendingWake::ByPush);
     }
 

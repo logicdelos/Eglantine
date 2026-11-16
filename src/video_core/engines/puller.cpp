@@ -217,6 +217,13 @@ void ReleaseFences(DmaPusher& dma_pusher) {
 
 } // Anonymous namespace
 
+Puller::~Puller() {
+    Nx2SemaphoreWaiters::Get().Remove(this);
+    if (pending_acquire && pending_acquire->fence_lean) {
+        Nx2SemaphoreFenceLean::pending.fetch_sub(1, std::memory_order_release);
+    }
+}
+
 bool Puller::PendingAcquire::Matches(u32 current) const {
     switch (static_cast<GpuSemaphoreOperation>(operation)) {
     case GpuSemaphoreOperation::AcquireEqual:
@@ -259,6 +266,24 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
 }
 
 bool Puller::PollAcquire(DmaPusher& dma_pusher) {
+    auto& pending = *pending_acquire;
+    if (pending.fence_lean) {
+        // The fence completion is an event, not a guest-memory poll. It owns all earlier
+        // report writes and cache downloads, including reports overwritten before we resume.
+        if (!acquire_fence_ready->load(std::memory_order_acquire)) {
+            return false;
+        }
+        const u32 current = dma_pusher.memory_manager.Read<u32>(pending.address);
+        if (Nx2SemaphoreWaiters::Get().Latched(this) || pending.Matches(current)) {
+            return true;
+        }
+        // A report can be invalidated or write a different value. A later CPU/untracked
+        // producer has no completion event: return to the existing polling fallback.
+        Nx2SemaphoreFenceLean::NoteResume(pending.since);
+        Nx2SemaphoreFenceLean::pending.fetch_sub(1, std::memory_order_release);
+        pending.fence_lean = false;
+        return false;
+    }
     // A latched release resumes the channel whatever the word holds now: only the log below
     // reads it, so drain for it only while that log is still printing.
     static std::atomic<u32> rescued{};
@@ -321,6 +346,22 @@ bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
     // counting those made the count odd ("suspended") at random, so submit-time snapshots were
     // thrown away for about half of all entries (CommandList::snapshot_suspensions).
     if (pending_acquire) {
+        if (pending_acquire->fence_lean) {
+            if (VideoCommon::Nx2Perf::Verify()) {
+                const u32 current =
+                    dma_pusher.memory_manager.Read<u32>(pending_acquire->address);
+                if (!pending_acquire->Matches(current)) {
+                    LOG_ERROR(HW_GPU,
+                              "Nx2Perf semaphore_fence_lean: channel {} resumed semaphore {:#x} "
+                              "(op {}, {:#x}) with word {:#x}, latched {}",
+                              dma_pusher.channel_state.bind_id, pending_acquire->address,
+                              pending_acquire->operation, pending_acquire->value, current,
+                              Nx2SemaphoreWaiters::Get().Latched(this));
+                }
+            }
+            Nx2SemaphoreFenceLean::NoteResume(pending_acquire->since);
+            Nx2SemaphoreFenceLean::pending.fetch_sub(1, std::memory_order_release);
+        }
         pending_acquire.reset();
         dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
         Nx2SemaphoreWaiters::Get().Remove(this);
@@ -516,6 +557,13 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             return;
         }
         DrainBack(VideoCommon::DrainSite::AcquireTrigger);
+        const bool fence_lean = VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::SemaphoreFenceLean);
+        const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address);
+        auto& waiters = Nx2SemaphoreWaiters::Get();
+        // Register before checking: a completion between the check and suspension must latch.
+        if (fence_lean && device) {
+            waiters.Add(this, *device, acquire.value, acquire.operation);
+        }
         const u32 drained = ReadSemaphoreWord(dma_pusher, acquire.address);
         if (acquire_class >= 0 && !acquire.Matches(drained)) {
             ++AcquireStats().unmet_after;
@@ -526,9 +574,11 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             }
         }
         if (acquire.Matches(drained)) {
+            if (fence_lean) {
+                waiters.Remove(this);
+            }
             return;
         }
-        const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address);
         // acquire_issued: a release already issued (its write delayed until the host GPU is
         // done) meets the value. Host work is recorded in issue order, so the channel goes on.
         // Verify runs the waiting path too and logs when it would have suspended.
@@ -547,15 +597,49 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                 if (issued.TakeUncommitted()) {
                     dma_pusher.rasterizer->SignalReference();
                 }
+                if (fence_lean) {
+                    waiters.Remove(this);
+                }
                 return;
             }
         }
         // Registered before the fences run, so a release among them that meets the value counts
         // even if a later one overwrites it.
-        auto& waiters = Nx2SemaphoreWaiters::Get();
-        if (device) {
+        if (!fence_lean && device) {
             waiters.Add(this, *device, acquire.value, acquire.operation);
         }
+        ++Nx2SemaphoreFenceLean::stats.unmet;
+        if (device && fence_lean &&
+            Settings::IsGPUFenceDelayed() &&
+            Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan &&
+            issued.HasPendingReport(*device)) {
+            if (!acquire_fence_ready) {
+                acquire_fence_ready = std::make_shared<std::atomic<bool>>();
+            }
+            acquire_fence_ready->store(false, std::memory_order_relaxed);
+            acquire.fence_lean = true;
+            acquire.since = std::chrono::steady_clock::now();
+            pending_acquire = acquire;
+            dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
+            Nx2SemaphoreFenceLean::pending.fetch_add(1, std::memory_order_release);
+            ++Nx2SemaphoreFenceLean::stats.suspended;
+            VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);
+            auto complete = [rasterizer = dma_pusher.rasterizer, ready = acquire_fence_ready] {
+                rasterizer->SignalFence([ready] {
+                    ready->store(true, std::memory_order_release);
+                    Nx2PendingWake::Wake(Nx2PendingWake::latch_seq, Nx2PendingWake::ByLatch);
+                });
+                rasterizer->ReleaseFences(false);
+            };
+            auto& split = VideoCommon::GpuSplit::Get();
+            if (split.Active()) {
+                split.DeferFunction(std::move(complete));
+            } else {
+                complete();
+            }
+            return;
+        }
+        ++Nx2SemaphoreFenceLean::stats.blocked;
         ReleaseFences(dma_pusher);
         u32 current{};
         if (!waiters.Latched(this) &&
@@ -617,6 +701,55 @@ void Puller::ProcessSemaphoreRelease(DmaPusher& dma_pusher) {
                       rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload,
                                         VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
                   });
+}
+
+// SEMAPHORED.OPERATION REDUCTION (clc76f.h): a 32-bit read-modify-write of the word at the
+// semaphore address with the payload, the way the compute report semaphore reduces.
+void Puller::ProcessSemaphoreReduction(DmaPusher& dma_pusher) {
+    Census::NoteClass(Census::Class::H3_SEMAPHORED_REDUCTION);
+    // REDUCTION 30:27 is MIN, MAX, XOR, AND, OR, ADD, INC, DEC; ReduceSemaphore's order differs.
+    constexpr std::array<u32, 8> reduction_op{1, 2, 7, 5, 6, 0, 3, 4};
+    const u32 reduction = (regs.semaphore_trigger >> 27) & 15;
+    if (reduction >= reduction_op.size()) {
+        if (static bool logged = false; !std::exchange(logged, true)) {
+            LOG_WARNING(HW_GPU, "Nx2 host semaphore reduction {} is invalid, skipped", reduction);
+        }
+        return;
+    }
+    const GPUVAddr address{regs.semaphore_address.SemaphoreAddress()};
+    const u32 payload = regs.semaphore_sequence;
+    const u32 op = reduction_op[reduction];
+    const bool is_signed = (regs.semaphore_trigger >> 31) == 0; // FORMAT: SIGNED 0, UNSIGNED 1
+    OnBackRelease(
+        dma_pusher, address,
+        [rasterizer = dma_pusher.rasterizer, memory_manager = &dma_pusher.memory_manager, address,
+         payload, op, is_signed] {
+            // acquire_issued, as in KeplerCompute::ProcessNativeReportSemaphore.
+            std::optional<u64> issued;
+            if (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::AcquireIssued) &&
+                Settings::IsGPUFenceDelayed()) {
+                issued = memory_manager->GpuToCpuAddress(address);
+                if (issued) {
+                    Nx2IssuedReleases::Get().IssueReduction(*issued, op, is_signed, payload);
+                }
+            }
+            rasterizer->SignalFence([memory_manager, address, payload, op, is_signed, issued] {
+                u32 value{};
+                const auto write = [&] {
+                    value = ReduceSemaphore(op, is_signed, memory_manager->Read<u32>(address),
+                                            payload);
+                    memory_manager->Write<u32>(address, value);
+                };
+                if (issued) {
+                    Nx2IssuedReleases::Get().Settle(*issued, write);
+                } else {
+                    write();
+                }
+                if (const auto device = memory_manager->GpuToCpuAddress(address)) {
+                    Nx2SemaphoreWaiters::Get().OnWrite(*device, value);
+                }
+            });
+        });
 }
 
 void Puller::ProcessSemaphoreAcquire(DmaPusher& dma_pusher) {

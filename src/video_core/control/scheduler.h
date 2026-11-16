@@ -38,16 +38,22 @@ public:
     [[nodiscard]] bool HasPendingChannelsAnyThread() const {
         return any_pending.load(std::memory_order_acquire);
     }
+    /// CPU-dependent acquires only: VI must not abandon pacing for a host-fence wait.
+    [[nodiscard]] bool HasCpuDependentChannelsAnyThread() const {
+        return any_cpu_pending.load(std::memory_order_acquire);
+    }
 
     void DeclareChannel(std::shared_ptr<ChannelState> new_channel);
 
 private:
     void BindChannel(GPU& gpu, s32 bind_id);
+    void PublishPendingState();
 
     ::Common::unordered_map<s32, std::shared_ptr<ChannelState>> channels;
     std::mutex scheduling_guard;
     std::vector<std::shared_ptr<ChannelState>> pending_channels; ///< Suspended on an acquire
     std::atomic<bool> any_pending{};
+    std::atomic<bool> any_cpu_pending{};
 };
 
 } // namespace Control

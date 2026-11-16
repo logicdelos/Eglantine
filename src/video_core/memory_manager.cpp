@@ -254,22 +254,27 @@ void MemoryManager::PreserveMapping(GPUVAddr gpu_addr, std::size_t size) {
 }
 
 // acquire_issued: the acquire a pending reduction met no longer waits for its write, which
-// resolves the GPU address when it runs. It has to land before the mapping under it changes.
+// resolves the GPU address when it runs. It has to land before the mapping under it changes, and
+// before a macro DMA read of the word (FlushQueryResults), which the query cache cannot flush.
 // For the map changes ordered with the command lists, on the GPU thread, as the acquire was.
-void MemoryManager::SettleIssuedReleases(GPUVAddr gpu_addr, std::size_t size) {
+// Returns whether a reduction was pending in the range; `wait` false only looks.
+bool MemoryManager::SettleIssuedReleases(GPUVAddr gpu_addr, std::size_t size, bool wait) const {
     auto& issued = Nx2IssuedReleases::Get();
     if (rasterizer == nullptr || size == 0 || !issued.Any() ||
         VideoCommon::GpuSplit::Get().Active()) {
-        return;
+        return false;
     }
     boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> ranges;
     GetSubmappedRangeImpl<false>(gpu_addr, size, ranges);
     for (const auto& [address, bytes] : ranges) {
         if (issued.HasReductionIn(address, bytes)) {
-            rasterizer->ReleaseFences();
-            return;
+            if (wait) {
+                rasterizer->ReleaseFences();
+            }
+            return true;
         }
     }
+    return false;
 }
 
 GPUVAddr MemoryManager::Map(GPUVAddr gpu_addr, DAddr dev_addr, std::size_t size, PTEKind kind, bool is_big_pages) {
@@ -705,6 +710,22 @@ void MemoryManager::WriteWordsCached(GPUVAddr gpu_dest_addr, const u32* words, s
 }
 
 void MemoryManager::FlushQueryResults(GPUVAddr gpu_addr, size_t size) const {
+    if (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::DmaReadSettle)) {
+        // dma_read_settle: a reduction release is a queued fence operation, not a query report, so
+        // the query flush below cannot publish it; the acquire it met (acquire_issued) no longer
+        // waited for it. Verify mode only counts, as before.
+        const bool verify = VideoCommon::Nx2Perf::Verify();
+        if (SettleIssuedReleases(gpu_addr, size, !verify)) {
+            static std::atomic<u32> hits{};
+            const u32 n = hits.fetch_add(1, std::memory_order_relaxed) + 1;
+            if ((n & (n - 1)) == 0) {
+                LOG_WARNING(HW_GPU,
+                            "Nx2Perf dma_read_settle: macro DMA read of {:#x}+{:#x} meets a pending "
+                            "semaphore reduction ({} so far){}",
+                            gpu_addr, size, n, verify ? ", read unsettled (verify)" : ", settled");
+            }
+        }
+    }
     constexpr GPUVAddr flush_page = 0x1000;
     const GPUVAddr end = gpu_addr + size;
     for (GPUVAddr begin = gpu_addr; begin < end;) {

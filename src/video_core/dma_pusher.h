@@ -182,6 +182,9 @@ public:
     [[nodiscard]] bool HasPendingAcquire() const {
         return puller.HasPendingAcquire();
     }
+    [[nodiscard]] bool HasCpuDependentAcquire() const {
+        return puller.HasCpuDependentAcquire();
+    }
     [[nodiscard]] bool CanResumeAcquire() {
         return puller.CanResumeAcquire(*this);
     }

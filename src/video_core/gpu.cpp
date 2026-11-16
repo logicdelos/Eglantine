@@ -607,7 +607,7 @@ bool GPU::IsAsync() const {
 }
 
 bool GPU::HasSuspendedChannels() const {
-    return impl->scheduler.HasPendingChannelsAnyThread();
+    return impl->scheduler.HasCpuDependentChannelsAnyThread();
 }
 
 bool GPU::UseNvdec() const {

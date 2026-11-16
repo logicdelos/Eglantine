@@ -347,6 +347,13 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         Tegra::Nx2SemaphoreWaiters::Get().OnWrite(query_cpu_addr,
                                                   static_cast<u32>(query_base->value));
         if (!is_synced) [[likely]] {
+            if (Nx2Perf::On(Nx2Perf::Opt::QueryLanded)) {
+                // query_landed: the report stays cached until a later fence frees it, and a flush
+                // of its address meanwhile (SemiFlushQueryDirty) must not write it again over a
+                // newer value. The cache lock orders this flag with the other flag writers.
+                std::scoped_lock lock(cache_mutex);
+                query_base->flags |= QueryFlagBits::IsLanded;
+            }
             impl->pending_unregister.push_back(query_location);
         }
     };
@@ -355,7 +362,8 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     std::function<void()> operation(std::move(operation_fn));
     Tegra::g_nx2_async_reports_issued[settle_slot].fetch_add(1, std::memory_order_release);
     if (is_delayed && Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
-        Nx2Perf::On(Nx2Perf::Opt::AcquireIssued)) {
+        (Nx2Perf::On(Nx2Perf::Opt::AcquireIssued) ||
+         Nx2Perf::On(Nx2Perf::Opt::SemaphoreFenceLean))) {
         // acquire_issued: the operation below stays queued. A payload release in a delayed fence
         // is predicted. Any other report writes a result not known yet, and one outside a fence
         // waits for some later fence to take it.
@@ -651,11 +659,38 @@ bool QueryCacheBase<Traits>::SemiFlushQueryDirty(QueryCacheBase<Traits>::QueryLo
     if (True(query_base->flags & QueryFlagBits::IsFinalValueSynced) &&
         False(query_base->flags & QueryFlagBits::IsGuestSynced)) {
         auto* ptr = impl->device_memory.template GetPointer<u8>(query_base->guest_address);
-        if (True(query_base->flags & QueryFlagBits::HasTimestamp)) {
+        const bool timestamped = True(query_base->flags & QueryFlagBits::HasTimestamp);
+        const u32 value_l = static_cast<u32>(query_base->value);
+        if (True(query_base->flags & QueryFlagBits::IsLanded) &&
+            Nx2Perf::On(Nx2Perf::Opt::QueryLanded)) {
+            // query_landed: its operation already wrote the result. Writing it again can only put
+            // an older word over a newer write (a reduction release, a later report) that ran
+            // since, before a later fence frees the query. Verify mode keeps the write and counts
+            // the ones that would have differed.
+            if (!Nx2Perf::Verify()) {
+                return false;
+            }
+            static std::atomic<u32> rewrites{};
+            static std::atomic<u32> clobbers{};
+            u64 current{};
+            std::memcpy(&current, ptr, timestamped ? sizeof(u64) : sizeof(u32));
+            const u64 wanted = timestamped ? query_base->value : u64{value_l};
+            rewrites.fetch_add(1, std::memory_order_relaxed);
+            if (current != wanted) {
+                const u32 n = clobbers.fetch_add(1, std::memory_order_relaxed) + 1;
+                if ((n & (n - 1)) == 0) {
+                    LOG_WARNING(HW_GPU,
+                                "Nx2Perf query_landed: flush of {:#x} rewrites the landed report "
+                                "{:#x} over {:#x} ({} such, {} rewrites)",
+                                query_base->guest_address, wanted, current, n,
+                                rewrites.load(std::memory_order_relaxed));
+                }
+            }
+        }
+        if (timestamped) {
             std::memcpy(ptr, &query_base->value, sizeof(query_base->value));
             return false;
         }
-        u32 value_l = static_cast<u32>(query_base->value);
         std::memcpy(ptr, &value_l, sizeof(value_l));
         return false;
     }
