@@ -72,3 +72,10 @@ EDEN_NX2_FENCE_BATCH=1
 # the "gwait" and "idle" columns of the 10 second EDEN_NX2_GPU_PROFILE line ("safe read" under
 # its drain sites). Set to 1 to turn on.
 #EDEN_NX2_SPLIT_AT_HIGH=1
+# --- Speed experiments (off by default; each is measured on and off before it is recommended) ---
+# Windows only. A background thread takes guest memory pages that hold only zeros out of the process
+# working set (the contents stay, a write brings the page back), so a PC that is nearly out of RAM
+# has more free memory and pages less. A pass comes every 5 s while it keeps finding pages, then
+# backs off to every 5 minutes, and waits while the game is mapping memory in bulk. The log line
+# "Trimmed ... MiB of all-zero guest pages" shows what it did. Set to 1 to turn on.
+#EDEN_NX2_ZERO_PAGE_TRIM=1
