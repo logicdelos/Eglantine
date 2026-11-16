@@ -276,6 +276,8 @@ struct SdlState {
 
 constexpr int kRestartExitCode = 75;
 static std::atomic_bool restart_requested{false};
+// Set by a "quit" line in the live keys file: the main loop ends and the system shuts down in order.
+static bool live_quit_requested = false;
 
 // ExecuteProgram state for the restarted process: what the Qt frontend keeps in-process when it
 // reboots a game. Only read when the launcher sets EDEN_CLI_RESTART_HANDOFF, so a leftover file
@@ -850,8 +852,9 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
 double Nx2KeyClockSeconds(); // emu_window_sdl3.cpp
 
 // EDEN_NX2_DIAG_DIR=<dir>: keys.txt there is read and removed while the game runs, for scripted
-// control (tools/nx2/lab_ctl.py press). One entry per line: "<code>" press, "-<code>" release, or
-// "<code> <milliseconds>" press and release after that long. Codes are SDL scancodes.
+// control (tools/nx2/lab_ctl.py press). One entry per line: "<code>" press, "-<code>" release,
+// "<code> <milliseconds>" press and release after that long, "gpu low|high", or "quit" (orderly
+// shutdown, so the reports written at shutdown reach the log). Codes are SDL scancodes.
 static void RunLiveKeys(InputCommon::InputSubsystem& input_subsystem, Core::System& system) {
     static const std::filesystem::path file = [] {
         const char* dir = std::getenv("EDEN_NX2_DIAG_DIR");
@@ -891,6 +894,11 @@ static void RunLiveKeys(InputCommon::InputSubsystem& input_subsystem, Core::Syst
                                                         : Settings::GpuAccuracy::Low);
             system.ApplySettings();
             LOG_INFO(Frontend, "Live keys: GPU accuracy {}", high ? "high" : "low");
+            continue;
+        }
+        if (line == "quit") {
+            LOG_INFO(Frontend, "Live keys: quit");
+            live_quit_requested = true;
             continue;
         }
         int code = 0, milliseconds = -1;
@@ -978,7 +986,7 @@ extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
     if (state->emu_window) {
         state->emu_window->ApplyPendingTitle();
     }
-    if (restart_requested) {
+    if (restart_requested || live_quit_requested) {
         return SDL_APP_SUCCESS;
     }
     return state->emu_window && state->emu_window->IsOpen() ? SDL_APP_CONTINUE : SDL_APP_SUCCESS;
