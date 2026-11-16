@@ -23,6 +23,11 @@ AboutDialog::AboutDialog(QWidget* parent)
     const auto yuzu_build_version = override_build.empty() ? yuzu_build : override_build;
 
     ui->setupUi(this);
+    // The heading carries the name of this build (an unofficial fork says so), not a fixed string.
+    ui->labelYuzu->setText(
+        QStringLiteral("<html><head/><body><p><span style=\" font-size:18pt;\">%1</span></p>"
+                       "</body></html>")
+            .arg(QString::fromUtf8(Common::g_build_name).toHtmlEscaped()));
     // Try and request the icon from Qt theme (Linux?)
     const QIcon yuzu_logo = QIcon::fromTheme(QStringLiteral("org.yuzu_emu.yuzu"));
     if (!yuzu_logo.isNull()) {

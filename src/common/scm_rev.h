@@ -40,8 +40,4 @@ extern const char g_build_release_platform[];
 // with the packaging flavour in parentheses when there is one.
 std::string BuildDisplayName();
 
-// g_build_name plus the identity CI composed for this build (g_display_version),
-// with the packaging flavour in parentheses when there is one.
-std::string BuildDisplayName();
-
 } // namespace Common
