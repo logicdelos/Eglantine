@@ -13,6 +13,7 @@
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <span>
 #include <utility>
 
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
@@ -23,6 +24,7 @@
 #include "common/div_ceil.h"
 #include "common/vector_math.h"
 #include "video_core/host_shaders/astc_decoder_comp_spv.h"
+#include "video_core/host_shaders/astc_decoder_cheap_comp_spv.h"
 #include "video_core/host_shaders/bc_encoder_comp_spv.h"
 #include "video_core/host_shaders/queries_prefix_scan_sum_comp_spv.h"
 #include "video_core/host_shaders/queries_prefix_scan_sum_nosubgroups_comp_spv.h"
@@ -53,6 +55,17 @@ namespace {
 constexpr u32 ASTC_BINDING_INPUT_BUFFER = 0;
 constexpr u32 ASTC_BINDING_OUTPUT_IMAGE = 1;
 constexpr size_t ASTC_NUM_BINDINGS = 2;
+
+// The ASTC decoder: with EDEN_NX2_ASTC_CHEAP_UPLOAD=1 (opt-in, read once) the build of the same
+// source with the cheaper block set-up (ASTC_CHEAP), otherwise the original.
+std::span<const u32> AstcDecoderCode() {
+    static const bool cheap = [] {
+        const char* value = std::getenv("EDEN_NX2_ASTC_CHEAP_UPLOAD");
+        return value != nullptr && value[0] == '1';
+    }();
+    return cheap ? std::span<const u32>{ASTC_DECODER_CHEAP_COMP_SPV}
+                 : std::span<const u32>{ASTC_DECODER_COMP_SPV};
+}
 
 template <size_t size>
 inline constexpr VkPushConstantRange COMPUTE_PUSH_CONSTANT_RANGE{
@@ -672,7 +685,7 @@ ASTCDecoderPass::ASTCDecoderPass(const Device& device_, Scheduler& scheduler_,
                                  MemoryAllocator& memory_allocator_)
     : ComputePass(device_, scheduler_, descriptor_pool_, ASTC_DESCRIPTOR_SET_BINDINGS,
                   ASTC_PASS_DESCRIPTOR_UPDATE_TEMPLATE_ENTRY, ASTC_BANK_INFO,
-                  COMPUTE_PUSH_CONSTANT_RANGE<sizeof(AstcPushConstants)>, ASTC_DECODER_COMP_SPV),
+                  COMPUTE_PUSH_CONSTANT_RANGE<sizeof(AstcPushConstants)>, AstcDecoderCode()),
       scheduler{scheduler_}, staging_buffer_pool{staging_buffer_pool_},
       compute_pass_descriptor_queue{compute_pass_descriptor_queue_}, memory_allocator{
                                                                          memory_allocator_} {}
