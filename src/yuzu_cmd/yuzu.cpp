@@ -38,6 +38,7 @@
 #include "common/driver_shader_cache.h"
 #include "common/fs/fs_util.h"
 #include "common/fs/path_util.h"
+#include "common/key_script.h"
 #include "common/logging.h"
 #include "common/nx2_bottleneck.h"
 #include "common/nx2_sampler.h"
@@ -64,6 +65,7 @@
 #include "video_core/gpu.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
+#include "video_core/shader_notify.h"
 #include "video_core/shader_warm/shader_warm_builder.h"
 #include "yuzu_cmd/cli_settings.h"
 #include "yuzu_cmd/run_report.h"
@@ -932,7 +934,8 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     return SDL_APP_CONTINUE;
 }
 // EDEN_NX2_KEY_SCRIPT="seconds:code,seconds:-code,..." (or "@<file>"): press (code) or release (-code) keyboard
-// keys, by SDL scancode, that many seconds after start. Lets hidden test runs drive menus.
+// keys, by SDL scancode, that many seconds after start. Lets hidden test runs drive menus. A step can
+// also wait for an event ("frame>=600:4", "after shaders_idle+5@120:4"): see common/key_script.h.
 double Nx2KeyClockSeconds(); // emu_window_sdl3.cpp
 
 // EDEN_NX2_DIAG_DIR=<dir>: keys.txt there is read and removed while the game runs, for scripted
@@ -1006,54 +1009,84 @@ static void RunLiveKeys(InputCommon::InputSubsystem& input_subsystem, Core::Syst
     std::filesystem::remove(taken, error);
 }
 
-static void RunKeyScript(InputCommon::InputSubsystem& input_subsystem, Core::System& system) {
-    struct KeyEvent {
-        double seconds; // when frame is 0
-        u64 frame;      // "f<frame>:code": after that many presents
-        int code;
-    };
-    static const std::vector<KeyEvent> script = [] {
-        std::vector<KeyEvent> events;
-        if (const char* text = std::getenv("EDEN_NX2_KEY_SCRIPT")) {
-            // "@<file>" reads the list from a file: long scripts in the environment slow down
-            // every getenv in the process.
-            std::string list{text};
-            if (!list.empty() && list[0] == '@') {
-                std::ifstream file{list.substr(1)};
-                list.assign(std::istreambuf_iterator<char>{file}, {});
-            }
-            size_t start = 0;
-            while (start < list.size()) {
-                const size_t end = (std::min)(list.find(',', start), list.size());
-                const std::string item = list.substr(start, end - start);
-                if (const size_t colon = item.find(':'); colon != std::string::npos) {
-                    const std::string when = item.substr(0, colon);
-                    const int code = std::stoi(item.substr(colon + 1));
-                    if (!when.empty() && when[0] == 'f') {
-                        events.push_back({0.0, std::stoull(when.substr(1)), code});
-                    } else {
-                        events.push_back({std::stod(when), 0, code});
-                    }
-                }
-                start = end + 1;
-            }
-        }
-        return events;
-    }();
-    static size_t next = 0;
-    const double elapsed = Nx2KeyClockSeconds();
-    const u64 frame = Core::g_nx2_present_count.load();
-    while (next < script.size() && (script[next].frame != 0 ? script[next].frame <= frame
-                                                            : script[next].seconds <= elapsed)) {
-        const int code = script[next].code;
-        LOG_INFO(Frontend, "Key script: {} key {} at {:.1f} s (frame {})",
-                 code < 0 ? "release" : "press", code < 0 ? -code : code, elapsed, frame);
-        if (code < 0) {
-            input_subsystem.GetKeyboard()->ReleaseKey(static_cast<std::size_t>(-code));
+// Reads EDEN_NX2_KEY_SCRIPT (or the file it names with "@": long scripts in the environment slow
+// down every getenv in the process); the syntax is in common/key_script.h. A script with an error
+// is dropped as a whole, and an unattended run ends as a startup error, so a half-read script
+// never presses the rest at the wrong moments.
+static Common::KeyScript::Runner* LoadKeyScript() {
+    const char* text = std::getenv("EDEN_NX2_KEY_SCRIPT");
+    if (text == nullptr) {
+        return nullptr;
+    }
+    std::string list{text};
+    std::string error;
+    if (!list.empty() && list[0] == '@') {
+        std::ifstream file{list.substr(1)};
+        if (file) {
+            list.assign(std::istreambuf_iterator<char>{file}, {});
         } else {
-            input_subsystem.GetKeyboard()->PressKey(static_cast<std::size_t>(code));
+            error = "cannot read the script file " + list.substr(1);
         }
-        ++next;
+    }
+    Common::KeyScript::ParseResult parsed;
+    if (error.empty()) {
+        parsed = Common::KeyScript::Parse(list);
+        error = parsed.error;
+    }
+    if (!error.empty()) {
+        LOG_CRITICAL(Frontend, "EDEN_NX2_KEY_SCRIPT is not used: {}", error);
+        Common::RunOutcome::Request(Common::RunOutcome::Reason::StartupError,
+                                    "EDEN_NX2_KEY_SCRIPT: " + error);
+        return nullptr;
+    }
+    if (parsed.steps.empty()) {
+        return nullptr;
+    }
+    // Never freed: the report writer can read it from the watchdog thread while the process ends.
+    auto* runner = new Common::KeyScript::Runner{std::move(parsed.steps)};
+    Common::KeyScript::SetCurrent(runner);
+    return runner;
+}
+
+static void RunKeyScript(InputCommon::InputSubsystem& input_subsystem, Core::System& system) {
+    static Common::KeyScript::Runner* const script = LoadKeyScript();
+    if (script != nullptr && !script->GetProgress().finished) {
+        Common::KeyScript::Observation now;
+        now.seconds = Nx2KeyClockSeconds();
+        if (Common::RunOutcome::Active()) {
+            now.run_seconds = Common::RunOutcome::ElapsedSeconds();
+        }
+        now.present_count = Core::g_nx2_present_count.load();
+        now.frames = Common::RunOutcome::FramesPresented();
+        if (system.IsPoweredOn()) {
+            now.shaders_building = system.GPU().ShaderNotify().NumBuildingNoReport();
+        }
+        const Common::KeyScript::PollResult result = script->Poll(now);
+        for (const size_t index : result.fired) {
+            const Common::KeyScript::Step& step = script->GetStep(index);
+            const int code = step.code;
+            const bool timed = step.trigger == Common::KeyScript::Trigger::Seconds ||
+                               step.trigger == Common::KeyScript::Trigger::PresentCount;
+            LOG_INFO(Frontend, "Key script: {} key {} at {:.1f} s (frame {}){}",
+                     code < 0 ? "release" : "press", code < 0 ? -code : code, now.seconds,
+                     now.present_count, timed ? std::string{} : " [" + step.when + "]");
+            if (code < 0) {
+                input_subsystem.GetKeyboard()->ReleaseKey(static_cast<std::size_t>(-code));
+            } else {
+                input_subsystem.GetKeyboard()->PressKey(static_cast<std::size_t>(code));
+            }
+        }
+        if (result.timed_out) {
+            // Exit code 124, reason timeout, as for --run-seconds; the detail names the step and
+            // the report's steps list says which ones ran. Outside an unattended run the
+            // request does nothing and the rest of the script is simply dropped.
+            const Common::KeyScript::Step& step = script->GetStep(*result.timed_out);
+            const std::string detail =
+                fmt::format("key script step {} ({}) did not happen within {} s",
+                            *result.timed_out + 1, step.when, step.timeout.value_or(0.0));
+            LOG_ERROR(Frontend, "Key script: {}; the steps after it are skipped", detail);
+            Common::RunOutcome::Request(Common::RunOutcome::Reason::Timeout, detail);
+        }
     }
     RunLiveKeys(input_subsystem, system);
 }

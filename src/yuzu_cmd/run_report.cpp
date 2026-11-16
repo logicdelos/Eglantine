@@ -34,6 +34,7 @@ extern char** environ;
 #include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/nx2_bottleneck.h"
+#include "common/key_script.h"
 #include "common/scm_rev.h"
 #include "common/settings.h"
 #include "common/settings_common.h"
@@ -297,6 +298,28 @@ std::string UserDirText() {
     return Common::FS::PathToUTF8String(Common::FS::GetEdenPath(Common::FS::EdenPath::EdenDir));
 }
 
+/// The scripted input (EDEN_NX2_KEY_SCRIPT): one entry per step, with the time each one fired.
+/// `step` counts from 1. `fired_seconds` is on the script clock (it starts at the first poll of
+/// the main loop, near the start of the game), `fired_run_seconds` since the run began.
+Json StepsJson(const Common::KeyScript::Runner& runner) {
+    Json steps = Json::array();
+    for (const Common::KeyScript::Record& record : runner.Records()) {
+        Json entry = Json::object();
+        entry["step"] = record.index + 1;
+        entry["when"] = record.when;
+        entry["key"] = record.code < 0 ? -record.code : record.code;
+        entry["action"] = record.code < 0 ? "release" : "press";
+        entry["status"] = std::string{Common::KeyScript::StatusName(record.status)};
+        const bool fired = record.status == Common::KeyScript::Status::Fired;
+        entry["fired_seconds"] = fired ? Json(record.fired_seconds) : Json(nullptr);
+        entry["fired_run_seconds"] =
+            fired && record.fired_run_seconds ? Json(*record.fired_run_seconds) : Json(nullptr);
+        entry["fired_frames"] = fired ? Json(record.fired_frames) : Json(nullptr);
+        steps.push_back(std::move(entry));
+    }
+    return steps;
+}
+
 /// Everything in the file, taken in one go (the recording is consumed).
 std::string Document(State& state, Common::RunOutcome::Reason reason, int code,
                      bool shutdown_complete, std::string_view detail) {
@@ -343,6 +366,9 @@ std::string Document(State& state, Common::RunOutcome::Reason reason, int code,
     document["windows"] = std::move(windows);
     document["logs"] = std::move(logs);
     document["exit"] = std::move(exit_json);
+    if (const Common::KeyScript::Runner* script = Common::KeyScript::Current()) {
+        document["steps"] = StepsJson(*script);
+    }
     document["tunables"] = state.tunables;
     document["settings"] = std::move(settings);
     // Invalid UTF-8 (a detail quoting a game string) must not cost the whole report.

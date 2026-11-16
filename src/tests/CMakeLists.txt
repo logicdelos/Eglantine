@@ -41,6 +41,7 @@ add_executable(tests
     common/fibers.cpp
     common/game_presets.cpp
     common/host_memory.cpp
+    common/key_script.cpp
     common/page_table.cpp
     common/progress_counter.cpp
     common/param_package.cpp

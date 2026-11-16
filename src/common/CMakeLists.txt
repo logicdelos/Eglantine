@@ -108,6 +108,8 @@ add_library(
     host_memory.h
     input.h
     intrusive_red_black_tree.h
+    key_script.cpp
+    key_script.h
     literals.h
     log_ring.h
     logging.cpp
