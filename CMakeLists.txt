@@ -269,10 +269,14 @@ cmake_dependent_option(ENABLE_LIBUSB "Enable the use of LibUSB" ON "WIN32 OR LIN
 cmake_dependent_option(ENABLE_OPENGL "Enable OpenGL" ON "NOT (WIN32 AND ARCHITECTURE_arm64) AND NOT APPLE AND NOT ANDROID" OFF)
 mark_as_advanced(FORCE ENABLE_OPENGL)
 
-option(ENABLE_WEB_SERVICE "Enable web services (telemetry, etc.)" ON)
+# There is no telemetry or crash upload in the code. This switch builds the multiplayer lobby list,
+# room announcements and the amiibo lookup, which only run when the user opens those dialogs.
+option(ENABLE_WEB_SERVICE "Enable web services (multiplayer lobby and room announcements, amiibo lookup)" ON)
 option(ENABLE_MCP_SERVER "Build the built-in MCP server for AI agents (off at runtime by default)" ON)
 option(ENABLE_WIFI_SCAN "Enable WiFi scanning" OFF)
 
+# Off in this fork. The Discord application id in src/qt_common/discord/discord_impl.cpp belongs to
+# Eglantine-Community, so a build with this on shows the official name and logo on the user's profile.
 cmake_dependent_option(USE_DISCORD_PRESENCE "Enables Discord Rich Presence" OFF "ENABLE_QT" OFF)
 
 option(YUZU_TESTS "Compile tests" "${BUILD_TESTING}")

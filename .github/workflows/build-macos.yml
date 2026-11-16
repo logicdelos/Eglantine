@@ -115,7 +115,7 @@ jobs:
             -DENABLE_UPDATE_CHECKER=OFF \
             -DEGLANTINE_UPDATE_REPO=${{ github.repository }} \
             -DEGLANTINE_RELEASE_PLATFORM=${{ env.PLATFORM }} \
-            -DUSE_DISCORD_PRESENCE=ON \
+            -DUSE_DISCORD_PRESENCE=OFF \
             -DUSE_CCACHE=ON \
             -DNIGHTLY_BUILD=${{ inputs.nightly && 'ON' || 'OFF' }}
 
