@@ -582,7 +582,7 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
     // Past what a frame needs, more device memory only keeps the textures of earlier scenes
     // (title 1 filled 6.7 GB of an 8 GB card and draws its races in ~5 GB), so collect from
     // MaxCriticalMemory on rather than near the card's budget. Larger cards get 5/8 of the
-    // driver's budget (GetDeviceLocalMemory is capped near 7 GiB): at 5 GiB title 1's races
+    // driver's budget, whatever GetDeviceLocalMemory allows: at 5 GiB title 1's races
     // recreate and upload ~8 MiB of render targets a frame. EDEN_NX2_TC_BUDGET=1 (native
     // scenes: Ocarina at 2x needs about 8 GiB) keeps up to three quarters of a larger heap.
     // What the device budget allows (budget minus margins), before that cap.

@@ -75,7 +75,10 @@ VK_DEFINE_HANDLE(VmaPool)
     FEATURE(EXT, 4444Formats, 4444_FORMATS, format_a4b4g4r4)                                       \
     FEATURE(EXT, IndexTypeUint8, INDEX_TYPE_UINT8, index_type_uint8)                               \
     FEATURE(EXT, LineRasterization, LINE_RASTERIZATION, line_rasterization)                        \
+    FEATURE(EXT, MemoryPriority, MEMORY_PRIORITY, memory_priority)                                 \
     FEATURE(EXT, MeshShader, MESH_SHADER, mesh_shader)                                             \
+    FEATURE(EXT, PageableDeviceLocalMemory, PAGEABLE_DEVICE_LOCAL_MEMORY,                          \
+            pageable_device_local_memory)                                                          \
     FEATURE(EXT, PrimitiveTopologyListRestart, PRIMITIVE_TOPOLOGY_LIST_RESTART,                    \
             primitive_topology_list_restart)                                                       \
     FEATURE(EXT, ProvokingVertex, PROVOKING_VERTEX, provoking_vertex)                              \
@@ -283,6 +286,11 @@ public:
         DeviceBuffers,
     };
     static constexpr VkDeviceSize SeparatePoolBlockSize = 16ULL << 20;
+
+    /// VK_EXT_memory_priority's default (the Vulkan default too). VMA hands a dedicated
+    /// allocation or pool exactly the priority it is given once the allocator uses the extension,
+    /// so a zero-initialized one would be the first the driver pages out of video memory.
+    static constexpr float DefaultMemoryPriority = 0.5f;
 
     /// The pool of that kind for a memory type, created on first use (null if that failed).
     VmaPool GetSeparatePool(SeparatePool kind, u32 memory_type) const;

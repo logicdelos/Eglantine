@@ -89,6 +89,18 @@ namespace {
         }
         return VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
     }
+
+    /// VK_EXT_memory_priority (VMA ignores the value when the allocator was created without it):
+    /// images a draw can render into outrank textures and buffers when the driver has to choose
+    /// what to page out of video memory. Only dedicated allocations (anything over half a 16 MiB
+    /// block) carry their own priority; smaller ones take their block's, the default.
+    [[nodiscard]] float ImageMemoryPriority(VkImageUsageFlags usage) {
+        constexpr float render_target_priority = 0.75f;
+        constexpr VkImageUsageFlags attachment_usage =
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+        return (usage & attachment_usage) != 0 ? render_target_priority
+                                               : Device::DefaultMemoryPriority;
+    }
 } // namespace
 
 //MemoryCommit is now VMA-backed
@@ -225,7 +237,7 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
             .memoryTypeBits = 0,
             .pool = VK_NULL_HANDLE,
             .pUserData = nullptr,
-            .priority = 0.f,
+            .priority = ImageMemoryPriority(ci.usage),
     };
 
     VkImage handle{};
@@ -330,7 +342,7 @@ vk::Image MemoryAllocator::TryCreateImage(const VkImageCreateInfo &ci, VkResult 
             .memoryTypeBits = 0,
             .pool = VK_NULL_HANDLE,
             .pUserData = nullptr,
-            .priority = 0.f,
+            .priority = ImageMemoryPriority(ci.usage),
     };
     VkImage handle{};
     VmaAllocation allocation{};
@@ -372,7 +384,7 @@ VmaAllocation MemoryAllocator::AllocateSparseMemory(const VkMemoryRequirements &
         .memoryTypeBits = requirements.memoryTypeBits,
         .pool = VK_NULL_HANDLE,
         .pUserData = nullptr,
-        .priority = 0.f,
+        .priority = Device::DefaultMemoryPriority,
     };
     VmaAllocation allocation{};
     VmaAllocationInfo info{};
@@ -454,7 +466,7 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
         .memoryTypeBits = usage == MemoryUsage::Stream ? 0u : valid_memory_types,
         .pool = VK_NULL_HANDLE,
         .pUserData = nullptr,
-        .priority = 0.f,
+        .priority = Device::DefaultMemoryPriority,
     };
 
     VkBuffer handle{};
@@ -512,7 +524,7 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
         .memoryTypeBits = memory_type_bits,
         .pool = VK_NULL_HANDLE,
         .pUserData = nullptr,
-        .priority = 0.f,
+        .priority = Device::DefaultMemoryPriority,
     };
 
     VkBuffer handle{};
@@ -549,6 +561,7 @@ MemoryCommit MemoryAllocator::Commit(const VkMemoryRequirements &reqs, MemoryUsa
     ci.memoryTypeBits = reqs.memoryTypeBits & valid_memory_types;
     ci.requiredFlags = 0;
     ci.preferredFlags = MemoryUsagePreferredVmaFlags(usage);
+    ci.priority = Device::DefaultMemoryPriority;
 
     VmaAllocation a{};
     VmaAllocationInfo info{};
@@ -584,7 +597,7 @@ MemoryCommit MemoryAllocator::Commit(const vk::Buffer &buffer, MemoryUsage usage
     ci.preferredFlags = MemoryUsagePreferredVmaFlags(usage);
     ci.pool = VK_NULL_HANDLE;
     ci.pUserData = nullptr;
-    ci.priority = 0.0f;
+    ci.priority = Device::DefaultMemoryPriority;
 
     const VkBuffer raw = *buffer;
 

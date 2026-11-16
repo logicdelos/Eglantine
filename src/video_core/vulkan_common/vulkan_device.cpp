@@ -32,6 +32,7 @@
 #include <ranges>
 #include "common/settings.h"
 #include "common/settings_enums.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/vulkan_common/nsight_aftermath_tracker.h"
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -802,6 +803,9 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     if (extensions.memory_budget) {
         flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
     }
+    if (extensions.memory_priority) {
+        flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_PRIORITY_BIT;
+    }
     if (extensions.buffer_device_address) {
         flags |= VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
     }
@@ -874,7 +878,7 @@ VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type) const {
             .blockSize = SeparatePoolBlockSize,
             .minBlockCount = 0,
             .maxBlockCount = 0,
-            .priority = 0.f,
+            .priority = DefaultMemoryPriority,
             .minAllocationAlignment = 0,
             .pMemoryAllocateNext = nullptr,
         };
@@ -1151,6 +1155,15 @@ bool Device::GetSuitability(bool requires_swapchain) {
 
     FOR_EACH_VK_FEATURE_EXT(FEATURE_EXTENSION);
     FOR_EACH_VK_EXTENSION(EXTENSION);
+
+    // VK_EXT_memory_priority and VK_EXT_pageable_device_local_memory: loaded where the device has
+    // them, unless the switch is off.
+    if (!VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::VramPriority)) {
+        loaded_extensions.erase(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
+        loaded_extensions.erase(VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME);
+        extensions.memory_priority = false;
+        extensions.pageable_device_local_memory = false;
+    }
 
     extensions.depth_stencil_resolve =
         extensions.depth_stencil_resolve &&
@@ -1736,6 +1749,19 @@ void Device::RemoveUnsuitableExtensions() {
     extensions.synchronization2 = features.synchronization2.synchronization2;
     RemoveExtensionFeatureIfUnsuitable(extensions.synchronization2, features.synchronization2,
                                        VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME);
+
+    // VK_EXT_memory_priority
+    extensions.memory_priority = features.memory_priority.memoryPriority;
+    RemoveExtensionFeatureIfUnsuitable(extensions.memory_priority, features.memory_priority,
+                                       VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
+
+    // VK_EXT_pageable_device_local_memory (its use of priorities needs VK_EXT_memory_priority)
+    extensions.pageable_device_local_memory =
+        extensions.memory_priority &&
+        features.pageable_device_local_memory.pageableDeviceLocalMemory;
+    RemoveExtensionFeatureIfUnsuitable(extensions.pageable_device_local_memory,
+                                       features.pageable_device_local_memory,
+                                       VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME);
 }
 
 void Device::SetupFamilies(VkSurfaceKHR surface) {
@@ -1939,20 +1965,43 @@ void Device::CollectPhysicalMemoryInfo() {
         }
         device_access_memory += heap_size;
     }
+    const u64 reported_memory = device_access_memory;
+    u64 reserve_memory = 0;
+    bool follows_reported_vram_budget = false;
     if (is_integrated) {
         const s64 available_memory = static_cast<s64>(device_access_memory - device_initial_usage);
         const u64 memory_size = Settings::values.vram_usage_mode.GetValue() == Settings::VramUsageMode::Aggressive ? 6_GiB : 4_GiB;
         device_access_memory = static_cast<u64>(std::max<s64>(std::min<s64>(available_memory - 8_GiB, memory_size), std::min<s64>(local_memory, memory_size)));
     } else {
-        const u64 reserve_memory = std::min<u64>(device_access_memory / 8, 1_GiB);
+        reserve_memory = std::min<u64>(device_access_memory / 8, 1_GiB);
         device_access_memory -= reserve_memory;
-        if (Settings::values.vram_usage_mode.GetValue() != Settings::VramUsageMode::Aggressive) {
+        // VK_EXT_memory_budget reports what this process may use, which is the room there is: the
+        // limit follows it minus the reserve, not a fixed 6 GiB plus 1 GiB per resolution step
+        // (7 GiB on a 12 GiB card at 1x resolution).
+        follows_reported_vram_budget =
+            extensions.memory_budget &&
+            VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::VramBudgetReported);
+        if (!follows_reported_vram_budget &&
+            Settings::values.vram_usage_mode.GetValue() != Settings::VramUsageMode::Aggressive) {
             // Account for resolution scaling in memory limits
             const size_t normal_memory = 6_GiB;
             const size_t scaler_memory = 1_GiB * Settings::values.resolution_info.ScaleUp(1);
             device_access_memory = std::min<u64>(device_access_memory, normal_memory + scaler_memory);
         }
     }
+    const bool aggressive =
+        Settings::values.vram_usage_mode.GetValue() == Settings::VramUsageMode::Aggressive;
+    const char* const policy = is_integrated ? "share of system memory"
+                               : follows_reported_vram_budget ? "following the reported budget"
+                               : aggressive ? "no cap" : "conservative cap";
+    LOG_INFO(Render_Vulkan,
+             "Device memory limit: {} MiB ({}; {} {} MiB, reserve {} MiB, device-local heaps {} "
+             "MiB, VRAM mode {}, memory priority {}, pageable device-local memory {})",
+             device_access_memory >> 20, policy,
+             extensions.memory_budget ? "driver budget" : "heap size", reported_memory >> 20,
+             reserve_memory >> 20, local_memory >> 20, aggressive ? "aggressive" : "conservative",
+             extensions.memory_priority ? "on" : "off",
+             extensions.pageable_device_local_memory ? "on" : "off");
 }
 
 void Device::CollectToolingInfo() {
