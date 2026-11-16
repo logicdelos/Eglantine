@@ -2,6 +2,8 @@
 
 A map of the emulator's systems, written from the source at commit `0aae940355` (branch `fe-buf`, 3294 C/C++ files under `src/`), with the defects found while reading. Built for a Windows, Vulkan, NVIDIA target; Android and OpenGL paths were not studied.
 
+Commit ids in these pages, such as `0aae940355`, come from the lab history where the map was written. Most of them are not commits of this repository, and the line numbers refer to that source, which can differ from this tree.
+
 ## How to read it
 
 - One page per system (`<slice>.md`): purpose, files, main types and who owns them, threads and locks, flow, connections, settings, invariants, hazards.
