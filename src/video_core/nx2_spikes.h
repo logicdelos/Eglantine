@@ -6,9 +6,13 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "common/common_types.h"
@@ -235,5 +239,390 @@ void Clear();
 
 /// The spike as the one line the recorder logs.
 [[nodiscard]] std::string Summary(const Spike& spike);
+
+// ---------------------------------------------------------------------------------------------
+// Attribution (milestone 0.5): which cause every long frame and the cold start are charged to.
+//
+// This block is a frozen contract (plan_0.5.md section 2, contracts_0.5.md). It extends this
+// recorder instead of adding another one; the Event counters above keep their meaning and the
+// frame spike recorder above is not changed by it. Nothing here is implemented by the header:
+// recorder code lives in nx2_attribution.cpp (and nx2_spikes.cpp), callers only use these
+// declarations. Common code (Nx2Bottleneck) does not include this file, and Dynarmic reaches it
+// only through the hook of dynarmic/interface/jit_stats.h.
+//
+// Clock: every timestamp is nanoseconds of std::chrono::steady_clock (NowNs), the clock of the
+// run report; durations are integer nanoseconds. A frame is the interval between two real,
+// successful host presents (OnHostPresent): F_i = (P(i-1), P(i)], duration = P(i) - P(i-1). It is
+// a long frame when the duration is strictly over the threshold (100 ms by default).
+//
+// Off cost: AttributionEnabled() is one relaxed load of a plain atomic bool. Every site tests it
+// once (SpanScope does) and does nothing else when it is false: no clock read, no allocation, no
+// queue operation.
+// ---------------------------------------------------------------------------------------------
+
+/// What a stretch of time is charged to (the roadmap's list). The value is the index into
+/// LongFrame::cause_ns and activity_ns.
+enum class Cause : u8 {
+    Disk,            ///< A synchronous file read for the guest or the shader caches
+    Shader,          ///< Shader environment capture, translation, SPIR-V emission, module creation
+    Pipeline,        ///< Driver pipeline object creation and pipeline preparation
+    Texture,         ///< CPU ASTC/BC decode, GPU decode submission
+    Decompression,   ///< NUP / zstd decompression (not the file reads nested inside it)
+    Waiting,         ///< A wait whose producer is known or unknown (see SpanFlags)
+    CodeTranslation, ///< The guest JIT translating, optimizing and emitting code
+    Unknown,         ///< Time no span explains
+    Count,
+};
+inline constexpr size_t CauseCount = static_cast<size_t>(Cause::Count);
+
+/// The names reports and log lines use, indexed by Cause.
+inline constexpr std::array<std::string_view, CauseCount> CauseNames{
+    "disk",          "shader",  "pipeline",        "texture",
+    "decompression", "waiting", "code_translation", "unknown",
+};
+[[nodiscard]] constexpr std::string_view CauseName(Cause cause) noexcept {
+    return CauseNames[static_cast<size_t>(cause)];
+}
+
+/// The stable names of the Event counters in reports (the counter_deltas of a long frame), indexed
+/// by Event. The recorder's own human readable names are not used for machine output.
+inline constexpr std::array<std::string_view, static_cast<size_t>(Event::Count)> EventTokens{
+    "driver_build",   "driver_compile",   "runtime_pipeline",   "draw_skipped",
+    "cpu_write_slow_path", "cpu_write_invalidate", "cpu_write_lock_wait", "protect_change",
+    "read_trap_hit",  "jit_compile",      "jit_fastmem_recompile", "jit_invalidate",
+    "jit_clear",      "svc",              "svc_sleep",          "svc_wait_sync",
+    "svc_mutex_condvar", "svc_address_arbiter", "svc_ipc",      "file_read",
+    "nup_decompress", "cpu_read_sync",
+};
+[[nodiscard]] constexpr std::string_view EventToken(Event event) noexcept {
+    return EventTokens[static_cast<size_t>(event)];
+}
+
+/// A stable 64-bit session-local identity for a unit of work (a pipeline build, a read request);
+/// 0 means unlinked. Allocated with NewWorkId and carried from enqueue to the worker that runs it.
+using WorkId = u64;
+[[nodiscard]] WorkId NewWorkId();
+
+/// Names one span for EndSpan and LinkWait. Valid until the session ends; a token of an earlier
+/// session generation is ignored.
+struct SpanToken {
+    u32 session_generation{};
+    u32 thread_registration_id{};
+    u64 sequence{}; ///< 0: no span (recording was off)
+
+    [[nodiscard]] constexpr bool Valid() const noexcept {
+        return sequence != 0;
+    }
+    friend constexpr bool operator==(const SpanToken&, const SpanToken&) = default;
+};
+
+/// Span::flags bits.
+namespace SpanFlags {
+inline constexpr u32 Incomplete = 1u << 0;      ///< Still open when the session ended
+inline constexpr u32 Failed = 1u << 1;          ///< The operation failed
+inline constexpr u32 Cancelled = 1u << 2;       ///< The operation was cancelled
+inline constexpr u32 ProducerUnknown = 1u << 3; ///< A wait that no LinkWait connected to work
+} // namespace SpanFlags
+
+/// One finished or open stretch of work on one thread. `parent` is the span open on the same
+/// thread when this one began (recorder-assigned; nested time is subtracted from the parent).
+struct Span {
+    SpanToken token;
+    SpanToken parent;
+    WorkId work{};
+    Cause cause{Cause::Unknown};
+    u32 flags{};
+    u64 begin_ns{};
+    u64 end_ns{}; ///< 0 while open
+    u64 amount{}; ///< Bytes, blocks or entries, whatever the cause counts
+};
+
+enum class DependencyKind : u8 {
+    Job,   ///< A queued job (pipeline build, translation) released the wait
+    Fence, ///< A GPU submission fence or timeline value
+    Join,  ///< A thread or worker join
+    Io,    ///< A read or decompression request
+};
+
+/// A wait span and the work whose completion released it.
+struct Dependency {
+    SpanToken wait_span;
+    WorkId producer_work{};
+    u64 release_ns{};
+    DependencyKind kind{DependencyKind::Job};
+};
+
+/// The result of one host present attempt, from the Vulkan call's VkResult.
+enum class PresentResult : u8 {
+    Success,
+    Suboptimal,
+    OutOfDate,
+    Error,
+};
+
+/// VK_SUCCESS, VK_SUBOPTIMAL_KHR and VK_ERROR_OUT_OF_DATE_KHR by value, so no Vulkan header is
+/// needed here.
+[[nodiscard]] constexpr PresentResult ClassifyPresent(s32 vk_result) noexcept {
+    if (vk_result == 0) {
+        return PresentResult::Success;
+    }
+    if (vk_result == 1000001003) {
+        return PresentResult::Suboptimal;
+    }
+    if (vk_result == -1000001004) {
+        return PresentResult::OutOfDate;
+    }
+    return PresentResult::Error;
+}
+
+/// Only a successful or suboptimal submission of a real frame ends a frame interval.
+[[nodiscard]] constexpr bool QualifiesAsHostPresent(PresentResult result, bool real_frame) noexcept {
+    return real_frame && (result == PresentResult::Success || result == PresentResult::Suboptimal);
+}
+
+/// One host present attempt. The renderer fills everything but host_present_id.
+struct FrameBoundary {
+    u64 host_present_id{}; ///< Assigned by the recorder, monotonic from 1, for qualifying presents
+    u64 guest_frame_id{};  ///< The guest frame that was presented, 0 when unknown
+    u64 timestamp_ns{};    ///< NowNs() taken right after the present call returned
+    bool real_frame{};     ///< False for a generated (frame generation) frame
+    PresentResult result{PresentResult::Success};
+};
+
+/// LongFrame::unknown_reasons bits: why part of a frame is Unknown.
+namespace UnknownReason {
+inline constexpr u32 PreInstrumentation = 1u << 0;
+inline constexpr u32 UnlinkedGuest = 1u << 1;
+inline constexpr u32 UninstrumentedDriver = 1u << 2;
+inline constexpr u32 SchedulerOrPaging = 1u << 3;
+inline constexpr u32 MissingGpuTimestamp = 1u << 4;
+inline constexpr u32 AmbiguousDependency = 1u << 5;
+inline constexpr u32 LostSpans = 1u << 6;
+inline constexpr u32 ProducerUnknownWait = 1u << 7;
+} // namespace UnknownReason
+
+/// The names reports use, indexed by the bit number of an UnknownReason.
+inline constexpr std::array<std::string_view, 8> UnknownReasonNames{
+    "pre_instrumentation", "unlinked_guest",     "uninstrumented_driver", "scheduler_or_paging",
+    "missing_gpu_timestamp", "ambiguous_dependency", "lost_spans",          "producer_unknown_wait",
+};
+
+inline constexpr size_t MaxCriticalWork = 8;
+
+/// One frame over the threshold. cause_ns is the exclusive wall-time decomposition of the frame
+/// and sums exactly to duration_ns (unresolved time is Unknown); activity_ns is the clipped sum
+/// over all threads and may exceed the duration. Fixed size: streamed to the report writer.
+struct LongFrame {
+    u64 id{};          ///< host_present_id of the present that ended the frame
+    u64 start_ns{};    ///< The previous qualifying present
+    u64 end_ns{};      ///< This present
+    u64 duration_ns{}; ///< end_ns - start_ns
+    std::array<u64, CauseCount> cause_ns{};
+    std::array<u64, CauseCount> activity_ns{};
+    Cause primary_cause{Cause::Unknown}; ///< The largest cause_ns, Unknown on ties
+    u32 confidence_permille{};           ///< 1000 - 1000 * Unknown / duration
+    u32 unknown_reasons{};               ///< UnknownReason bits
+    /// Event counts during the frame (the existing Note counters, not their times).
+    std::array<u64, static_cast<size_t>(Event::Count)> counter_deltas{};
+    std::array<WorkId, MaxCriticalWork> critical_work_ids{}; ///< Longest first
+    u32 critical_work_count{};
+    PresentResult present_result{PresentResult::Success};
+    bool instrumentation_complete{}; ///< No lost or still-open spans touched the frame
+};
+
+/// The monotonic clock of every attribution timestamp.
+[[nodiscard]] inline u64 NowNs() {
+    return static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch())
+            .count());
+}
+
+namespace Detail {
+inline std::atomic<bool> attribution_enabled{false}; ///< Set by BeginSession, cleared by EndSession
+} // namespace Detail
+
+/// True between BeginSession and EndSession. The one branch every site pays when recording is off.
+[[nodiscard]] inline bool AttributionEnabled() noexcept {
+    return Detail::attribution_enabled.load(std::memory_order_relaxed);
+}
+
+struct SessionConfig {
+    u64 threshold_ns{100'000'000};
+    /// Detailed span storage, shared by all threads; spans past it are counted as lost.
+    size_t buffer_bytes{size_t{16} << 20};
+};
+
+/// Starts a session: a new generation, empty buffers, recording on. False when one is running.
+/// Called by the frontend after option validation (CLI) or before the emulation thread runs (Qt).
+bool BeginSession(const SessionConfig& config);
+
+/// Ends the session: still-open spans become incomplete spans, the consumer is drained, producer
+/// completion is awaited and the final snapshot becomes readable (until the next BeginSession).
+/// Called after every producer thread has been joined.
+void EndSession();
+
+/// Gives the calling thread a collision-free registration (once per thread; later calls return
+/// the first id). A thread that records without registering is registered as "unnamed".
+u32 RegisterThread(std::string_view name);
+
+/// Opens a span on the calling thread and returns its token (invalid when recording is off).
+/// The span open on this thread becomes its parent. Call only when AttributionEnabled().
+SpanToken BeginSpan(Cause cause, WorkId work = 0, u64 amount = 0);
+
+/// Closes the span, adding `amount` to the one given at BeginSpan, and ORing in SpanFlags.
+void EndSpan(SpanToken token, u64 amount = 0, u32 flags = 0);
+
+/// Records a span that is already over (the JIT hook, a timestamped GPU result).
+void RecordSpan(Cause cause, u64 begin_ns, u64 end_ns, WorkId work = 0, u64 amount = 0,
+                u32 flags = 0);
+
+/// States that `wait` ended because `producer` finished. Time of the wait that overlaps the
+/// producer's spans is charged to the producer's cause; an unlinked wait stays Waiting.
+void LinkWait(SpanToken wait, WorkId producer, DependencyKind kind);
+
+/// Times a scope into BeginSpan/EndSpan; costs one atomic load when recording is off.
+class SpanScope {
+public:
+    explicit SpanScope(Cause cause, WorkId work = 0, u64 amount = 0)
+        : token{AttributionEnabled() ? BeginSpan(cause, work, amount) : SpanToken{}} {}
+    ~SpanScope() {
+        if (token.Valid()) {
+            EndSpan(token, end_amount, flags);
+        }
+    }
+    SpanScope(const SpanScope&) = delete;
+    SpanScope& operator=(const SpanScope&) = delete;
+
+    [[nodiscard]] SpanToken Token() const noexcept {
+        return token;
+    }
+    /// Adds to the amount reported at the end (bytes read, blocks decoded).
+    void AddAmount(u64 value) noexcept {
+        end_amount += value;
+    }
+    void Fail() noexcept {
+        flags |= SpanFlags::Failed;
+    }
+
+private:
+    SpanToken token;
+    u64 end_amount{};
+    u32 flags{};
+};
+
+/// Publishes a host present attempt. Returns its host_present_id when it qualifies
+/// (QualifiesAsHostPresent), 0 otherwise; a non-qualifying attempt is only counted (and keeps
+/// the interval open, it never ends or starts one).
+u64 OnHostPresent(const FrameBoundary& boundary);
+
+/// A cold-start phase of the frontend (the startup.phases list of the report).
+enum class BootPhase : u8 {
+    FrontendLoad,   ///< Frontend loads the program, up to the first thing below
+    WarmRefresh,    ///< Guessed warm-compute archive scan and conversion
+    CacheValidate,  ///< Cache header read, identity check and indexing
+    PipelineReplay, ///< Starting and waiting for disk replay at boot
+    GameRun,        ///< Until the guest program runs
+    Count,
+};
+inline constexpr std::array<std::string_view, static_cast<size_t>(BootPhase::Count)>
+    BootPhaseNames{"frontend_load", "warm_refresh", "cache_validate", "pipeline_replay",
+                   "game_run"};
+
+enum class PhaseOutcome : u8 { NotRun, Ok, Cancelled, Error };
+
+void BeginBootPhase(BootPhase phase);
+void EndBootPhase(BootPhase phase, PhaseOutcome outcome);
+
+/// When the OS created the process, on the NowNs clock (the frontend maps it at initialization)
+/// and how uncertain that mapping is. Time before the session began is Unknown/pre_instrumentation.
+void SetProcessCreated(u64 created_ns, u64 uncertainty_ns);
+
+/// The verified interactive-scene marker (the lab supplies it, F validates the session nonce).
+struct InteractiveMarker {
+    std::string scene_id;
+    std::string origin; ///< Who supplied it ("lab", "manual")
+    u64 marker_ns{};    ///< On the NowNs clock
+    bool scene_check_passed{};
+};
+
+enum class MarkerResult : u8 {
+    Accepted,
+    Duplicate,    ///< A marker was already accepted this session
+    Backdated,    ///< marker_ns is before the first host present or after now
+    NoSession,
+};
+[[nodiscard]] MarkerResult MarkInteractive(const InteractiveMarker& marker);
+
+/// Whether an interval of the report was observed completely.
+enum class IntervalStatus : u8 { NotObserved, Complete, Incomplete };
+
+struct IntervalAttribution {
+    u64 duration_ns{};
+    std::array<u64, CauseCount> cause_ns{}; ///< Sums to duration_ns
+    IntervalStatus status{IntervalStatus::NotObserved};
+};
+
+struct PhaseRecord {
+    BootPhase phase{BootPhase::FrontendLoad};
+    PhaseOutcome outcome{PhaseOutcome::NotRun};
+    u64 begin_ns{};
+    u64 end_ns{}; ///< 0 while running
+};
+
+/// The first two minutes after the first real host present (strictly over the threshold counts,
+/// the lower bound is exclusive and the upper inclusive).
+inline constexpr u64 FirstWindowNs = 120'000'000'000ull;
+struct FirstWindow {
+    u64 anchor_ns{}; ///< The first qualifying present, 0 before it
+    bool complete{}; ///< A present crossed anchor + FirstWindowNs
+    u64 elapsed_ns{};
+    u64 frames{};
+    u64 frames_over_threshold{};
+    u64 max_ns{};
+    u64 crossing_tail_interval_ns{}; ///< The interval that crossed the window's end
+};
+
+/// Everything the report needs from the recorder, immutable.
+struct AttributionSnapshot {
+    bool enabled{};
+    bool complete{}; ///< No lost spans, no write failure, session ended with producers joined
+    u64 threshold_ns{};
+    u64 lost_events{};
+    u64 sink_write_errors{};
+    u64 rejected_presents{}; ///< Present attempts that did not qualify
+    u64 frames{};            ///< Qualifying intervals (from the second present on)
+    u64 long_frames{};
+    double unknown_wall_fraction{};          ///< Over all long frames and both startup intervals
+    double unknown_primary_frame_fraction{}; ///< Long frames whose largest bucket is Unknown
+    u64 producer_unknown_wait_ns{};
+    u64 process_created_ns{}; ///< 0: not set
+    u64 process_created_uncertainty_ns{};
+    u64 first_host_present_ns{}; ///< 0: no present yet
+    IntervalAttribution process_to_first_present;
+    IntervalAttribution first_present_to_interactive;
+    InteractiveMarker interactive;
+    IntervalStatus interactive_status{IntervalStatus::NotObserved};
+    std::vector<PhaseRecord> phases; ///< In the order begun, at most 64
+    FirstWindow first_120s;
+};
+
+/// Valid while a session runs (then incomplete) and after EndSession (final).
+[[nodiscard]] AttributionSnapshot ReadAttributionSnapshot();
+
+/// Where long frames go as they are resolved: called on the recorder's one consumer thread, once
+/// per long frame, in order. `write` returns false when the record could not be stored (counted
+/// in sink_write_errors, the snapshot becomes incomplete). Set once, before BeginSession;
+/// clearing (an empty sink) waits for a call in progress.
+struct LongFrameSink {
+    bool (*write)(void* user, const LongFrame& frame){};
+    void* user{};
+};
+void SetLongFrameSink(LongFrameSink sink);
+
+/// The line the recorder logs for every long frame, for example
+/// "Nx2LongFrame frame=123 dt_ms=154.2 primary=shader shader_ms=92.1 waiting_ms=40.0
+/// unknown_ms=22.1 complete=1" (milliseconds with one decimal; every cause is printed, in
+/// CauseNames order, as <name>_ms).
+[[nodiscard]] std::string LongFrameLine(const LongFrame& frame);
 
 } // namespace VideoCommon::Nx2Spikes

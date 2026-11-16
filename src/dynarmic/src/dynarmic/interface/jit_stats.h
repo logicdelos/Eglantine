@@ -21,4 +21,18 @@ struct JitStats {
 
 inline JitStats g_jit_stats;
 
+enum class JitPhase : std::uint8_t {
+    Compile,      ///< Translate, optimize and emit one block (the span compile_ns totals)
+    MemoryCommit, ///< Making the code buffer's memory ready before compiling
+};
+
+/// Optional hook told when a phase ended, with its begin and end as nanoseconds of
+/// std::chrono::steady_clock since its epoch (the clock of VideoCommon::Nx2Spikes::NowNs). It is
+/// installed once by the core, which turns the call into an attribution span, so that Dynarmic
+/// does not depend on video_core. Called on the compiling thread after g_jit_stats was updated;
+/// it must not throw, block or take a lock the JIT holds. Null: nothing extra is timed.
+using JitPhaseHook = void (*)(JitPhase phase, std::uint64_t begin_ns, std::uint64_t end_ns);
+
+inline std::atomic<JitPhaseHook> g_jit_phase_hook{nullptr};
+
 } // namespace Dynarmic
