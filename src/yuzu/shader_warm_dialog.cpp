@@ -25,6 +25,7 @@
 #include "core/loader/loader.h"
 #include "video_core/shader_warm/shader_warm_builder.h"
 #include "yuzu/shader_warm_dialog.h"
+#include "yuzu_cmd/run_control.h"
 
 namespace ShaderWarm = VideoCommon::ShaderWarm;
 
@@ -190,7 +191,12 @@ void ShaderWarmDialog::Start() {
         };
         ShaderWarm::Result result;
         try {
-            result = ShaderWarm::BuildWarmFiles(system, game_path, title_id, on_progress, stop);
+            // The identity of the game being built, assembled here the way the next launch
+            // assembles it (update, add-ons, mods), off the UI thread because of the manifest walk.
+            const auto host = RunControl::AssembleHostIdentity(
+                RunControl::SourceFromSystem(system, title_id, game_path));
+            result = ShaderWarm::BuildWarmFiles(system, game_path, title_id, host, on_progress,
+                                                stop);
         } catch (const std::exception& e) {
             result.ok = false;
             result.error = e.what();

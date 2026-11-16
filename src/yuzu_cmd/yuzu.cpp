@@ -486,16 +486,16 @@ static bool BuildWarm(Core::System& system, int argc, char** argv) {
                    progress.done, progress.total);
         std::fflush(stdout);
     };
-    // The identity of the title being built, not of whatever stamped the process before: the
+    // The identity of the title being built, passed to the builder and published nowhere: the
     // game file and the add-on option are all an offline build sees (it has no update, DLC or
     // mods), and it is the content stamp the later launch compares.
     RunControl::HostIdentitySource identity_source;
     identity_source.title_id = title_id;
     identity_source.game_path = std::filesystem::path{Common::FS::ToU8String(argv[2])};
     identity_source.warm_addons = RunControl::WarmAddonsOption();
-    VideoCommon::CacheEnvelope::SetHostIdentity(RunControl::AssembleHostIdentity(identity_source));
+    const auto host = RunControl::AssembleHostIdentity(identity_source);
     const auto result = ShaderWarm::BuildWarmFilesWith(
-        system, Common::FS::ToU8String(argv[2]), title_id, options, on_progress, {});
+        system, Common::FS::ToU8String(argv[2]), title_id, host, options, on_progress, {});
     // The error can hold a Windows path: escape it so the summary stays valid JSON.
     std::string error;
     for (const char c : result.error) {
