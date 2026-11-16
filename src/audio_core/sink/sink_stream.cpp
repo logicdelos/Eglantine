@@ -24,6 +24,7 @@
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/logging.h"
+#include "common/nx2_bottleneck.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 
@@ -141,6 +142,7 @@ void SinkStream::ProcessAudioIn(std::span<const s16> input_buffer, std::size_t n
             if (!queue.TryPop(playing_buffer)) {
                 // If no buffer was available we've underrun, just push the samples and
                 // continue.
+                Nx2Bottleneck::NoteAudioUnderrun();
                 samples_buffer.Push(&input_buffer[frames_written * frame_size], (num_frames - frames_written) * frame_size);
                 frames_written = num_frames;
                 continue;

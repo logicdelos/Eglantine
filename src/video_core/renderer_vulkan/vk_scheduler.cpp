@@ -19,6 +19,7 @@
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 
 #include "common/logging.h"
+#include "common/nx2_bottleneck.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "video_core/gpu_logging/gpu_logging.h"
@@ -146,6 +147,7 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore)
 }
 
 void Scheduler::WaitWorker() {
+    Nx2Bottleneck::WaitScope wait{Nx2Bottleneck::Wait::VulkanWorker};
     DispatchWork();
 
     // Ensure the queue is drained.
@@ -372,6 +374,7 @@ bool Scheduler::UpdateGraphicsPipelineImpl(GraphicsPipeline* pipeline) {
 
 void Scheduler::WorkerThread(std::stop_token stop_token) {
     Common::SetCurrentThreadName("VulkanWorker");
+    Nx2Bottleneck::MarkThread(Nx2Bottleneck::Thread::VulkanWorker);
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
     Common::SetCurrentThreadToPerformanceCores();
 
@@ -393,10 +396,12 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
             std::unique_lock lk{queue_mutex};
 
             // Wait for work.
+            Nx2Bottleneck::BeginIdle(Nx2Bottleneck::Thread::VulkanWorker);
             event_cv.wait(lk, stop_token, [&] {
                 worker_waiting = !TryPopQueue(work);
                 return !worker_waiting;
             });
+            Nx2Bottleneck::EndIdle(Nx2Bottleneck::Thread::VulkanWorker);
             worker_waiting = false;
 
             // If we've been asked to stop, we're done.

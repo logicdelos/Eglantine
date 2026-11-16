@@ -10,6 +10,7 @@
 #include <thread>
 
 #include <ranges>
+#include "common/nx2_bottleneck.h"
 #include "common/settings.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -86,6 +87,7 @@ void MasterSemaphore::Wait(u64 tick) {
             return;
         }
 
+        Nx2Bottleneck::WaitScope wait{Nx2Bottleneck::Wait::HostGpu};
         u64 last_tick = gpu_tick.load(std::memory_order_relaxed);
         while (gpu_tick.load(std::memory_order_acquire) < tick) {
             gpu_tick.wait(last_tick, std::memory_order_acquire);
@@ -106,6 +108,7 @@ void MasterSemaphore::Wait(u64 tick) {
         return;
     }
 
+    Nx2Bottleneck::WaitScope wait{Nx2Bottleneck::Wait::HostGpu};
     // If none of the above is hit, fallback to a regular wait
     try {
         while (!semaphore.Wait(tick)) {

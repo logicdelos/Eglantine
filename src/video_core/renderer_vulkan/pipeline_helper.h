@@ -18,6 +18,7 @@
 
 #include "common/common_types.h"
 #include "common/logging.h"
+#include "common/nx2_bottleneck.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
@@ -49,7 +50,13 @@ inline void ReportPipelineBuildWait(const char* kind, u64 hash,
                                     std::string_view details = {}) {
     static std::atomic<u32> logged{};
     const auto elapsed = std::chrono::steady_clock::now() - begin;
-    if (elapsed > std::chrono::milliseconds{2} && logged.fetch_add(1) < 400) {
+    if (elapsed <= std::chrono::milliseconds{2}) {
+        return;
+    }
+    Nx2Bottleneck::AddWait(
+        Nx2Bottleneck::Wait::ShaderBuild,
+        static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()));
+    if (logged.fetch_add(1) < 400) {
         LOG_INFO(Render_Vulkan,
                  "Submission thread waited {:.1f} ms for {} pipeline {:016x} to finish building{}",
                  std::chrono::duration<double, std::milli>(elapsed).count(), kind, hash, details);

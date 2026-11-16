@@ -9,6 +9,7 @@
 | `src/common/logging.cpp`, `log_ring.h` | log filter, backends, `FmtLogMessageImpl` | full |
 | `src/common/settings.cpp`, `settings_setting.h` | `Settings::values`, `LogSettings`, `SwitchableSetting` global/custom | partial (lines 1-303 and 290-439) |
 | `src/common/nx2_sampler.cpp` | Windows sampling profiler and stall watchdog (fork) | full except the report text assembly |
+| `src/common/nx2_bottleneck.cpp` | what limits the game: one `Report` log line every 10 s from wall-time meters at the wait sites (fork) | full |
 | `src/common/fs/file.cpp`, `file.h` | `IOFile` | partial |
 | `src/common/driver_shader_cache.cpp`, `host_memory.cpp`, `thread.cpp`, `env_gate.h` | env switches only | skimmed (grep) |
 | `src/common/assert.cpp`, `bounded_threadsafe_queue.h` | `Log::Stop` caller; queues (not used by logging) | partial |
@@ -40,6 +41,7 @@
 - CLI: SDL main-callback thread runs `SDL_AppIterate` at about 240 Hz; the emulator runs on its own threads started by `system.Run()`.
 - MCP: one `http_thread` running `listen_after_bind`, plus 8 httplib workers. Long waits (`wait_for`, `act`, `/events/wait`, SSE) each hold a worker. Tools that need the UI marshal to the GUI thread (`QtMcpHost`) or to `DrainMainThread` (CLI). `StopMcpServer` runs the server destructor on a helper thread while the GUI thread keeps pumping events, because in-flight requests may wait for the GUI thread.
 - Nx2 sampler: detached threads (`EDEN_NX2_SAMPLE` thread, `StallWatch`). They suspend other threads one at a time with `SuspendThread`, walk the stack without allocating, and resume.
+- Nx2 bottleneck: one detached `Nx2Bottleneck` thread that sleeps 10 s, swaps the atomic counters to zero and logs. The metered threads only add to atomics; no lock.
 - Lock order: not documented. The only visible nesting is log call to ring mutex or external sink to `Timeline::Push` (timeline.cpp has no `LOG_` calls, so no cycle there).
 
 ## Flow

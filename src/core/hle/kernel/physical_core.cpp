@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <thread>
+#include "common/nx2_bottleneck.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/core.h"
@@ -105,7 +106,9 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
                     thread->SetStepState(StepState::StepPerformed);
                 }
             } else {
+                const u64 run_begin = Nx2Bottleneck::Now();
                 hr = interface->RunThread(thread);
+                Nx2Bottleneck::AddGuestRun(m_core_index, Nx2Bottleneck::Now() - run_begin);
             }
 
             ExitContext();

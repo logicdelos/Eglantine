@@ -34,6 +34,7 @@
 #include "common/alignment.h"
 #include "common/div_ceil.h"
 #include "common/game_presets.h"
+#include "common/nx2_bottleneck.h"
 #include "common/nx2_sampler.h"
 #include "common/settings.h"
 #include "common/thread.h"
@@ -1976,6 +1977,10 @@ private:
                 return std::chrono::duration_cast<us>(d).count();
             };
             m_stats.fence_us += to_us(waited - entered);
+            Nx2Bottleneck::AddWait(
+                Nx2Bottleneck::Wait::GuestOnGpu,
+                static_cast<u64>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(waited - entered).count()));
             m_stats.composite_us += to_us(composited - waited);
             m_stats.pace_us += to_us(paced - composited);
             m_stats.max_fence_us = (std::max<long long>)(m_stats.max_fence_us, static_cast<long long>(to_us(waited - entered)));

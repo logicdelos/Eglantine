@@ -26,6 +26,7 @@
 #include <string>
 
 #include "common/logging.h"
+#include "common/nx2_bottleneck.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/core.h"
@@ -218,6 +219,7 @@ void GpuSplit::WaitForSpace(size_t words) {
     }
     Publish();
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
+    Nx2Bottleneck::WaitScope wait{Nx2Bottleneck::Wait::GpuBack};
     for (u32 spins = 0;; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (write_position + words - consumed_cache <= RingWords) {
@@ -255,6 +257,7 @@ void GpuSplit::Drain(DrainSite site) {
     Publish();
     hook_requested.store(true, std::memory_order_release);
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
+    Nx2Bottleneck::WaitScope wait{Nx2Bottleneck::Wait::GpuBack};
     const u64 start = Nx2Profile::Enabled() ? Nx2Profile::Now() : 0;
     // Everything consumed is not enough: the back submits deferred work (Scheduler::DeferFlush)
     // from its idle hook afterwards, and the caller may use the scheduler once this returns.
@@ -294,6 +297,7 @@ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
     }
     wait_target.store(target, std::memory_order_seq_cst);
     Publish();
+    Nx2Bottleneck::WaitScope wait{Nx2Bottleneck::Wait::GpuBack};
     const u64 start = Nx2Profile::Enabled() ? Nx2Profile::Now() : 0;
     for (u32 spins = 0;; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
@@ -645,6 +649,7 @@ void GpuSplit::RunIdleHook() {
 void GpuSplit::BackLoop(std::stop_token stop_token) {
     Common::SetCurrentThreadName("GPUBack");
     on_back_thread = true;
+    Nx2Bottleneck::MarkThread(Nx2Bottleneck::Thread::GpuBack);
     back_running.store(true, std::memory_order_release);
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
     Common::SetCurrentThreadToPerformanceCores();
@@ -659,6 +664,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         if (available == read_position) {
             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
             back_idle.store(true, std::memory_order_relaxed);
+            Nx2Bottleneck::BeginIdle(Nx2Bottleneck::Thread::GpuBack);
             // The front usually sends more within microseconds: spin briefly before sleeping.
             for (u32 spins = 0; spins < 8192 && available == read_position &&
                                 !hook_requested.load(std::memory_order_relaxed);
@@ -666,6 +672,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 Pause();
                 available = published.load(std::memory_order_acquire);
             }
+            Nx2Bottleneck::EndIdle(Nx2Bottleneck::Thread::GpuBack);
             if (available == read_position) {
                 hook_requested.store(false, std::memory_order_seq_cst);
                 // The front may already see everything consumed: Drain() waits for back_quiet
@@ -679,6 +686,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 available = published.load(std::memory_order_acquire);
             }
             if (available == read_position) {
+                Nx2Bottleneck::IdleScope idle{Nx2Bottleneck::Thread::GpuBack};
                 // Publish bumps `wake` when it sees back_waiting: read it before the last look
                 // at `published`, so a publish in between ends the wait at once.
                 back_waiting.store(true, std::memory_order_seq_cst);

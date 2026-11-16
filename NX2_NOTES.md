@@ -42,6 +42,28 @@ scope for this pass.
   - Stall watch: when a running guest presents no frame for `EDEN_NX2_STALL_SECONDS` (default 60,
     0 = off) the emulator writes every thread's call stack to `stall_<date>_<time>.txt` in the
     log directory, at most three times a run.
+  - What limits the game: every 10 s of gameplay `common/nx2_bottleneck.cpp` logs one `Report`
+    line (class `Core`, level Info, always on, no switch): the frame rate, a verdict after
+    `Limited by:`, then the figures behind it. Verdicts:
+    - `nothing, a steady 30 fps` (or 60): the game holds a rate it chose. With `no time to spare
+      in X` after it, X is at least 85% busy: a title that wants 60 would be held at 30 by X.
+    - `hitches: N of M frames ran long`: the other frames were on time. The notes after the
+      verdict name what was measured in the same 10 s (`shader builds held rendering for N ms`,
+      `a file read took N ms`, `host memory is nearly full` under 5% of RAM free).
+    - a named part (`the emulator's GPU thread`, `the emulator's Vulkan worker`, `the graphics
+      card`, `the game's own code on CPU core N`): it was at least 85% busy. Two parts joined by
+      `and` when neither takes 1.5 times the other's share.
+    - `the GPU side, though no thread is saturated`: the game waited for its frames on the GPU
+      for more than half the window; the parts named after it take most of the GPU thread's time.
+    - `unclear, nothing measured is saturated`: none of the above. Seen in windows with many
+      shader builds and too many long frames for the hitch verdict; the notes still name them.
+    The thread shares are wall time: `idle` is waiting for work, `waiting for the graphics card`
+    is `FenceManager::WaitPendingFences` and `MasterSemaphore::Wait`, `working` is the rest,
+    driver calls included. Checked against `QueryThreadCycleTime` in Fortune's Weave at 2x
+    resolution: GPU thread 41-42% working in the line, 42% on a CPU core; Vulkan worker 9% and
+    10%. `shader build waits` counts the same waits as the `Submission thread waited` lines.
+    Not covered: the game's target frame rate is not known to the verdict, the memory figures
+    are Windows only, and with asynchronous GPU emulation off there is no GPU thread to measure.
   - Guest RAM on Windows is reserved at boot and committed as the kernel allocates or maps it
     (`HostMemory::Impl::Commit`), 2 MiB at a time; `EDEN_NX2_RAM_PRECOMMIT=1` commits all of it at
     boot as before. Measured 40 s into Fire Emblem: Fortune's Weave and Xenoblade Chronicles 2:

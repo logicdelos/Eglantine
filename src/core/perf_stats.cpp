@@ -16,6 +16,7 @@
 #include "common/fs/file.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
+#include "common/nx2_bottleneck.h"
 #include "common/nx2_sampler.h"
 #include "common/settings.h"
 #include "core/perf_stats.h"
@@ -87,6 +88,7 @@ void PerfStats::EndSystemFrame() {
 
 void PerfStats::EndGameFrame() {
     game_frames.fetch_add(1, std::memory_order_relaxed);
+    Nx2Bottleneck::NoteFrame();
 }
 
 double PerfStats::GetMeanFrametime() const {

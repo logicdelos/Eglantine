@@ -22,6 +22,7 @@
 
 #include "common/common_types.h"
 #include "common/logging.h"
+#include "common/nx2_bottleneck.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "video_core/delayed_destruction_ring.h"
@@ -159,6 +160,8 @@ public:
             // With delayed fence operations the callback waits for this fence's tick, whose
             // submission may be deferred to the waiting thread itself (the GPU split's back).
             SubmitDeferred();
+            // Until the host GPU has finished everything submitted before this fence.
+            Nx2Bottleneck::WaitScope wait{Nx2Bottleneck::Wait::HostGpu};
             std::unique_lock lk(wait_mutex);
             wait_cv.wait(
                 lk, [&wait_finished] { return wait_finished.load(std::memory_order_relaxed); });

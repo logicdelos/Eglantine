@@ -117,6 +117,8 @@ add_library(
     memory_detect.h
     multi_level_page_table.cpp
     multi_level_page_table.h
+    nx2_bottleneck.cpp
+    nx2_bottleneck.h
     nx2_sampler.cpp
     nx2_sampler.h
     overflow.h

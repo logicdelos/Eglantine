@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "common/logging.h"
+#include "common/nx2_bottleneck.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/frontend/emu_window.h"
@@ -178,8 +179,8 @@ PresentManager::PresentManager(const vk::Instance& instance_,
 PresentManager::~PresentManager() = default;
 
 Frame* PresentManager::GetRenderFrame() {
-
     // Wait for free presentation frames
+    Nx2Bottleneck::WaitScope wait{Nx2Bottleneck::Wait::Present};
     std::unique_lock lock{free_mutex};
     free_cv.wait(lock, [this] { return !free_queue.empty(); });
 

@@ -18,6 +18,7 @@
 
 #include "common/assert.h"
 #include "common/logging.h"
+#include "common/nx2_bottleneck.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/thread.h"
@@ -177,6 +178,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
     thread = std::jthread([&](std::stop_token stop_token) {
         Common::SetCurrentThreadName("GPU");
         VideoCommon::GpuSplit::MarkGpuThread();
+        Nx2Bottleneck::MarkThread(Nx2Bottleneck::Thread::Gpu);
         Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
         Common::SetCurrentThreadToPerformanceCores();
         system.RegisterHostThread();
@@ -229,6 +231,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     // millisecond before sleeping, or every wait also waits out a host sleep
                     // (title 1 waits ~25 times a second).
                     Profile::Scope scope{Profile::Zone::PendingSleep};
+                    Nx2Bottleneck::IdleScope idle{Nx2Bottleneck::Thread::Gpu};
                     if (std::chrono::steady_clock::now() - last_progress <
                         std::chrono::microseconds{100}) {
 #if defined(ARCHITECTURE_x86_64)
@@ -246,6 +249,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 }
             } else {
                 Profile::Scope scope{Profile::Zone::Idle};
+                Nx2Bottleneck::IdleScope idle{Nx2Bottleneck::Thread::Gpu};
                 state.queue.PopWait(next, stop_token);
             }
             if (stop_token.stop_requested()) {
@@ -257,6 +261,8 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
             // A blocking (synchronous GPU) submit already keeps the game thread waiting.
             if (const auto* list = std::get_if<SubmitListCommand>(&next.data);
                 list != nullptr && !next.block) {
+                // Held on purpose: not work.
+                Nx2Bottleneck::IdleScope idle{Nx2Bottleneck::Thread::Gpu};
                 HoldForGpuLatency(*list, stop_token);
             }
             if (split.Active()) {
