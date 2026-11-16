@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -18,7 +19,8 @@ namespace Nx2Sampler {
 // Names are comma separated; a name ending in '*' matches by prefix (CPUCore_*). From
 // EDEN_NX2_SAMPLE_START seconds (default 60) for EDEN_NX2_SAMPLE_SECONDS (default 30), each
 // thread is paused about 1000 times a second and its call stack recorded; the counts per
-// function (where the thread is, and everything on its stack) go to EDEN_NX2_SAMPLE_OUT
+// function (where the thread is, and everything on its stack) and the 25 most frequent full
+// stacks go to EDEN_NX2_SAMPLE_OUT
 // (default nx2_samples.txt). <out>.timeline lists every sample and present with its QPC time.
 // JIT samples are also split by guest block, module and region (see g_track_guest), and
 // CPUCore threads get a "cpu split:" line.
@@ -46,9 +48,12 @@ struct GuestModule {
     std::uint64_t end;
 };
 
-/// The loaded guest modules, taken by the core on a JIT thread while the process is alive. The
-/// report only uses this copy; it never reads the loader, the process or guest memory.
+/// The loaded guest modules, taken by the core on a JIT thread while the process is alive.
 void SetGuestModules(std::vector<GuestModule> modules);
+
+/// Resolve a guest byte to host RAM. The sampler safely copies with ReadProcessMemory.
+/// Clearing waits for any report read to finish; call after cores stop, before process teardown.
+void SetGuestMemoryPointer(std::function<const void*(std::uint64_t)> pointer);
 
 /// Samples the named threads for `seconds` now (blocking), writes the report to `out` (and
 /// the folded stacks to `out`.folded) and returns the report.

@@ -572,6 +572,7 @@ struct System::Impl {
 
     void ShutdownMainProcess() {
         Nx2Sampler::SetGuestRunning(false);
+        Nx2Sampler::SetGuestMemoryPointer({});
         Nx2Bottleneck::SetGuestRunning(false);
         VideoCommon::Nx2Spikes::SetGuestThreadSource({});
         Nx2Bottleneck::SetSleepThreadNameSource(nullptr, nullptr);

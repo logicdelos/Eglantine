@@ -19,6 +19,7 @@
 
 #include "common/assert.h"
 #include "common/logging.h"
+#include "common/nx2_sampler.h"
 #include "common/scope_exit.h"
 #include "common/thread.h"
 #include "common/thread_worker.h"
@@ -371,11 +372,16 @@ struct KernelCore::Impl {
         if (application_process == process)
             return;
 
+        Nx2Sampler::SetGuestMemoryPointer({});
         KProcess* const previous = application_process;
         application_process = process;
 
-        if (application_process != nullptr)
+        if (application_process != nullptr) {
             application_process->Open(kernel);
+            Nx2Sampler::SetGuestMemoryPointer([process](u64 pc) -> const void* {
+                return process->GetMemory().GetPointerSilent(pc);
+            });
+        }
 
         if (previous != nullptr)
             previous->Close(kernel);

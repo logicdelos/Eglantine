@@ -291,6 +291,8 @@ JitLog* const jit_log = new JitLog;
 
 std::mutex modules_mutex;
 std::vector<GuestModule> guest_modules;
+std::mutex guest_memory_mutex;
+std::function<const void*(u64)> guest_memory_pointer;
 
 void AppendJit(const void* begin, size_t size, u64 guest_pc) {
     JitLog& log = *jit_log;
@@ -445,6 +447,7 @@ struct GuestMap {
 struct BlockCounts {
     unsigned self = 0; // sampled inside the block
     unsigned host = 0; // sampled in a host call the block made
+    unsigned total = 0; // guest execution and host calls attributed to the block
 };
 
 struct GuestThread {
@@ -492,6 +495,7 @@ GuestTables BuildGuest(const std::vector<Sample>& samples, const std::vector<Jit
         }
         BlockCounts& counts = thread.blocks[info.pc];
         ++(info.frame == 0 ? counts.self : counts.host);
+        ++counts.total;
         tables.any = true;
     }
     if (!tables.any) {
@@ -510,6 +514,45 @@ GuestTables BuildGuest(const std::vector<Sample>& samples, const std::vector<Jit
     return tables;
 }
 
+std::string GuestBytes(u64 pc) {
+    std::scoped_lock lock{guest_memory_mutex};
+    if (!guest_memory_pointer) {
+        return "unavailable";
+    }
+    std::array<u8, 128> bytes{};
+    size_t count = 0;
+    while (count < bytes.size()) {
+        // Resolve each page separately. ReadProcessMemory handles an unmap/protection race
+        // without dereferencing an inaccessible pointer in the sampler.
+        const u64 address = pc + count;
+        if (address < pc) {
+            break;
+        }
+        const void* pointer = guest_memory_pointer(address);
+        if (pointer == nullptr) {
+            break;
+        }
+        const size_t chunk = (std::min)(bytes.size() - count,
+                                       size_t{4096} - static_cast<size_t>(address & 4095));
+        SIZE_T copied{};
+        const BOOL ok = ReadProcessMemory(GetCurrentProcess(), pointer, bytes.data() + count,
+                                          chunk, &copied);
+        count += copied;
+        if (!ok || copied != chunk) {
+            break;
+        }
+    }
+    if (count == 0) {
+        return "unmapped";
+    }
+    std::string hex;
+    hex.reserve(count * 2);
+    for (size_t i = 0; i < count; ++i) {
+        fmt::format_to(std::back_inserter(hex), "{:02x}", bytes[i]);
+    }
+    return hex;
+}
+
 void PrintGuest(std::string& text, const GuestTables& tables, const GuestThread& guest,
                 unsigned total) {
     const auto share = [&](unsigned samples) {
@@ -523,6 +566,9 @@ void PrintGuest(std::string& text, const GuestTables& tables, const GuestThread&
     for (const auto& [pc, count] : guest.by_self) {
         text += fmt::format("guest code: {:5.1f}% {} ({} samples)\n", share(count), where(pc),
                             count);
+    }
+    for (const auto& block : TopBlocks(guest.blocks, &BlockCounts::total, 12)) {
+        text += fmt::format("guest bytes: {}: {}\n", where(block.first), GuestBytes(block.first));
     }
     text += fmt::format("guest runtime: {:5.1f}% dispatcher, thunks, unmapped code ({} samples)\n",
                         share(guest.runtime), guest.runtime);
@@ -762,6 +808,39 @@ std::string Report(const std::vector<Target>& targets, const std::vector<Sample>
         }
         print("self <- caller", self_caller, 50);
         print("inclusive (on the stack)", inclusive, 90);
+        // The most frequent full call stacks, aggregated here from the samples already captured.
+        constexpr unsigned StackDepth = 24;
+        constexpr size_t StackLimit = 25;
+        std::map<std::string, unsigned> stack_counts;
+        for (size_t s = 0; s < samples.size(); ++s) {
+            const Sample& sample = samples[s];
+            if (sample.thread != thread || sample.depth == 0) {
+                continue;
+            }
+            std::string stack;
+            for (unsigned i = 0; i < (std::min)(sample.depth, StackDepth); ++i) {
+                stack += "         ";
+                if (static_cast<int>(i) == jit[s].frame) {
+                    stack += JitLabel(guest, jit[s]);
+                } else {
+                    stack += symbolizer.Name(sample.frames[i]);
+                }
+                stack += '\n';
+            }
+            ++stack_counts[stack];
+        }
+        std::vector<std::pair<unsigned, std::string>> ranked;
+        for (const auto& [stack, count] : stack_counts) {
+            ranked.emplace_back(count, stack);
+        }
+        std::sort(ranked.rbegin(), ranked.rend());
+        text += fmt::format("-- top stacks (innermost frame first, {} frames at most)\n",
+                            StackDepth);
+        for (size_t i = 0; i < (std::min)(StackLimit, ranked.size()); ++i) {
+            text += fmt::format("{:6} {:5.1f}%\n{}", ranked[i].first,
+                                100.0 * ranked[i].first / (std::max)(total, 1U),
+                                ranked[i].second);
+        }
         text += "\n";
     }
     if (std::FILE* const file = std::fopen(path, "w")) {
@@ -1007,6 +1086,11 @@ void SetGuestModules(std::vector<GuestModule> modules) {
     guest_modules = std::move(modules);
 }
 
+void SetGuestMemoryPointer(std::function<const void*(u64)> pointer) {
+    std::scoped_lock lock{guest_memory_mutex};
+    guest_memory_pointer = std::move(pointer);
+}
+
 void StartFromEnvironment() {
     const char* names = std::getenv("EDEN_NX2_SAMPLE");
     const char* guest = std::getenv("EDEN_NX2_SAMPLE_GUEST");
@@ -1071,6 +1155,7 @@ void NoteJitCode(const void*, std::size_t) {}
 void NoteJitBlock(const void*, std::size_t, std::uint64_t) {}
 void NoteJitClear(const void*, std::size_t) {}
 void SetGuestModules(std::vector<GuestModule>) {}
+void SetGuestMemoryPointer(std::function<const void*(std::uint64_t)>) {}
 void SetGuestRunning(bool) {}
 std::string CurrentStack(unsigned) {
     return {};
