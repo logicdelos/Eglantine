@@ -1783,13 +1783,15 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
 
     const auto build_begin = std::chrono::steady_clock::now();
     {
-        // The driver compiles the pipeline here. Work id: the one the draw's wait links to.
-        VideoCommon::Nx2Spikes::SpanScope build_span{
-            VideoCommon::Nx2Spikes::Cause::Pipeline,
+        // The driver compiles the pipeline here. Work id: the one the draw's wait links to. One
+        // enable test: the key hash and the span exist only while recording.
+        const VideoCommon::Nx2Spikes::SpanToken build_token =
             VideoCommon::Nx2Spikes::AttributionEnabled()
-                ? VideoCommon::Nx2Spikes::DerivedWorkId(
-                      VideoCommon::Nx2Spikes::WorkKind::GraphicsPipelineBuild, key.Hash())
-                : 0};
+                ? VideoCommon::Nx2Spikes::BeginSpan(
+                      VideoCommon::Nx2Spikes::Cause::Pipeline,
+                      VideoCommon::Nx2Spikes::DerivedWorkId(
+                          VideoCommon::Nx2Spikes::WorkKind::GraphicsPipelineBuild, key.Hash()))
+                : VideoCommon::Nx2Spikes::SpanToken{};
         try {
             pipeline = device.GetLogical().CreateGraphicsPipeline({
                 .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
@@ -1817,8 +1819,14 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
                 .basePipelineIndex = 0,
             }, *pipeline_cache);
         } catch (...) {
-            build_span.Fail();
+            if (build_token.Valid()) {
+                VideoCommon::Nx2Spikes::EndSpan(build_token, 0,
+                                                VideoCommon::Nx2Spikes::SpanFlags::Failed);
+            }
             throw;
+        }
+        if (build_token.Valid()) {
+            VideoCommon::Nx2Spikes::EndSpan(build_token);
         }
     }
     DriverBuildReport::Record(DriverBuildReport::Kind::Graphics,
