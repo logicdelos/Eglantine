@@ -39,6 +39,7 @@
 #include "video_core/surface.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/nx2_spikes.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/texture_cache/accelerated_swizzle.h"
@@ -728,6 +729,15 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
                                    const StagingBufferRef& map,
                                    std::span<const VideoCommon::SwizzleParameters> swizzles) {
     using namespace VideoCommon::Accelerated;
+    // Recording and submitting the decode. The GPU's own run time is not measured (no timestamp
+    // queries): it is reported as unavailable, never as zero. The wait for the submit to finish
+    // (Finish below) is a Waiting span linked to the submission by the scheduler.
+    const VideoCommon::Nx2Spikes::SpanScope decode_span{VideoCommon::Nx2Spikes::Cause::Texture, 0,
+                                                       static_cast<u64>(guest_size_bytes)};
+    if (decode_span.Token().Valid()) {
+        VideoCommon::Nx2Spikes::NoteUnknownReason(
+            VideoCommon::Nx2Spikes::UnknownReason::MissingGpuTimestamp);
+    }
     const std::array<u32, 2> block_dims{
         VideoCore::Surface::DefaultBlockWidth(info.format),
         VideoCore::Surface::DefaultBlockHeight(info.format),

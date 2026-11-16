@@ -37,6 +37,7 @@
 #include "video_core/texture_cache/formatter.h"
 #include "video_core/texture_cache/samples_helper.h"
 #include "video_core/texture_cache/util.h"
+#include "video_core/nx2_spikes.h"
 #include "video_core/textures/astc.h"
 #include "video_core/textures/bcn.h"
 #include "video_core/textures/decoders.h"
@@ -865,6 +866,9 @@ boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(Tegra::Memory
                                                                    std::span<const u8> input,
                                                                    std::span<u8> output) {
     const size_t guest_size_bytes = input.size_bytes();
+    // CPU untiling (or the linear copy) of the guest texture into the upload buffer.
+    const VideoCommon::Nx2Spikes::SpanScope unswizzle_span{VideoCommon::Nx2Spikes::Cause::Texture,
+                                                           0, guest_size_bytes};
     const u32 bpp_log2 = BytesPerBlockLog2(info.format);
     const Extent2D tile_size = DefaultBlockSize(info.format);
     const Extent3D size = info.size;
@@ -1129,6 +1133,8 @@ std::vector<BufferImageCopy> UnswizzleImageRects(Tegra::MemoryManager& gpu_memor
                                                  GPUVAddr gpu_addr, const ImageInfo& info,
                                                  std::span<const LevelRect> rects,
                                                  std::span<u8> output) {
+    // CPU untiling of the dirty rectangles into the upload buffer.
+    const VideoCommon::Nx2Spikes::SpanScope unswizzle_span{VideoCommon::Nx2Spikes::Cause::Texture};
     const std::vector<BlockLinearLevel> levels = BlockLinearLevels(info);
     const u32 bpp_log2 = BytesPerBlockLog2(info.format);
     const Extent2D block_size = DefaultBlockSize(info.format);
@@ -1298,6 +1304,8 @@ UnswizzlePlan PlanUnswizzleImageRows(
 
 void ExecuteUnswizzlePlan(Tegra::MemoryManager& gpu_memory, const UnswizzlePlan& plan,
                          std::span<u8> output) {
+    // CPU untiling of the guest texture into the upload buffer.
+    const VideoCommon::Nx2Spikes::SpanScope unswizzle_span{VideoCommon::Nx2Spikes::Cause::Texture};
     std::vector<u8> run;
     for (const auto& r : plan.runs) {
         run.resize(r.guest_bytes);
@@ -1358,6 +1366,13 @@ void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8
 
         const auto recompression_setting = Settings::GetAstcRecompression();
         const bool astc = IsPixelFormatASTC(info.format);
+
+        // CPU decode or recompression of this level; the amount is the texels converted.
+        VideoCommon::Nx2Spikes::SpanScope level_span{VideoCommon::Nx2Spikes::Cause::Texture};
+        if (level_span.Token().Valid()) {
+            level_span.AddAmount(u64{copy.image_extent.width} * copy.image_extent.height *
+                                 copy.image_extent.depth * copy.image_subresource.num_layers);
+        }
 
         if (astc && recompression_setting == Settings::AstcRecompression::Uncompressed) {
             Tegra::Texture::ASTC::Decompress(
