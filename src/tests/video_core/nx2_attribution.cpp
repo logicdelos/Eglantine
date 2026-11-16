@@ -249,9 +249,9 @@ TEST_CASE("A span open at a frame end is clipped there and finishes in the next 
     Run run{Config(1)};
     Present(NowNs());
     const SpanToken span = BeginSpan(Cause::Shader);
-    std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    WaitUntil(NowNs() + 10 * Ms);
     Present(NowNs()); // the span is still open
-    std::this_thread::sleep_for(std::chrono::milliseconds{5});
+    WaitUntil(NowNs() + 5 * Ms);
     EndSpan(span);
     Present(NowNs());
     run.Finish();
@@ -532,32 +532,52 @@ bool BlockFirstFrame(void*, const LongFrame& frame) {
     return true;
 }
 
-} // Anonymous namespace
-
-TEST_CASE("Ending a session with open spans marks the frames they touch incomplete",
-          "[nx2][attribution]") {
+void ResetBlock() {
     g_frames.clear();
     g_block.entered = false;
     g_block.release = false;
     g_block.calls = 0;
+}
+
+/// Returns once the consumer is inside the sink of the first long frame (so everything the test
+/// does next is queued or published while it cannot drain).
+void AwaitBlocked() {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
+    while (!g_block.entered.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    REQUIRE(g_block.entered.load());
+}
+
+/// Returns once the consumer has resolved `frames` intervals.
+void AwaitFrames(u64 frames) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
+    while (ReadCrashStatus().frames < frames && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    REQUIRE(ReadCrashStatus().frames >= frames);
+}
+
+} // Anonymous namespace
+
+TEST_CASE("Ending a session with open spans marks the frames they touch incomplete",
+          "[nx2][attribution]") {
+    ResetBlock();
     SetLongFrameSink({BlockFirstFrame, nullptr});
     REQUIRE(BeginSession({}));
     const u64 base = NowNs();
     Present(base);
     Present(base + 150 * Ms); // the consumer stops in the sink with this frame
-    for (int i = 0; i < 10000 && !g_block.entered.load(); ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds{1});
-    }
-    REQUIRE(g_block.entered.load());
+    AwaitBlocked();
     const SpanToken open = BeginSpan(Cause::Shader); // never ended
     REQUIRE(open.Valid());
     Present(base + 300 * Ms); // queued behind the blocked one
     std::thread releaser{[] {
+        // EndSession has begun (recording is off, the stop follows at once); the sink polls every
+        // millisecond, so the consumer sees the stop before it takes the queued present.
         while (AttributionEnabled()) {
             std::this_thread::yield();
         }
-        // EndSession has begun: the consumer sees the stop before it takes the queued present.
-        std::this_thread::sleep_for(std::chrono::milliseconds{20});
         g_block.release.store(true);
     }};
     EndSession();
@@ -565,11 +585,138 @@ TEST_CASE("Ending a session with open spans marks the frames they touch incomple
     SetLongFrameSink({});
     EndSpan(open); // after the end of the session: ignored
     const AttributionSnapshot snap = ReadAttributionSnapshot();
-    CHECK_FALSE(snap.enabled);
+    CHECK(snap.enabled); // a session was recorded, and its snapshot says so after it ended
+    CHECK_FALSE(AttributionEnabled());
     REQUIRE(g_frames.size() == 2);
     // The span began (in real time) before the second frame started: open all through it.
     CHECK(At(g_frames[1].cause_ns, Cause::Shader) == 150 * Ms);
     CHECK_FALSE(g_frames[1].instrumentation_complete);
+    CHECK_FALSE(snap.complete);
+}
+
+TEST_CASE("A cross-thread end drained before its begin is kept until the begin arrives",
+          "[nx2][attribution]") {
+    ResetBlock();
+    SetLongFrameSink({BlockFirstFrame, nullptr});
+    REQUIRE(BeginSession(Config(0)));
+    const u32 ender = RegisterThread("ender"); // registered before the owner: drained before it
+    const u64 base = NowNs();
+    Present(base);
+    Present(base + 1); // long for a zero threshold: the consumer blocks in the sink
+    AwaitBlocked();
+    SpanToken token;
+    OnThread([&token] {
+        RegisterThread("owner");
+        token = BeginSpan(Cause::Shader);
+    });
+    REQUIRE(token.Valid());
+    REQUIRE(token.thread_registration_id > ender);
+    EndSpan(token); // the End goes into the ender's ring, the Begin sits in a higher one
+    Present(base + 10'000 * Ms);
+    g_block.release.store(true);
+    EndSession();
+    SetLongFrameSink({});
+    const AttributionSnapshot snap = ReadAttributionSnapshot();
+    REQUIRE(g_frames.size() == 2);
+    // Closed after a few microseconds, not open for the 10 s of the frame.
+    CHECK(At(g_frames[1].cause_ns, Cause::Shader) < 1'000 * Ms);
+    CHECK(g_frames[1].instrumentation_complete);
+    CHECK(snap.lost_events == 0);
+}
+
+TEST_CASE("A cross-thread end whose begin never arrives is counted as lost at the end",
+          "[nx2][attribution]") {
+    Run run;
+    SpanToken stale{run.generation, run.root + 5, 77}; // no such registration or span
+    EndSpan(stale);
+    const AttributionSnapshot snap = run.Finish();
+    CHECK(snap.lost_events == 1);
+    CHECK_FALSE(snap.complete);
+}
+
+TEST_CASE("Dropped present boundaries never merge into an invented long frame",
+          "[nx2][attribution]") {
+    constexpr u64 QueueItems = 4096; // the recorder's bound on queued boundaries
+    constexpr u64 Dropped = 904;
+    ResetBlock();
+    SetLongFrameSink({BlockFirstFrame, nullptr});
+    REQUIRE(BeginSession(Config(50 * Ms)));
+    const u64 base = NowNs();
+    Present(base);
+    Present(base + 60 * Ms); // long: the consumer blocks in the sink, the queue is empty
+    AwaitBlocked();
+    u64 now = base + 60 * Ms;
+    for (u64 i = 0; i < QueueItems + Dropped; ++i) {
+        now += 10 * Ms; // every interval is far below the threshold
+        REQUIRE(Present(now) != 0);
+    }
+    g_block.release.store(true);
+    AwaitFrames(1 + QueueItems);
+    now += 10 * Ms;
+    Present(now); // its predecessor was dropped: the interval is still 10 ms
+    EndSession();
+    SetLongFrameSink({});
+    const AttributionSnapshot snap = ReadAttributionSnapshot();
+    CHECK(snap.frames == 1 + QueueItems + 1);
+    CHECK(snap.long_frames == 1);
+    REQUIRE(g_frames.size() == 1);
+    CHECK(g_frames[0].duration_ns == 60 * Ms);
+    CHECK(snap.first_120s.frames_over_threshold == 1);
+    CHECK(snap.first_120s.max_ns == 60 * Ms);
+    CHECK(snap.lost_events == Dropped); // the lost boundaries are counted, never silent
+    CHECK_FALSE(snap.complete);
+}
+
+TEST_CASE("A marker is never queued before the first present", "[nx2][attribution]") {
+    // The interleaving is a few instructions wide, so many rounds; the barrier releases both
+    // threads together and the marker thread acts the moment the first present is visible.
+    for (int round = 0; round < 200; ++round) {
+        REQUIRE(BeginSession({}));
+        std::atomic<bool> go{false};
+        MarkerResult result = MarkerResult::NoSession;
+        std::thread marker_thread{[&go, &result] {
+            while (!go.load()) {
+                std::this_thread::yield();
+            }
+            while (ReadCrashStatus().first_host_present_ns == 0) {
+            }
+            InteractiveMarker marker;
+            marker.scene_id = "scene";
+            marker.origin = "lab";
+            marker.marker_ns = NowNs();
+            result = MarkInteractive(marker);
+        }};
+        go.store(true);
+        Present(NowNs());
+        marker_thread.join();
+        EndSession();
+        const AttributionSnapshot snap = ReadAttributionSnapshot();
+        REQUIRE(result == MarkerResult::Accepted);
+        REQUIRE(snap.interactive_status == IntervalStatus::Complete);
+        REQUIRE(snap.first_present_to_interactive.status == IntervalStatus::Complete);
+    }
+}
+
+TEST_CASE("Rings and retained history share one fixed budget", "[nx2][attribution]") {
+    SessionConfig config = Config(100 * Ms);
+    config.buffer_bytes = 64 * 1024;
+    Run run{config};
+    constexpr u64 Presents = 100;
+    constexpr u64 PerPresent = 4;
+    for (u64 k = 1; k <= Presents; ++k) {
+        // Spans that end after every present, so none is pruned or late; the consumer has drained
+        // the rings before the next batch.
+        for (u64 i = 0; i < PerPresent; ++i) {
+            RecordSpan(Cause::Shader, run.T(1'000 * Ms), run.T(100'000 * Ms));
+        }
+        Present(run.T(k * Ms));
+        AwaitFrames(k - 1);
+    }
+    const AttributionSnapshot snap = run.Finish();
+    // Half of 64 KiB for the history leaves room for far fewer than 400 spans; the rest is lost
+    // and counted, not silently kept beyond the budget.
+    CHECK(snap.lost_events > 0);
+    CHECK(snap.lost_events < Presents * PerPresent);
     CHECK_FALSE(snap.complete);
 }
 
