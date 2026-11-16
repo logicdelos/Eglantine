@@ -134,6 +134,8 @@ add_library(
     range_sets.h
     range_sets.inc
     ring_buffer.h
+    run_outcome.cpp
+    run_outcome.h
     ${CMAKE_CURRENT_BINARY_DIR}/scm_rev.cpp
     scm_rev.h
     scope_exit.h
