@@ -25,6 +25,7 @@
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_surface.h"
+#include "video_core/nx2_spikes.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace Vulkan {
@@ -121,6 +122,25 @@ bool CanBlitToSwapchain(const vk::PhysicalDevice& physical_device, VkFormat form
     };
 }
 
+/// Publishes one host present attempt to the attribution recorder. `result` is what the host
+/// presentation call returned, or the failure the frame was dropped with when it never reached
+/// one. Only a successful or suboptimal present of a real (not generated) frame ends a frame
+/// interval; the recorder counts every other attempt as rejected. Called right after the present
+/// call returns, so the timestamp is the end of the host present submission.
+void ReportHostPresent(const Frame* frame, VkResult result) {
+    namespace Spikes = VideoCommon::Nx2Spikes;
+    if (!Spikes::AttributionEnabled()) {
+        return;
+    }
+    static_cast<void>(Spikes::OnHostPresent(Spikes::FrameBoundary{
+        .host_present_id = 0,
+        .guest_frame_id = frame->guest_frame_id,
+        .timestamp_ns = Spikes::NowNs(),
+        .real_frame = !frame->is_generated,
+        .result = Spikes::ClassifyPresent(result),
+    }));
+}
+
 } // Anonymous namespace
 
 PresentManager::PresentManager(const vk::Instance& instance_,
@@ -183,14 +203,20 @@ Frame* PresentManager::GetRenderFrame() {
     // Wait for free presentation frames
     Nx2Bottleneck::WaitScope wait{Nx2Bottleneck::Wait::Present};
     std::unique_lock lock{free_mutex};
-    free_cv.wait(lock, [this] { return !free_queue.empty(); });
+    {
+        const VideoCommon::Nx2Spikes::SpanScope free_wait{VideoCommon::Nx2Spikes::Cause::Waiting};
+        free_cv.wait(lock, [this] { return !free_queue.empty(); });
+    }
 
     // Take the frame from the queue
     Frame* frame = free_queue.front();
     free_queue.pop_front();
 
     // Wait for the presentation to be finished so all frame resources are free
-    frame->present_done.Wait();
+    {
+        const VideoCommon::Nx2Spikes::SpanScope fence_wait{VideoCommon::Nx2Spikes::Cause::Waiting};
+        frame->present_done.Wait();
+    }
     frame->present_done.Reset();
 
     return frame;
@@ -342,6 +368,9 @@ void PresentManager::WaitPresent() {
         return;
     }
 
+    // The render thread waits for the present thread to finish every queued frame.
+    const VideoCommon::Nx2Spikes::SpanScope present_wait{VideoCommon::Nx2Spikes::Cause::Waiting};
+
     // Wait for the present queue to be empty and any held frame to transition to swapchain_mutex
     {
         std::unique_lock queue_lock{queue_mutex};
@@ -359,6 +388,7 @@ void PresentManager::WaitPresent() {
 
 void PresentManager::PresentThread(std::stop_token token) {
     Common::SetCurrentThreadName("VulkanPresent");
+    VideoCommon::Nx2Spikes::RegisterThread("VulkanPresent");
     Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
     Common::SetCurrentThreadToPerformanceCores();
 
@@ -583,6 +613,8 @@ void PresentManager::CopyToSwapchain(Frame* frame) {
         }
     }
 
+    // Every attempt failed with a lost surface: the frame is dropped, not presented.
+    ReportHostPresent(frame, VK_ERROR_SURFACE_LOST_KHR);
     DiscardFrame(frame);
 }
 
@@ -601,6 +633,8 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
     // loop there never ends, and it holds the present thread or the GPU thread for as long.
     for (u32 attempt = 0; swapchain.AcquireNextImage(!use_present_thread); ++attempt) {
         if (attempt == MAX_PRESENT_ATTEMPTS || !RecreateSwapchain(frame)) {
+            // No image could be acquired: nothing is presented for this frame.
+            ReportHostPresent(frame, VK_ERROR_OUT_OF_DATE_KHR);
             DiscardFrame(frame);
             return;
         }
@@ -750,7 +784,7 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
     }
 
     // Present
-    swapchain.Present(render_semaphore);
+    ReportHostPresent(frame, swapchain.Present(render_semaphore));
 }
 
 } // namespace Vulkan

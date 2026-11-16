@@ -8,6 +8,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cstring>
 #include <memory>
@@ -25,6 +26,7 @@
 #include "core/core_timing.h"
 #include "core/frontend/graphics_context.h"
 #include "video_core/capture.h"
+#include "video_core/nx2_spikes.h"
 #include "video_core/gpu.h"
 #include "video_core/present.h"
 #include "video_core/renderer_vulkan/present/util.h"
@@ -113,6 +115,11 @@ std::string BuildCommaSeparatedExtensions(
     const std::set<std::string, std::less<>>& available_extensions) {
     return fmt::format("{}", fmt::join(available_extensions, ","));
 }
+
+/// Guest frames that reached the renderer (one per Composite that is shown); ids start at 1 and
+/// only move while attribution records. Composite runs on one thread, the atomic only makes a
+/// second renderer in the same process (a title change) safe.
+std::atomic<u64> guest_frames_composited{};
 
 } // Anonymous namespace
 
@@ -227,6 +234,11 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     frame->is_generated = false;
     frame->generation_index = 0;
     frame->generation_count = 0;
+    // The guest frame this host frame shows; the id travels in the Frame to the host present.
+    // Off: one branch, no counter update.
+    frame->guest_frame_id = VideoCommon::Nx2Spikes::AttributionEnabled()
+                                ? guest_frames_composited.fetch_add(1, std::memory_order_relaxed) + 1
+                                : 0;
 
     scheduler.RequestOutsideRenderPassOperationContext();
     blit_swapchain.DrawToFrame(device, rasterizer, frame, framebuffers,
@@ -249,6 +261,7 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
         generated->is_generated = true;
         generated->generation_index = static_cast<u32>(generation);
         generated->generation_count = static_cast<u32>(generated_frames);
+        generated->guest_frame_id = frame->guest_frame_id;
         blit_swapchain.PrepareFrame(device, generated, render_window.GetFramebufferLayout());
         frame_gen.GenerateInto(device, generated, generation);
         scheduler.Flush(*generated->render_ready);

@@ -45,8 +45,10 @@ public:
     /// Returns true when no image was acquired and the swapchain has to be recreated.
     bool AcquireNextImage(bool may_flush = true);
 
-    /// Presents the rendered image to the swapchain.
-    void Present(VkSemaphore render_semaphore);
+    /// Presents the rendered image to the swapchain. Returns the result of vkQueuePresentKHR
+    /// (VK_SUCCESS, VK_SUBOPTIMAL_KHR, VK_ERROR_OUT_OF_DATE_KHR or another error); only a
+    /// success or suboptimal result means the frame reached the presentation queue.
+    [[nodiscard]] VkResult Present(VkSemaphore render_semaphore);
 
     /// Returns true when the swapchain needs to be recreated.
     bool NeedsRecreation() const {

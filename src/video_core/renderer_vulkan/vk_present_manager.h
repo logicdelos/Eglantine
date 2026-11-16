@@ -43,6 +43,9 @@ struct Frame {
     bool storage_capable{};
     bool is_generated{};
     u32 generation_index{};
+    /// The guest frame this host frame shows (the renderer's count of composited guest frames),
+    /// 0 when frame attribution is off. Generated frames carry the id of their source frame.
+    u64 guest_frame_id{};
     u32 generation_count{};
 };
 

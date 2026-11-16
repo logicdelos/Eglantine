@@ -19,6 +19,7 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
+#include "video_core/nx2_spikes.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 #include "video_core/vulkan_common/vk_enum_string_helper.h"
@@ -177,9 +178,14 @@ bool Swapchain::AcquireNextImage(bool may_flush) {
         // Never created: the surface had no area yet.
         return true;
     }
-    const VkResult result = device.GetLogical().AcquireNextImageKHR(
-        *swapchain, (std::numeric_limits<u64>::max)(), *present_semaphores[frame_index],
-        VK_NULL_HANDLE, &image_index);
+    // Blocks until the presentation engine releases an image: waiting with no producer to name.
+    VkResult result;
+    {
+        const VideoCommon::Nx2Spikes::SpanScope acquire_wait{VideoCommon::Nx2Spikes::Cause::Waiting};
+        result = device.GetLogical().AcquireNextImageKHR(
+            *swapchain, (std::numeric_limits<u64>::max)(), *present_semaphores[frame_index],
+            VK_NULL_HANDLE, &image_index);
+    }
     switch (result) {
     case VK_SUCCESS:
         break;
@@ -234,7 +240,7 @@ bool Swapchain::AcquireNextImage(bool may_flush) {
     return is_outdated;
 }
 
-void Swapchain::Present(VkSemaphore render_semaphore) {
+VkResult Swapchain::Present(VkSemaphore render_semaphore) {
     const auto present_queue{device.GetPresentQueue()};
     const VkPresentInfoKHR present_info{
         .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
@@ -246,8 +252,12 @@ void Swapchain::Present(VkSemaphore render_semaphore) {
         .pImageIndices = &image_index,
         .pResults = nullptr,
     };
+    // The submit lock and the present call can both block (a full presentation queue): that is
+    // waiting before the host present this call ends, with no producer to name.
+    const VideoCommon::Nx2Spikes::SpanScope present_wait{VideoCommon::Nx2Spikes::Cause::Waiting};
     std::scoped_lock lock{scheduler.submit_mutex};
-    switch (const VkResult result = present_queue.Present(present_info)) {
+    const VkResult result = present_queue.Present(present_info);
+    switch (result) {
     case VK_SUCCESS:
         break;
     case VK_SUBOPTIMAL_KHR:
@@ -267,6 +277,7 @@ void Swapchain::Present(VkSemaphore render_semaphore) {
     if (frame_index >= image_count) {
         frame_index = 0;
     }
+    return result;
 }
 
 void Swapchain::CreateSwapchain(const VkSurfaceCapabilitiesKHR& capabilities) {
