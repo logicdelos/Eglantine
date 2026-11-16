@@ -24,6 +24,7 @@
 #include "common/thread.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/nx2_perf.h"
+#include "video_core/nx2_spikes.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/renderer_vulkan/upload_batch.h"
 #include "video_core/renderer_vulkan/vk_command_pool.h"
@@ -110,6 +111,15 @@ bool Scheduler::WaitSubmitted(u64 tick) {
         return true;
     }
     Nx2Bottleneck::WaitScope wait{Nx2Bottleneck::Wait::GpuBack};
+    // The producer is the worker's submission of `tick` (see SubmitExecution).
+    const VideoCommon::Nx2Spikes::SpanScope submitted_wait{VideoCommon::Nx2Spikes::Cause::Waiting};
+    if (submitted_wait.Token().Valid()) {
+        VideoCommon::Nx2Spikes::LinkWait(
+            submitted_wait.Token(),
+            VideoCommon::Nx2Spikes::DerivedWorkId(VideoCommon::Nx2Spikes::WorkKind::Submission,
+                                                  tick),
+            VideoCommon::Nx2Spikes::DependencyKind::Job);
+    }
     auto& split = VideoCommon::GpuSplit::Get();
     split.RequestIdleHook();
     // No time limit: the back can spend seconds on one entry (a large shader's translation),
@@ -150,6 +160,9 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore)
 void Scheduler::WaitWorker() {
     Nx2Bottleneck::WaitScope wait{Nx2Bottleneck::Wait::VulkanWorker};
     DispatchWork();
+
+    // The render thread waits for the worker to drain its queue and finish executing.
+    const VideoCommon::Nx2Spikes::SpanScope worker_wait{VideoCommon::Nx2Spikes::Cause::Waiting};
 
     // Ensure the queue is drained.
     {
@@ -381,6 +394,7 @@ bool Scheduler::UpdateGraphicsPipelineImpl(GraphicsPipeline* pipeline) {
 void Scheduler::WorkerThread(std::stop_token stop_token) {
     Common::SetCurrentThreadName("VulkanWorker");
     Nx2Bottleneck::MarkThread(Nx2Bottleneck::Thread::VulkanWorker);
+    VideoCommon::Nx2Spikes::RegisterThread("VulkanWorker");
     Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
     Common::SetCurrentThreadToPerformanceCores();
 
@@ -505,6 +519,12 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
             on_submit();
         }
 
+        // The worker takes the queue lock and calls into the driver: waiting that ends in this
+        // submission, the producer of every wait for `signal_value` (WaitSubmitted, GPU ticks).
+        const VideoCommon::Nx2Spikes::SpanScope submit_wait{
+            VideoCommon::Nx2Spikes::Cause::Waiting,
+            VideoCommon::Nx2Spikes::DerivedWorkId(VideoCommon::Nx2Spikes::WorkKind::Submission,
+                                                  signal_value)};
         std::scoped_lock lock{submit_mutex};
         switch (const VkResult result = master_semaphore->SubmitQueue(
                     cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, signal_value)) {

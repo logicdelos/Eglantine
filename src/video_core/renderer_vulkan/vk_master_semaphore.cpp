@@ -12,11 +12,35 @@
 #include <ranges>
 #include "common/nx2_bottleneck.h"
 #include "common/settings.h"
+#include "video_core/nx2_spikes.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace Vulkan {
+
+namespace {
+
+/// A Waiting span for the GPU to reach `tick`, linked to the submission that signals it (the
+/// producer the scheduler records as DerivedWorkId(Submission, tick)). The wait covers the GPU's
+/// execution, which is not timed (no GPU timestamps), so only the linked part is attributed.
+class GpuWaitSpan {
+public:
+    explicit GpuWaitSpan(u64 tick) : span{VideoCommon::Nx2Spikes::Cause::Waiting} {
+        if (span.Token().Valid()) {
+            VideoCommon::Nx2Spikes::LinkWait(
+                span.Token(),
+                VideoCommon::Nx2Spikes::DerivedWorkId(
+                    VideoCommon::Nx2Spikes::WorkKind::Submission, tick),
+                VideoCommon::Nx2Spikes::DependencyKind::Fence);
+        }
+    }
+
+private:
+    VideoCommon::Nx2Spikes::SpanScope span;
+};
+
+} // Anonymous namespace
 
 constexpr u64 FENCE_RESERVE_SIZE = 8;
 
@@ -88,6 +112,7 @@ void MasterSemaphore::Wait(u64 tick) {
         }
 
         Nx2Bottleneck::WaitScope wait{Nx2Bottleneck::Wait::HostGpu};
+        const GpuWaitSpan wait_span{tick};
         u64 last_tick = gpu_tick.load(std::memory_order_relaxed);
         while (gpu_tick.load(std::memory_order_acquire) < tick) {
             gpu_tick.wait(last_tick, std::memory_order_acquire);
@@ -109,6 +134,7 @@ void MasterSemaphore::Wait(u64 tick) {
     }
 
     Nx2Bottleneck::WaitScope wait{Nx2Bottleneck::Wait::HostGpu};
+    const GpuWaitSpan wait_span{tick};
     // If none of the above is hit, fallback to a regular wait
     try {
         while (!semaphore.Wait(tick)) {
