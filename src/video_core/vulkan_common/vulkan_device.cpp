@@ -1018,6 +1018,17 @@ void Device::ReportLoss() const {
     std::this_thread::sleep_for(std::chrono::seconds{15});
 }
 
+bool Device::ConsumeLossInUnattendedRun(const vk::Exception& exception) const {
+    if (exception.GetResult() != VK_ERROR_DEVICE_LOST || !Common::RunOutcome::Active()) {
+        return false;
+    }
+    // A loss that no ReportLoss site saw (any vk::Check) is recorded here.
+    if (Common::RunOutcome::CurrentReason() != Common::RunOutcome::Reason::DeviceLost) {
+        ReportLoss();
+    }
+    return true;
+}
+
 void Device::SaveShader(std::span<const u32> spirv) const {
     if (nsight_aftermath_tracker) {
         nsight_aftermath_tracker->SaveShader(spirv);

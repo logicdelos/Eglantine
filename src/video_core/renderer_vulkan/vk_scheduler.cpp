@@ -20,6 +20,7 @@
 
 #include "common/logging.h"
 #include "common/nx2_bottleneck.h"
+#include "common/run_outcome.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "video_core/gpu_logging/gpu_logging.h"
@@ -390,6 +391,7 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
         return true;
     }};
 
+    bool device_lost = false;
     while (!stop_token.stop_requested()) {
         std::unique_ptr<CommandChunk> work;
 
@@ -418,15 +420,30 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
             // Perform the work, tracking whether the chunk was a submission
             // before executing.
             const bool has_submit = work->HasSubmit();
-            work->ExecuteAll(current_cmdbuf, current_upload_cmdbuf);
-
-            // If the chunk was a submission, reallocate the command buffer.
-            if (has_submit) {
-                AllocateWorkerCommandBuffer();
+            if (device_lost) {
+                // The device is gone: nothing can run, but the queue still has to drain.
+                work.reset();
+            } else {
+                try {
+                    work->ExecuteAll(current_cmdbuf, current_upload_cmdbuf);
+                    // If the chunk was a submission, reallocate the command buffer.
+                    if (has_submit) {
+                        AllocateWorkerCommandBuffer();
+                    }
+                } catch (const vk::Exception& exception) {
+                    // In an unattended run a device loss ends the run (exit code 71) and must not
+                    // end the process as a crash of the worker thread. The chunk was cut short:
+                    // it is dropped, not recycled.
+                    if (!device.ConsumeLossInUnattendedRun(exception)) {
+                        throw;
+                    }
+                    device_lost = true;
+                    work.reset();
+                }
             }
         }
 
-        {
+        if (work) {
             std::scoped_lock rl{reserve_mutex};
 
             // Recycle the chunk back to the reserve.

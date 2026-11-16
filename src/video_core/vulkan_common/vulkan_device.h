@@ -263,6 +263,11 @@ public:
     /// Reports a device loss.
     void ReportLoss() const;
 
+    /// For a thread that catches a Vulkan exception at its outermost frame: true when it is a
+    /// device loss in an unattended run, which is then on record as such and ends the run (the
+    /// thread must stop using the device). False for anything else, which the caller rethrows.
+    bool ConsumeLossInUnattendedRun(const vk::Exception& exception) const;
+
     /// Reports a shader to Nsight Aftermath.
     void SaveShader(std::span<const u32> spirv) const;
 

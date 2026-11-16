@@ -378,6 +378,7 @@ void PresentManager::PresentThread(std::stop_token token) {
     u32 cadence_real_count = 0;
     u32 cadence_gen_count = 0;
 
+    bool device_lost = false;
     while (!token.stop_requested()) {
         std::unique_lock lock{queue_mutex};
         // Wait for presentation frames
@@ -448,7 +449,18 @@ void PresentManager::PresentThread(std::stop_token token) {
             // before the queue lock goes out of scope. This way the swapchain
             // lock in WaitPresent is guaranteed to occur after here.
             void(std::exchange(lock, std::unique_lock{swapchain_mutex}));
-            CopyToSwapchain(frame);
+            if (!device_lost) {
+                try {
+                    CopyToSwapchain(frame);
+                } catch (const vk::Exception& exception) {
+                    // An unattended run ends as device lost (exit code 71), not as a crash of this
+                    // thread; the frames still go back to the free queue.
+                    if (!device.ConsumeLossInUnattendedRun(exception)) {
+                        throw;
+                    }
+                    device_lost = true;
+                }
+            }
 
             const auto done_now = Clock::now();
             if (frame->is_generated && frame->generation_index == 0) {
