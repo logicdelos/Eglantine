@@ -1,9 +1,16 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
@@ -109,6 +116,17 @@ Envelope::CacheReport MakeAcceptedCache() {
     return report;
 }
 
+const RunControl::SessionInfo NoSession{};
+
+RunControl::SessionInfo MakeSession() {
+    RunControl::SessionInfo session;
+    session.title_id = 0x0100000000001234ull;
+    session.nonce = 0xa1b2c3d4e5f60718ull;
+    session.rejected = {1, 2, 3, 4, 5};
+    session.manifest = {42, true, 1'500'000};
+    return session;
+}
+
 std::string SpoolOf(const std::vector<Spikes::LongFrame>& frames) {
     std::string text;
     for (const Spikes::LongFrame& frame : frames) {
@@ -157,7 +175,7 @@ TEST_CASE("schema 2 normal run: golden members", "[report][schema2]") {
     const Spikes::AttributionSnapshot snapshot = MakeSnapshot(2);
     const Envelope::CacheReport cache = MakeAcceptedCache();
     bool ok = false;
-    const Json report = WriteReport({snapshot, cache, &spool, true, false}, &ok);
+    const Json report = WriteReport({snapshot, cache, MakeSession(), &spool, true, false}, &ok);
     REQUIRE(ok);
 
     const Json attribution = report["attribution"];
@@ -195,7 +213,11 @@ TEST_CASE("schema 2 normal run: golden members", "[report][schema2]") {
         {"phase": "cache_validate", "outcome": "ok", "begin_ns": 910000000,
          "end_ns": 930000000},
         {"phase": "pipeline_replay", "outcome": "cancelled", "begin_ns": 930000000,
-         "end_ns": null}]
+         "end_ns": null}],
+      "session": {"title_id": "0100000000001234", "nonce": "a1b2c3d4e5f60718",
+        "markers_rejected": {"malformed": 1, "missing_credentials": 2, "title_mismatch": 3,
+                             "nonce_mismatch": 4, "refused": 5},
+        "content_manifest": {"entries": 42, "over_cap": true, "duration_ns": 1500000}}
     })");
     CHECK(report["startup"] == expected_startup);
 
@@ -235,7 +257,7 @@ TEST_CASE("schema 2 keeps every schema 1 member", "[report][schema2]") {
     std::istringstream spool{""};
     const Spikes::AttributionSnapshot snapshot = MakeSnapshot(0);
     const Envelope::CacheReport cache = MakeAcceptedCache();
-    const Json report = WriteReport({snapshot, cache, &spool, true, false});
+    const Json report = WriteReport({snapshot, cache, NoSession, &spool, true, false});
 
     for (const auto& [key, value] : schema1.items()) {
         INFO("schema 1 member " << key);
@@ -259,7 +281,7 @@ TEST_CASE("attribution is complete only when everything was stored", "[report][s
     const auto complete_of = [&cache](const Spikes::AttributionSnapshot& snapshot,
                                       std::istream* spool, bool run_complete, bool spool_failed,
                                       size_t& lines) {
-        const Json report = WriteReport({snapshot, cache, spool, run_complete, spool_failed});
+        const Json report = WriteReport({snapshot, cache, NoSession, spool, run_complete, spool_failed});
         lines = report["attribution"]["long_frames"].size();
         return report["attribution"]["complete"].get<bool>();
     };
@@ -320,7 +342,7 @@ TEST_CASE("disabled attribution reports nothing as zero", "[report][schema2]") {
     Spikes::AttributionSnapshot snapshot; // the recorder never ran
     std::istringstream spool{SpoolOf({MakeFrame(9, 200'000'000)})};
     const Envelope::CacheReport cache; // nothing published
-    const Json report = WriteReport({snapshot, cache, &spool, true, false});
+    const Json report = WriteReport({snapshot, cache, NoSession, &spool, true, false});
 
     const Json attribution = report["attribution"];
     CHECK(attribution["enabled"] == false);
@@ -340,6 +362,8 @@ TEST_CASE("disabled attribution reports nothing as zero", "[report][schema2]") {
     CHECK(startup["interactive_scene"]["status"] == "not_observed");
     CHECK(startup["interactive_scene"]["id"].is_null());
     CHECK(startup["interactive_scene"]["scene_check"].is_null());
+    CHECK(startup["session"]["nonce"].is_null()); // no session: nothing a marker could match
+    CHECK(startup["session"]["markers_rejected"]["malformed"] == 0);
 
     const Json first = report["first_120s"];
     CHECK(first["complete"] == false);
@@ -490,7 +514,7 @@ TEST_CASE("cache block: a rejected cache is in the report with its reason", "[re
     // the cache block is an input to it, and the rest of the report is unchanged by it.
     std::istringstream spool{""};
     const Spikes::AttributionSnapshot snapshot = MakeSnapshot(0);
-    const Json full = WriteReport({snapshot, report, &spool, true, false});
+    const Json full = WriteReport({snapshot, report, NoSession, &spool, true, false});
     CHECK(full["exit"]["code"] == 0);
     CHECK(full["exit"]["reason"] == "run_seconds");
     CHECK(full["cache"]["files"][0]["reason"] == "format_version");
@@ -558,60 +582,180 @@ TEST_CASE("spool excerpt join", "[report][schema2][crash]") {
     CHECK(join("\n") == "");
 }
 
+namespace {
+
+constexpr u64 TestTitle = 0x0100000000001234ull;
+constexpr u64 TestNonce = 0xa1b2c3d4e5f60718ull;
+constexpr std::string_view TestCredentials = "0100000000001234 a1b2c3d4e5f60718";
+
+std::string MarkerWith(std::string_view body, std::string_view credentials = TestCredentials) {
+    return "interactive " + std::string{body} + " " + std::string{credentials};
+}
+
+RunControl::MarkerParse Classify(std::string_view line) {
+    return RunControl::ClassifyMarkerLine(line, TestTitle, TestNonce, 1).parse;
+}
+
+} // Anonymous namespace
+
 TEST_CASE("interactive marker lines", "[report][schema2][marker]") {
-    using RunControl::ParseMarkerLine;
+    using RunControl::ClassifyMarkerLine;
+    using RunControl::MarkerParse;
 
     SECTION("a valid line") {
-        const auto marker = ParseMarkerLine("interactive menu_1.a-b pass lab2", 123'456);
-        REQUIRE(marker.has_value());
-        CHECK(marker->scene_id == "menu_1.a-b");
-        CHECK(marker->origin == "lab2");
-        CHECK(marker->scene_check_passed);
-        CHECK(marker->marker_ns == 123'456);
+        const auto marker = ClassifyMarkerLine(
+            "interactive menu_1.a-b pass 0100000000001234 a1b2c3d4e5f60718 lab2", TestTitle,
+            TestNonce, 123'456);
+        REQUIRE(marker.parse == MarkerParse::Valid);
+        CHECK(marker.marker.scene_id == "menu_1.a-b");
+        CHECK(marker.marker.origin == "lab2");
+        CHECK(marker.marker.scene_check_passed);
+        CHECK(marker.marker.marker_ns == 123'456);
     }
     SECTION("origin defaults, verdict fail, tabs and line ends are tolerated") {
-        const auto marker = ParseMarkerLine("  interactive\tscene\tfail \r\n", 5);
-        REQUIRE(marker.has_value());
-        CHECK(marker->origin == "lab");
-        CHECK_FALSE(marker->scene_check_passed);
+        const auto marker = ClassifyMarkerLine(
+            "  interactive\tscene\tfail 0100000000001234\ta1b2c3d4e5f60718 \r\n", TestTitle,
+            TestNonce, 5);
+        REQUIRE(marker.parse == MarkerParse::Valid);
+        CHECK(marker.marker.origin == "lab");
+        CHECK_FALSE(marker.marker.scene_check_passed);
     }
     SECTION("lengths are checked at their limits") {
         const std::string longest_scene(RunControl::MaxSceneIdLength, 'a');
         const std::string longest_origin(RunControl::MaxOriginLength, 'b');
-        CHECK(ParseMarkerLine("interactive " + longest_scene + " pass " + longest_origin, 1)
-                  .has_value());
-        CHECK_FALSE(ParseMarkerLine("interactive " + longest_scene + "a pass", 1).has_value());
-        CHECK_FALSE(
-            ParseMarkerLine("interactive scene pass " + longest_origin + "b", 1).has_value());
+        CHECK(Classify(MarkerWith(longest_scene + " pass") + " " + longest_origin) ==
+              MarkerParse::Valid);
+        CHECK(Classify(MarkerWith(longest_scene + "a pass")) == MarkerParse::Malformed);
+        CHECK(Classify(MarkerWith("scene pass") + " " + longest_origin + "b") ==
+              MarkerParse::Malformed);
+    }
+    SECTION("lines that are not markers") {
+        for (const std::string& line : {
+                 std::string{},
+                 std::string{"   "},
+                 std::string{"gpu high"},
+                 std::string{"12 500"},
+                 std::string{"Interactive scene pass"},
+                 std::string{"interactivescene pass"},
+                 std::string{"interactive_ scene pass"},
+                 std::string{"x interactive scene pass"},
+             }) {
+            INFO("line: " << line);
+            CHECK(Classify(line) == MarkerParse::NotMarker);
+            CHECK_FALSE(RunControl::IsMarkerLine(line));
+        }
     }
     SECTION("malformed lines are rejected") {
         const std::string long_scene(RunControl::MaxSceneIdLength + 1, 'a');
         for (const std::string& line : {
-                 std::string{},
-                 std::string{"   "},
                  std::string{"interactive"},
                  std::string{"interactive scene"},
                  std::string{"interactive scene maybe"},
-                 std::string{"interactive scene PASS"},
-                 std::string{"interactive scene pass lab extra"},
-                 std::string{"interactive scene pass lab extra more"},
-                 std::string{"Interactive scene pass"},
-                 std::string{"interactivescene pass"},
-                 std::string{"interactive_ scene pass"},
-                 std::string{"interactive scene/../x pass"},
-                 std::string{"interactive sc\"ene pass"},
-                 std::string{"interactive scene pass la/b"},
-                 std::string{"interactive sc\xc3\xa9ne pass"},
-                 std::string{"interactive scene\x01 pass"},
-                 std::string{"interactive scene pass\0lab", 24},
-                 "interactive " + long_scene + " pass",
-                 std::string{"gpu high"},
-                 std::string{"12 500"},
+                 MarkerWith("scene maybe"),
+                 MarkerWith("scene PASS"),
+                 MarkerWith("scene pass") + " lab extra",
+                 MarkerWith("scene/../x pass"),
+                 MarkerWith("sc\"ene pass"),
+                 MarkerWith("scene pass") + " la/b",
+                 MarkerWith("sc\xc3\xa9ne pass"),
+                 MarkerWith("scene\x01 pass"),
+                 MarkerWith(long_scene + " pass"),
+                 // the credentials are exactly 16 lowercase hex digits each
+                 MarkerWith("scene pass", "0100000000001234 A1B2C3D4E5F60718"),
+                 MarkerWith("scene pass", "010000000000123 a1b2c3d4e5f60718"),
+                 MarkerWith("scene pass", "0100000000001234 a1b2c3d4e5f607180"),
+                 MarkerWith("scene pass", "0x00000000001234 a1b2c3d4e5f60718"),
+                 MarkerWith("scene pass", "0100000000001234 zzzzzzzzzzzzzzzz"),
              }) {
             INFO("line: " << line);
-            CHECK_FALSE(ParseMarkerLine(line, 1).has_value());
+            CHECK(Classify(line) == MarkerParse::Malformed);
+            CHECK(RunControl::IsMarkerLine(line));
         }
     }
+    SECTION("a marker without title and nonce is refused, not read as the old grammar") {
+        CHECK(Classify("interactive scene pass") == MarkerParse::MissingCredentials);
+        CHECK(Classify("interactive scene fail lab") == MarkerParse::MissingCredentials);
+    }
+    SECTION("title and nonce must be this run's") {
+        // a marker left over from an earlier run of the same title: another nonce
+        CHECK(Classify(MarkerWith("scene pass", "0100000000001234 0000000000000001")) ==
+              MarkerParse::NonceMismatch);
+        // a marker meant for another title
+        CHECK(Classify(MarkerWith("scene pass", "0100000000005678 a1b2c3d4e5f60718")) ==
+              MarkerParse::TitleMismatch);
+        // both wrong: the title is what is said first
+        CHECK(Classify(MarkerWith("scene pass", "0100000000005678 0000000000000001")) ==
+              MarkerParse::TitleMismatch);
+        CHECK(Classify(MarkerWith("scene pass")) == MarkerParse::Valid);
+        // no session (nonce 0) accepts nothing, not even a line that says 0
+        CHECK(ClassifyMarkerLine(MarkerWith("scene pass", "0100000000001234 0000000000000000"),
+                                 TestTitle, 0, 1)
+                  .parse == MarkerParse::NonceMismatch);
+    }
+}
+
+TEST_CASE("marker dispatch: the line reaches the parser, whatever its blanks", "[report][marker]") {
+    // yuzu_cmd's RunLiveKeys routes a line by IsMarkerLine to HandleMarkerLine, which classifies
+    // it with DispatchMarkerLine: the same functions, so that nothing the parser accepts is lost
+    // on the way.
+    const std::string fixture =
+        "  interactive\tscene\tfail 0100000000001234\ta1b2c3d4e5f60718\r\n";
+    CHECK(RunControl::IsMarkerLine(fixture));
+    CHECK(RunControl::IsMarkerLine("\tinteractive scene pass"));
+    CHECK(RunControl::IsMarkerLine("interactive\r"));
+    CHECK_FALSE(RunControl::IsMarkerLine("quit"));
+
+    RunControl::SetSession(TestTitle, TestNonce);
+    const RunControl::MarkerClassification accepted = RunControl::DispatchMarkerLine(fixture, 77);
+    REQUIRE(accepted.parse == RunControl::MarkerParse::Valid);
+    CHECK_FALSE(accepted.marker.scene_check_passed);
+    CHECK(accepted.marker.marker_ns == 77);
+    RunControl::SetSession(0, 0);
+}
+
+TEST_CASE("marker dispatch binds a marker to this run and counts what it refuses",
+          "[report][marker]") {
+    using RunControl::MarkerParse;
+    RunControl::SetSession(TestTitle, TestNonce);
+    const RunControl::MarkerRejections before = RunControl::ReadSession().rejected;
+    const auto dispatch = [](std::string_view line) {
+        return RunControl::DispatchMarkerLine(line, 1).parse;
+    };
+
+    // a line from an earlier run, a line for another title, and one without credentials
+    CHECK(dispatch(MarkerWith("scene pass", "0100000000001234 1111111111111111")) ==
+          MarkerParse::NonceMismatch);
+    CHECK(dispatch(MarkerWith("scene pass", "0100000000009999 a1b2c3d4e5f60718")) ==
+          MarkerParse::TitleMismatch);
+    CHECK(dispatch("interactive scene pass") == MarkerParse::MissingCredentials);
+    CHECK(dispatch("interactive scene") == MarkerParse::Malformed);
+    const RunControl::MarkerRejections refused = RunControl::ReadSession().rejected;
+    CHECK(refused.nonce_mismatch == before.nonce_mismatch + 1);
+    CHECK(refused.title_mismatch == before.title_mismatch + 1);
+    CHECK(refused.missing_credentials == before.missing_credentials + 1);
+    CHECK(refused.malformed == before.malformed + 1);
+
+    // the right line, and a line that is no marker, count nothing
+    CHECK(dispatch(MarkerWith("scene pass")) == MarkerParse::Valid);
+    CHECK(dispatch("gpu high") == MarkerParse::NotMarker);
+    const RunControl::MarkerRejections after = RunControl::ReadSession().rejected;
+    CHECK(after.nonce_mismatch == refused.nonce_mismatch);
+    CHECK(after.title_mismatch == refused.title_mismatch);
+    CHECK(after.missing_credentials == refused.missing_credentials);
+    CHECK(after.malformed == refused.malformed);
+    CHECK(after.refused == refused.refused);
+
+    // the report says it
+    const Json json = Json::parse(Schema2::SessionJson(RunControl::ReadSession()));
+    CHECK(json["title_id"] == "0100000000001234");
+    CHECK(json["nonce"] == "a1b2c3d4e5f60718");
+    CHECK(json["markers_rejected"]["nonce_mismatch"] == after.nonce_mismatch);
+    RunControl::SetSession(0, 0);
+
+    // session.txt is exactly these two lines
+    CHECK(RunControl::SessionFileText(TestTitle, TestNonce) ==
+          "title 0100000000001234\nnonce a1b2c3d4e5f60718\n");
+    CHECK(RunControl::NewNonce() != 0);
 }
 
 TEST_CASE("host identity hashing separates fields", "[report][schema2]") {
@@ -636,4 +780,289 @@ TEST_CASE("host identity hashing separates fields", "[report][schema2]") {
     RunControl::Fnv64 a;
     a.Bytes("a", 1);
     CHECK(a.Value() == 0xaf63dc4c8601ec8cull);
+}
+
+namespace {
+
+/// A directory of files that is removed with it. Write times are fixed, so that a stamp changes
+/// only where a test changes a file.
+class TempTree {
+public:
+    TempTree() {
+        static u64 counter = 0;
+        root = std::filesystem::temp_directory_path() /
+               fmt::format("eglantine_manifest_test_{}_{}", Spikes::NowNs(), counter++);
+        std::filesystem::create_directories(root);
+    }
+    ~TempTree() {
+        std::error_code ec;
+        std::filesystem::remove_all(root, ec);
+    }
+    TempTree(const TempTree&) = delete;
+    TempTree& operator=(const TempTree&) = delete;
+
+    std::filesystem::path Write(std::string_view relative, std::string_view content) const {
+        const std::filesystem::path path = root / std::filesystem::path{std::string{relative}};
+        std::filesystem::create_directories(path.parent_path());
+        {
+            std::ofstream out{path, std::ios::binary | std::ios::trunc};
+            out << content;
+        }
+        Stamp(path, 0);
+        return path;
+    }
+
+    static void Stamp(const std::filesystem::path& path, int minutes) {
+        static const auto base = std::filesystem::file_time_type::clock::now();
+        std::filesystem::last_write_time(path, base + std::chrono::minutes{minutes});
+    }
+
+    std::filesystem::path root;
+};
+
+u64 StampOf(const RunControl::HostIdentitySource& source,
+            RunControl::ManifestSummary* summary = nullptr) {
+    return RunControl::AssembleHostIdentity(source, summary).content_stamp;
+}
+
+/// Sets or clears an environment variable for the life of the object.
+class EnvGuard {
+public:
+    EnvGuard(std::string name_, const std::optional<std::string>& value) : name{std::move(name_)} {
+        if (const char* const old = std::getenv(name.c_str())) {
+            saved = old;
+        }
+        Set(value);
+    }
+    ~EnvGuard() {
+        Set(saved);
+    }
+    EnvGuard(const EnvGuard&) = delete;
+    EnvGuard& operator=(const EnvGuard&) = delete;
+
+    void Set(const std::optional<std::string>& value) const {
+#ifdef _WIN32
+        _putenv_s(name.c_str(), value ? value->c_str() : "");
+#else
+        if (value) {
+            setenv(name.c_str(), value->c_str(), 1);
+        } else {
+            unsetenv(name.c_str());
+        }
+#endif
+    }
+
+private:
+    std::string name;
+    std::optional<std::string> saved;
+};
+
+} // Anonymous namespace
+
+TEST_CASE("content stamp covers every file of an enabled mod", "[report][identity]") {
+    TempTree tree;
+    tree.Write("game.nsp", "game");
+    tree.Write("mods/Same/romfs/a.bin", "aaaa");
+    const std::filesystem::path deep = tree.Write("mods/Same/romfs/deep/b.bin", "bbbb");
+    tree.Write("mods/Other/romfs/c.bin", "cccc");
+
+    RunControl::HostIdentitySource source;
+    source.title_id = 0x0100000000001234ull;
+    source.game_path = tree.root / "game.nsp";
+    source.labels = {"2|0100000000001234|0|Same|1.0"};
+    source.content_trees = {tree.root / "mods" / "Same"};
+    const u64 base = StampOf(source);
+    CHECK(StampOf(source) == base);
+
+    SECTION("one file of the mod changes size, the name and version stay") {
+        tree.Write("mods/Same/romfs/deep/b.bin", "bbbbb");
+        CHECK(StampOf(source) != base);
+    }
+    SECTION("one file of the mod changes only its write time") {
+        TempTree::Stamp(deep, 90);
+        CHECK(StampOf(source) != base);
+    }
+    SECTION("a file is added") {
+        tree.Write("mods/Same/romfs/new.bin", "n");
+        CHECK(StampOf(source) != base);
+    }
+    SECTION("a file is removed") {
+        std::filesystem::remove(deep);
+        CHECK(StampOf(source) != base);
+    }
+    SECTION("a mod that is not enabled is not in the stamp") {
+        tree.Write("mods/Other/romfs/c.bin", "much longer");
+        CHECK(StampOf(source) == base);
+    }
+    SECTION("the order of the lists does not matter") {
+        tree.Write("update.nsp", "u");
+        source.content_files = {tree.root / "update.nsp", tree.root / "game.nsp"};
+        source.labels.push_back("1|0100000000001234|65536|Update|1.0.1");
+        const u64 first = StampOf(source);
+        std::ranges::reverse(source.content_files);
+        std::ranges::reverse(source.labels);
+        source.content_trees.push_back(tree.root / "mods" / "Other");
+        const u64 with_other = StampOf(source);
+        CHECK(with_other != first);
+        std::ranges::reverse(source.content_trees);
+        CHECK(StampOf(source) == with_other);
+    }
+}
+
+TEST_CASE("content stamp covers the game, the update and a loose RomFS", "[report][identity]") {
+    TempTree tree;
+    tree.Write("dump/exefs/main", "MAIN");
+    tree.Write("dump/romfs/data/x.bin", "xxxx");
+    tree.Write("game.nsp", "game");
+    tree.Write("update.nsp", "update");
+
+    RunControl::HostIdentitySource loose;
+    loose.title_id = 0x0100000000001234ull;
+    loose.game_path = tree.root / "dump";
+    const u64 loose_base = StampOf(loose);
+
+    SECTION("a RomFS file changes while main is untouched") {
+        tree.Write("dump/romfs/data/x.bin", "xxxxxx");
+        CHECK(StampOf(loose) != loose_base);
+    }
+    SECTION("a RomFS file is added") {
+        tree.Write("dump/romfs/data/y.bin", "y");
+        CHECK(StampOf(loose) != loose_base);
+    }
+    SECTION("main changes") {
+        tree.Write("dump/exefs/main", "MAIN2");
+        CHECK(StampOf(loose) != loose_base);
+    }
+
+    RunControl::HostIdentitySource packaged;
+    packaged.title_id = loose.title_id;
+    packaged.game_path = tree.root / "game.nsp";
+    packaged.content_files = {tree.root / "update.nsp"};
+    const u64 packaged_base = StampOf(packaged);
+    CHECK(packaged_base != loose_base);
+
+    SECTION("the game file changes size") {
+        tree.Write("game.nsp", "game!");
+        CHECK(StampOf(packaged) != packaged_base);
+    }
+    SECTION("the update file changes size") {
+        tree.Write("update.nsp", "update!");
+        CHECK(StampOf(packaged) != packaged_base);
+    }
+    SECTION("the update file is gone") {
+        std::filesystem::remove(tree.root / "update.nsp");
+        CHECK(StampOf(packaged) != packaged_base);
+    }
+    SECTION("another title") {
+        packaged.title_id += 1;
+        CHECK(StampOf(packaged) != packaged_base);
+    }
+}
+
+TEST_CASE("content manifest cap is deterministic and part of the stamp", "[report][identity]") {
+    TempTree tree;
+    for (int i = 0; i < 6; ++i) {
+        tree.Write(fmt::format("mod/f{}.bin", i), "x");
+    }
+    RunControl::HostIdentitySource source;
+    source.title_id = 0x0100000000001234ull;
+    source.content_trees = {tree.root / "mod"};
+
+    RunControl::ManifestSummary exact;
+    RunControl::ManifestSummary roomy;
+    RunControl::ManifestSummary capped;
+    source.max_manifest_entries = 6; // exactly the number of files: not over the cap
+    const u64 stamp_exact = StampOf(source, &exact);
+    source.max_manifest_entries = 100;
+    const u64 stamp_roomy = StampOf(source, &roomy);
+    source.max_manifest_entries = 5; // one file too many
+    const u64 stamp_capped = StampOf(source, &capped);
+
+    CHECK(exact.entries == 6);
+    CHECK_FALSE(exact.over_cap);
+    CHECK(stamp_exact == stamp_roomy);
+    CHECK(roomy.entries == 6);
+    CHECK(capped.entries == 5);
+    CHECK(capped.over_cap);
+    CHECK(stamp_capped != stamp_exact);
+
+    // The walk stops in the same place every time (name order): a file past the cap is not
+    // seen, a file before it is.
+    tree.Write("mod/f5.bin", "changed past the cap");
+    CHECK(StampOf(source) == stamp_capped);
+    tree.Write("mod/f0.bin", "changed before the cap");
+    CHECK(StampOf(source) != stamp_capped);
+}
+
+TEST_CASE("settings hash covers every switch that changes generated shaders",
+          "[report][identity]") {
+    const u64 base = RunControl::HostSettingsHash();
+    CHECK(RunControl::HostSettingsHash() == base);
+
+    for (const std::string_view name : RunControl::ShaderGenerationSwitches) {
+        INFO("switch " << name);
+        EnvGuard guard{std::string{name}, std::nullopt};
+        const u64 unset = RunControl::HostSettingsHash();
+        guard.Set("1");
+        const u64 one = RunControl::HostSettingsHash();
+        guard.Set("0");
+        const u64 zero = RunControl::HostSettingsHash();
+        CHECK(unset != one);
+        CHECK(one != zero);
+        CHECK(zero != unset);
+    }
+    CHECK(RunControl::HostSettingsHash() == base);
+
+    const auto changes_hash = [](const auto& flip) {
+        const u64 before = RunControl::HostSettingsHash();
+        flip();
+        const u64 after = RunControl::HostSettingsHash();
+        flip();
+        return after != before && RunControl::HostSettingsHash() == before;
+    };
+    CHECK(changes_hash([] {
+        Settings::values.fix_bloom_effects.SetValue(!Settings::values.fix_bloom_effects.GetValue());
+    }));
+    CHECK(changes_hash([] {
+        Settings::values.disable_shader_loop_safety_checks.SetValue(
+            !Settings::values.disable_shader_loop_safety_checks.GetValue());
+    }));
+    CHECK(changes_hash([] {
+        Settings::values.renderer_debug.SetValue(!Settings::values.renderer_debug.GetValue());
+    }));
+    CHECK(changes_hash([] {
+        Settings::values.vertex_input_dynamic_state.SetValue(
+            !Settings::values.vertex_input_dynamic_state.GetValue());
+    }));
+    CHECK(changes_hash([] {
+        Settings::values.use_squashed_iterated_blend = !Settings::values.use_squashed_iterated_blend;
+    }));
+    CHECK(changes_hash([] {
+        Settings::values.resolution_info.active = !Settings::values.resolution_info.active;
+    }));
+    for (u32* const field : {&Settings::values.resolution_info.up_scale,
+                             &Settings::values.resolution_info.down_shift}) {
+        const u32 original = *field;
+        ++*field;
+        const u64 changed = RunControl::HostSettingsHash();
+        *field = original;
+        CHECK(changed != base);
+        CHECK(RunControl::HostSettingsHash() == base);
+    }
+}
+
+TEST_CASE("a disabled boot phase scope does nothing", "[report][schema2][startup]") {
+    REQUIRE_FALSE(Spikes::AttributionEnabled());
+    const size_t phases_before = Spikes::ReadAttributionSnapshot().phases.size();
+
+    RunControl::BootPhaseScope scope{Spikes::BootPhase::GameRun};
+    CHECK_FALSE(scope.Active()); // so End returns before it reads a clock or writes a log line
+    scope.End(Spikes::PhaseOutcome::Ok);
+    CHECK_FALSE(scope.Active());
+
+    RunControl::DiskLoadPhases load;
+    load.OnStage(VideoCore::LoadCallbackStage::Build);
+    load.Finish(Spikes::PhaseOutcome::Ok);
+
+    CHECK(Spikes::ReadAttributionSnapshot().phases.size() == phases_before);
 }
