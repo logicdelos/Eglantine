@@ -266,17 +266,17 @@ Json MetricsJson(const Nx2Bottleneck::RunMetrics& metrics) {
 
 Json BuildJson() {
     Json json = Json::object();
-    json["revision"] = Common::g_scm_rev;
-    json["branch"] = Common::g_scm_branch;
-    json["description"] = Common::g_scm_desc;
-    json["build_id"] = Common::g_build_id;
-    json["build_date"] = Common::g_build_date;
-    json["compiler"] = Common::g_compiler_id;
-    json["name"] = Common::g_build_name;
-    json["full_name"] = Common::g_build_fullname;
-    json["version"] = Common::g_build_version;
-    json["display_version"] = Common::g_display_version;
-    json["flavour"] = Common::g_build_flavour;
+    json["revision"] = std::string(Common::g_scm_rev);
+    json["branch"] = std::string(Common::g_scm_branch);
+    json["description"] = std::string(Common::g_scm_desc);
+    json["build_id"] = std::string(Common::g_build_id);
+    json["build_date"] = std::string(Common::g_build_date);
+    json["compiler"] = std::string(Common::g_compiler_id);
+    json["name"] = std::string(Common::g_build_name);
+    json["full_name"] = std::string(Common::g_build_fullname);
+    json["version"] = std::string(Common::g_build_version);
+    json["display_version"] = std::string(Common::g_display_version);
+    json["flavour"] = std::string(Common::g_build_flavour);
     return json;
 }
 
@@ -737,8 +737,8 @@ PrepareResult Prepare(const std::string& destination, std::string& message) {
     }
     fs::path temporary = path;
     temporary += "." + std::to_string(ProcessId()) + ".tmp";
-    fs::path crash_temporary = path;
-    crash_temporary += "." + std::to_string(ProcessId()) + ".crash.tmp";
+    fs::path crash_temporary_path = path;
+    crash_temporary_path += "." + std::to_string(ProcessId()) + ".crash.tmp";
     {
         std::ofstream probe{temporary, std::ios::binary | std::ios::out | std::ios::trunc};
         if (!probe) {
@@ -748,7 +748,7 @@ PrepareResult Prepare(const std::string& destination, std::string& message) {
     }
     state.destination = path;
     state.temporary = std::move(temporary);
-    state.crash_temporary = std::move(crash_temporary);
+    state.crash_temporary = std::move(crash_temporary_path);
     state.prepared = true;
     ArmCrashReport(state);
     return PrepareResult::Ready;
