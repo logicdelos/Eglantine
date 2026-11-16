@@ -149,6 +149,8 @@ add_library(video_core STATIC
 
     # Vulkan
     renderer_vulkan/present/anti_alias_pass.h
+    renderer_vulkan/present/buf.cpp
+    renderer_vulkan/present/buf.h
     renderer_vulkan/present/filters.cpp
     renderer_vulkan/present/filters.h
     renderer_vulkan/present/fsr.cpp

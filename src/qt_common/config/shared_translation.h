@@ -64,6 +64,7 @@ static const std::map<Settings::ScalingFilter, QString> scaling_filter_texts_map
     {Settings::ScalingFilter::Sgsr, QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "SGSR"))},
     {Settings::ScalingFilter::SgsrEdge, QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "SGSR EdgeDir"))},
     {Settings::ScalingFilter::Fsr3, QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "FSR 1 Soft"))},
+    {Settings::ScalingFilter::Buf, QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "BUF"))},
 };
 
 static const std::map<Settings::ConsoleMode, QString> use_docked_mode_texts_map = {

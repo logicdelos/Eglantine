@@ -84,6 +84,7 @@ set(SHADER_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_color_clear.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_color_clear.vert
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_depthstencil_clear.frag
+    ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_buf.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_fidelityfx_fsr.vert
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_fidelityfx_fsr_easu_fp16.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_fidelityfx_fsr_easu_fp32.frag

@@ -119,6 +119,7 @@ void BlitScreen::CreateWindowAdapt() {
         break;
     case Settings::ScalingFilter::Fsr:
     case Settings::ScalingFilter::Fsr3:
+    case Settings::ScalingFilter::Buf:
     case Settings::ScalingFilter::Sgsr:
     case Settings::ScalingFilter::SgsrEdge:
     case Settings::ScalingFilter::Bilinear:

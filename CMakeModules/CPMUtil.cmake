@@ -174,6 +174,25 @@ function(get_cache_path package key out)
     return(PROPAGATE ${out})
 endfunction()
 
+# Local build only: fetch one URL to file with aria2c when it is on PATH, else file(DOWNLOAD).
+# Sets <code_out> to 0 on success.
+function(cpm_fetch_file url file code_out)
+    find_program(ARIA2C_EXE aria2c)
+    if (ARIA2C_EXE)
+        get_filename_component(dl_dir ${file} DIRECTORY)
+        get_filename_component(dl_name ${file} NAME)
+        file(MAKE_DIRECTORY ${dl_dir})
+        execute_process(
+            COMMAND ${ARIA2C_EXE} -q -x4 -s4 --allow-overwrite=true --auto-file-renaming=false
+                --max-tries=5 -d ${dl_dir} -o ${dl_name} ${url}
+            RESULT_VARIABLE code)
+    else()
+        file(DOWNLOAD ${url} ${file} STATUS ret)
+        list(GET ret 0 code)
+    endif()
+    set(${code_out} ${code} PARENT_SCOPE)
+endfunction()
+
 # Download a URL to file, with a sha512 hash
 # And retry 5 times
 function(cpm_download url file)
@@ -181,17 +200,21 @@ function(cpm_download url file)
     list(LENGTH ARGN argn_len)
     if(argn_len GREATER 0)
         list(GET ARGN 0 hash)
-        set(args EXPECTED_HASH SHA512=${hash})
+        string(TOLOWER "${hash}" hash)
     else()
-        unset(args)
+        unset(hash)
     endif()
 
     foreach(i RANGE 5)
-        file(DOWNLOAD ${url} ${file}
-            ${args}
-            STATUS ret)
-
-        list(GET ret 0 code)
+        cpm_fetch_file(${url} ${file} code)
+        if (code EQUAL 0 AND DEFINED hash)
+            file(SHA512 ${file} got)
+            if (NOT got STREQUAL hash)
+                echo_error("Hash mismatch for ${url}")
+                file(REMOVE ${file})
+                set(code 1)
+            endif()
+        endif()
         if (code EQUAL 0)
             break()
         endif()
@@ -1065,9 +1088,7 @@ function(AddCIPackage)
         set(sha512sum_file
             "${CMAKE_CURRENT_BINARY_DIR}/.cpmutil_${ARTIFACT}_sha512sum")
 
-        file(DOWNLOAD "${sha512sum_url}" "${sha512sum_file}"
-            STATUS sha512sum_status)
-        list(GET sha512sum_status 0 sha512sum_error)
+        cpm_fetch_file("${sha512sum_url}" "${sha512sum_file}" sha512sum_error)
 
         if(sha512sum_error)
             message(FATAL_ERROR "[CPMUtil] Failed to download sha512sum "

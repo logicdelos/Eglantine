@@ -15,6 +15,7 @@
 #include "common/math_util.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
+#include "video_core/renderer_vulkan/present/buf.h"
 #include "video_core/renderer_vulkan/present/fsr.h"
 #include "video_core/renderer_vulkan/present/fsr3.h"
 #include "video_core/renderer_vulkan/present/sgsr.h"
@@ -104,7 +105,7 @@ private:
 
     Settings::AntiAliasing anti_alias_setting{};
     std::variant<std::monostate, FXAA, SMAA> anti_alias{};
-    std::variant<std::monostate, SGSR, FSR, FSR3> sr_filter{};
+    std::variant<std::monostate, SGSR, FSR, FSR3, BUF> sr_filter{};
 #ifdef HAS_RESHADE
     std::optional<PostProcessChain> post_process{};
     u64 post_process_generation{};
