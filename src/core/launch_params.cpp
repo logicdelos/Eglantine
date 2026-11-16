@@ -9,6 +9,7 @@
 #include <cerrno>
 #include <cmath>
 #include <utility>
+#include <string_view>
 
 #include "common/assert.h"
 #include "common/logging.h"
@@ -71,6 +72,30 @@ static std::optional<u64> ParseFrames(const char* text) {
     return static_cast<u64>(frames);
 }
 
+/// See EarlyOptions. Mirrors only what getopt would find for the spelled-out option names; an
+/// abbreviation is left to ParseLaunchParams. The values of -p and -x are skipped: they take the
+/// next argument whatever it says.
+EarlyOptions ScanEarlyOptions(int argc, char* argv[]) noexcept {
+    bool version = false;
+    bool json = false;
+    for (int i = 1; i < argc; ++i) {
+        const std::string_view arg{argv[i]};
+        if (arg == "--") {
+            break;
+        }
+        if (arg == "-p" || arg == "--program" || arg == "-x" || arg == "--filter") {
+            ++i;
+        } else if (arg == "-v" || arg == "--version") {
+            version = true;
+        } else if (arg == "--json") {
+            json = true;
+        }
+    }
+    EarlyOptions early{};
+    early.version_json = version && json;
+    return early;
+}
+
 /// Parses the command line options into a LaunchParams.
 LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wchar_t *argv_w[]) noexcept {
     LaunchParams p{};
@@ -108,6 +133,7 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
         {"report", required_argument, 0, 0x108},
         {"run-seconds", required_argument, 0, 0x109},
         {"run-frames", required_argument, 0, 0x10A},
+        {"json", no_argument, 0, 0x10B},
         {0, 0, 0, 0},
         // clang-format on
     };
@@ -291,6 +317,9 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
                          "': expected a positive whole number");
                 }
                 break;
+            case 0x10B:
+                p.print_json = true;
+                break;
             case '?':
                 // An unknown option, or one without its argument. Only an automated run
                 // (--report, --run-seconds, --run-frames) refuses it, so nothing else changes.
@@ -319,6 +348,9 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
             }
             optind++;
         }
+    }
+    if (p.print_json && !p.print_version) {
+        fail("--json is only valid together with --version");
     }
     if ((p.report_path || p.run_seconds || p.run_frames) &&
         (p.print_help || p.print_version || p.pack_nup_source || p.unpack_nup_source ||
@@ -361,7 +393,7 @@ void ApplyLaunchParams(LaunchParams const& lp) noexcept {
         Settings::values.renderer_backend = Settings::RendererBackend::Null;
     }
 
-    if (lp.print_version) {
+    if (lp.print_version && !lp.print_json) {
         LOG_INFO(Frontend, "{} | commit {}", Common::BuildDisplayName(), Common::g_scm_rev);
     }
     if (lp.print_help) {
@@ -378,6 +410,8 @@ void ApplyLaunchParams(LaunchParams const& lp) noexcept {
             "-u, --user            Select a specific user profile from 0 to 7\n"
             "-d, --debug           Run the GDB stub on a port from 1 to 65535\n"
             "-v, --version         Output version information and exit\n"
+            "--version --json      Print the build identity (version, revision, compiler, options) as one\n"
+            "                      JSON object on standard output and exit; no window, no user directory\n"
             "--pack-nup <dump> [<out.nup>]"
             " Pack a loose dump with all its updates and DLC into a NUP file and exit\n"
             "--unpack-nup <file.nup> [<out_dir>]"

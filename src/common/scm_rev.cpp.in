@@ -19,6 +19,7 @@
 #define EGLANTINE_BUILD_FLAVOUR "@EGLANTINE_BUILD_FLAVOUR@"
 #undef BUILD_ID
 #define BUILD_ID "@BUILD_ID@"
+#define EGLANTINE_UPSTREAM_BASE "@UPSTREAM_BASE@"
 #define TITLE_BAR_FORMAT_IDLE "@TITLE_BAR_FORMAT_IDLE@"
 #define TITLE_BAR_FORMAT_RUNNING "@TITLE_BAR_FORMAT_RUNNING@"
 #define IS_DEV_BUILD @IS_DEV_BUILD@
@@ -41,6 +42,7 @@ constexpr const char g_build_version[] = BUILD_VERSION;
 constexpr const char g_display_version[] = EGLANTINE_DISPLAY_VERSION;
 constexpr const char g_build_flavour[] = EGLANTINE_BUILD_FLAVOUR;
 constexpr const char g_build_id[] = BUILD_ID;
+constexpr const char g_upstream_base[] = EGLANTINE_UPSTREAM_BASE;
 constexpr const char g_title_bar_format_idle[] = TITLE_BAR_FORMAT_IDLE;
 constexpr const char g_title_bar_format_running[] = TITLE_BAR_FORMAT_RUNNING;
 constexpr const char g_compiler_id[] = COMPILER_ID;

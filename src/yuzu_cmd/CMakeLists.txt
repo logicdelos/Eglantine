@@ -38,6 +38,8 @@ add_executable(yuzu-cmd
     run_report.h
     sdl_config.cpp
     sdl_config.h
+    version_info.cpp
+    version_info.h
     yuzu.cpp
     yuzu.rc
     ${OPENGL_SOURCES}
@@ -52,6 +54,13 @@ if (ENABLE_MCP_SERVER)
 endif()
 if (ENABLE_OPENGL)
     target_link_libraries(yuzu-cmd PRIVATE glad)
+endif()
+# What `--version --json` reports of the build.
+if (ENABLE_UPDATE_CHECKER)
+    target_compile_definitions(yuzu-cmd PRIVATE EGLANTINE_BUILD_UPDATE_CHECKER)
+endif()
+if (USE_DISCORD_PRESENCE)
+    target_compile_definitions(yuzu-cmd PRIVATE EGLANTINE_BUILD_DISCORD_PRESENCE)
 endif()
 target_link_libraries(yuzu-cmd PRIVATE ${PLATFORM_LIBRARIES} Threads::Threads)
 

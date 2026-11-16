@@ -322,7 +322,7 @@ std::string Document(State& state, Common::RunOutcome::Reason reason, int code,
     settings["final"] = ReportedSettings();
 
     Json document = Json::object();
-    document["schema_version"] = 1;
+    document["schema_version"] = kSchemaVersion;
     document["build"] = BuildJson();
     document["title_id"] = state.title_id ? Json(fmt::format("{:016X}", *state.title_id))
                                           : Json(nullptr);
@@ -635,7 +635,7 @@ void RebuildCrashDocument(State& state) {
     }
     constexpr auto replace = Json::error_handler_t::replace;
     Json fixed = Json::object();
-    fixed["schema_version"] = 1;
+    fixed["schema_version"] = kSchemaVersion;
     fixed["build"] = BuildJson();
     fixed["title_id"] = state.title_id ? Json(fmt::format("{:016X}", *state.title_id))
                                       : Json(nullptr);

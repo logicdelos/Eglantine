@@ -292,6 +292,9 @@ option(YUZU_LEGACY "Apply patches that improve compatibility with older GPUs (e.
 option(NIGHTLY_BUILD "Use Nightly qualifiers in the update checker and build metadata" OFF)
 
 set(EGLANTINE_FORK_VERSION "" CACHE STRING "Version this build reports (window title, About dialog, first log line). Empty: the GIT-DISPLAY/DISPLAYVERSION identity when CI gives one, else git describe --tags --match 'fork-v*' without the prefix, else 0.1.0-dev+<short commit>")
+# The upstream commit this build is based on, reported by `eden-cli --version --json`. Nothing
+# computes it: a release build passes it in. Empty means it is not recorded.
+set(EGLANTINE_UPSTREAM_BASE "" CACHE STRING "Upstream commit this build is based on (reported by --version --json). Empty: not recorded")
 # The repository the in-game news feed (and the update checker, when enabled) reads releases from.
 set(EGLANTINE_UPDATE_REPO "logicdelos/Eglantine" CACHE STRING "GitHub owner/name repository the news feed and the update checker read releases from")
 set(EGLANTINE_RELEASE_PLATFORM "" CACHE STRING "Release asset platform of this build, e.g. windows-x86_64, linux-aarch64-pgo, macos-arm64")

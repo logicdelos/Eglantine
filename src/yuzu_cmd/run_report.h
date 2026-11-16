@@ -14,6 +14,9 @@
 // destination, gathers the rest and writes the file (to a temporary name first, then renamed).
 namespace RunReport {
 
+/// `schema_version` of the report; `--version --json` names it as well.
+inline constexpr int kSchemaVersion = 1;
+
 enum class PrepareResult {
     Ready,
     /// The destination exists, or its directory does not: the caller's mistake (exit code 64).

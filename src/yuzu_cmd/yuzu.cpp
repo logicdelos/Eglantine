@@ -66,6 +66,7 @@
 #include "video_core/renderer_base.h"
 #include "video_core/shader_warm/shader_warm_builder.h"
 #include "yuzu_cmd/run_report.h"
+#include "yuzu_cmd/version_info.h"
 #include "yuzu_cmd/emu_window/emu_window_sdl3.h"
 #ifdef HAS_OPENGL
 #include "yuzu_cmd/emu_window/emu_window_sdl3_gl.h"
@@ -525,9 +526,6 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     // SDL calls SDL_AppIterate back to back by default, which kept a host core at 100% polling
     // input; 240 Hz is plenty for input and the key script.
     SDL_SetHint(SDL_HINT_MAIN_CALLBACK_RATE, "240");
-    SdlState* state = new SdlState();
-    *appstate = state;
-
 #ifdef _WIN32
     // A launcher that redirected a stream keeps it; only an unredirected one goes to the
     // parent's console.
@@ -551,6 +549,17 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         setrlimit(RLIMIT_NOFILE, &rl);
     }
 #endif
+
+    // Options that must act before the user directory, the log, the crash handler and Core::System
+    // exist. They are found by a scan of their own; the full parse needs a Core::System.
+    if (Core::ScanEarlyOptions(argc, argv).version_json) {
+        fmt::print("{}", VersionInfo::BuildInfoJson());
+        std::fflush(stdout);
+        return SDL_APP_SUCCESS;
+    }
+
+    SdlState* state = new SdlState();
+    *appstate = state;
 
     Common::Log::Initialize();
     Common::Log::SetColorConsoleBackendEnabled(true);
@@ -630,6 +639,13 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     Core::ApplyLaunchParams(lp);
     if (Common::RunOutcome::Active()) {
         RunReport::CaptureStart();
+    }
+
+    // The early scan missed --version --json (an abbreviated option): the same text, a little later.
+    if (lp.print_version && lp.print_json) {
+        fmt::print("{}", VersionInfo::BuildInfoJson());
+        std::fflush(stdout);
+        return SDL_APP_SUCCESS;
     }
 
     // Informational options already printed by ApplyLaunchParams; handle them before any

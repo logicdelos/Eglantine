@@ -84,6 +84,11 @@ if (FORK_VERSION)
 endif()
 message(STATUS "[Eglantine] ${REPO_NAME} ${EGLANTINE_DISPLAY_VERSION}")
 
+# Inside a C string literal, like the version above.
+set(UPSTREAM_BASE "${EGLANTINE_UPSTREAM_BASE}")
+string(REPLACE "\\" "\\\\" UPSTREAM_BASE "${UPSTREAM_BASE}")
+string(REPLACE "\"" "\\\"" UPSTREAM_BASE "${UPSTREAM_BASE}")
+
 set(BUILD_ID ${GIT_REFSPEC})
 set(BUILD_FULLNAME "${REPO_NAME} ${BUILD_VERSION} ")
 set(CXX_COMPILER "${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")

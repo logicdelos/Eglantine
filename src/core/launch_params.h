@@ -59,12 +59,24 @@ struct LaunchParams {
     bool force_single_core = false;
     // print
     bool print_version = false;
+    // --json (with --version): the build identity as one JSON object on standard output.
+    bool print_json = false;
     bool print_help = false;
     // qt
     bool launch_hlaunch = false;
     bool launch_qlaunch = false;
     bool launch_setup = false;
 };
+
+/// The options that must act before the log, the crash handler and Core::System exist. They are
+/// found by a scan of their own that does not use getopt, so it can run before ParseLaunchParams;
+/// ParseLaunchParams still parses them, to report mistakes and for the callers that skip the scan.
+struct EarlyOptions {
+    // --version together with --json (written out in full).
+    bool version_json = false;
+};
+
+EarlyOptions ScanEarlyOptions(int argc, char* argv[]) noexcept;
 
 LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wchar_t *argv_w[]) noexcept;
 void ApplyLaunchParams(LaunchParams const& lp) noexcept;

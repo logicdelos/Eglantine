@@ -28,6 +28,15 @@ Milestone 0.4, "Measured speed work": every speed change ships off by default be
 - `EDEN_NX2_WARM_ADDON`: the shader precache build also reads the add-on packages of a `.nup`. Results: to be filled from the measurement table.
 - `EDEN_NX2_ASTC_CHEAP_UPLOAD`: cheaper per-block set-up in the Vulkan GPU ASTC decoder, and the opaque-ASTC scan reads guest data in place. Results: to be filled from the measurement table.
 
+## Unreleased
+
+Command-line additions for scripted runs of `eden-cli`. Not built or run yet at the time of writing.
+
+### New
+
+- `eden-cli --version --json` prints one JSON object on one line on standard output and exits with 0: `name`, `fork_version`, `flavour`, `revision`, `branch`, `description`, `upstream_base`, `build_id`, `build_date`, `compiler`, `report_schema_version` and an `options` object (`discord_presence`, `mcp_server`, `opengl`, `update_checker`, `web_service`). `fork_version`, `flavour` and `upstream_base` are `null` when the build recorded none. It answers before the log, the crash handler, the configuration and the user directory are touched, and creates no window. Plain `--version` is unchanged. `--json` without `--version` is a bad argument.
+- New CMake variable `EGLANTINE_UPSTREAM_BASE` (empty by default): the upstream commit a build is based on, reported as `upstream_base`. Nothing computes it; a release build passes it with `-DEGLANTINE_UPSTREAM_BASE=<commit>`.
+
 ## 0.3.0 (2026-11-16)
 
 Milestone 0.3, "Unattended runs": a scripted run ends by itself, says why in its exit code, and leaves one report file. Verified on the as-shipped folder: the release gate passed against the `fork-v0.2.0` baseline (three runs, no new error lines, pictures within the limit), and the unattended exit test passed 10 of 10 cases (bad arguments, frame limit, time limit and forced crash on Fire Emblem: Fortune's Weave and Xenoblade Chronicles 2). Other error paths were read from the code, not provoked.
