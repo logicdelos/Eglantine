@@ -249,13 +249,34 @@ struct ColorConsoleBackend final : public Backend {
 /// @brief Backend that writes to a file passed into the constructor
 struct FileBackend final : public Backend {
     explicit FileBackend(const std::filesystem::path filename) noexcept {
-        auto old_filename = filename;
-        old_filename += ".old.txt";
-        // Existence checks are done within the functions themselves.
-        // We don't particularly care if these succeed or not.
-        void(FS::RemoveFile(old_filename));
-        void(FS::RenameFile(filename, old_filename));
-        file.emplace(filename, FS::FileAccessMode::Write, FS::FileType::TextFile);
+        // Move a log over its ".old.txt" copy. The rename replaces the copy atomically, and fails
+        // if the log is still open elsewhere (e.g. in an emulator process that hasn't exited yet).
+        // A log that can't even be checked counts as a failure, so it is never truncated.
+        const auto rotate = [](const std::filesystem::path& path) {
+            std::error_code ec;
+            if (!std::filesystem::exists(path, ec))
+                return !ec;
+            auto old_path = path;
+            old_path += ".old.txt";
+            std::filesystem::rename(path, old_path, ec);
+            return !ec;
+        };
+        // If the log can't be moved, write this session to a second log (eden_log_2.txt) so that
+        // the previous session is kept and this one still gets the full size limit. If that one
+        // can't be moved either, append to it.
+        auto path = filename;
+        auto mode = FS::FileAccessMode::Write;
+        if (!rotate(path)) {
+            path = filename.parent_path() / filename.stem();
+            path += "_2";
+            path += filename.extension();
+            if (!rotate(path))
+                mode = FS::FileAccessMode::Append;
+        }
+        file.emplace(path, mode, FS::FileType::TextFile);
+        // Count what is already there so the size limit still applies when appending.
+        if (mode == FS::FileAccessMode::Append)
+            bytes_written = file->GetSize();
     }
     ~FileBackend() noexcept override = default;
 
@@ -285,7 +306,7 @@ struct FileBackend final : public Backend {
 
         // Option to log each line rather than 4k buffers
         if (Settings::values.log_flush_line.GetValue())
-            file->Flush();
+            Flush();
 
         using namespace Common::Literals;
         // Prevent logs from exceeding a set maximum size in the event that log entries are spammed.
@@ -296,12 +317,18 @@ struct FileBackend final : public Backend {
             // Don't close the file so we can print a stacktrace if necessary
             if (write_limit_exceeded)
                 enabled = false;
-            file->Flush();
+            Flush();
         }
     }
 
     void Flush() noexcept override {
+        // A failed flush logs an Error, whose own flush would fail and log again without end.
+        static thread_local bool flushing = false;
+        if (flushing)
+            return;
+        flushing = true;
         file->Flush();
+        flushing = false;
     }
 private:
     std::optional<FS::IOFile> file;
@@ -405,6 +432,10 @@ struct Impl {
     LogcatBackend lc_backend{};
 #endif
     std::chrono::steady_clock::time_point time_origin{std::chrono::steady_clock::now()};
+#ifndef __OPENORBIS__
+    // Last, so it stops before the file backend it flushes is destroyed.
+    std::jthread file_flush_thread;
+#endif
 };
 } // Anonymous namespace
 
@@ -458,6 +489,17 @@ void Initialize() {
 }
 
 void Start() {
+#ifndef __OPENORBIS__
+    // Lines below Error wait in the file's buffer until it fills. Flushing it every second keeps a
+    // hang or a kill from losing more than the last second of the log.
+    if (!logging_instance || !logging_instance->file_backend || logging_instance->file_flush_thread.joinable())
+        return;
+    logging_instance->file_flush_thread = std::jthread([&backend = *logging_instance->file_backend](std::stop_token token) {
+        Common::SetCurrentThreadName("LogFlush");
+        while (Common::StoppableTimedWait(token, std::chrono::seconds{1}))
+            backend.Flush();
+    });
+#endif
 }
 
 void Stop() {
