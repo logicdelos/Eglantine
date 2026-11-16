@@ -279,6 +279,8 @@ struct RecordMeta {
     FirstUse first_use_phase{FirstUse::Run};
     u32 first_use_ordinal{};
     u64 first_use_ns{};
+    /// Zero in files the pipeline cache writes: translation is timed inside build_cost_us and
+    /// not on its own, and the report says "not_separately_measured", never 0.
     u32 translate_cost_us{};
     u32 build_cost_us{};
 };

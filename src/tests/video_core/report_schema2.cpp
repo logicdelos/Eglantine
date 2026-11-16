@@ -53,6 +53,7 @@ Spikes::AttributionSnapshot MakeSnapshot(u64 long_frames) {
     snapshot.complete = true;
     snapshot.threshold_ns = 100'000'000;
     snapshot.rejected_presents = 3;
+    snapshot.dropped_boundaries = 2;
     snapshot.frames = 500;
     snapshot.long_frames = long_frames;
     snapshot.unknown_wall_fraction = 0.125;
@@ -112,6 +113,9 @@ Envelope::CacheReport MakeAcceptedCache() {
     report.stats.prepared = 700;
     report.stats.adopted = 650;
     report.stats.demand_wait_ns = 1'234'567;
+    report.stats.evicted = 3;
+    report.stats.checkpoints = 2;
+    report.stats.bytes_committed = 4096;
     report.stats.write_status = Envelope::WriteStatus::Ok;
     return report;
 }
@@ -184,6 +188,7 @@ TEST_CASE("schema 2 normal run: golden members", "[report][schema2]") {
     CHECK(attribution["enabled"] == true);
     CHECK(attribution["complete"] == true);
     CHECK(attribution["lost_events"] == 0);
+    CHECK(attribution["dropped_boundaries"] == 2);
     CHECK(attribution["sink_write_errors"] == 0);
     CHECK(attribution["rejected_presents"] == 3);
     CHECK(attribution["unknown_wall_fraction"] == 0.125);
@@ -242,7 +247,8 @@ TEST_CASE("schema 2 normal run: golden members", "[report][schema2]") {
       "recorded": 5, "prepared": 700, "adopted": 650, "demand_promoted": 0,
       "demand_wait_ns": 1234567, "prepare_failures": 0, "records_skipped": 0,
       "write_status": "ok", "queue_high_water": 0, "memory_high_water_bytes": 0,
-      "budget_pauses": 0
+      "budget_pauses": 0, "evicted": 3, "checkpoints": 2, "bytes_committed": 4096,
+      "translate_cost": "not_separately_measured"
     })");
     Json actual_cache = report["cache"];
     // The envelope version is the header's constant: the golden only pins that it is a number.
@@ -349,6 +355,7 @@ TEST_CASE("disabled attribution reports nothing as zero", "[report][schema2]") {
     CHECK(attribution["complete"].is_null());
     CHECK(attribution["threshold_ns"].is_null());
     CHECK(attribution["lost_events"].is_null());
+    CHECK(attribution["dropped_boundaries"].is_null());
     CHECK(attribution["unknown_wall_fraction"].is_null());
     CHECK(attribution["long_frames"].empty());
 
@@ -376,6 +383,8 @@ TEST_CASE("disabled attribution reports nothing as zero", "[report][schema2]") {
     CHECK(report["cache"]["files"].empty());
     CHECK(report["cache"]["recorded"].is_null());
     CHECK(report["cache"]["write_status"].is_null());
+    CHECK(report["cache"]["evicted"].is_null());
+    CHECK(report["cache"]["translate_cost"].is_null());
 }
 
 TEST_CASE("first 120 s: before the first present and at the window edge", "[report][schema2]") {

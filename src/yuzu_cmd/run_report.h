@@ -61,7 +61,8 @@ void SetTitleId(u64 program_id);
 //
 //   "schema_version": 2
 //   "attribution": { "source": "host_present_submission", "threshold_ns", "enabled", "complete",
-//       "lost_events", "sink_write_errors", "rejected_presents", "unknown_wall_fraction",
+//       "lost_events", "dropped_boundaries", "sink_write_errors", "rejected_presents",
+//       "unknown_wall_fraction",
 //       "unknown_primary_frame_fraction", "producer_unknown_wait_ns",
 //       "long_frames": [LongFrame...] }
 //   LongFrame: { "id", "start_ns", "end_ns", "duration_ns", "cause_ns": {<cause>: ns...},
@@ -78,7 +79,9 @@ void SetTitleId(u64 program_id);
 //   "cache": { "identity": {...}, "files": [{"kind", "status": "accepted"|"rejected"|"missing",
 //       "reason", "expected", "found", "records"}...], "recorded", "prepared", "adopted",
 //       "demand_promoted", "demand_wait_ns", "prepare_failures", "records_skipped",
-//       "write_status", "queue_high_water", "memory_high_water_bytes", "budget_pauses" }
+//       "write_status", "queue_high_water", "memory_high_water_bytes", "budget_pauses",
+//       "evicted", "checkpoints", "bytes_committed", "translate_cost" (the text
+//       "not_separately_measured": translation is timed inside the build of a record) }
 // <cause> is a Nx2Spikes::CauseName, <event> an Event name, "reason" a RejectReasonName.
 namespace Schema2 {
 

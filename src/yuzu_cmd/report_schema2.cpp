@@ -281,6 +281,7 @@ std::string AttributionJsonHead(const Spikes::AttributionSnapshot& snapshot) {
     json["enabled"] = enabled;
     json["complete"] = enabled ? Json(snapshot.complete) : Json(nullptr);
     json["lost_events"] = enabled ? Json(snapshot.lost_events) : Json(nullptr);
+    json["dropped_boundaries"] = enabled ? Json(snapshot.dropped_boundaries) : Json(nullptr);
     json["sink_write_errors"] = enabled ? Json(snapshot.sink_write_errors) : Json(nullptr);
     json["rejected_presents"] = enabled ? Json(snapshot.rejected_presents) : Json(nullptr);
     json["unknown_wall_fraction"] =
@@ -373,6 +374,11 @@ std::string CacheJson(const Envelope::CacheReport& report) {
     json["queue_high_water"] = number(stats.queue_high_water);
     json["memory_high_water_bytes"] = number(stats.memory_high_water_bytes);
     json["budget_pauses"] = number(stats.budget_pauses);
+    json["evicted"] = number(stats.evicted);
+    json["checkpoints"] = number(stats.checkpoints);
+    json["bytes_committed"] = number(stats.bytes_committed);
+    // Translation is timed inside the build of a record (build_cost_us), never on its own.
+    json["translate_cost"] = reported ? Json("not_separately_measured") : Json(nullptr);
     return Dump(json);
 }
 
