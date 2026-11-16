@@ -2400,7 +2400,10 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
             return true;
         }
     }
-    {
+    // Pages no image was ever registered on hold no image or stale page to update, as in
+    // GetFlushArea, so the texture cache's lock (held by the back through each draw) is not
+    // waited for there.
+    if (texture_cache.page_filter.Any(addr, size)) {
         const auto lock_start = spikes ? SpikeClock::now() : SpikeClock::time_point{};
         std::scoped_lock lock{texture_cache.mutex};
         if (spikes) {
