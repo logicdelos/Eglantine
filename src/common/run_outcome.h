@@ -32,6 +32,7 @@ enum class Reason : u32 {
     ShaderFailure, // a pipeline the game cannot go without failed to build
     GuestCrash,    // the game broke, or hit a fatal error
     DeviceLost,    // the Vulkan device was lost
+    HostCrash,     // the emulator itself crashed (written by the crash handler, never requested)
     BadArguments,  // set by the frontend, never requested
     ReportIoError, // set by the frontend, never requested
 };
@@ -91,5 +92,24 @@ void NoteFrame() noexcept;
 /// Makes SIGINT and SIGTERM (and Ctrl+Break on Windows) request a stop. The handlers only set a
 /// flag, which StopRequested converts. Call after anything that installs handlers of its own.
 void InstallSignalHandlers();
+
+/// Frames presented since Begin, counted whether or not there is a frame limit.
+[[nodiscard]] u64 FramesPresented() noexcept;
+
+// A crash of the emulator itself. The crash handlers (common/windows/crash_handler.cpp) call these
+// two from an exception filter or a signal handler: no allocation, no lock, nothing that waits.
+
+/// Writes the report of a crash. The frontend gives the writer; it was prepared before the run
+/// (open file, text already formatted) and gets the one-line detail of the crash.
+using CrashReportWriter = void (*)(std::string_view detail) noexcept;
+void SetCrashReportWriter(CrashReportWriter writer) noexcept;
+
+/// The first call hands `detail` to the writer; later calls (a second crashing thread) do nothing.
+void ReportHostCrash(std::string_view detail) noexcept;
+
+/// Ends the process with ExitCode(Reason::HostCrash), without unwinding or running the exit
+/// handlers, when this is an unattended run or a report is prepared. Returns otherwise, and the
+/// crash takes its usual course.
+void ExitAfterHostCrash() noexcept;
 
 } // namespace Common::RunOutcome

@@ -16,6 +16,7 @@
 #include <dbghelp.h>
 
 #include "common/logging.h"
+#include "common/run_outcome.h"
 #include "common/windows/crash_handler.h"
 
 #define LOG_CRASH(...) ::Common::Log::FmtCrashMessage(__FILE__, __LINE__, __func__, __VA_ARGS__)
@@ -89,6 +90,23 @@ void Report(EXCEPTION_POINTERS* pointers, const char* fail_fast) {
         LocalFree(description);
     }
 
+    // The run report of an unattended run goes first: the log and the dump below can block.
+    {
+        char detail[1536];
+        if (!fail_fast) {
+            const EXCEPTION_RECORD& record = *pointers->ExceptionRecord;
+            const CodeAddress at = Locate(fault);
+            std::snprintf(detail, sizeof(detail),
+                          "unhandled exception 0x%08lX at %s+0x%llx on thread %lu \"%s\"; stack:%s",
+                          static_cast<unsigned long>(record.ExceptionCode), at.module, at.offset,
+                          static_cast<unsigned long>(GetCurrentThreadId()), thread_name, stack);
+        } else {
+            std::snprintf(detail, sizeof(detail), "%s on thread %lu \"%s\"; stack:%s", fail_fast,
+                          static_cast<unsigned long>(GetCurrentThreadId()), thread_name, stack);
+        }
+        Common::RunOutcome::ReportHostCrash(detail);
+    }
+
     if (!fail_fast) {
         const EXCEPTION_RECORD& record = *pointers->ExceptionRecord;
         const CodeAddress at = Locate(fault);
@@ -150,6 +168,8 @@ bool BeginReport() {
 LONG WINAPI OnUnhandledException(EXCEPTION_POINTERS* pointers) {
     if (BeginReport()) {
         Report(pointers, nullptr);
+        // An unattended run leaves with the host-crash code; any other run takes its usual course.
+        Common::RunOutcome::ExitAfterHostCrash();
     }
     return previous_filter ? previous_filter(pointers) : EXCEPTION_CONTINUE_SEARCH;
 }
@@ -159,6 +179,7 @@ LONG WINAPI OnUnhandledException(EXCEPTION_POINTERS* pointers) {
 void OnAbort(int) {
     if (BeginReport()) {
         ReportFailFast("abort()", _ReturnAddress());
+        Common::RunOutcome::ExitAfterHostCrash();
     }
 }
 
@@ -168,6 +189,7 @@ void OnInvalidParameter(const wchar_t* expression, const wchar_t* function, cons
                         unsigned int line, std::uintptr_t reserved) {
     if (BeginReport()) {
         ReportFailFast("CRT invalid-parameter failure", _ReturnAddress());
+        Common::RunOutcome::ExitAfterHostCrash();
     }
     // What the C runtime does without a handler.
     _invoke_watson(expression, function, file, line, reserved);

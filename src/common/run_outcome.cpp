@@ -16,6 +16,12 @@
 
 #include "common/thread.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
+
 namespace Common::RunOutcome {
 
 namespace {
@@ -52,6 +58,8 @@ std::atomic<u64> frames_seen{};
 /// 0 when there is no frame limit.
 std::atomic<u64> frame_target{};
 std::atomic<u32> reason_bits{static_cast<u32>(Reason::None)};
+std::atomic<CrashReportWriter> crash_writer{};
+std::atomic_flag crash_reported;
 std::stop_source& GetStopSource() {
     static auto* source = new std::stop_source;
     return *source;
@@ -98,10 +106,12 @@ constexpr u32 Rank(Reason reason) noexcept {
         return 7;
     case Reason::DeviceLost:
         return 8;
-    case Reason::BadArguments:
+    case Reason::HostCrash:
         return 9;
-    case Reason::ReportIoError:
+    case Reason::BadArguments:
         return 10;
+    case Reason::ReportIoError:
+        return 11;
     }
     return 0;
 }
@@ -185,6 +195,8 @@ std::string_view ReasonName(Reason reason) noexcept {
         return "device_lost";
     case Reason::BadArguments:
         return "bad_arguments";
+    case Reason::HostCrash:
+        return "host_crash";
     case Reason::ReportIoError:
         return "report_io_error";
     }
@@ -213,6 +225,8 @@ int ExitCode(Reason reason) noexcept {
         return 70;
     case Reason::DeviceLost:
         return 71;
+    case Reason::HostCrash:
+        return 73;
     case Reason::BadArguments:
         return 64;
     case Reason::ReportIoError:
@@ -296,13 +310,18 @@ std::stop_token StopToken() noexcept {
 }
 
 void NoteFrame() noexcept {
-    const u64 target = frame_target.load(std::memory_order_relaxed);
-    if (target == 0 || stop.load(std::memory_order_relaxed)) {
+    if (!active.load(std::memory_order_relaxed)) {
         return;
     }
-    if (frames_seen.fetch_add(1, std::memory_order_relaxed) + 1 >= target) {
+    const u64 seen = frames_seen.fetch_add(1, std::memory_order_relaxed) + 1;
+    const u64 target = frame_target.load(std::memory_order_relaxed);
+    if (target != 0 && seen >= target && !stop.load(std::memory_order_relaxed)) {
         Request(Reason::FrameLimit, "the --run-frames limit was reached");
     }
+}
+
+u64 FramesPresented() noexcept {
+    return frames_seen.load(std::memory_order_relaxed);
 }
 
 Reason CurrentReason() noexcept {
@@ -319,6 +338,33 @@ void InstallSignalHandlers() {
     std::signal(SIGTERM, OnSignal);
 #ifdef SIGBREAK
     std::signal(SIGBREAK, OnSignal);
+#endif
+}
+
+void SetCrashReportWriter(CrashReportWriter writer) noexcept {
+    crash_writer.store(writer, std::memory_order_release);
+}
+
+void ReportHostCrash(std::string_view detail) noexcept {
+    if (crash_reported.test_and_set(std::memory_order_acq_rel)) {
+        return;
+    }
+    if (const CrashReportWriter writer = crash_writer.load(std::memory_order_acquire)) {
+        writer(detail);
+    }
+}
+
+void ExitAfterHostCrash() noexcept {
+    if (!active.load(std::memory_order_acquire) &&
+        crash_writer.load(std::memory_order_acquire) == nullptr) {
+        return;
+    }
+    const int code = ExitCode(Reason::HostCrash);
+#ifdef _WIN32
+    // Not exit(): the crashed process may hold the loader lock or a CRT lock.
+    TerminateProcess(GetCurrentProcess(), static_cast<UINT>(code));
+#else
+    _exit(code);
 #endif
 }
 
