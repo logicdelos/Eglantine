@@ -1028,27 +1028,33 @@ extern "C" SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
         state->emu_window->OnEvent(*event);
     return SDL_APP_CONTINUE;
 }
-// How an unattended run ended: the reason on record (or the one the frontend can tell), the exit
-// code, and the report. Returns the exit code the process must leave with.
-static int EndUnattendedRun(SDL_AppResult result) {
+// Records why an unattended run is leaving when nothing asked for a stop (the window was closed,
+// the game asked for a restart, the game did not start).
+static void RecordFallbackReason(SDL_AppResult result) {
+    using Common::RunOutcome::Reason;
+    if (Common::RunOutcome::CurrentReason() != Reason::None) {
+        return;
+    }
+    if (restart_requested) {
+        Common::RunOutcome::Request(Reason::Restart, "the game asked to be restarted");
+    } else if (result == SDL_APP_FAILURE) {
+        Common::RunOutcome::Request(Reason::StartupError, "the game did not start");
+    } else {
+        Common::RunOutcome::Request(Reason::WindowClosed, "the window was closed");
+    }
+}
+
+// How an unattended run ended: the reason on record, the exit code, and the report. Returns the
+// exit code the process must leave with.
+static int EndUnattendedRun() {
     using Common::RunOutcome::Reason;
     Common::RunOutcome::Finish();
     Reason reason = Common::RunOutcome::CurrentReason();
     std::string detail = Common::RunOutcome::Detail();
     if (reason == Reason::None) {
-        if (startup_reason != Reason::None) {
-            reason = startup_reason;
-            detail = startup_detail;
-        } else if (restart_requested) {
-            reason = Reason::Restart;
-            detail = "the game asked to be restarted";
-        } else if (result == SDL_APP_FAILURE) {
-            reason = Reason::StartupError;
-            detail = "the game did not start";
-        } else {
-            reason = Reason::WindowClosed;
-            detail = "the window was closed";
-        }
+        // The run never began: bad arguments, or a report that cannot be written.
+        reason = startup_reason;
+        detail = startup_detail;
     }
     int code = Common::RunOutcome::ExitCode(reason);
     if (!RunReport::Publish(reason, code, true, detail)) {
@@ -1061,6 +1067,11 @@ extern "C" void SDL_AppQuit(void *appstate, SDL_AppResult result) {
     SdlState *state = (SdlState *)appstate;
     if (!state) {
         return;
+    }
+    if (Common::RunOutcome::Active()) {
+        // Before the teardown below, which can stall: the stop is on record, so the run clock's
+        // grace period covers the teardown, and a deadline reached meanwhile does not rename it.
+        RecordFallbackReason(result);
     }
 #ifdef YUZU_ENABLE_MCP
     state->mcp_server.reset(); // stops serving before the system goes away
@@ -1080,7 +1091,7 @@ extern "C" void SDL_AppQuit(void *appstate, SDL_AppResult result) {
         Network::Shutdown();
     }
     if (Common::RunOutcome::Active() || startup_reason != Common::RunOutcome::Reason::None) {
-        const int code = EndUnattendedRun(result);
+        const int code = EndUnattendedRun();
         if (code != (result == SDL_APP_FAILURE ? 1 : 0)) {
             // SDL maps SDL_APP_SUCCESS to 0 and SDL_APP_FAILURE to 1; leave with the real code.
             SDL_Quit();
