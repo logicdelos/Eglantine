@@ -859,14 +859,15 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
         const char* value = std::getenv("EDEN_NX2_ASTC_FLUSH");
         return value == nullptr || value[0] != '0';
     }();
-    if (!target.wait) {
-        return;
-    }
+    // wait is false when the caller records the next pass into the same submit
+    // (EDEN_NX2_ASTC_ONE_SUBMIT=1): the decode is still counted, with no wait.
     const auto start = std::chrono::steady_clock::now();
-    if (flush_only) {
-        scheduler.Flush();
-    } else {
-        scheduler.Finish();
+    if (target.wait) {
+        if (flush_only) {
+            scheduler.Flush();
+        } else {
+            scheduler.Finish();
+        }
     }
     const auto end = std::chrono::steady_clock::now();
     static u32 decodes{};
@@ -878,7 +879,7 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
         LOG_INFO(Render_Vulkan, "ASTC GPU decodes: {} in {} ms, {} ms waiting ({})", decodes,
                  std::chrono::duration_cast<std::chrono::milliseconds>(end - window_start).count(),
                  std::chrono::duration_cast<std::chrono::milliseconds>(waited).count(),
-                 flush_only ? "flush" : "finish");
+                 !target.wait ? "same submit" : (flush_only ? "flush" : "finish"));
         decodes = 0;
         waited = {};
         window_start = end;
