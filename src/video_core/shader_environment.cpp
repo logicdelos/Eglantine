@@ -17,9 +17,14 @@
 #include <cstring>
 #include <string>
 #include <fstream>
+#include <istream>
 #include <memory>
 #include <optional>
+#include <ostream>
+#include <span>
+#include <streambuf>
 #include <utility>
+#include <vector>
 
 #include "common/assert.h"
 #include "common/cityhash.h"
@@ -1072,80 +1077,160 @@ u32 ComputeEnvironment::ReadViewportTransformState() {
     return viewport_transform_state;
 }
 
+namespace {
+
+/// The bytes left in the stream from its current position; a stream that cannot seek is bounded
+/// by the largest record instead.
+u64 RemainingBytes(std::istream& stream) {
+    const auto here = stream.tellg();
+    if (here != std::istream::pos_type(-1)) {
+        stream.seekg(0, std::ios_base::end);
+        const auto end = stream.tellg();
+        stream.seekg(here);
+        if (stream && end >= here) {
+            return static_cast<u64>(end - here);
+        }
+    }
+    return CacheEnvelope::MaxRecordBytes;
+}
+
+/// Reads a serialized environment. Every count read is checked against the bytes that remain
+/// before it sizes an allocation, and every read against what is left, so a corrupt or malicious
+/// file ends in an exception, not in an allocation or an out-of-bounds read.
+class BoundedReader {
+public:
+    explicit BoundedReader(std::istream& stream_)
+        : stream{stream_}, remaining{RemainingBytes(stream_)}, unclaimed{remaining} {}
+
+    template <typename T>
+    T Read() {
+        T value;
+        ReadBytes(&value, sizeof(value));
+        return value;
+    }
+
+    void ReadBytes(void* data, u64 size) {
+        if (size > remaining) {
+            Corrupt("environment is longer than its record");
+        }
+        if (size == 0) {
+            return;
+        }
+        stream.read(static_cast<char*>(data), static_cast<std::streamsize>(size));
+        if (!stream) {
+            Corrupt("environment ends early");
+        }
+        remaining -= size;
+    }
+
+    /// Accounts for `count` entries of `entry_bytes` each that are about to be read; all of the
+    /// claims together cannot pass the bytes that remain.
+    void Claim(u64 count, u64 entry_bytes) {
+        if (count > unclaimed / entry_bytes) {
+            Corrupt("environment table is longer than its record");
+        }
+        unclaimed -= count * entry_bytes;
+    }
+
+    [[noreturn]] static void Corrupt(const char* what) {
+        throw std::ios_base::failure(what);
+    }
+
+private:
+    std::istream& stream;
+    u64 remaining;
+    u64 unclaimed;
+};
+
+} // Anonymous namespace
+
 void FileEnvironment::Deserialize(std::istream& file, bool with_mesh_state) {
-    u64 code_size{};
-    u64 num_texture_types{};
-    u64 num_texture_pixel_formats{};
-    u64 num_cbuf_values{};
-    u64 num_storage_pointer_types{};
-    u64 num_cbuf_replacement_values{};
-    file.read(reinterpret_cast<char*>(&code_size), sizeof(code_size))
-        .read(reinterpret_cast<char*>(&num_texture_types), sizeof(num_texture_types))
-        .read(reinterpret_cast<char*>(&num_texture_pixel_formats),
-              sizeof(num_texture_pixel_formats))
-        .read(reinterpret_cast<char*>(&num_cbuf_values), sizeof(num_cbuf_values))
-        .read(reinterpret_cast<char*>(&num_storage_pointer_types),
-              sizeof(num_storage_pointer_types))
-        .read(reinterpret_cast<char*>(&num_cbuf_replacement_values),
-              sizeof(num_cbuf_replacement_values))
-        .read(reinterpret_cast<char*>(&local_memory_size), sizeof(local_memory_size))
-        .read(reinterpret_cast<char*>(&texture_bound), sizeof(texture_bound))
-        .read(reinterpret_cast<char*>(&start_address), sizeof(start_address))
-        .read(reinterpret_cast<char*>(&read_lowest), sizeof(read_lowest))
-        .read(reinterpret_cast<char*>(&read_highest), sizeof(read_highest))
-        .read(reinterpret_cast<char*>(&viewport_transform_state), sizeof(viewport_transform_state))
-        .read(reinterpret_cast<char*>(&stage), sizeof(stage));
-    code.resize(Common::DivCeil(code_size, sizeof(u64)));
-    file.read(reinterpret_cast<char*>(code.data()), code_size);
-    for (size_t i = 0; i < num_texture_types; ++i) {
-        u32 key;
-        Shader::TextureType type;
-        file.read(reinterpret_cast<char*>(&key), sizeof(key))
-            .read(reinterpret_cast<char*>(&type), sizeof(type));
-        texture_types.emplace(key, type);
+    static_assert(sizeof(Shader::TextureType) == sizeof(u32));
+    static_assert(sizeof(Shader::TexturePixelFormat) == sizeof(u32));
+    static_assert(sizeof(Shader::ReplaceConstant) == sizeof(u32));
+    BoundedReader in{file};
+    const u64 code_size = in.Read<u64>();
+    const u64 num_texture_types = in.Read<u64>();
+    const u64 num_texture_pixel_formats = in.Read<u64>();
+    const u64 num_cbuf_values = in.Read<u64>();
+    const u64 num_storage_pointer_types = in.Read<u64>();
+    const u64 num_cbuf_replacement_values = in.Read<u64>();
+    local_memory_size = in.Read<u32>();
+    texture_bound = in.Read<u32>();
+    start_address = in.Read<u32>();
+    read_lowest = in.Read<u32>();
+    read_highest = in.Read<u32>();
+    viewport_transform_state = in.Read<u32>();
+    const u32 stage_value = in.Read<u32>();
+    if (stage_value > static_cast<u32>(Shader::Stage::Mesh)) {
+        BoundedReader::Corrupt("unknown shader stage");
     }
-    for (size_t i = 0; i < num_texture_pixel_formats; ++i) {
-        u32 key;
-        Shader::TexturePixelFormat format;
-        file.read(reinterpret_cast<char*>(&key), sizeof(key))
-            .read(reinterpret_cast<char*>(&format), sizeof(format));
-        texture_pixel_formats.emplace(key, format);
+    stage = static_cast<Shader::Stage>(stage_value);
+
+    in.Claim(code_size, 1);
+    in.Claim(num_texture_types, sizeof(u32) + sizeof(u32));
+    in.Claim(num_texture_pixel_formats, sizeof(u32) + sizeof(u32));
+    in.Claim(num_cbuf_values, sizeof(u64) + sizeof(u32));
+    in.Claim(num_storage_pointer_types, sizeof(u64) + sizeof(u8));
+    in.Claim(num_cbuf_replacement_values, sizeof(u64) + sizeof(u32));
+
+    code.assign(static_cast<size_t>(Common::DivCeil(code_size, sizeof(u64))), 0);
+    in.ReadBytes(code.data(), code_size);
+    // Every instruction the shader may read lies in the code that was stored.
+    if (read_highest < read_lowest || (read_highest - read_lowest) / sizeof(u64) >= code.size()) {
+        BoundedReader::Corrupt("environment code range does not match its code");
     }
-    for (size_t i = 0; i < num_cbuf_values; ++i) {
-        u64 key;
-        u32 value;
-        file.read(reinterpret_cast<char*>(&key), sizeof(key))
-            .read(reinterpret_cast<char*>(&value), sizeof(value));
-        cbuf_values.emplace(key, value);
+
+    texture_types.reserve(static_cast<size_t>(num_texture_types));
+    for (u64 i = 0; i < num_texture_types; ++i) {
+        const u32 key = in.Read<u32>();
+        const u32 type = in.Read<u32>();
+        if (type >= Shader::NUM_TEXTURE_TYPES) {
+            BoundedReader::Corrupt("unknown texture type");
+        }
+        texture_types.emplace(key, static_cast<Shader::TextureType>(type));
     }
-    for (size_t i = 0; i < num_storage_pointer_types; ++i) {
-        u64 key;
-        u8 value;
-        file.read(reinterpret_cast<char*>(&key), sizeof(key))
-            .read(reinterpret_cast<char*>(&value), sizeof(value));
-        storage_pointer_types.emplace(key, value);
+    texture_pixel_formats.reserve(static_cast<size_t>(num_texture_pixel_formats));
+    for (u64 i = 0; i < num_texture_pixel_formats; ++i) {
+        const u32 key = in.Read<u32>();
+        const u32 format = in.Read<u32>();
+        if (format >= VideoCore::Surface::MaxPixelFormat) {
+            BoundedReader::Corrupt("unknown pixel format");
+        }
+        texture_pixel_formats.emplace(key, static_cast<Shader::TexturePixelFormat>(format));
     }
-    for (size_t i = 0; i < num_cbuf_replacement_values; ++i) {
-        u64 key;
-        Shader::ReplaceConstant value;
-        file.read(reinterpret_cast<char*>(&key), sizeof(key))
-            .read(reinterpret_cast<char*>(&value), sizeof(value));
-        cbuf_replacements.emplace(key, value);
+    cbuf_values.reserve(static_cast<size_t>(num_cbuf_values));
+    for (u64 i = 0; i < num_cbuf_values; ++i) {
+        const u64 key = in.Read<u64>();
+        cbuf_values.emplace(key, in.Read<u32>());
+    }
+    storage_pointer_types.reserve(static_cast<size_t>(num_storage_pointer_types));
+    for (u64 i = 0; i < num_storage_pointer_types; ++i) {
+        const u64 key = in.Read<u64>();
+        storage_pointer_types.emplace(key, in.Read<u8>());
+    }
+    cbuf_replacements.reserve(static_cast<size_t>(num_cbuf_replacement_values));
+    for (u64 i = 0; i < num_cbuf_replacement_values; ++i) {
+        const u64 key = in.Read<u64>();
+        const u32 value = in.Read<u32>();
+        if (value > static_cast<u32>(Shader::ReplaceConstant::DrawID)) {
+            BoundedReader::Corrupt("unknown replacement constant");
+        }
+        cbuf_replacements.emplace(key, static_cast<Shader::ReplaceConstant>(value));
     }
     if (stage == Shader::Stage::Compute) {
-        file.read(reinterpret_cast<char*>(&workgroup_size), sizeof(workgroup_size))
-            .read(reinterpret_cast<char*>(&shared_memory_size), sizeof(shared_memory_size));
+        in.ReadBytes(&workgroup_size, sizeof(workgroup_size));
+        shared_memory_size = in.Read<u32>();
         initial_offset = Shader::Ampere::HasNativeAddressMap(code) ? sizeof(sph) : 0;
     } else {
-        file.read(reinterpret_cast<char*>(&sph), sizeof(sph));
+        in.ReadBytes(&sph, sizeof(sph));
         initial_offset = sizeof(sph);
         if (stage == Shader::Stage::Geometry) {
-            file.read(reinterpret_cast<char*>(&gp_passthrough_mask), sizeof(gp_passthrough_mask));
+            in.ReadBytes(&gp_passthrough_mask, sizeof(gp_passthrough_mask));
         }
         if (with_mesh_state && (stage == Shader::Stage::Task || stage == Shader::Stage::Mesh)) {
-            file.read(reinterpret_cast<char*>(&mesh_registers), sizeof(mesh_registers))
-                .read(reinterpret_cast<char*>(&mesh_primitive_header),
-                      sizeof(mesh_primitive_header));
+            in.ReadBytes(&mesh_registers, sizeof(mesh_registers));
+            in.ReadBytes(&mesh_primitive_header, sizeof(mesh_primitive_header));
         }
     }
     // Native programs fold bank 1 reads as they did when they were built.
@@ -1370,6 +1455,9 @@ void LoadPipelines(
         const auto record_begin{file.tellg()};
         u32 num_envs{};
         file.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
+        if (num_envs == 0 || num_envs > CacheEnvelope::MaxEnvsPerRecord) {
+            throw std::ios_base::failure("Invalid environment count in pipeline record");
+        }
         std::vector<FileEnvironment> envs(num_envs);
         for (FileEnvironment& env : envs) {
             env.Deserialize(file, with_mesh_state);
@@ -1431,6 +1519,152 @@ void RewritePipelines(const std::filesystem::path& filename, u32 cache_version, 
     if (!std::filesystem::exists(filename, error) && std::filesystem::exists(backup, error)) {
         std::filesystem::rename(backup, filename, error);
     }
+}
+
+namespace {
+
+/// Appends to a byte vector as if it were an output stream.
+class VectorBuffer final : public std::streambuf {
+public:
+    explicit VectorBuffer(std::vector<u8>& bytes_) : bytes{bytes_} {}
+
+protected:
+    std::streamsize xsputn(const char* data, std::streamsize count) override {
+        const auto* const first = reinterpret_cast<const u8*>(data);
+        bytes.insert(bytes.end(), first, first + count);
+        return count;
+    }
+
+    int_type overflow(int_type ch) override {
+        if (!traits_type::eq_int_type(ch, traits_type::eof())) {
+            bytes.push_back(static_cast<u8>(ch));
+        }
+        return traits_type::not_eof(ch);
+    }
+
+private:
+    std::vector<u8>& bytes;
+};
+
+/// Reads a byte span as if it were an input stream; supports the seeks the environment reader
+/// uses to learn how many bytes remain.
+class SpanBuffer final : public std::streambuf {
+public:
+    explicit SpanBuffer(std::span<const u8> bytes) {
+        auto* const first = const_cast<char*>(reinterpret_cast<const char*>(bytes.data()));
+        setg(first, first, first + bytes.size());
+    }
+
+protected:
+    pos_type seekoff(off_type offset, std::ios_base::seekdir dir,
+                     std::ios_base::openmode which) override {
+        if ((which & std::ios_base::in) == 0) {
+            return pos_type(off_type(-1));
+        }
+        off_type base = 0;
+        if (dir == std::ios_base::cur) {
+            base = gptr() - eback();
+        } else if (dir == std::ios_base::end) {
+            base = egptr() - eback();
+        }
+        return seekpos(pos_type(base + offset), which);
+    }
+
+    pos_type seekpos(pos_type position, std::ios_base::openmode which) override {
+        const off_type target = off_type(position);
+        if ((which & std::ios_base::in) == 0 || target < 0 || target > egptr() - eback()) {
+            return pos_type(off_type(-1));
+        }
+        setg(eback(), eback() + target, egptr());
+        return position;
+    }
+};
+
+void PutU32(std::vector<u8>& out, u32 value) {
+    const auto* const bytes = reinterpret_cast<const u8*>(&value);
+    out.insert(out.end(), bytes, bytes + sizeof(value));
+}
+
+} // Anonymous namespace
+
+bool EncodePipelineRecord(std::span<const u8> key, std::span<const GenericEnvironment* const> envs,
+                          bool with_mesh_state, std::vector<u8>& out) {
+    if (envs.empty() || envs.size() > CacheEnvelope::MaxEnvsPerRecord) {
+        return false;
+    }
+    for (const GenericEnvironment* const env : envs) {
+        if (env == nullptr || !env->CanBeSerialized()) {
+            return false;
+        }
+    }
+    std::vector<u8> payload;
+    PutU32(payload, static_cast<u32>(envs.size()));
+    VectorBuffer buffer{payload};
+    std::ostream stream{&buffer};
+    for (const GenericEnvironment* const env : envs) {
+        const size_t length_at = payload.size();
+        PutU32(payload, 0);
+        env->Serialize(stream, with_mesh_state);
+        const size_t length = payload.size() - length_at - sizeof(u32);
+        if (!stream || length > CacheEnvelope::MaxRecordBytes) {
+            return false;
+        }
+        const u32 stored = static_cast<u32>(length);
+        std::memcpy(payload.data() + length_at, &stored, sizeof(stored));
+    }
+    PutU32(payload, static_cast<u32>(key.size()));
+    payload.insert(payload.end(), key.begin(), key.end());
+    if (payload.size() > CacheEnvelope::MaxRecordBytes) {
+        return false;
+    }
+    out = std::move(payload);
+    return true;
+}
+
+CacheEnvelope::RejectReason DecodePipelineRecord(std::span<const u8> payload, bool with_mesh_state,
+                                                 PipelineRecord& out) {
+    constexpr auto bad = CacheEnvelope::RejectReason::BadRecord;
+    size_t position = 0;
+    const auto take_u32 = [&](u32& value) {
+        if (payload.size() - position < sizeof(u32)) {
+            return false;
+        }
+        std::memcpy(&value, payload.data() + position, sizeof(value));
+        position += sizeof(value);
+        return true;
+    };
+    u32 env_count{};
+    if (!take_u32(env_count) || env_count == 0 || env_count > CacheEnvelope::MaxEnvsPerRecord) {
+        return bad;
+    }
+    PipelineRecord record;
+    try {
+        record.envs.resize(env_count);
+        for (FileEnvironment& env : record.envs) {
+            u32 length{};
+            if (!take_u32(length) || length > payload.size() - position) {
+                return bad;
+            }
+            SpanBuffer buffer{payload.subspan(position, length)};
+            std::istream stream{&buffer};
+            env.Deserialize(stream, with_mesh_state);
+            // The environment must use its bytes exactly.
+            if (stream.peek() != std::char_traits<char>::eof()) {
+                return bad;
+            }
+            position += length;
+        }
+    } catch (const std::exception&) {
+        return bad;
+    }
+    u32 key_length{};
+    if (!take_u32(key_length) || key_length != payload.size() - position) {
+        return bad;
+    }
+    record.key.assign(payload.begin() + static_cast<std::ptrdiff_t>(position), payload.end());
+    record.is_compute = record.envs.front().ShaderStage() == Shader::Stage::Compute;
+    out = std::move(record);
+    return CacheEnvelope::RejectReason::None;
 }
 
 } // namespace VideoCommon
