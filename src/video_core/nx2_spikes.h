@@ -641,4 +641,20 @@ void SetLongFrameSink(LongFrameSink sink);
 /// CauseNames order, as <name>_ms).
 [[nodiscard]] std::string LongFrameLine(const LongFrame& frame);
 
+/// Crash-path status: relaxed atomic loads only, no allocation, no lock. Valid at any time (zeros
+/// before the first session).
+struct CrashStatus {
+    bool session_active{};
+    bool complete{}; ///< Same meaning as AttributionSnapshot::complete, computed so far
+    u64 threshold_ns{};
+    u64 lost_events{};
+    u64 frames{};
+    u64 long_frames{};
+    u64 first_host_present_ns{};
+    u64 last_host_present_ns{};
+    u64 last_long_frame_id{}; ///< 0: none yet
+    u64 last_long_frame_ns{}; ///< Duration of that frame
+};
+[[nodiscard]] CrashStatus ReadCrashStatus() noexcept;
+
 } // namespace VideoCommon::Nx2Spikes
