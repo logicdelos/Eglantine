@@ -2,9 +2,22 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <span>
+#include <string>
 #include <tuple>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 #include "video_core/pipeline_prepare.h"
 
@@ -522,6 +535,34 @@ RejectReason JoinDriverBlob(
         blob.clear();
     }
     return reason;
+}
+
+u64 AvailablePhysicalMemoryBytes() {
+#ifdef _WIN32
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    if (GlobalMemoryStatusEx(&status)) {
+        return static_cast<u64>(status.ullAvailPhys);
+    }
+#elif defined(__linux__)
+    if (FILE* const file = std::fopen("/proc/meminfo", "r")) {
+        char line[256];
+        u64 kilobytes = 0;
+        bool found = false;
+        while (std::fgets(line, sizeof(line), file) != nullptr) {
+            if (std::strncmp(line, "MemAvailable:", 13) == 0) {
+                kilobytes = std::strtoull(line + 13, nullptr, 10);
+                found = true;
+                break;
+            }
+        }
+        std::fclose(file);
+        if (found) {
+            return kilobytes * 1024;
+        }
+    }
+#endif
+    return ~u64{0}; // Unknown: never pause for memory
 }
 
 } // namespace VideoCommon::PipelinePrepare

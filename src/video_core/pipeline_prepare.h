@@ -225,4 +225,8 @@ bool ForEachDriverBlobChunk(std::span<const u8> blob,
     const std::function<CacheEnvelope::RejectReason(size_t, std::vector<u8>&)>& read_record,
     const CacheEnvelope::DeviceIdentity& device, std::vector<u8>& blob);
 
+/// Physical memory available to the process now, in bytes; the maximum when the host cannot say
+/// (preparation then never pauses for memory).
+[[nodiscard]] u64 AvailablePhysicalMemoryBytes();
+
 } // namespace VideoCommon::PipelinePrepare
