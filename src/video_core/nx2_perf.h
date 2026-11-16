@@ -112,6 +112,36 @@ enum class Opt : unsigned {
     /// Switch 2 titles: a GPFIFO entry's sync bit keeps its hardware meaning (fetch ordered after
     /// Host processing) and no longer waits for the host GPU when "sync memory operations" is on
     GpSyncHost,
+    /// Pipeline driver-build and translation pools run at the host's physical cores less six,
+    /// shared by both pools (at least 2 each), once the disk cache is loaded
+    WorkerBudget,
+    /// Discrete GPU with VK_EXT_memory_budget: device memory limit = reported heap budget minus
+    /// the reserve, not 6 GiB + 1 GiB per resolution step
+    VramBudgetReported,
+    /// VK_EXT_memory_priority and VK_EXT_pageable_device_local_memory: render-target images 0.75,
+    /// everything else 0.5
+    VramPriority,
+    /// Query cache: a report whose delayed operation already ran is not rewritten by a later
+    /// partial flush
+    QueryLanded,
+    /// A macro's DMA read of guest memory first settles issued releases (AcquireIssued) whose
+    /// guest write is still pending for the range
+    DmaReadSettle,
+    /// Native uniform bank shadow: an entry is not zero-filled on insert and one entry is evicted
+    /// at the cap, not the whole map
+    UniformShadowLean,
+    /// Compute pipelines known to take tens of seconds in the driver's optimiser are built with
+    /// optimisation disabled
+    ComputeUnoptimizedSlow,
+    /// Disk cache load: a compute pipeline the driver cache does not hold is built in the
+    /// background, not waited for before the guest starts
+    ComputeBootDeferred,
+    /// Image view and sampler handles of a draw's descriptors are memoised per binding
+    DescriptorHandleMemo,
+    /// An unmet semaphore acquire suspends its channel behind the ordered fences, not the thread
+    SemaphoreFenceLean,
+    /// A draw whose image views and samplers equal the previous draw's reuses its descriptors
+    DescriptorRunReuse,
     Count,
 };
 
@@ -126,7 +156,10 @@ inline constexpr std::array<std::string_view, static_cast<size_t>(Opt::Count)> o
     "handle_page_cache", "dma_forward", "draw_begin_coalesce", "pending_wake", "diag_draw_lite",
     "shader_build_budget", "compute_rebuild_async", "compute_preload_variants", "stale_target_skip",
     "geometry_consistency", "build_order_priority", "replay_disk_recordings", "acquire_issued",
-    "image_admission", "gp_sync_host",
+    "image_admission", "gp_sync_host", "worker_budget", "vram_budget_reported", "vram_priority",
+    "query_landed", "dma_read_settle", "uniform_shadow_lean", "compute_unoptimized_slow",
+    "compute_boot_deferred", "descriptor_handle_memo", "semaphore_fence_lean",
+    "descriptor_run_reuse",
 };
 
 static_assert(static_cast<size_t>(Opt::Count) <= 64, "the off-mask is 64 bits");
@@ -159,15 +192,21 @@ inline constexpr u64 DefaultOffMask() {
                           Opt::DownloadBatch, Opt::PipelineFastCache, Opt::DrawPreamble,
                           Opt::BindMemo, Opt::SubmitWhileWaited, Opt::DmaForward,
                           Opt::BankOncePerFrame, Opt::DrawBeginCoalesce, Opt::PendingWake,
-                          Opt::DiagDrawLite}) {
+                          Opt::DiagDrawLite, Opt::WorkerBudget, Opt::VramBudgetReported,
+                          Opt::VramPriority, Opt::SemaphoreFenceLean, Opt::DescriptorRunReuse}) {
         mask |= Bit(opt);
     }
     return mask;
 }
 
+/// Off unless EDEN_NX2_PERF_ON names them: built, not yet proven by a lab run.
+inline constexpr u64 OptInMask() {
+    return Bit(Opt::SemaphoreFenceLean) | Bit(Opt::DescriptorRunReuse);
+}
+
 /// The off-mask from EDEN_NX2_PERF_SAFE (safe), EDEN_NX2_PERF_ON (on) and EDEN_NX2_PERF_OFF (off).
 inline u64 ParseOffMask(bool safe, std::string_view on, std::string_view off) {
-    u64 mask = safe ? DefaultOffMask() : u64{0};
+    u64 mask = (safe ? DefaultOffMask() : u64{0}) | OptInMask();
     while (!on.empty()) {
         const size_t comma = on.find(',');
         const std::string_view name = on.substr(0, comma);

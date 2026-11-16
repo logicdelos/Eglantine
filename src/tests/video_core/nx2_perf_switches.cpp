@@ -29,7 +29,7 @@ TEST_CASE("Nx2Perf pending_wake is on by default and off under SAFE", "[nx2_perf
     REQUIRE(!IsOff(ParseOffMask(false, "", ""), Index(Opt::PendingWake)));
     REQUIRE(IsOff(ParseOffMask(true, "", ""), Index(Opt::PendingWake)));
     REQUIRE(!IsOff(ParseOffMask(true, "pending_wake", ""), Index(Opt::PendingWake)));
-    REQUIRE(ParseOffMask(false, "", "pending_wake") == Bit(Opt::PendingWake));
+    REQUIRE(ParseOffMask(false, "", "pending_wake") == (OptInMask() | Bit(Opt::PendingWake)));
 }
 
 TEST_CASE("Nx2Perf diag_draw_lite is on by default and off under SAFE", "[nx2_perf]") {
@@ -38,7 +38,16 @@ TEST_CASE("Nx2Perf diag_draw_lite is on by default and off under SAFE", "[nx2_pe
     REQUIRE(!IsOff(ParseOffMask(false, "", ""), Index(Opt::DiagDrawLite)));
     REQUIRE(IsOff(ParseOffMask(true, "", ""), Index(Opt::DiagDrawLite)));
     REQUIRE(!IsOff(ParseOffMask(true, "diag_draw_lite", ""), Index(Opt::DiagDrawLite)));
-    REQUIRE(ParseOffMask(false, "", "diag_draw_lite") == Bit(Opt::DiagDrawLite));
+    REQUIRE(ParseOffMask(false, "", "diag_draw_lite") == (OptInMask() | Bit(Opt::DiagDrawLite)));
+}
+
+TEST_CASE("Nx2Perf opt-in switches stay off until EDEN_NX2_PERF_ON names them", "[nx2_perf]") {
+    for (const Opt opt : {Opt::SemaphoreFenceLean, Opt::DescriptorRunReuse}) {
+        REQUIRE(IsOff(ParseOffMask(false, "", ""), Index(opt)));
+        REQUIRE(IsOff(ParseOffMask(true, "", ""), Index(opt)));
+        REQUIRE(!IsOff(ParseOffMask(false, opt_names[Index(opt)], ""), Index(opt)));
+        REQUIRE(!IsOff(ParseOffMask(true, opt_names[Index(opt)], ""), Index(opt)));
+    }
 }
 
 TEST_CASE("diag_draw_lite: folded draws equal the synchronous Touch and Note calls", "[nx2_perf]") {
