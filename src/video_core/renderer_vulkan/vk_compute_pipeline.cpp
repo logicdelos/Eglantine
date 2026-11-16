@@ -26,6 +26,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
+#include "video_core/nx2_spikes.h"
 #include "video_core/shader_handle_program.h"
 #include "video_core/shader_notify.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -166,7 +167,20 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         };
         try {
             const auto build_begin = std::chrono::steady_clock::now();
-            pipeline = device.GetLogical().CreateComputePipeline(compute_ci, *pipeline_cache);
+            {
+                // The driver compiles the pipeline here. Work id: the one the dispatch waits on.
+                VideoCommon::Nx2Spikes::SpanScope build_span{
+                    VideoCommon::Nx2Spikes::Cause::Pipeline,
+                    VideoCommon::Nx2Spikes::DerivedWorkId(
+                        VideoCommon::Nx2Spikes::WorkKind::ComputePipelineBuild, shader_hash)};
+                try {
+                    pipeline =
+                        device.GetLogical().CreateComputePipeline(compute_ci, *pipeline_cache);
+                } catch (...) {
+                    build_span.Fail();
+                    throw;
+                }
+            }
             const auto elapsed = std::chrono::steady_clock::now() - build_begin;
             DriverBuildReport::Record(DriverBuildReport::Kind::Compute, elapsed);
             if (elapsed > std::chrono::seconds{5}) {
@@ -438,6 +452,15 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
             RunBuild();
             {
                 std::unique_lock lock{build_mutex};
+                const VideoCommon::Nx2Spikes::SpanScope build_wait{
+                    VideoCommon::Nx2Spikes::Cause::Waiting};
+                if (build_wait.Token().Valid()) {
+                    VideoCommon::Nx2Spikes::LinkWait(
+                        build_wait.Token(),
+                        VideoCommon::Nx2Spikes::DerivedWorkId(
+                            VideoCommon::Nx2Spikes::WorkKind::ComputePipelineBuild, shader_hash),
+                        VideoCommon::Nx2Spikes::DependencyKind::Job);
+                }
                 build_condvar.wait(lock,
                                    [this] { return is_built.load(std::memory_order::relaxed); });
             }

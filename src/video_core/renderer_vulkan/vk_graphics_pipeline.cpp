@@ -33,6 +33,7 @@
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/nx2_perf.h"
+#include "video_core/nx2_spikes.h"
 #include "video_core/shader_handle_program.h"
 #include "video_core/shader_notify.h"
 #include "video_core/texture_cache/texture_cache.h"
@@ -1005,6 +1006,15 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                 RunBuild();
                 Nx2Bottleneck::WaitScope wait{Nx2Bottleneck::Wait::ShaderBuild};
                 std::unique_lock lock{build_mutex};
+                const VideoCommon::Nx2Spikes::SpanScope build_wait{
+                    VideoCommon::Nx2Spikes::Cause::Waiting};
+                if (build_wait.Token().Valid()) {
+                    VideoCommon::Nx2Spikes::LinkWait(
+                        build_wait.Token(),
+                        VideoCommon::Nx2Spikes::DerivedWorkId(
+                            VideoCommon::Nx2Spikes::WorkKind::GraphicsPipelineBuild, key.Hash()),
+                        VideoCommon::Nx2Spikes::DependencyKind::Job);
+                }
                 build_condvar.wait(lock,
                                    [this] { return is_built.load(std::memory_order::relaxed); });
             });
@@ -1155,6 +1165,15 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             RunBuild();
             {
                 std::unique_lock lock{build_mutex};
+                const VideoCommon::Nx2Spikes::SpanScope build_wait{
+                    VideoCommon::Nx2Spikes::Cause::Waiting};
+                if (build_wait.Token().Valid()) {
+                    VideoCommon::Nx2Spikes::LinkWait(
+                        build_wait.Token(),
+                        VideoCommon::Nx2Spikes::DerivedWorkId(
+                            VideoCommon::Nx2Spikes::WorkKind::GraphicsPipelineBuild, key.Hash()),
+                        VideoCommon::Nx2Spikes::DependencyKind::Job);
+                }
                 build_condvar.wait(lock,
                                    [this] { return is_built.load(std::memory_order::relaxed); });
             }
@@ -1763,31 +1782,45 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
     }
 
     const auto build_begin = std::chrono::steady_clock::now();
-    pipeline = device.GetLogical().CreateGraphicsPipeline({
-        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = flags,
-        .stageCount = static_cast<u32>(shader_stages.size()),
-        .pStages = shader_stages.data(),
-        .pVertexInputState = mesh_emulation ? &emulation_vertex_input
-                             : is_mesh      ? nullptr
-                                            : &vertex_input_ci,
-        .pInputAssemblyState = mesh_emulation ? &emulation_input_assembly
-                               : is_mesh      ? nullptr
-                                              : &input_assembly_ci,
-        .pTessellationState = is_mesh ? nullptr : &tessellation_ci,
-        .pViewportState = &viewport_ci,
-        .pRasterizationState = &rasterization_ci,
-        .pMultisampleState = &multisample_ci,
-        .pDepthStencilState = &depth_stencil_ci,
-        .pColorBlendState = &color_blend_ci,
-        .pDynamicState = &dynamic_state_ci,
-        .layout = *pipeline_layout,
-        .renderPass = render_pass,
-        .subpass = 0,
-        .basePipelineHandle = nullptr,
-        .basePipelineIndex = 0,
-    }, *pipeline_cache);
+    {
+        // The driver compiles the pipeline here. Work id: the one the draw's wait links to.
+        VideoCommon::Nx2Spikes::SpanScope build_span{
+            VideoCommon::Nx2Spikes::Cause::Pipeline,
+            VideoCommon::Nx2Spikes::AttributionEnabled()
+                ? VideoCommon::Nx2Spikes::DerivedWorkId(
+                      VideoCommon::Nx2Spikes::WorkKind::GraphicsPipelineBuild, key.Hash())
+                : 0};
+        try {
+            pipeline = device.GetLogical().CreateGraphicsPipeline({
+                .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = flags,
+                .stageCount = static_cast<u32>(shader_stages.size()),
+                .pStages = shader_stages.data(),
+                .pVertexInputState = mesh_emulation ? &emulation_vertex_input
+                                     : is_mesh      ? nullptr
+                                                    : &vertex_input_ci,
+                .pInputAssemblyState = mesh_emulation ? &emulation_input_assembly
+                                       : is_mesh      ? nullptr
+                                                      : &input_assembly_ci,
+                .pTessellationState = is_mesh ? nullptr : &tessellation_ci,
+                .pViewportState = &viewport_ci,
+                .pRasterizationState = &rasterization_ci,
+                .pMultisampleState = &multisample_ci,
+                .pDepthStencilState = &depth_stencil_ci,
+                .pColorBlendState = &color_blend_ci,
+                .pDynamicState = &dynamic_state_ci,
+                .layout = *pipeline_layout,
+                .renderPass = render_pass,
+                .subpass = 0,
+                .basePipelineHandle = nullptr,
+                .basePipelineIndex = 0,
+            }, *pipeline_cache);
+        } catch (...) {
+            build_span.Fail();
+            throw;
+        }
+    }
     DriverBuildReport::Record(DriverBuildReport::Kind::Graphics,
                               std::chrono::steady_clock::now() - build_begin);
 
