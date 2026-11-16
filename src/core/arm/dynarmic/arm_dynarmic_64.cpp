@@ -505,6 +505,31 @@ void ArmDynarmic64::RewindBreakpointInstruction() {
     this->SetContext(m_breakpoint_context);
 }
 
+namespace {
+
+/// Commit windows shorter than this did no work (the common case is a compare that finds the
+/// code space already committed): they are not worth a span each.
+constexpr u64 MinCommitSpanNs = 5'000;
+
+/// Turns the JIT's phase callback into an attribution span. Runs on the compiling guest thread
+/// inside GetBlock, takes no lock and does not throw; one relaxed load when no session runs.
+void RecordJitPhase(Dynarmic::JitPhase phase, u64 begin_ns, u64 end_ns) {
+    namespace Spikes = VideoCommon::Nx2Spikes;
+    if (!Spikes::AttributionEnabled()) {
+        return;
+    }
+    if (phase == Dynarmic::JitPhase::MemoryCommit) {
+        if (end_ns < begin_ns || end_ns - begin_ns < MinCommitSpanNs) {
+            return;
+        }
+        Spikes::RecordSpan(Spikes::Cause::CodeTranslation, begin_ns, end_ns);
+        return;
+    }
+    Spikes::RecordSpan(Spikes::Cause::CodeTranslation, begin_ns, end_ns, 0, 1);
+}
+
+} // namespace
+
 ArmDynarmic64::ArmDynarmic64(System& system, bool uses_wall_clock, Kernel::KProcess* process, DynarmicExclusiveMonitor& exclusive_monitor, std::size_t core_index)
     : ArmInterface{uses_wall_clock}, m_system{system}, m_exclusive_monitor{exclusive_monitor}
     , m_cb(std::make_optional<DynarmicCallbacks64>(*this, process))
@@ -525,6 +550,7 @@ ArmDynarmic64::ArmDynarmic64(System& system, bool uses_wall_clock, Kernel::KProc
             Event::JitFastmemRecompile,
             [] { return u64{Dynarmic::g_jit_stats.fastmem_recompiles.load(std::memory_order_relaxed)}; },
             nullptr);
+        Dynarmic::g_jit_phase_hook.store(&RecordJitPhase, std::memory_order_relaxed);
     });
     std::call_once(bottleneck_source, [] {
         Nx2Bottleneck::SetJitSource([] {

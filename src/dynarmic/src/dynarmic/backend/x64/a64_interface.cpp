@@ -250,6 +250,17 @@ private:
         if (auto block = emitter.GetBasicBlock(descriptor))
             return block->entrypoint;
 
+        // The hook is read once per miss (a compile costs far more than this); with none set no
+        // time stamp is taken beyond the one compile_ns already needs. A hit returned above.
+        const JitPhaseHook phase_hook = g_jit_phase_hook.load(std::memory_order_relaxed);
+        const auto to_ns = [](std::chrono::steady_clock::time_point time) {
+            return std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     time.time_since_epoch())
+                                     .count());
+        };
+        const auto commit_start = phase_hook ? std::chrono::steady_clock::now()
+                                             : std::chrono::steady_clock::time_point{};
+
         constexpr size_t MINIMUM_REMAINING_CODESIZE = 1 * 1024 * 1024;
         if (block_of_code.SpaceRemaining() < MINIMUM_REMAINING_CODESIZE) {
             // Immediately evacuate cache
@@ -260,6 +271,9 @@ private:
 
         // JIT Compile
         const auto compile_start = std::chrono::steady_clock::now();
+        if (phase_hook) {
+            phase_hook(JitPhase::MemoryCommit, to_ns(commit_start), to_ns(compile_start));
+        }
         const auto get_code = [this](u64 vaddr) { return conf.callbacks->MemoryReadCode(vaddr); };
         // LocationDescriptor ctor() does important ops (like tflags) do not skip
         auto const arch_descriptor = A64::LocationDescriptor{descriptor};
@@ -267,12 +281,16 @@ private:
         A64::Translate(ir_block, arch_descriptor, get_code, {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
         Optimization::Optimize(ir_block, conf, polyfill_options);
         const CodePtr entrypoint = emitter.Emit(ir_block).entrypoint;
+        const auto compile_end = std::chrono::steady_clock::now();
         g_jit_stats.blocks_compiled.fetch_add(1, std::memory_order_relaxed);
         g_jit_stats.compile_ns.fetch_add(
-            std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                              std::chrono::steady_clock::now() - compile_start)
+            std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(compile_end -
+                                                                                compile_start)
                               .count()),
             std::memory_order_relaxed);
+        if (phase_hook) {
+            phase_hook(JitPhase::Compile, to_ns(compile_start), to_ns(compile_end));
+        }
         return entrypoint;
     }
 
