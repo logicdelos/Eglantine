@@ -3,9 +3,11 @@
 
 #pragma once
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -46,6 +48,7 @@ enum class State : u8 {
     Failed,
     Skipped,
     Cancelled,
+    Evicted, ///< Ready but unused while the ready cap held back others: released, built when drawn
 };
 
 /// What the scheduler knows of one record before reading it: the index entry.
@@ -80,6 +83,9 @@ public:
         u64 work{};  ///< Attribution id of this entry's work
         u64 epoch{}; ///< For WaitForChange
         std::shared_ptr<void> payload; ///< Build: what Loaded stored
+        /// Ready object released to make room under the ready cap (oldest unused first): the
+        /// caller destroys it, outside the scheduler's lock.
+        std::shared_ptr<void> evicted;
     };
 
     enum class LoadOutcome : u8 {
@@ -115,7 +121,9 @@ public:
     [[nodiscard]] std::vector<std::shared_ptr<void>> Cancel();
 
     // ---- workers ----
-    [[nodiscard]] Task Next(u64 generation, u64 available_ram_bytes);
+    /// `hold_builds` keeps queued records queued (a draw can still claim them) while the caller
+    /// waits out a burst of runtime compilation; loads and evictions go on.
+    [[nodiscard]] Task Next(u64 generation, u64 available_ram_bytes, bool hold_builds = false);
     void WaitForChange(u64 epoch, std::chrono::milliseconds timeout);
     LoadOutcome Loaded(EntryId id, u64 generation, u64 hash, std::span<const u8> key,
                        std::shared_ptr<void> payload, bool variants_allowed);
@@ -139,7 +147,7 @@ public:
     [[nodiscard]] bool Running() const;
     [[nodiscard]] u64 Generation() const;
     /// Fills prepared, adopted, demand_promoted, prepare_failures, queue_high_water,
-    /// memory_high_water_bytes and budget_pauses.
+    /// memory_high_water_bytes, budget_pauses and evicted.
     void FillStats(CacheEnvelope::CacheStats& stats) const;
 
 private:
@@ -153,6 +161,7 @@ private:
         std::vector<u8> key;
         std::shared_ptr<void> payload;
         std::shared_ptr<void> result;
+        u64 ready_seq{}; ///< Order in which entries became Ready (eviction: smallest first)
     };
     struct Counters {
         u64 prepared{};
@@ -162,6 +171,7 @@ private:
         u64 queue_high_water{};
         u64 memory_high_water{};
         u64 budget_pauses{};
+        u64 evicted{};
     };
 
     [[nodiscard]] bool IsCurrent(EntryId id, u64 generation, State expected) const;
@@ -194,6 +204,8 @@ private:
     u32 loading_{};
     u32 building_{};
     u32 ready_{};
+    u64 ready_seq_{};
+    std::map<u64, EntryId> ready_order_; ///< Ready entries by ready_seq
     bool ram_paused_{};
     bool paused_{};
     Counters counters_;
@@ -228,5 +240,39 @@ bool ForEachDriverBlobChunk(std::span<const u8> blob,
 /// Physical memory available to the process now, in bytes; the maximum when the host cannot say
 /// (preparation then never pauses for memory).
 [[nodiscard]] u64 AvailablePhysicalMemoryBytes();
+
+// ---- checkpoints ----
+// New records are committed as a generation of the file before the run ends, so a kill or a crash
+// loses at most the last interval. Each commit rewrites the whole file (the writer copies the
+// previous generation first), so the interval grows with the file: one second per MiB, never
+// under 20 s, which keeps the copying below about 1 MiB/s on average. The end of the first two
+// minutes of play, when most of the pipelines of a route exist, commits at once.
+
+inline constexpr u64 CheckpointMinIntervalNs = u64{20} * 1'000'000'000;
+inline constexpr u64 CheckpointNsPerByte = 1'000'000'000 / (u64{1} << 20); ///< 1 s per MiB
+inline constexpr u64 FirstWindowNs = u64{120} * 1'000'000'000;
+
+/// Whether a checkpoint is due: something is uncommitted and either the interval for a file of
+/// `committed_bytes` has passed since the last commit or `first_window_ended` (once per run).
+[[nodiscard]] constexpr bool CheckpointDue(u64 uncommitted_records, u64 since_last_commit_ns,
+                                           u64 committed_bytes, bool first_window_ended) noexcept {
+    if (uncommitted_records == 0) {
+        return false;
+    }
+    const u64 scaled = committed_bytes > ~u64{0} / CheckpointNsPerByte
+                           ? ~u64{0}
+                           : committed_bytes * CheckpointNsPerByte;
+    return first_window_ended ||
+           since_last_commit_ns >= (std::max)(CheckpointMinIntervalNs, scaled);
+}
+
+inline constexpr u32 NoRecord = ~u32{0};
+
+/// For each entry of `before`, the position of the same record (kind, length, checksum) in
+/// `after`, or NoRecord when the new generation does not hold it. A committed generation keeps
+/// the order of the one it was seeded from unless a record was dropped, so this is the identity
+/// map in the usual case; it is not assumed.
+[[nodiscard]] std::vector<u32> RemapRecords(std::span<const CacheEnvelope::IndexEntry> before,
+                                            std::span<const CacheEnvelope::IndexEntry> after);
 
 } // namespace VideoCommon::PipelinePrepare

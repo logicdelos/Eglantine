@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <span>
 #include <string>
 #include <tuple>
@@ -82,6 +83,8 @@ u64 Scheduler::Begin(std::span<const Candidate> candidates) {
     index_bytes_ = u64{candidates.size()} * sizeof(Entry);
     used_ = index_bytes_;
     loading_ = building_ = ready_ = 0;
+    ready_seq_ = 0;
+    ready_order_.clear();
     ram_paused_ = paused_ = false;
     counters_ = {};
     counters_.memory_high_water = used_;
@@ -122,6 +125,7 @@ std::vector<std::shared_ptr<void>> Scheduler::Cancel() {
         demanded_.clear();
         used_ = 0;
         loading_ = building_ = ready_ = 0;
+        ready_order_.clear();
         cursor_ = order_.size();
         Changed();
     }
@@ -184,7 +188,7 @@ bool Scheduler::RamPaused(u64 available_ram_bytes) {
     return ram_paused_;
 }
 
-Scheduler::Task Scheduler::Next(u64 generation, u64 available_ram_bytes) {
+Scheduler::Task Scheduler::Next(u64 generation, u64 available_ram_bytes, bool hold_builds) {
     std::scoped_lock lock{mutex_};
     Task task;
     task.generation = generation;
@@ -193,7 +197,7 @@ Scheduler::Task Scheduler::Next(u64 generation, u64 available_ram_bytes) {
         return task; // Done
     }
     const bool ram_low = RamPaused(available_ram_bytes);
-    const bool cap_reached = u64{ready_} + building_ >= options.ready_cap;
+    bool cap_reached = u64{ready_} + building_ >= options.ready_cap;
     bool blocked = ram_low;
     // Decode ahead first, up to the window: a decoded record is known by its key, so a draw that
     // needs it can claim it instead of building it a second time.
@@ -227,7 +231,20 @@ Scheduler::Task Scheduler::Next(u64 generation, u64 available_ram_bytes) {
         NoteInFlight();
         return task;
     }
-    if (!ram_low && !cap_reached && !queued_.empty()) {
+    if (!ram_low && !hold_builds && cap_reached && ready_ != 0 && !queued_.empty()) {
+        // Ready objects nobody has asked for would hold every remaining record back for ever:
+        // the one that became ready first is released (built again if its draw ever comes).
+        const auto oldest = ready_order_.begin();
+        Entry& victim = entries_[oldest->second];
+        ready_order_.erase(oldest);
+        Release(victim);
+        task.evicted = std::move(victim.result);
+        victim.state = State::Evicted;
+        --ready_;
+        ++counters_.evicted;
+        cap_reached = u64{ready_} + building_ >= options.ready_cap;
+    }
+    if (!ram_low && !hold_builds && !cap_reached && !queued_.empty()) {
         const EntryId id = order_[*queued_.begin()];
         queued_.erase(queued_.begin());
         Entry& entry = entries_[id];
@@ -338,6 +355,8 @@ bool Scheduler::BuildFinished(EntryId id, u64 generation, bool ok,
         Reserve(*entry, ReadyBookkeepingBytes);
         entry->result = std::move(result);
         entry->state = State::Ready;
+        entry->ready_seq = ++ready_seq_;
+        ready_order_.emplace(entry->ready_seq, id);
         ++ready_;
         ++counters_.prepared;
     } else {
@@ -367,6 +386,7 @@ Scheduler::Demand Scheduler::Request(u64 hash, std::span<const u8> key) {
         switch (entry.state) {
         case State::Ready:
             Release(entry);
+            ready_order_.erase(entry.ready_seq);
             demand.results.push_back(std::move(entry.result));
             entry.state = State::Adopted;
             --ready_;
@@ -459,6 +479,7 @@ void Scheduler::FillStats(CacheEnvelope::CacheStats& stats) const {
     stats.queue_high_water = counters_.queue_high_water;
     stats.memory_high_water_bytes = counters_.memory_high_water;
     stats.budget_pauses = counters_.budget_pauses;
+    stats.evicted = counters_.evicted;
 }
 
 bool ForEachDriverBlobChunk(std::span<const u8> blob,
@@ -490,7 +511,10 @@ RejectReason ValidateDriverBlobHeader(std::span<const u8> blob,
     if (blob.size() < HeaderSize) {
         return RejectReason::Truncated;
     }
-    if (ReadLe32(blob.data()) < HeaderSize || ReadLe32(blob.data() + 4) != HeaderVersionOne) {
+    // The header lies inside the blob: a declared size past its end is not a header of this blob.
+    const u32 declared_size = ReadLe32(blob.data());
+    if (declared_size < HeaderSize || declared_size > blob.size() ||
+        ReadLe32(blob.data() + 4) != HeaderVersionOne) {
         return RejectReason::BadRecord;
     }
     if (ReadLe32(blob.data() + 8) != device.vendor_id ||
@@ -563,6 +587,26 @@ u64 AvailablePhysicalMemoryBytes() {
     }
 #endif
     return ~u64{0}; // Unknown: never pause for memory
+}
+
+std::vector<u32> RemapRecords(std::span<const CacheEnvelope::IndexEntry> before,
+                              std::span<const CacheEnvelope::IndexEntry> after) {
+    using Identity = std::tuple<u32, u32, u64>; // kind, length, checksum: the writer's identity
+    std::map<Identity, u32> positions;
+    for (size_t i = 0; i < after.size(); ++i) {
+        positions.try_emplace(
+            Identity{static_cast<u32>(after[i].meta.kind), after[i].length, after[i].checksum},
+            static_cast<u32>(i));
+    }
+    std::vector<u32> mapped(before.size(), NoRecord);
+    for (size_t i = 0; i < before.size(); ++i) {
+        const auto found = positions.find(Identity{static_cast<u32>(before[i].meta.kind),
+                                                   before[i].length, before[i].checksum});
+        if (found != positions.end()) {
+            mapped[i] = found->second;
+        }
+    }
+    return mapped;
 }
 
 } // namespace VideoCommon::PipelinePrepare

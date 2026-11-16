@@ -135,8 +135,18 @@ TEST_CASE("The queue is built best first, however the decodes finished",
           "[video_core][pipeline_prepare]") {
     Scheduler scheduler{Options(), &NextWorkId};
     const u64 generation = scheduler.Begin(Run(3));
-    const auto loads = LoadAll(scheduler, generation, {1, 2, 3});
-    REQUIRE(loads.size() == 3);
+    std::vector<Scheduler::Task> loads;
+    for (int i = 0; i < 3; ++i) {
+        loads.push_back(scheduler.Next(generation, PlentyOfRam));
+        REQUIRE(loads.back().kind == Scheduler::TaskKind::Load);
+    }
+    // The decodes end in the opposite order of the priority.
+    for (size_t i = loads.size(); i-- > 0;) {
+        const u8 value = static_cast<u8>(loads[i].id + 1);
+        REQUIRE(scheduler.Loaded(loads[i].id, generation, KeyHash(value), Key(value),
+                                 std::make_shared<int>(value),
+                                 false) == Scheduler::LoadOutcome::Queued);
+    }
     CHECK(BuildNext(scheduler, generation).id == 0);
     CHECK(BuildNext(scheduler, generation).id == 1);
     CHECK(BuildNext(scheduler, generation).id == 2);
@@ -336,7 +346,9 @@ TEST_CASE("A draw that finds its record building waits for that build, not a sec
     entered.get_future().wait();
     auto object = std::make_shared<int>(9);
     REQUIRE(scheduler.BuildFinished(build.id, generation, true, object));
-    // However the threads interleave, the waiter returns after the build is Ready.
+    // However the threads interleave, the waiter returns after the build is Ready. The bound
+    // only keeps a missed wakeup from hanging the run.
+    REQUIRE(waiter.wait_for(std::chrono::seconds(30)) == std::future_status::ready);
     CHECK(waiter.get() == State::Ready);
 
     const auto adopted = scheduler.Request(KeyHash(1), Key(1));
@@ -370,7 +382,8 @@ TEST_CASE("Cancelling ends the generation: waiters wake, completions are refused
     auto waiter = std::async(std::launch::async, [&] { scheduler.Await(in_flight.id, generation); });
 
     auto dropped = scheduler.Cancel();
-    waiter.get(); // woke
+    REQUIRE(waiter.wait_for(std::chrono::seconds(30)) == std::future_status::ready); // woke
+    waiter.get();
     CHECK(dropped.size() >= 2); // the ready object and the queued record
     dropped.clear();
     CHECK(watch.expired()); // nothing in the scheduler still holds the ready object
@@ -594,7 +607,9 @@ TEST_CASE("WaitForChange returns at once when something changed since the epoch"
     REQUIRE(wait.kind == Scheduler::TaskKind::Wait);
     // The load ends after the epoch was read: the wait must not sleep through the change.
     REQUIRE(scheduler.LoadSkipped(task.id, generation));
-    scheduler.WaitForChange(wait.epoch, std::chrono::hours(1));
+    const auto begin = std::chrono::steady_clock::now();
+    scheduler.WaitForChange(wait.epoch, std::chrono::seconds(30));
+    CHECK(std::chrono::steady_clock::now() - begin < std::chrono::seconds(20));
     SUCCEED();
 }
 
@@ -753,6 +768,22 @@ TEST_CASE("A driver blob is checked against the device before it can reach the d
     auto bad_version = blob;
     bad_version[4] = 2;
     CHECK(ValidateDriverBlobHeader(bad_version, device) == RejectReason::BadRecord);
+
+    // A declared header size reaching past the blob is not a header of this blob.
+    const auto declare = [&](u32 size) {
+        auto declared = blob;
+        std::memcpy(declared.data(), &size, sizeof(size));
+        return declared;
+    };
+    CHECK(ValidateDriverBlobHeader(declare(static_cast<u32>(blob.size())), device) ==
+          RejectReason::None); // exactly the blob
+    CHECK(ValidateDriverBlobHeader(declare(static_cast<u32>(blob.size()) + 1), device) ==
+          RejectReason::BadRecord);
+    CHECK(ValidateDriverBlobHeader(declare(0xFFFFFFFFu), device) == RejectReason::BadRecord);
+    // A blob of exactly the header, declaring more than it holds.
+    const auto header_only = declare(33);
+    CHECK(ValidateDriverBlobHeader(std::span<const u8>(header_only).first(32), device) ==
+          RejectReason::BadRecord);
 }
 
 TEST_CASE("A joined blob with a foreign UUID is rejected and not returned",
@@ -763,4 +794,155 @@ TEST_CASE("A joined blob with a foreign UUID is rejected and not returned",
     std::vector<u8> joined;
     CHECK(Join(Chunks(BlobFor(other, 100)), device, joined) == RejectReason::PipelineUuid);
     CHECK(joined.empty());
+}
+
+TEST_CASE("A held back build leaves its record to the draw that needs it",
+          "[video_core][pipeline_prepare]") {
+    Scheduler scheduler{Options(), &NextWorkId};
+    const u64 generation = scheduler.Begin(Run(2));
+    LoadAll(scheduler, generation, {1, 2});
+
+    // The worker waits out a burst of runtime compilation: the record stays queued...
+    CHECK(scheduler.Next(generation, PlentyOfRam, true).kind == Scheduler::TaskKind::Wait);
+    CHECK(scheduler.StateOf(0) == State::Queued);
+    // ...so the draw takes it at once, instead of waiting for a build nobody has started.
+    CHECK(scheduler.Request(KeyHash(1), Key(1)).kind == Scheduler::DemandKind::Claimed);
+    CHECK(scheduler.StateOf(0) == State::Claimed);
+
+    // The burst is over: the other record is built.
+    const auto build = scheduler.Next(generation, PlentyOfRam, false);
+    REQUIRE(build.kind == Scheduler::TaskKind::Build);
+    CHECK(build.id == 1);
+}
+
+TEST_CASE("Holding builds back does not hold back decoding", "[video_core][pipeline_prepare]") {
+    Scheduler scheduler{Options(), &NextWorkId};
+    const u64 generation = scheduler.Begin(Run(2));
+    CHECK(scheduler.Next(generation, PlentyOfRam, true).kind == Scheduler::TaskKind::Load);
+}
+
+TEST_CASE("Unused ready objects are released oldest first so the rest of the index is prepared",
+          "[video_core][pipeline_prepare]") {
+    Scheduler scheduler{Options(1, /*ready_cap=*/2), &NextWorkId};
+    const u64 generation = scheduler.Begin(Run(4));
+    LoadAll(scheduler, generation, {1, 2, 3, 4});
+    std::weak_ptr<int> first_watch;
+    for (const int value : {1, 2}) {
+        const auto build = BuildNext(scheduler, generation);
+        auto object = std::make_shared<int>(value);
+        if (value == 1) {
+            first_watch = object;
+        }
+        REQUIRE(scheduler.BuildFinished(build.id, generation, true, std::move(object)));
+    }
+    CHECK(scheduler.ReadyCount() == 2); // the cap, and the game has asked for neither
+
+    // Record 3 is built: the oldest ready object makes the room.
+    auto third = scheduler.Next(generation, PlentyOfRam);
+    REQUIRE(third.kind == Scheduler::TaskKind::Build);
+    CHECK(third.id == 2);
+    REQUIRE(third.evicted != nullptr);
+    CHECK(*std::static_pointer_cast<int>(third.evicted) == 1);
+    third.evicted.reset();
+    CHECK(first_watch.expired()); // nothing in the scheduler keeps it
+    CHECK(scheduler.StateOf(0) == State::Evicted);
+    CHECK(scheduler.ReadyCount() == 1);
+    REQUIRE(scheduler.BuildFinished(third.id, generation, true, std::make_shared<int>(3)));
+
+    // And record 4: now the second one goes, not the newest.
+    auto fourth = scheduler.Next(generation, PlentyOfRam);
+    REQUIRE(fourth.kind == Scheduler::TaskKind::Build);
+    CHECK(fourth.id == 3);
+    REQUIRE(fourth.evicted != nullptr);
+    CHECK(*std::static_pointer_cast<int>(fourth.evicted) == 2);
+    REQUIRE(scheduler.BuildFinished(fourth.id, generation, true, std::make_shared<int>(4)));
+
+    // Everything was visited; the last two stay ready, nothing more is released.
+    const auto done = scheduler.Next(generation, PlentyOfRam);
+    CHECK(done.kind == Scheduler::TaskKind::Done);
+    CHECK(done.evicted == nullptr);
+    CHECK(scheduler.ReadyCount() == 2);
+    CacheStats stats;
+    scheduler.FillStats(stats);
+    CHECK(stats.prepared == 4);
+    CHECK(stats.evicted == 2);
+
+    // A released record is built when its draw comes; a kept one is adopted.
+    CHECK(scheduler.Request(KeyHash(1), Key(1)).kind == Scheduler::DemandKind::Unavailable);
+    const auto kept = scheduler.Request(KeyHash(4), Key(4));
+    REQUIRE(kept.kind == Scheduler::DemandKind::Ready);
+    CHECK(*std::static_pointer_cast<int>(kept.results[0]) == 4);
+}
+
+TEST_CASE("A ready object is released only for a record that is waiting to be built",
+          "[video_core][pipeline_prepare]") {
+    Scheduler scheduler{Options(1, /*ready_cap=*/2), &NextWorkId};
+    const u64 generation = scheduler.Begin(Run(3));
+    LoadAll(scheduler, generation, {1, 2, 3});
+    for (const int value : {1, 2}) {
+        const auto build = BuildNext(scheduler, generation);
+        REQUIRE(scheduler.BuildFinished(build.id, generation, true,
+                                        std::make_shared<int>(value)));
+    }
+    // Builds held back for runtime compilation do not release anything.
+    const auto held = scheduler.Next(generation, PlentyOfRam, true);
+    CHECK(held.kind == Scheduler::TaskKind::Wait);
+    CHECK(held.evicted == nullptr);
+    CHECK(scheduler.ReadyCount() == 2);
+    // The last record goes to a draw: nothing is left to prepare, so nothing is released.
+    REQUIRE(scheduler.Request(KeyHash(3), Key(3)).kind == Scheduler::DemandKind::Claimed);
+    const auto done = scheduler.Next(generation, PlentyOfRam);
+    CHECK(done.kind == Scheduler::TaskKind::Done);
+    CHECK(done.evicted == nullptr);
+    CHECK(scheduler.ReadyCount() == 2);
+}
+
+TEST_CASE("A checkpoint is due after the interval, which grows with the file",
+          "[video_core][pipeline_prepare]") {
+    constexpr u64 Mib = u64{1} << 20;
+    // Nothing uncommitted: never, whatever else holds.
+    CHECK_FALSE(CheckpointDue(0, ~u64{0}, 0, true));
+    // The minimum interval, to the nanosecond.
+    CHECK_FALSE(CheckpointDue(1, CheckpointMinIntervalNs - 1, 0, false));
+    CHECK(CheckpointDue(1, CheckpointMinIntervalNs, 0, false));
+    // A small file does not lengthen it.
+    CHECK(CheckpointDue(1, CheckpointMinIntervalNs, 10 * Mib, false));
+    // A large file waits one second per MiB.
+    const u64 interval = 100 * Mib * CheckpointNsPerByte;
+    CHECK_FALSE(CheckpointDue(1, interval - 1, 100 * Mib, false));
+    CHECK(CheckpointDue(1, interval, 100 * Mib, false));
+    // The end of the first window commits at once.
+    CHECK(CheckpointDue(1, 0, 100 * Mib, true));
+    // A size that would overflow the scaling saturates instead of wrapping to "due".
+    CHECK_FALSE(CheckpointDue(1, ~u64{0} - 1, ~u64{0}, false));
+}
+
+TEST_CASE("Records are found again in the committed generation by what they are",
+          "[video_core][pipeline_prepare]") {
+    using VideoCommon::CacheEnvelope::IndexEntry;
+    const auto entry = [](RecordKind kind, u32 length, u64 checksum) {
+        IndexEntry index;
+        index.meta.kind = kind;
+        index.length = length;
+        index.checksum = checksum;
+        return index;
+    };
+    const std::vector<IndexEntry> before{entry(RecordKind::Graphics, 10, 111),
+                                         entry(RecordKind::Graphics, 20, 222),
+                                         entry(RecordKind::Compute, 30, 333)};
+    // Unchanged order.
+    CHECK(RemapRecords(before, before) == std::vector<u32>{0, 1, 2});
+    // Reordered, with a new record in front.
+    const std::vector<IndexEntry> reordered{entry(RecordKind::Graphics, 99, 999), before[2],
+                                            before[1], before[0]};
+    CHECK(RemapRecords(before, reordered) == std::vector<u32>{3, 2, 1});
+    // A record the new generation dropped has no place; the others keep theirs.
+    const std::vector<IndexEntry> dropped{before[0], before[2]};
+    CHECK(RemapRecords(before, dropped) == std::vector<u32>{0, NoRecord, 1});
+    // Same checksum is not the same record: length and kind count too.
+    const std::vector<IndexEntry> lookalikes{entry(RecordKind::Graphics, 11, 111),
+                                             entry(RecordKind::Compute, 20, 222)};
+    CHECK(RemapRecords(before, lookalikes) == std::vector<u32>{NoRecord, NoRecord, NoRecord});
+    CHECK(RemapRecords({}, before).empty());
+    CHECK(RemapRecords(before, {}) == std::vector<u32>{NoRecord, NoRecord, NoRecord});
 }
