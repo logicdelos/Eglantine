@@ -12,7 +12,7 @@ Where a fix is described as a "likely fix", it was written to remove a cause fou
 
 All runs were made on one Windows 11 laptop: AMD Ryzen 9 8940HX, NVIDIA GeForce RTX 5070 Ti Laptop GPU, 16 GB RAM. Only Fire Emblem: Fortune's Weave and Xenoblade Chronicles 2 were run. Fixes marked "Orchid" or "Lichii" were ported from those forks, with the original author named in the commit message.
 
-## 0.1.0 (unreleased)
+## 0.1.0 (2026-11-16)
 
 Based on upstream build daily-20261116.
 
@@ -77,3 +77,4 @@ Stability and correctness:
 - `NX2_NOTES.md` gets rows 151 to 158 for the fixes above.
 - `src/audio_core/out` is tracked. It was ignored by mistake before.
 - Local builds: dependency downloads use `aria2c` when it is on `PATH`, and a hash mismatch is retried.
+- MinGW executables no longer hold the absolute source and build directory in file names, assert text or the `.pdb` reference.
