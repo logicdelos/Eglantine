@@ -5,6 +5,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <array>
+#include <cstdlib>
 #include <cstring>
 
 #include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
@@ -117,18 +119,18 @@ std::optional<ComputeControl> ReadComputeControl(std::span<const u8> control) {
 
 std::vector<u8> ComputeEntry(const LoweredCode& lowered, const ComputeControl& control,
                              ComputeKey& key) {
-    std::vector<u8> out;
-    out.reserve(4 + EnvHeaderSize + lowered.code.size() + 16 + key.size());
-    Put<u32>(out, 1);
+    std::vector<u8> env;
+    env.reserve(EnvHeaderSize + lowered.code.size() + 16);
     // Like InitializeNativeCode: the program's own bank when it names one.
     const u32 texture_bound = lowered.texture_buffer != ~0U ? lowered.texture_buffer : 0;
-    PutEnvHeader(out, lowered.code.size(), 0, control.local_memory, texture_bound, 80,
+    PutEnvHeader(env, lowered.code.size(), 0, control.local_memory, texture_bound, 80,
                  ComputeStage);
-    PutBytes(out, lowered.code);
+    PutBytes(env, lowered.code);
     for (const u32 size : control.workgroup) {
-        Put<u32>(out, size);
+        Put<u32>(env, size);
     }
-    Put<u32>(out, control.shared_memory);
+    Put<u32>(env, control.shared_memory);
+    // The key as ComputePipelineCacheKey lays it out, written field by field.
     std::vector<u8> key_bytes;
     Put<u64>(key_bytes, StageHash(lowered.code));
     Put<u32>(key_bytes, control.shared_memory);
@@ -136,8 +138,38 @@ std::vector<u8> ComputeEntry(const LoweredCode& lowered, const ComputeControl& c
         Put<u32>(key_bytes, size);
     }
     std::memcpy(key.data(), key_bytes.data(), key.size());
+
+    std::vector<u8> out;
+    out.reserve(3 * sizeof(u32) + env.size() + key_bytes.size());
+    Put<u32>(out, 1); // environments
+    Put<u32>(out, static_cast<u32>(env.size()));
+    PutBytes(out, env);
+    Put<u32>(out, static_cast<u32>(key_bytes.size()));
     PutBytes(out, key_bytes);
     return out;
+}
+
+bool WarmAddonsEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_WARM_ADDON");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+CacheEnvelope::CacheIdentity WarmFileIdentity(const CacheEnvelope::HostIdentity& host,
+                                              bool with_addons) {
+    CacheEnvelope::CacheIdentity identity;
+    identity.kind = CacheEnvelope::PayloadKind::WarmCompute;
+    identity.shader_format_version = WarmCacheVersion;
+    identity.host = host;
+    // What the game files hold is what is cached, so the content stamp and the add-on choice
+    // identify it; no emulator setting changes how a program is lowered.
+    identity.host.settings_hash = 0;
+    const std::array<u64, 2> content{host.content_stamp, with_addons ? u64{1} : u64{0}};
+    identity.host.content_stamp = CacheEnvelope::Checksum(std::span<const u8>(
+        reinterpret_cast<const u8*>(content.data()), sizeof(content)));
+    return identity;
 }
 
 } // namespace VideoCommon::ShaderWarm

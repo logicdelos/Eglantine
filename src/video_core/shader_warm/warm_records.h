@@ -13,11 +13,12 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "video_core/cache_envelope.h"
 
 namespace VideoCommon::ShaderWarm {
 
-/// Precache file records: compute entries in the disk pipeline cache format, with no recorded
-/// reads (the emulator guesses them, see GuessMissing).
+/// Precache file records: compute records of the envelope (CacheEnvelope::PayloadKind::WarmCompute)
+/// with no recorded reads (the emulator guesses them, see GuessMissing).
 
 /// Precache files use the Vulkan pipeline cache version: the emulator loads one only when it
 /// matches, so the two must move together (vk_pipeline_cache.cpp checks it).
@@ -56,8 +57,22 @@ struct ComputeControl {
 /// memory (byte 104). Empty when the control is too short.
 std::optional<ComputeControl> ReadComputeControl(std::span<const u8> control);
 
-/// One compute entry (env count, env, code, compute trailer, key); `key` gets the 24-byte key.
+/// One compute record payload in the envelope's record codec (EncodePipelineRecord): environment
+/// count 1, the environment (length-prefixed; code, compute trailer, no recorded reads), then the
+/// 24-byte key (length-prefixed). `key` gets the same 24 bytes: the explicit little endian
+/// encoding of ComputePipelineCacheKey (u64 stage hash, u32 shared memory, 3 x u32 workgroup).
 std::vector<u8> ComputeEntry(const LoweredCode& lowered, const ComputeControl& control,
                              ComputeKey& key);
+
+/// Whether EDEN_NX2_WARM_ADDON=1 asks for add-on content to be read too (read once).
+bool WarmAddonsEnabled();
+
+/// The identity of the precache file: kind WarmCompute, shader format WarmCacheVersion, the
+/// host's build, title and game version, and a content stamp that mixes the host's with the
+/// add-on choice. The device fields stay zero (the precache is built without a Vulkan device, the
+/// done marker carries the driver) and the settings hash is zero (no setting changes how a program
+/// is lowered). The builder, RefreshWarmFiles and the pipeline cache's reader must all use it.
+CacheEnvelope::CacheIdentity WarmFileIdentity(const CacheEnvelope::HostIdentity& host,
+                                              bool with_addons);
 
 } // namespace VideoCommon::ShaderWarm

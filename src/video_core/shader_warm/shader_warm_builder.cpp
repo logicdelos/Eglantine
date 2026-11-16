@@ -126,12 +126,9 @@ std::optional<std::string> OpenGame(Core::System& system, const fs::path& game_p
         game.program_romfs = game.romfs.size();
         // Add-on content after them: the Xenoblade Chronicles 2 Switch 2 Edition keeps all its
         // game data in add-ons. A standalone update names the application as well as a base.
-        // Opt-in (default off): EDEN_NX2_WARM_ADDON=1 reads the add-ons too. Read once.
-        static const bool read_addons = [] {
-            const char* value = std::getenv("EDEN_NX2_WARM_ADDON");
-            return value != nullptr && value[0] == '1';
-        }();
-        if (read_addons && (base || update)) {
+        // Opt-in (default off): EDEN_NX2_WARM_ADDON=1 reads the add-ons too (WarmAddonsEnabled;
+        // the choice is part of the precache file's identity).
+        if (WarmAddonsEnabled() && (base || update)) {
             const u64 program_id = game.nup->GetPackages()[base ? *base : *update].title_id;
             for (const size_t addon : game.nup->FindAddonPackages(program_id)) {
                 if (stop.stop_requested()) {
@@ -304,14 +301,40 @@ private:
     std::vector<std::thread> workers;
 };
 
-template <typename T>
-void Write(std::ofstream& out, const T& value) {
-    out.write(reinterpret_cast<const char*>(&value), sizeof(T));
-}
-
-void WriteHeader(std::ofstream& out) {
-    out.write("yuzucach", 8);
-    Write(out, WarmCacheVersion);
+/// Why the precache file must be built again, if it must. The envelope (magic, versions, build,
+/// title, content) decides first, then the builder version and size in the count file. An old
+/// unenveloped file is moved aside by the open and counts as stale. `rejection` gets what the
+/// envelope said.
+std::optional<std::string> WarmStaleReason(const fs::path& warm_file,
+                                           const CacheEnvelope::CacheIdentity& identity,
+                                           CacheEnvelope::CacheLoadResult& rejection) {
+    std::error_code ec;
+    if (!fs::exists(warm_file, ec)) {
+        return "none built yet";
+    }
+    if (!CacheEnvelope::EnvelopeReader::Open(warm_file, identity, rejection)) {
+        switch (rejection.reason) {
+        case CacheEnvelope::RejectReason::LegacyFormat:
+            return "built in the old file format";
+        case CacheEnvelope::RejectReason::FormatVersion:
+        case CacheEnvelope::RejectReason::ShaderFormat:
+            return "built for another cache version";
+        default:
+            return fmt::format("cache file rejected ({})",
+                               CacheEnvelope::RejectReasonName(rejection.reason));
+        }
+    }
+    std::ifstream in(WarmCountPath(warm_file));
+    u64 entries{};
+    u64 size{};
+    u32 builder{};
+    if (!(in >> entries >> size >> builder) || builder != WarmBuilderVersion) {
+        return "built by an older version";
+    }
+    if (fs::file_size(warm_file, ec) != size || ec) {
+        return "changed since it was built";
+    }
+    return std::nullopt;
 }
 
 /// Records `entries` for the finished precache file at `warm_file` (see WarmCountPath).
@@ -369,14 +392,15 @@ std::optional<WarmStamp> CurrentWarmStamp(const fs::path& warm_file, u64 entries
     return WarmStamp{size,      static_cast<s64>(time.time_since_epoch().count()),
                      entries,   driver,
                      device_id, cache_version,
-                     u64{}};
+                     CacheEnvelope::GetHostIdentity().content_stamp};
 }
 
 std::optional<WarmStamp> ReadWarmMarker(const fs::path& warm_file) {
     std::ifstream in(WarmMarkerPath(warm_file));
     WarmStamp stamp;
+    // A marker without the content stamp (written before it existed) is not one.
     if (!(in >> stamp.size >> stamp.write_time >> stamp.entries >> stamp.driver >>
-          stamp.device_id >> stamp.cache_version)) {
+          stamp.device_id >> stamp.cache_version >> stamp.content_stamp)) {
         return std::nullopt;
     }
     return stamp;
@@ -385,7 +409,8 @@ std::optional<WarmStamp> ReadWarmMarker(const fs::path& warm_file) {
 bool WriteWarmMarker(const fs::path& warm_file, const WarmStamp& stamp) {
     std::ofstream out(WarmMarkerPath(warm_file), std::ios::trunc);
     out << stamp.size << ' ' << stamp.write_time << ' ' << stamp.entries << ' ' << stamp.driver
-        << ' ' << stamp.device_id << ' ' << stamp.cache_version << '\n';
+        << ' ' << stamp.device_id << ' ' << stamp.cache_version << ' ' << stamp.content_stamp
+        << '\n';
     out.close();
     return static_cast<bool>(out);
 }
@@ -399,8 +424,10 @@ bool DeleteWarmFiles(u64 title_id, std::string* error) {
     const auto warm = ComputeWarmPath(title_id);
     fs::path tmp = warm;
     tmp += ".tmp";
+    fs::path legacy = warm;
+    legacy += ".legacy.bak";
     bool ok = true;
-    for (const auto& path : {warm, WarmMarkerPath(warm), WarmCountPath(warm), tmp}) {
+    for (const auto& path : {warm, WarmMarkerPath(warm), WarmCountPath(warm), tmp, legacy}) {
         std::error_code ec;
         fs::remove(path, ec);
         if (ec) {
@@ -414,39 +441,27 @@ bool DeleteWarmFiles(u64 title_id, std::string* error) {
 }
 
 std::optional<std::string> WarmFilesStale(const fs::path& warm_file) {
-    std::error_code ec;
-    if (!fs::exists(warm_file, ec)) {
-        return "none built yet";
-    }
-    {
-        std::ifstream in(warm_file, std::ios::binary);
-        std::array<char, 8> magic{};
-        u32 version{};
-        in.read(magic.data(), magic.size()).read(reinterpret_cast<char*>(&version), sizeof(version));
-        if (!in || version != WarmCacheVersion) {
-            return "built for another cache version";
-        }
-    }
-    std::ifstream in(WarmCountPath(warm_file));
-    u64 entries{};
-    u64 size{};
-    u32 builder{};
-    if (!(in >> entries >> size >> builder) || builder != WarmBuilderVersion) {
-        return "built by an older version";
-    }
-    if (fs::file_size(warm_file, ec) != size || ec) {
-        return "changed since it was built";
-    }
-    return std::nullopt;
+    CacheEnvelope::CacheLoadResult rejection;
+    return WarmStaleReason(warm_file,
+                           WarmFileIdentity(CacheEnvelope::GetHostIdentity(), WarmAddonsEnabled()),
+                           rejection);
 }
 
 bool RefreshWarmFiles(Core::System& system, u64 title_id, std::stop_token stop) {
     if (title_id == 0 || !Settings::CurrentProgramIsSwitch2()) {
         return false;
     }
-    const auto reason = WarmFilesStale(ComputeWarmPath(title_id));
+    CacheEnvelope::HostIdentity host = CacheEnvelope::GetHostIdentity();
+    host.title_id = title_id; // The file is the title's, whatever the host identity holds
+    CacheEnvelope::CacheLoadResult rejection;
+    const auto reason = WarmStaleReason(ComputeWarmPath(title_id),
+                                        WarmFileIdentity(host, WarmAddonsEnabled()), rejection);
     if (!reason) {
         return false;
+    }
+    if (rejection.reason != CacheEnvelope::RejectReason::None &&
+        rejection.reason != CacheEnvelope::RejectReason::Missing) {
+        LOG_INFO(Render_Vulkan, "{}", CacheEnvelope::CacheRejectLine(rejection));
     }
     const std::string& file_path = system.GetCurrentApplicationFilePath();
     if (file_path.empty()) {
@@ -511,13 +526,10 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
     std::error_code ec;
     fs::create_directories(output_dir, ec);
     const fs::path compute_path = output_dir / "warm-compute.bin";
-    fs::path compute_tmp = compute_path;
-    compute_tmp += ".tmp";
-    std::ofstream compute_out;
+    std::unique_ptr<CacheEnvelope::EnvelopeWriter> writer;
+    bool write_failed = false;
     const auto fail = [&](std::string error) {
-        compute_out.close();
-        std::error_code ignored;
-        fs::remove(compute_tmp, ignored);
+        writer.reset(); // Drops the unfinished file, the previous one stays
         result.ok = false;
         result.error = std::move(error);
         LOG_WARNING(Render_Vulkan, "Shader precache build for {:016x} failed: {}", title_id,
@@ -605,11 +617,14 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
     LOG_INFO(Render_Vulkan, "Shader precache build: {} archives, {} zstd dictionaries",
              archives.size(), dictionary_count);
 
-    compute_out.open(compute_tmp, std::ios::binary | std::ios::trunc);
-    if (!compute_out) {
+    // The title is the one being built, whatever the host identity holds.
+    CacheEnvelope::HostIdentity host = CacheEnvelope::GetHostIdentity();
+    host.title_id = title_id;
+    writer = CacheEnvelope::EnvelopeWriter::Create(
+        compute_path, WarmFileIdentity(host, WarmAddonsEnabled()), CacheEnvelope::MaxWarmBytes);
+    if (!writer) {
         return fail("Cannot write to " + Common::FS::PathToUTF8String(output_dir));
     }
-    WriteHeader(compute_out);
 
     std::unordered_set<PairHash, PairHasher> compute_identities;
     std::unordered_set<std::string> compute_keys;
@@ -631,10 +646,24 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
         }
         const std::string key(reinterpret_cast<const char*>(r.compute_key.data()),
                               r.compute_key.size());
-        if (compute_keys.insert(key).second) {
-            compute_out.write(reinterpret_cast<const char*>(r.bytes.data()),
-                              static_cast<std::streamsize>(r.bytes.size()));
+        if (!compute_keys.insert(key).second) {
+            return;
+        }
+        CacheEnvelope::RecordMeta meta;
+        meta.kind = CacheEnvelope::RecordKind::Compute;
+        switch (writer->Append(meta, r.bytes)) {
+        case CacheEnvelope::AppendResult::Ok:
             ++result.compute_programs;
+            break;
+        case CacheEnvelope::AppendResult::Duplicate:
+            break;
+        case CacheEnvelope::AppendResult::TooLarge:
+        case CacheEnvelope::AppendResult::BudgetFull:
+            ++result.skipped;
+            break;
+        case CacheEnvelope::AppendResult::IoError:
+            write_failed = true;
+            break;
         }
     };
     const auto drain = [&] {
@@ -712,18 +741,14 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
     converter.reset();
 
     report(StageWriting, 0, 1);
-    compute_out.close();
-    if (!compute_out) {
+    if (write_failed || !writer->Commit()) {
         return fail("Writing the precache file failed");
     }
+    writer.reset();
     // A new file: the marker and count of the old one no longer apply.
     std::error_code ignored;
     fs::remove(WarmMarkerPath(compute_path), ignored);
     fs::remove(WarmCountPath(compute_path), ignored);
-    fs::rename(compute_tmp, compute_path, ec);
-    if (ec) {
-        return fail("Cannot replace " + Common::FS::PathToUTF8String(compute_path));
-    }
     WriteWarmCount(compute_path, result.compute_programs);
     report(StageWriting, 1, 1);
     result.ok = true;
