@@ -604,6 +604,7 @@ struct AttributionSnapshot {
     bool complete{}; ///< No lost spans, no write failure, session ended with producers joined
     u64 threshold_ns{};
     u64 lost_events{};
+    u64 dropped_boundaries{}; ///< Present boundaries lost; each leaves an unattributed gap
     u64 sink_write_errors{};
     u64 rejected_presents{}; ///< Present attempts that did not qualify
     u64 frames{};            ///< Qualifying intervals (from the second present on)

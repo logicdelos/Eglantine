@@ -247,6 +247,9 @@ struct CacheStats {
     u64 queue_high_water{};
     u64 memory_high_water_bytes{};
     u64 budget_pauses{};
+    u64 evicted{};          ///< Ready objects released unused under the ready cap, oldest first
+    u64 checkpoints{};      ///< Generations committed before shutdown
+    u64 bytes_committed{};  ///< Bytes of the transferable files committed (checkpoints and final)
     WriteStatus write_status{WriteStatus::NotAttempted};
 };
 
