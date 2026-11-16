@@ -2,10 +2,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <cwchar>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -19,6 +22,7 @@
 #ifdef _WIN32
 #include <process.h>
 #else
+#include <fcntl.h>
 #include <unistd.h>
 extern char** environ;
 #endif
@@ -33,6 +37,17 @@ extern char** environ;
 #include "common/settings.h"
 #include "common/settings_common.h"
 #include "yuzu_cmd/run_report.h"
+
+// After the others: windows.h defines min and max.
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 namespace RunReport {
 
@@ -256,6 +271,11 @@ Json BuildJson() {
     json["build_id"] = Common::g_build_id;
     json["build_date"] = Common::g_build_date;
     json["compiler"] = Common::g_compiler_id;
+    json["name"] = Common::g_build_name;
+    json["full_name"] = Common::g_build_fullname;
+    json["version"] = Common::g_build_version;
+    json["display_version"] = Common::g_display_version;
+    json["flavour"] = Common::g_build_flavour;
     return json;
 }
 
@@ -323,7 +343,7 @@ bool Fail(const std::string& message) {
     return false;
 }
 
-bool WriteFile(State& state, const std::string& text) {
+bool WriteReportFile(State& state, const std::string& text) {
     std::error_code ec;
     {
         std::ofstream out{state.temporary, std::ios::binary | std::ios::out | std::ios::trunc};
@@ -353,6 +373,294 @@ bool WriteFile(State& state, const std::string& text) {
                     " failed: " + reason);
     }
     return true;
+}
+
+// The report of a crash of the emulator itself (a crash handler calls WriteCrashReport through
+// Common::RunOutcome::ReportHostCrash). The process is damaged then, so nothing here takes a lock,
+// allocates, or waits: the file is opened before the run, and the text is formatted into static
+// buffers before the run too, except for a handful of numbers and the detail line. There are two
+// static documents so that one can be rebuilt (title, settings) while the other can be read.
+
+enum CrashPhase : int {
+    CrashUnarmed,
+    CrashArmed,
+    CrashWriting,
+    CrashPublishing,
+};
+
+constexpr size_t CrashHeadCapacity = 8 * 1024;
+constexpr size_t CrashTailCapacity = 96 * 1024;
+constexpr size_t CrashMiddleCapacity = 8 * 1024;
+constexpr size_t CrashPathCapacity = 1024;
+
+struct CrashDocument {
+    char head[CrashHeadCapacity];
+    char tail[CrashTailCapacity];
+    size_t head_size;
+    size_t tail_size;
+};
+
+CrashDocument crash_documents[2];
+std::atomic<int> crash_document{-1};
+std::atomic<int> crash_phase{CrashUnarmed};
+#ifdef _WIN32
+HANDLE crash_file = INVALID_HANDLE_VALUE;
+wchar_t crash_temporary[CrashPathCapacity];
+wchar_t crash_destination[CrashPathCapacity];
+#else
+int crash_file = -1;
+char crash_temporary[CrashPathCapacity];
+char crash_destination[CrashPathCapacity];
+#endif
+
+/// Text appended to a fixed buffer, cut off where it ends.
+class CrashText {
+public:
+    CrashText(char* data_, size_t capacity_) noexcept : data{data_}, capacity{capacity_} {}
+
+    void Add(std::string_view text) noexcept {
+        const size_t count = text.size() < capacity - size ? text.size() : capacity - size;
+        std::memcpy(data + size, text.data(), count);
+        size += count;
+    }
+
+    void AddNumber(unsigned long long value) noexcept {
+        char digits[24];
+        size_t count = 0;
+        do {
+            digits[count++] = static_cast<char>('0' + value % 10);
+            value /= 10;
+        } while (value != 0);
+        while (count != 0) {
+            Add(std::string_view{&digits[--count], 1});
+        }
+    }
+
+    /// As the inside of a JSON string, ASCII only; leaves `reserve` bytes free after it.
+    void AddEscaped(std::string_view text, size_t reserve) noexcept {
+        static constexpr char hex[] = "0123456789abcdef";
+        const size_t limit = capacity > reserve ? capacity - reserve : 0;
+        for (const char c : text) {
+            const auto byte = static_cast<unsigned char>(c);
+            if (c == '"' || c == '\\') {
+                if (size + 2 > limit) {
+                    return;
+                }
+                data[size++] = '\\';
+                data[size++] = c;
+            } else if (byte < 0x20) {
+                if (size + 6 > limit) {
+                    return;
+                }
+                const char escape[6] = {'\\', 'u', '0', '0', hex[byte >> 4], hex[byte & 15]};
+                std::memcpy(data + size, escape, sizeof(escape));
+                size += sizeof(escape);
+            } else {
+                if (size + 1 > limit) {
+                    return;
+                }
+                data[size++] = byte < 0x7F ? c : '?';
+            }
+        }
+    }
+
+    char* data;
+    size_t capacity;
+    size_t size = 0;
+};
+
+void CloseCrashFile() noexcept {
+#ifdef _WIN32
+    if (crash_file != INVALID_HANDLE_VALUE) {
+        CloseHandle(crash_file);
+        crash_file = INVALID_HANDLE_VALUE;
+    }
+#else
+    if (crash_file >= 0) {
+        close(crash_file);
+        crash_file = -1;
+    }
+#endif
+}
+
+bool WriteCrashPart(const char* data, size_t size) noexcept {
+#ifdef _WIN32
+    while (size != 0) {
+        DWORD written = 0;
+        if (!WriteFile(crash_file, data, static_cast<DWORD>(size), &written, nullptr) ||
+            written == 0) {
+            return false;
+        }
+        data += written;
+        size -= written;
+    }
+#else
+    while (size != 0) {
+        const ssize_t written = write(crash_file, data, size);
+        if (written <= 0) {
+            return false;
+        }
+        data += written;
+        size -= static_cast<size_t>(written);
+    }
+#endif
+    return true;
+}
+
+void WriteCrashReport(std::string_view detail) noexcept {
+    const int index = crash_document.load(std::memory_order_acquire);
+    if (index < 0) {
+        return;
+    }
+    int expected = CrashArmed;
+    if (!crash_phase.compare_exchange_strong(expected, CrashWriting, std::memory_order_acq_rel)) {
+        return;
+    }
+    const CrashDocument& document = crash_documents[index];
+
+    char middle[CrashMiddleCapacity];
+    CrashText text{middle, sizeof(middle)};
+    const double elapsed =
+        Common::RunOutcome::Active() ? Common::RunOutcome::ElapsedSeconds() : 0.0;
+    const auto milliseconds = static_cast<unsigned long long>(elapsed > 0.0 ? elapsed * 1000.0 : 0.0);
+    text.AddNumber(milliseconds / 1000);
+    text.Add(".");
+    text.AddNumber(milliseconds % 1000 / 100);
+    text.AddNumber(milliseconds % 100 / 10);
+    text.AddNumber(milliseconds % 10);
+    text.Add(",\"summary\":{\"frames\":");
+    text.AddNumber(Common::RunOutcome::FramesPresented());
+    const Common::Log::LogCounts counts = Common::Log::GetLogCounts();
+    text.Add("},\"windows\":[],\"logs\":{\"scope\":\"filtered_emitted\",\"error\":");
+    text.AddNumber(counts.error);
+    text.Add(",\"critical\":");
+    text.AddNumber(counts.critical);
+    text.Add("},\"exit\":{\"reason\":\"host_crash\",\"code\":");
+    text.AddNumber(static_cast<unsigned long long>(
+        Common::RunOutcome::ExitCode(Common::RunOutcome::Reason::HostCrash)));
+    text.Add(",\"shutdown_complete\":false,\"metrics_complete\":false,\"detail\":\"");
+    text.AddEscaped(detail, 64);
+    text.Add("\"}");
+
+    // Seeking is not needed: the file was empty when it was opened.
+    const bool ok = WriteCrashPart(document.head, document.head_size) &&
+                    WriteCrashPart(middle, text.size) &&
+                    WriteCrashPart(document.tail, document.tail_size);
+#ifdef _WIN32
+    if (ok) {
+        FlushFileBuffers(crash_file);
+    }
+    CloseCrashFile();
+    if (ok) {
+        // Not replacing: an existing destination is never overwritten.
+        MoveFileExW(crash_temporary, crash_destination, 0);
+    }
+#else
+    if (ok) {
+        fsync(crash_file);
+    }
+    CloseCrashFile();
+    if (ok) {
+        rename(crash_temporary, crash_destination);
+    }
+#endif
+}
+
+/// Formats the fixed parts of the crash report from what is known now. Called with the state
+/// mutex held, before the run and again when the title and the settings are known.
+void RebuildCrashDocument(State& state) {
+    if (crash_phase.load(std::memory_order_acquire) != CrashArmed) {
+        return;
+    }
+    constexpr auto replace = Json::error_handler_t::replace;
+    Json fixed = Json::object();
+    fixed["schema_version"] = 1;
+    fixed["build"] = BuildJson();
+    fixed["title_id"] = state.title_id ? Json(fmt::format("{:016X}", *state.title_id))
+                                      : Json(nullptr);
+    fixed["limits"] = LimitsJson();
+    // Not closed: the dynamic part (elapsed seconds on) is written after it.
+    std::string head = fixed.dump(-1, ' ', false, replace);
+    head.pop_back();
+    head += ",\"elapsed_seconds\":";
+
+    const auto make_tail = [&state](bool with_settings) {
+        Json settings = Json::object();
+        settings["initial"] = with_settings ? state.initial_settings : Json::object();
+        settings["final"] = nullptr;
+        Json rest = Json::object();
+        rest["tunables"] = state.tunables;
+        rest["settings"] = std::move(settings);
+        // The members of `rest` continue the document: its opening brace is dropped, and its
+        // closing one ends the document.
+        std::string text = rest.dump(-1, ' ', false, replace);
+        text[0] = ',';
+        text += '\n';
+        return text;
+    };
+    std::string tail = make_tail(true);
+    if (tail.size() > CrashTailCapacity) {
+        tail = make_tail(false);
+    }
+    if (head.size() > CrashHeadCapacity || tail.size() > CrashTailCapacity) {
+        return;
+    }
+    const int current = crash_document.load(std::memory_order_relaxed);
+    const int next = current == 0 ? 1 : 0;
+    CrashDocument& document = crash_documents[next];
+    std::memcpy(document.head, head.data(), head.size());
+    document.head_size = head.size();
+    std::memcpy(document.tail, tail.data(), tail.size());
+    document.tail_size = tail.size();
+    crash_document.store(next, std::memory_order_release);
+}
+
+/// Opens the temporary file for the crash writer and hands the writer to RunOutcome. A path that
+/// does not fit the static buffers, or a file that does not open, leaves the crash report off:
+/// the run still ends with the host-crash exit code.
+void ArmCrashReport(State& state) {
+#ifdef _WIN32
+    const std::wstring& temporary = state.temporary.native();
+    const std::wstring& destination = state.destination.native();
+#else
+    const std::string& temporary = state.temporary.native();
+    const std::string& destination = state.destination.native();
+#endif
+    if (temporary.size() >= CrashPathCapacity || destination.size() >= CrashPathCapacity) {
+        return;
+    }
+#ifdef _WIN32
+    crash_file = CreateFileW(temporary.c_str(), GENERIC_WRITE,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (crash_file == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    std::wmemcpy(crash_temporary, temporary.c_str(), temporary.size() + 1);
+    std::wmemcpy(crash_destination, destination.c_str(), destination.size() + 1);
+#else
+    crash_file = open(temporary.c_str(), O_WRONLY | O_CLOEXEC);
+    if (crash_file < 0) {
+        return;
+    }
+    std::memcpy(crash_temporary, temporary.c_str(), temporary.size() + 1);
+    std::memcpy(crash_destination, destination.c_str(), destination.size() + 1);
+#endif
+    crash_phase.store(CrashArmed, std::memory_order_release);
+    RebuildCrashDocument(state);
+    Common::RunOutcome::SetCrashReportWriter(&WriteCrashReport);
+}
+
+/// The normal report is about to be written: the crash report is off, and its file closed so
+/// the normal write can replace the contents. False when a crash is writing its report instead.
+bool DisarmCrashReport() {
+    int expected = CrashArmed;
+    if (crash_phase.compare_exchange_strong(expected, CrashPublishing,
+                                            std::memory_order_acq_rel)) {
+        CloseCrashFile();
+        return true;
+    }
+    return expected != CrashWriting;
 }
 
 } // Anonymous namespace
@@ -391,6 +699,7 @@ PrepareResult Prepare(const std::string& destination, std::string& message) {
     state.destination = path;
     state.temporary = std::move(temporary);
     state.prepared = true;
+    ArmCrashReport(state);
     return PrepareResult::Ready;
 }
 
@@ -399,12 +708,14 @@ void CaptureStart() {
     std::scoped_lock lock{state.mutex};
     state.tunables = SetTunables();
     state.initial_settings = ReportedSettings();
+    RebuildCrashDocument(state);
 }
 
 void SetTitleId(u64 program_id) {
     State& state = GetState();
     std::scoped_lock lock{state.mutex};
     state.title_id = program_id;
+    RebuildCrashDocument(state);
 }
 
 bool Publish(Common::RunOutcome::Reason reason, int code, bool shutdown_complete,
@@ -418,9 +729,13 @@ bool Publish(Common::RunOutcome::Reason reason, int code, bool shutdown_complete
         return state.published_ok;
     }
     state.published = true;
+    if (!DisarmCrashReport()) {
+        // A crash is writing its own report, which is the report of this run.
+        return true;
+    }
     try {
         state.published_ok =
-            WriteFile(state, Document(state, reason, code, shutdown_complete, detail));
+            WriteReportFile(state, Document(state, reason, code, shutdown_complete, detail));
     } catch (const std::exception& e) {
         std::error_code ec;
         fs::remove(state.temporary, ec);
