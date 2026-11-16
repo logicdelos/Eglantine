@@ -63,3 +63,12 @@ EDEN_NX2_FENCE_BATCH=1
 # (fewer submits per second; compare "submits by origin: fence" in the EDEN_NX2_GPU_PROFILE log
 # line, written every 10 seconds). Set to 1 to turn on.
 #EDEN_NX2_SKIP_EMPTY_FLUSH=1
+# --- Speed experiments (off by default; each is measured on and off before it is recommended) ---
+# Keep the GPU front/back thread split running at GPU accuracy High (and safe DMA). Today the split
+# only runs below High. With this on, the back writes out what the texture and query caches hold
+# of a command list before the front reads it, and the macros stay on the back at High. Weaker
+# than a plain High: command lists a draw writes into a buffer are not flushed before they are
+# read. Watch the sky and other buffer-fed effects, especially in long sessions. Compare fps and
+# the "gwait" and "idle" columns of the 10 second EDEN_NX2_GPU_PROFILE line ("safe read" under
+# its drain sites). Set to 1 to turn on.
+#EDEN_NX2_SPLIT_AT_HIGH=1

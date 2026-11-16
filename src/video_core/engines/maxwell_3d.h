@@ -3242,6 +3242,13 @@ public:
     /// written by queued GPU work: culling): the caller needs neither to wait for the back nor
     /// to read the words fresh.
     bool FrontTakeIndirectRecord(u32 parameter_method, GPUVAddr record);
+    /// The split stopped: hands the macros back to the engine when the front owns them
+    /// (ReleaseFront), so a restart that keeps them on the back starts clean.
+    void ReleaseFrontIfOwned() {
+        if (front) {
+            ReleaseFront();
+        }
+    }
     /// Nx2Perf FrontRun: FrontCallMethod for `count` words of one command below the macro
     /// range, `methods_pending` of the command's words left at the first one.
     void FrontCallMethodRun(Core::System& system, VideoCommon::GpuSplit& split, u32 method,

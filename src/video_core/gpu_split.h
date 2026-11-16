@@ -54,6 +54,7 @@ enum class DrainSite : u32 {
     Map,            ///< GPU memory maps before later command reads
     FrontStart,     ///< The front takes an engine's macros over
     FrontVerify,    ///< EDEN_NX2_FRONT_VERIFY
+    SafeRead,       ///< Safe command list reads: images and reports on the list's pages
     Count,
 };
 
@@ -62,7 +63,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> 
     "semaphore flush", "fence release",
     "list writers", "list sync",      "list flush", "macro dma read",  "macro dma writes",
     "macro dma flush",
-    "gp sync fence", "map",           "front start", "front verify",
+    "gp sync fence", "map",           "front start", "front verify", "safe read",
 };
 
 // Splits the GPU thread in two (NX2_GPU_THREAD_SPLIT.md). The GPU thread (the front) takes the
@@ -122,6 +123,10 @@ public:
                hook_requested.load(std::memory_order_relaxed) ||
                front_waiting.load(std::memory_order_relaxed);
     }
+
+    /// EDEN_NX2_SPLIT_AT_HIGH=1 (off by default, read once): the split also runs at accurate GPU
+    /// and safe DMA (Lichii #1808).
+    [[nodiscard]] static bool AtHighAccuracy();
 
     /// Starts the back thread once the split is wanted (EDEN_NX2_SPLIT=1, a Switch 2 title,
     /// commands read without cache flushes). Called by the front between commands.
@@ -418,6 +423,8 @@ private:
     /// Nx2Perf::Verify() with draw_begin_coalesce, read once at Start before the back starts
     bool verify_repeats{};
     bool front_macros{};
+    /// The GPU and DMA accuracy settings the front last decided under (MaybeStart).
+    u8 started_accuracy{};
     std::unique_ptr<u64[]> ring;
 
     // Front side.
