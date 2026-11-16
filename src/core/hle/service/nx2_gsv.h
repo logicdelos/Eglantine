@@ -2002,6 +2002,10 @@ private:
         }
         const auto entered = std::chrono::steady_clock::now();
         m_host_while_suspended = frames_ahead != 0;
+        // The whole wait for the GPU thread (fence, back thread) is one Waiting span; whatever
+        // links it to the work that released it is up to the renderer's LinkWait.
+        std::optional<VideoCommon::Nx2Spikes::SpanScope> fence_wait;
+        fence_wait.emplace(VideoCommon::Nx2Spikes::Cause::Waiting);
         if (frames_ahead == 1 || (frames_ahead == -1 && !WaitForFrame(~w[22], w[24], true))) {
             LOG_DEBUG(Service, "nx2:vi2 present #{} fence ({}, {:#x}), waiting for ({}, {:#x}); now {:#x}",
                       m_presents, ~w[22], w[24], m_previous_fence_id, m_previous_fence_value,
@@ -2037,6 +2041,7 @@ private:
         }
         m_previous_fence_id = ~w[22];
         m_previous_fence_value = w[24];
+        fence_wait.reset();
         const auto waited = std::chrono::steady_clock::now();
         if (VideoCommon::Nx2Timeline::Enabled()) {
             const u64 now = VideoCommon::Nx2Timeline::Now();
@@ -2158,6 +2163,8 @@ private:
                         "fences: the game may ignore them; pacing the present instead",
                         m_presents, ReleaseBackstopDepth);
         }
+        // Pacing, not work: a Waiting span with no producer (it ends with the function).
+        const VideoCommon::Nx2Spikes::SpanScope release_wait{VideoCommon::Nx2Spikes::Cause::Waiting};
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{250};
         while (!syncpoints.IsReadyGuest(m_release_syncpoint, target) &&
                std::chrono::steady_clock::now() < deadline) {
@@ -2365,6 +2372,9 @@ private:
             // sleep held that core for the whole wait: game threads scheduled there ran only
             // between presents (Fortune's Weave's loader read one RomFS block per frame).
             const auto wait = std::chrono::duration_cast<std::chrono::nanoseconds>(m_next_vblank - now);
+            // Pacing to the vblank: a Waiting span with no producer (it ends with this block).
+            const VideoCommon::Nx2Spikes::SpanScope pacing_wait{
+                VideoCommon::Nx2Spikes::Cause::Waiting};
             static_cast<void>(Kernel::GetCurrentThread(kernel).Sleep(
                 kernel, kernel.HardwareTimer().GetTick() + wait.count() + 2));
         }
