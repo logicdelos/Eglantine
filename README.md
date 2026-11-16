@@ -25,6 +25,8 @@ This is an independent fork. It is not an official Eglantine release, and it is 
 | Xenoblade Chronicles 2 | [fork-v0.1.0](https://github.com/logicdelos/Eglantine/releases/tag/fork-v0.1.0) | 2026-11-16 | Boots to the title screen at 1x resolution scale. 60.0 fps with the speed limit on, longest frame 59 ms, no error lines in the log, clean exit. Play past the title screen was not part of this test. |
 | Fire Emblem: Fortune's Weave | [fork-v0.2.0](https://github.com/logicdelos/Eglantine/releases/tag/fork-v0.2.0) | 2026-11-16 | Same test as fork-v0.1.0, same result: reference scene reached at 1x and 2x. 30.0 fps with the speed limit on, longest frame 57 ms at 1x and 72 ms at 2x, no error lines in the log, clean exit. End picture differs from the fork-v0.1.0 one by 0.019 at 1x and 0.009 at 2x (limit 0.06). |
 | Xenoblade Chronicles 2 | [fork-v0.2.0](https://github.com/logicdelos/Eglantine/releases/tag/fork-v0.2.0) | 2026-11-16 | Same test as fork-v0.1.0, same result: title screen reached at 1x. 60.0 fps with the speed limit on, longest frame 41 ms, no error lines in the log, clean exit. End picture differs from the fork-v0.1.0 one by 0.002. |
+| Fire Emblem: Fortune's Weave | [fork-v0.3.0](https://github.com/logicdelos/Eglantine/releases/tag/fork-v0.3.0) | 2026-11-16 | Same test as fork-v0.2.0: reference scene reached at 1x and 2x. 30.0 fps with the speed limit on, longest frame 64 ms at 1x and 73 ms at 2x, no error lines in the log, clean exit. End picture differs from the fork-v0.2.0 one by 0.007 at 1x and 0.009 at 2x (limit 0.06). |
+| Xenoblade Chronicles 2 | [fork-v0.3.0](https://github.com/logicdelos/Eglantine/releases/tag/fork-v0.3.0) | 2026-11-16 | Same test as fork-v0.2.0: title screen reached at 1x. 60.0 fps with the speed limit on, longest frame 34 ms, no error lines in the log, clean exit. End picture differs from the fork-v0.2.0 one by 0.002. The unattended exit test also passed on this build: frame limit, time limit and a forced crash, on both tested games. |
 
 Each run lasted about 3 minutes with Vulkan, GPU accuracy High, SMAA, the BUF scaling filter and docked mode. The release notes of each build carry the full table.
 
@@ -37,7 +39,7 @@ Frame-rate figures in this repository always come with the scene, settings, hard
 - It tracks upstream daily builds; each release names the upstream build it is based on.
 - It carries its own fixes for the two tested games and for stability, listed per release in [FORK_CHANGELOG.md](FORK_CHANGELOG.md).
 - It ports selected fixes from other Eglantine forks, each credited to its author in the commit and in the release notes.
-- It adds a log line that names what limits the frame rate. Command-line runs that end by themselves and write a result file are planned; see the [roadmap](ROADMAP.md).
+- It adds a log line that names what limits the frame rate, and a command-line build that can run a game unattended: `eden-cli.exe --run-seconds`, `--run-frames` and `--report`, with exit codes that say how the run ended. See the [guide](fork-notes/unattended-runs.md).
 - Long term, it adds a fast graphics path beside the existing one. See the [roadmap](ROADMAP.md).
 
 Everything else behaves as upstream does. The [user handbook](https://github.com/Eglantine-Community/docs/blob/38e8d2a962a6137731e67fc8e89163691a4521cd/content/user/README.mdx) applies unchanged.

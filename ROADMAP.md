@@ -51,11 +51,11 @@ Status: released as [fork-v0.2.0](https://github.com/logicdelos/Eglantine/releas
 Done when: both games reach their reference scenes with no new error lines and pictures within the comparison limit.
 
 ### 0.3: Unattended runs
-Status: planned.
+Status: released as [fork-v0.3.0](https://github.com/logicdelos/Eglantine/releases/tag/fork-v0.3.0) on 2026-11-16. The release gate passed against `fork-v0.2.0`, and the unattended exit test passed 10 of 10 cases: bad arguments, a frame limit, a time limit and a forced crash, on both tested games.
 
 **Significant change:** the command-line build can run a game for a set time or number of frames and write a machine-readable result file.
 
-- `--report`, `--run-seconds`, `--run-frames`, and exit codes that say how the run ended.
+- `--report`, `--run-seconds`, `--run-frames`, and exit codes that say how the run ended. See [fork-notes/unattended-runs.md](fork-notes/unattended-runs.md).
 - Crash handler, log flush thread and log rotation.
 
 Done when: a scripted run of each tested game ends with the right exit code and a complete report, including after a forced crash.

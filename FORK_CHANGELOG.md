@@ -12,9 +12,9 @@ Where a fix is described as a "likely fix", it was written to remove a cause fou
 
 All runs were made on one Windows 11 laptop: AMD Ryzen 9 8940HX, NVIDIA GeForce RTX 5070 Ti Laptop GPU, 16 GB RAM. Only Fire Emblem: Fortune's Weave and Xenoblade Chronicles 2 were run. Fixes marked "Orchid" or "Lichii" were ported from those forks, with the original author named in the commit message.
 
-## 0.3.0 (unreleased)
+## 0.3.0 (2026-11-16)
 
-Milestone 0.3, "Unattended runs": a scripted run ends by itself, says why in its exit code, and leaves one report file. Not run on a build yet at the time of writing; each line below says what was checked once it was.
+Milestone 0.3, "Unattended runs": a scripted run ends by itself, says why in its exit code, and leaves one report file. Verified on the as-shipped folder: the release gate passed against the `fork-v0.2.0` baseline (three runs, no new error lines, pictures within the limit), and the unattended exit test passed 10 of 10 cases (bad arguments, frame limit, time limit and forced crash on Fire Emblem: Fortune's Weave and Xenoblade Chronicles 2). Other error paths were read from the code, not provoked.
 
 ### New
 
@@ -29,7 +29,7 @@ Milestone 0.3, "Unattended runs": a scripted run ends by itself, says why in its
 
 ### Fixes
 
-- Crash handler on Windows: an unhandled exception, `abort()` or a failed CRT parameter check writes one Critical "Host crash" line with the code, the faulting address and the stack as module and offset, and the thread, then writes `eden_crash.dmp` in the log directory (`EDEN_NX2_CRASH_DUMP=<dir>` moves it). The dump is now always written, and the earlier `eden-crash-<pid>.dmp` name and the stderr stack print are gone. Ported from Lichii #1453 (zortos293), with the later fixes of #1710 and #1728. Not run in a crash yet at the time of writing.
+- Crash handler on Windows: an unhandled exception, `abort()` or a failed CRT parameter check writes one Critical "Host crash" line with the code, the faulting address and the stack as module and offset, and the thread, then writes `eden_crash.dmp` in the log directory (`EDEN_NX2_CRASH_DUMP=<dir>` moves it). The dump is now always written, and the earlier `eden-crash-<pid>.dmp` name and the stderr stack print are gone. Ported from Lichii #1453 (zortos293), with the later fixes of #1710 and #1728. The forced-crash cases of the unattended exit test ran this path on both tested games.
 - Log file: a thread flushes it once a second, so lines below Error no longer wait in the buffer until a hang or kill. Rotation renames the log over the previous one in one step; if the log cannot be moved, the session writes to `eden_log_2.txt`, and if that cannot be moved either it appends. A failed flush no longer recurses. Ported from Lichii #1771 (zortos293) and #889 (Eduardo Gomes).
 
 ### Internal
