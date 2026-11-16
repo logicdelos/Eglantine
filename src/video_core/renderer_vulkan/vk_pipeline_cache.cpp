@@ -24,8 +24,10 @@
 #include <numeric>
 #include <optional>
 #include <span>
+#include <shared_mutex>
 #include <thread>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 #include "common/cityhash.h"
 #include "common/env_gate.h"
@@ -488,6 +490,8 @@ public:
         std::unique_ptr<CE::EnvelopeReader> reader;
         std::unique_ptr<CE::EnvelopeWriter> writer; ///< Serialization thread only
         bool writer_failed{};
+        u64 uncommitted{};     ///< Records appended to `writer` that are not committed yet
+        u64 committed_bytes{}; ///< Size of the file at its last commit
     };
     /// Where candidate `i` of the scheduler lives: file and record index.
     struct Source {
@@ -511,6 +515,15 @@ public:
     std::atomic<u64> skipped{};
     std::atomic<u64> demand_wait_ns{};
     CE::WriteStatus write_status{CE::WriteStatus::NotAttempted};
+    /// Workers read records with it shared; a commit replaces the files, their readers and the
+    /// record numbers of `sources` with it exclusive.
+    std::shared_mutex reader_gate;
+    std::atomic<u64> uncommitted{};      ///< Records of all writers not committed yet
+    std::atomic<u64> last_commit_ns{};   ///< Spikes::NowNs() of the session start or last commit
+    std::atomic<u64> committed_bytes{};  ///< Size of the committed files
+    std::atomic<u64> checkpoints{};      ///< Commits made before the session ended
+    std::atomic<bool> checkpoint_queued{};
+    bool window_checkpoint_done{};       ///< GPU thread only
 };
 
 namespace {
@@ -600,6 +613,8 @@ void PublishSession(PipelineCacheSession& session) {
     report.stats.records_skipped = session.skipped.load(std::memory_order_relaxed);
     report.stats.demand_wait_ns = session.demand_wait_ns.load(std::memory_order_relaxed);
     report.stats.write_status = session.write_status;
+    report.stats.checkpoints = session.checkpoints.load(std::memory_order_relaxed);
+    report.stats.bytes_committed = session.committed_bytes.load(std::memory_order_relaxed);
     CE::PublishCacheReport(std::move(report));
 }
 
@@ -643,6 +658,8 @@ void RecordPipeline(PipelineCacheSession& session, const CE::RecordMeta& meta,
             switch (target->writer->Append(meta, payload)) {
             case CE::AppendResult::Ok:
                 session.recorded.fetch_add(1, std::memory_order_relaxed);
+                session.uncommitted.fetch_add(1, std::memory_order_relaxed);
+                ++target->uncommitted;
                 break;
             case CE::AppendResult::Duplicate:
                 break;
@@ -655,6 +672,82 @@ void RecordPipeline(PipelineCacheSession& session, const CE::RecordMeta& meta,
         }
     }
     session.staged.fetch_sub(1, std::memory_order_relaxed);
+}
+
+/// Commits the new generation of `session.files[index]`, when it has one with something new in it.
+/// With `keep_reader` (a checkpoint) the committed file is opened again as the file's reader and
+/// every source record is found in it, so preparation goes on reading the right records. The
+/// readers' gate is held exclusively: no worker is inside a read while the file is replaced
+/// (Windows cannot replace an open file) and none sees a reader or record number of the old
+/// generation. Runs on the serialization thread, or on the closing thread once that one is idle.
+bool CommitFile(PipelineCacheSession& session, size_t index, bool keep_reader) {
+    PipelineCacheSession::File& file = session.files[index];
+    if (!file.writer) {
+        return true;
+    }
+    const std::unique_lock gate{session.reader_gate};
+    std::vector<CE::IndexEntry> before;
+    if (file.reader) {
+        const auto old_index = file.reader->Index();
+        before.assign(old_index.begin(), old_index.end());
+    }
+    file.reader.reset();
+    const u64 pending = std::exchange(file.uncommitted, u64{0});
+    session.uncommitted.fetch_sub(pending, std::memory_order_relaxed);
+    // A writer that only holds the previous generation again is dropped, the file stays as it is.
+    bool ok = true;
+    if (pending != 0) {
+        const u64 bytes = file.writer->Bytes();
+        ok = file.writer->Commit();
+        if (ok) {
+            file.committed_bytes = bytes;
+        } else {
+            session.skipped.fetch_add(pending, std::memory_order_relaxed);
+        }
+    }
+    file.writer.reset();
+    u64 total = 0;
+    for (const auto& other : session.files) {
+        total += other.committed_bytes;
+    }
+    session.committed_bytes.store(total, std::memory_order_relaxed);
+    if (keep_reader) {
+        CE::CacheIdentity identity = session.identity;
+        identity.kind = file.kind;
+        CE::CacheLoadResult load;
+        file.reader = CE::EnvelopeReader::Open(file.path, identity, load);
+        const std::vector<u32> mapped =
+            file.reader ? PP::RemapRecords(before, file.reader->Index())
+                        : std::vector<u32>(before.size(), PP::NoRecord);
+        for (auto& source : session.sources) {
+            if (source.file == index) {
+                source.record = source.record < mapped.size() ? mapped[source.record] : PP::NoRecord;
+            }
+        }
+    }
+    return ok;
+}
+
+/// A checkpoint: what was recorded since the last commit becomes the committed generation, so a
+/// run that ends without a clean shutdown loses at most the last interval (PP::CheckpointDue).
+void CheckpointSession(PipelineCacheSession& session) {
+    bool committed = false;
+    for (size_t index = 0; index < session.files.size(); ++index) {
+        if (session.files[index].uncommitted == 0) {
+            continue;
+        }
+        if (CommitFile(session, index, true)) {
+            committed = true;
+        } else {
+            LOG_WARNING(Render_Vulkan, "Pipeline cache {} not checkpointed; the previous one is kept",
+                        CE::PayloadKindName(session.files[index].kind));
+        }
+    }
+    session.last_commit_ns.store(Spikes::NowNs(), std::memory_order_relaxed);
+    if (committed) {
+        session.checkpoints.fetch_add(1, std::memory_order_relaxed);
+        PublishSession(session);
+    }
 }
 
 /// Whether this device can use a recorded graphics pipeline as it was keyed (the dynamic state
@@ -694,19 +787,34 @@ bool GraphicsRecordUsable(const GraphicsPipelineCacheKey& key,
 void LoadPreparedRecord(PipelineCacheSession& session, const DynamicFeatures& features,
                         const PP::Scheduler::Task& task) {
     PP::Scheduler& prepare = session.scheduler;
-    const PipelineCacheSession::Source source = session.sources[task.id];
-    PipelineCacheSession::File& file = session.files[source.file];
-    const bool mesh_file = file.kind == CE::PayloadKind::TransferableMesh;
-    const CE::IndexEntry entry = file.reader->Index()[source.record];
+    CE::IndexEntry entry;
     std::vector<u8> bytes;
-    CE::RejectReason reason;
+    CE::RejectReason reason = CE::RejectReason::None;
+    size_t file_index = 0;
+    bool available = false;
     {
-        Spikes::SpanScope disk{Spikes::Cause::Disk, task.work, entry.length};
-        reason = file.reader->ReadRecord(source.record, bytes);
-        if (reason != CE::RejectReason::None) {
-            disk.Fail();
+        // A checkpoint replaces the files, their readers and the record numbers: shared while
+        // this one is looked up and read.
+        const std::shared_lock gate{session.reader_gate};
+        const PipelineCacheSession::Source source = session.sources[task.id];
+        file_index = source.file;
+        const PipelineCacheSession::File& file = session.files[file_index];
+        available = source.record != PP::NoRecord && file.reader != nullptr;
+        if (available) {
+            entry = file.reader->Index()[source.record];
+            Spikes::SpanScope disk{Spikes::Cause::Disk, task.work, entry.length};
+            reason = file.reader->ReadRecord(source.record, bytes);
+            if (reason != CE::RejectReason::None) {
+                disk.Fail();
+            }
         }
     }
+    if (!available) {
+        // The committed generation does not hold it any more: compiled normally when drawn.
+        prepare.LoadSkipped(task.id, task.generation);
+        return;
+    }
+    const bool mesh_file = session.files[file_index].kind == CE::PayloadKind::TransferableMesh;
     VideoCommon::PipelineRecord record;
     if (reason != CE::RejectReason::None ||
         VideoCommon::DecodePipelineRecord(bytes, mesh_file, record) != CE::RejectReason::None ||
@@ -1502,6 +1610,17 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         last_flush = std::chrono::steady_clock::now();
     }
 
+    // Replay admission starts: the boot moves from validation to the recorded pipelines.
+    size_t admitted = 0;
+    for (const auto& file : session->files) {
+        if (file.reader) {
+            const auto index = file.reader->Index();
+            admitted += static_cast<size_t>(std::ranges::count_if(index, [](const auto& entry) {
+                return entry.meta.kind != CE::RecordKind::Opaque;
+            }));
+        }
+    }
+    callback(VideoCore::LoadCallbackStage::Build, 0, admitted);
     std::vector<PP::Candidate> candidates;
     for (size_t file_index = 0; file_index < session->files.size(); ++file_index) {
         const auto& file = session->files[file_index];
@@ -1520,6 +1639,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     }
     cache_session = std::move(session);
     PipelineCacheSession& active = *cache_session;
+    active.last_commit_ns.store(Spikes::NowNs(), std::memory_order_relaxed);
     if (!candidates.empty() && !stop_loading.stop_requested()) {
         active.generation = active.scheduler.Begin(candidates);
         prepare_active.store(true, std::memory_order_release);
@@ -1531,6 +1651,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                  candidates.size(), options.workers);
     }
     PublishSession(active);
+    // Admission done: the loader's rows, recorded pipelines being prepared from here on.
     callback(VideoCore::LoadCallbackStage::Build, candidates.size(), candidates.size());
     if (!stop_loading.stop_requested()) {
         StartShaderPrecache(title_id);
@@ -1541,25 +1662,37 @@ void PipelineCache::RunPreparation(u64 generation) {
     PipelineCacheSession& session = *cache_session;
     PP::Scheduler& prepare = session.scheduler;
     ShaderPools pools;
+    // Demand wins: while runtime pipelines are being compiled the scheduler keeps this worker's
+    // records queued (Next with hold_builds), where a draw that needs one claims it at once; it
+    // is held for at most HoldBuildsFor in a row, so a constant stream of new pipelines cannot
+    // starve preparation.
+    constexpr auto HoldBuildsFor = std::chrono::milliseconds{500};
+    constexpr auto HoldPoll = std::chrono::milliseconds{20};
+    std::optional<std::chrono::steady_clock::time_point> held_since;
     for (;;) {
-        const PP::Scheduler::Task task =
-            prepare.Next(generation, PP::AvailablePhysicalMemoryBytes());
+        bool hold = false;
+        if (RuntimeBuildsBusy()) {
+            const auto now = std::chrono::steady_clock::now();
+            held_since = held_since.value_or(now);
+            hold = now - *held_since < HoldBuildsFor;
+        } else {
+            held_since.reset();
+        }
+        PP::Scheduler::Task task =
+            prepare.Next(generation, PP::AvailablePhysicalMemoryBytes(), hold);
+        // Released to make room under the ready cap: destroyed here, outside the scheduler.
+        task.evicted.reset();
         switch (task.kind) {
         case PP::Scheduler::TaskKind::Done:
             return;
         case PP::Scheduler::TaskKind::Wait:
-            prepare.WaitForChange(task.epoch, std::chrono::milliseconds{250});
+            prepare.WaitForChange(task.epoch, hold ? HoldPoll : std::chrono::milliseconds{250});
             break;
         case PP::Scheduler::TaskKind::Load:
             LoadPreparedRecord(session, dynamic_features, task);
             break;
         case PP::Scheduler::TaskKind::Build: {
-            // Demand wins: wait out a burst of runtime compilation, but not for good, so a
-            // constant stream of new pipelines cannot starve preparation.
-            for (int waited = 0; waited < 25 && RuntimeBuildsBusy() && prepare.Running();
-                 ++waited) {
-                std::this_thread::sleep_for(std::chrono::milliseconds{20});
-            }
+            held_since.reset();
             const auto record = std::static_pointer_cast<PreparedRecord>(task.payload);
             std::shared_ptr<void> result;
             bool ok = false;
@@ -1629,19 +1762,25 @@ void PipelineCache::FinishCacheSession() {
         session.statistics->Report();
     }
     CE::WriteStatus status = CE::WriteStatus::NotAttempted;
-    for (auto& file : session.files) {
-        file.reader.reset();
+    for (size_t index = 0; index < session.files.size(); ++index) {
+        auto& file = session.files[index];
         if (!file.writer) {
+            file.reader.reset();
             continue;
         }
-        if (file.writer->Commit() && status != CE::WriteStatus::Failed) {
-            status = CE::WriteStatus::Ok;
+        const bool new_records = file.uncommitted != 0;
+        if (CommitFile(session, index, false)) {
+            if (new_records && status != CE::WriteStatus::Failed) {
+                status = CE::WriteStatus::Ok;
+            }
         } else {
             status = CE::WriteStatus::Failed;
             LOG_WARNING(Render_Vulkan, "Pipeline cache {} was not written; the previous one is kept",
                         CE::PayloadKindName(file.kind));
         }
-        file.writer.reset();
+    }
+    if (status == CE::WriteStatus::NotAttempted && session.checkpoints.load() != 0) {
+        status = CE::WriteStatus::Ok; // Written by checkpoints, nothing new since the last
     }
     session.write_status = status;
     if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
@@ -1753,6 +1892,8 @@ CE::RecordMeta PipelineCache::NextRecordMeta(CE::RecordKind kind,
         .first_use_phase = boot ? CE::FirstUse::Boot : CE::FirstUse::Run,
         .first_use_ordinal = ++record_ordinal,
         .first_use_ns = boot ? 0 : Spikes::NowNs() - first_frame_ns,
+        // Not measured apart: translation runs inside the build on the calling thread or on a
+        // translation worker, and only the whole is timed (build_cost_us).
         .translate_cost_us = 0,
         .build_cost_us = static_cast<u32>(
             std::clamp<s64>(micros, 0, std::numeric_limits<u32>::max())),
@@ -2263,6 +2404,27 @@ void PipelineCache::TickFrame() {
             over_budget_mesh = 0;
         }
     }
+    // Checkpoint the recorded pipelines now and then so they survive a run that is killed; the
+    // commit itself runs on the serialization thread. One masked compare per frame.
+    constexpr u64 CheckpointCheckFrames = 256;
+    if (frame_count % CheckpointCheckFrames == 0 && cache_session) {
+        PipelineCacheSession& session = *cache_session;
+        const u64 now = Spikes::NowNs();
+        const bool window_over =
+            !session.window_checkpoint_done && now - first_frame_ns >= PP::FirstWindowNs;
+        if (!session.checkpoint_queued.load(std::memory_order_relaxed) &&
+            PP::CheckpointDue(session.uncommitted.load(std::memory_order_relaxed),
+                              now - session.last_commit_ns.load(std::memory_order_relaxed),
+                              session.committed_bytes.load(std::memory_order_relaxed),
+                              window_over)) {
+            session.window_checkpoint_done = session.window_checkpoint_done || window_over;
+            session.checkpoint_queued.store(true, std::memory_order_relaxed);
+            serialization_thread.QueueWork([&session] {
+                CheckpointSession(session);
+                session.checkpoint_queued.store(false, std::memory_order_release);
+            });
+        }
+    }
 }
 
 void PipelineCache::EvictUnusedPipelines() {
@@ -2334,13 +2496,10 @@ void PipelineCache::StartShaderPrecache(u64 title_id) {
     std::function<void()> write_marker = [] {};
     std::unordered_map<ComputePipelineCacheKey, std::vector<FileEnvironment>> programs;
     size_t entries = 0;
-    const auto reject = [this](CE::RejectReason reason, u64 found) {
-        const CE::CacheLoadResult result{.accepted = false,
-                                         .reason = reason,
-                                         .kind = CE::PayloadKind::WarmCompute,
-                                         .expected = CACHE_VERSION,
-                                         .found = found};
-        LOG_WARNING(Render_Vulkan, "{}", CE::CacheRejectLine(result));
+    const auto publish = [this](const CE::CacheLoadResult& result) {
+        if (!result.accepted) {
+            LOG_WARNING(Render_Vulkan, "{}", CE::CacheRejectLine(result));
+        }
         if (cache_session) {
             cache_session->extra_reports.push_back({CE::PayloadKind::WarmCompute, result});
             PublishSession(*cache_session);
@@ -2352,57 +2511,64 @@ void PipelineCache::StartShaderPrecache(u64 title_id) {
         if (!std::filesystem::exists(warm_file, ec)) {
             return;
         }
-        const std::string path = Common::FS::PathToUTF8String(warm_file);
         const u32 driver = device.GetDriverVersion();
         const u32 device_id = device.GetDeviceID();
         const auto marker = ShaderWarm::ReadWarmMarker(warm_file);
         const auto current =
             ShaderWarm::CurrentWarmStamp(warm_file, 0, driver, device_id, CACHE_VERSION);
         const bool done = current && marker && marker->Matches(*current);
-        size_t warm_entries = 0;
-        try {
-            std::ifstream file(warm_file, std::ios::binary | std::ios::ate);
-            file.exceptions(std::ifstream::failbit);
-            const auto end{file.tellg()};
-            file.seekg(0, std::ios::beg);
-            std::array<char, 8> magic;
-            u32 version{};
-            file.read(magic.data(), magic.size())
-                .read(reinterpret_cast<char*>(&version), sizeof(version));
-            constexpr std::array<char, 8> expected_magic{'y', 'u', 'z', 'u', 'c', 'a', 'c', 'h'};
-            if (magic != expected_magic) {
-                reject(CE::RejectReason::BadMagic, 0);
-                return;
-            }
-            if (version != CACHE_VERSION) {
-                // Not read: pre-compiling the game's shaders again writes a current file.
-                reject(CE::RejectReason::FormatVersion, version);
-                return;
-            }
-            while (file.tellg() != end) {
-                u32 num_envs{};
-                file.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
-                FileEnvironment env;
-                env.Deserialize(file);
-                if (num_envs != 1 || env.ShaderStage() != Shader::Stage::Compute) {
-                    throw std::runtime_error("unexpected entry");
-                }
-                ComputePipelineCacheKey key;
-                file.read(reinterpret_cast<char*>(&key), sizeof(key));
-                ++warm_entries;
-                precache_keys.insert(key.Hash());
-                if (!done && !programs.contains(key)) {
-                    static const VideoCommon::GuessMissing guess{};
-                    env.SetGuessMissing(&guess);
-                    programs[key].push_back(std::move(env));
-                }
-            }
-        } catch (const std::exception& e) {
-            LOG_WARNING(Render_Vulkan, "Shader precache: reading {} failed: {}", path, e.what());
-            precache_keys.clear();
-            programs.clear();
-            reject(CE::RejectReason::BadRecord, 0);
+        // The envelope carries the build, content, add-on and shader format stamps of the
+        // builder that wrote the file; one that does not match, or an old unenveloped one, is
+        // rejected here (and rebuilt by the builder) without being read.
+        CE::CacheLoadResult result;
+        const auto reader = CE::EnvelopeReader::Open(
+            warm_file,
+            ShaderWarm::WarmFileIdentity(CE::GetHostIdentity(), ShaderWarm::WarmAddonsEnabled()),
+            result);
+        if (!reader) {
+            publish(result);
             return;
+        }
+        // Every record is checked before any is used: a damaged file is rejected whole.
+        std::vector<std::pair<ComputePipelineCacheKey, FileEnvironment>> records;
+        std::vector<u8> payload;
+        CE::RejectReason failure = CE::RejectReason::None;
+        for (size_t index = 0; index < reader->Index().size() && failure == CE::RejectReason::None;
+             ++index) {
+            failure = reader->ReadRecord(index, payload);
+            if (failure != CE::RejectReason::None) {
+                break;
+            }
+            VideoCommon::PipelineRecord record;
+            failure = VideoCommon::DecodePipelineRecord(payload, false, record);
+            if (failure != CE::RejectReason::None) {
+                break;
+            }
+            const auto key = DecodeComputeKey(record.key);
+            if (!record.is_compute || record.envs.size() != 1 || !key ||
+                record.envs.front().ShaderStage() != Shader::Stage::Compute) {
+                failure = CE::RejectReason::BadRecord;
+                break;
+            }
+            records.emplace_back(*key, std::move(record.envs.front()));
+        }
+        if (failure != CE::RejectReason::None) {
+            publish(CE::CacheLoadResult{.accepted = false,
+                                        .reason = failure,
+                                        .kind = CE::PayloadKind::WarmCompute,
+                                        .expected = 0,
+                                        .found = 0});
+            return;
+        }
+        publish(result);
+        const size_t warm_entries = records.size();
+        for (auto& [key, env] : records) {
+            precache_keys.insert(key.Hash());
+            if (!done && !programs.contains(key)) {
+                static const VideoCommon::GuessMissing guess{};
+                env.SetGuessMissing(&guess);
+                programs[key].push_back(std::move(env));
+            }
         }
         LOG_INFO(Render_Vulkan, "Shader precache: {} compute programs", warm_entries);
         entries += warm_entries;
