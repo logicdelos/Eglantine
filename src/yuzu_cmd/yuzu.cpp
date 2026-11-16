@@ -617,6 +617,8 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
         Common::RunOutcome::Begin({.seconds = lp.run_seconds, .frames = lp.run_frames},
                                   &ForceFinish);
+        // At once: a signal during the set-up below ends the run as interrupted (130).
+        Common::RunOutcome::InstallSignalHandlers();
         Nx2Bottleneck::BeginRecording(Nx2Bottleneck::Now());
     }
     SdlConfig config{lp.config_path};
@@ -685,7 +687,7 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     }
 
     if (Common::RunOutcome::Active()) {
-        // After SDL started: the window and the renderer must not replace these handlers.
+        // Again, now that SDL started: the window or the renderer may have replaced them.
         Common::RunOutcome::InstallSignalHandlers();
     }
 
