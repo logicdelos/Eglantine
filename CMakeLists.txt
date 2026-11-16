@@ -76,6 +76,8 @@ endif()
 # qt stuff
 option(ENABLE_QT "Enable the Qt frontend" ON)
 option(ENABLE_QT_TRANSLATION "Enable translations for the Qt frontend" ON)
+# Off in this fork and not built into its releases: the checker only reads upstream's tag scheme
+# (vX.Y.Z, vX.Y.Z-rcN, daily-YYYYMMDD), and this fork tags its releases fork-vX.Y.Z.
 option(ENABLE_UPDATE_CHECKER "Enable update checker (for Qt and Android)" OFF)
 cmake_dependent_option(YUZU_USE_QT_MULTIMEDIA "Use QtMultimedia for Camera"  OFF "NOT YUZU_USE_BUNDLED_QT" OFF)
 cmake_dependent_option(YUZU_USE_QT_WEB_ENGINE "Use QtWebEngine for web applet implementation" OFF "NOT YUZU_USE_BUNDLED_QT" OFF)
@@ -286,8 +288,21 @@ option(YUZU_LEGACY "Apply patches that improve compatibility with older GPUs (e.
 option(NIGHTLY_BUILD "Use Nightly qualifiers in the update checker and build metadata" OFF)
 
 set(EGLANTINE_FORK_VERSION "" CACHE STRING "Version this build reports (window title, About dialog, first log line). Empty: the GIT-DISPLAY/DISPLAYVERSION identity when CI gives one, else git describe --tags --match 'fork-v*' without the prefix, else 0.1.0-dev+<short commit>")
-set(EGLANTINE_UPDATE_REPO "Eglantine-Community/Eglantine" CACHE STRING "GitHub owner/name repository the update checker reads releases from")
+# The repository the in-game news feed (and the update checker, when enabled) reads releases from.
+set(EGLANTINE_UPDATE_REPO "logicdelos/Eglantine" CACHE STRING "GitHub owner/name repository the news feed and the update checker read releases from")
 set(EGLANTINE_RELEASE_PLATFORM "" CACHE STRING "Release asset platform of this build, e.g. windows-x86_64, linux-aarch64-pgo, macos-arm64")
+
+# A build of this fork must never read, or replace itself with, upstream's releases. An existing
+# build directory keeps the value it cached, so say so instead of silently using it.
+if (EGLANTINE_UPDATE_REPO STREQUAL "Eglantine-Community/Eglantine")
+    if (ENABLE_UPDATE_CHECKER)
+        message(FATAL_ERROR "ENABLE_UPDATE_CHECKER is ON and EGLANTINE_UPDATE_REPO is Eglantine-Community/Eglantine, "
+                            "so this build could install an upstream build over itself. "
+                            "Set -DEGLANTINE_UPDATE_REPO=logicdelos/Eglantine or turn the update checker off.")
+    endif()
+    message(WARNING "EGLANTINE_UPDATE_REPO is Eglantine-Community/Eglantine, so the in-game news feed reads upstream's "
+                    "releases. Set -DEGLANTINE_UPDATE_REPO=logicdelos/Eglantine for a build of this fork.")
+endif()
 
 # GetSCMRev (CMakeModules/GetSCMRev.cmake) reads GIT-COMMIT, GIT-REFSPEC,
 # GIT-TAG and GIT-RELEASE from the source root so a build with no .git still

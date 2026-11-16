@@ -127,7 +127,7 @@ jobs:
           -DYUZU_USE_BUNDLED_QT=OFF
           -DYUZU_USE_BUNDLED_SDL3=ON
           -DENABLE_QT_TRANSLATION=ON
-          -DENABLE_UPDATE_CHECKER=${{ (inputs.release || startsWith(inputs.tag, 'daily-')) && 'ON' || 'OFF' }}
+          -DENABLE_UPDATE_CHECKER=OFF
           -DEGLANTINE_UPDATE_REPO=${{ github.repository }}
           -DEGLANTINE_RELEASE_PLATFORM=windows-x86_64
           -DUSE_DISCORD_PRESENCE=ON
@@ -143,8 +143,6 @@ jobs:
         shell: bash
         run: |
           targets="yuzu yuzu-cmd"
-          # The updater helper only exists in release and daily builds, where the update checker is on.
-          if [ "${{ inputs.release || startsWith(inputs.tag, 'daily-') }}" = "true" ]; then targets="$targets eglantine-updater"; fi
           cmake --build build/release --target $targets --parallel
           sccache --show-stats
 
@@ -255,7 +253,7 @@ jobs:
             -DVulkanHeaders_FORCE_BUNDLED=ON \
             -DVulkanUtilityLibraries_FORCE_BUNDLED=ON \
             -DENABLE_QT_TRANSLATION=ON \
-            -DENABLE_UPDATE_CHECKER=${{ (inputs.release || startsWith(inputs.tag, 'daily-')) && 'ON' || 'OFF' }} \
+            -DENABLE_UPDATE_CHECKER=OFF \
             -DEGLANTINE_UPDATE_REPO=${{ github.repository }} \
             -DEGLANTINE_RELEASE_PLATFORM=windows-x86_64-pgo \
             -DUSE_DISCORD_PRESENCE=ON \
@@ -279,8 +277,6 @@ jobs:
         run: |
           ccache --zero-stats
           targets="yuzu yuzu-cmd"
-          # The updater helper only exists in release and daily builds, where the update checker is on.
-          if [ "${{ inputs.release || startsWith(inputs.tag, 'daily-') }}" = "true" ]; then targets="$targets eglantine-updater"; fi
           cmake --build build/release --target $targets --parallel
           ccache --show-stats
 
