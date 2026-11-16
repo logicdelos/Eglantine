@@ -23,6 +23,11 @@ EDEN_NX2_FENCE_BATCH=1
 # Enable only if frame pacing stability is preferred over responsive controls.
 #EDEN_NX2_FRAMES_AHEAD=2
 
+# Opt-in (default off): the host timer thread, which delivers the guest's timed events (vsync among
+# them), waits on a high resolution waitable timer instead of a condition variable wait that follows
+# the Windows timer resolution. Windows 10 1803 or later. Read at start; =1 turns it on.
+#EDEN_NX2_HIRES_TIMER=1
+
 # --- Workarounds / Debug ---
 # Terrain/indirect drawing fix for Donkey Kong Bananza: enabled by default. Set to 0 only to leave to GPU.
 #EDEN_NX2_RESETFIX=0
