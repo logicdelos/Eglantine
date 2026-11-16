@@ -14,6 +14,7 @@
 #include <ctime>
 #include <fmt/chrono.h>
 #include "common/logging.h"
+#include "common/run_outcome.h"
 #include "common/scm_rev.h"
 #include "common/swap.h"
 #include "core/arm/debug.h"
@@ -213,6 +214,12 @@ static void ThrowFatalError(Core::System& system, Result error_code, FatalType f
         [[fallthrough]];
     case FatalType::ErrorScreen:
         // Since we have no fatal:u error screen. We should just kill execution instead
+        if (Common::RunOutcome::Active()) {
+            // An unattended run ends in order and says why, instead of aborting the host.
+            Common::RunOutcome::Request(Common::RunOutcome::Reason::GuestCrash,
+                                        fmt::format("fatal error {:#x}", error_code.raw));
+            break;
+        }
         ASSERT(false);
         break;
         // Should not throw a fatal screen but should generate an error report

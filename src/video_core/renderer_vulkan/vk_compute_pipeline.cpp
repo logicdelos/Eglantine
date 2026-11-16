@@ -32,6 +32,7 @@
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "common/logging.h"
+#include "common/run_outcome.h"
 #include "common/settings.h"
 
 namespace Vulkan {
@@ -190,6 +191,11 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
             }
             LOG_CRITICAL(Render_Vulkan, "Adreno rejected compute shader {:016X}: {}", shader_hash,
                          exception.what());
+            Common::RunOutcome::Request(exception.GetResult() == VK_ERROR_DEVICE_LOST
+                                            ? Common::RunOutcome::Reason::DeviceLost
+                                            : Common::RunOutcome::Reason::ShaderFailure,
+                                        fmt::format("compute pipeline build failed: {}",
+                                                    exception.what()));
             std::scoped_lock lock{build_mutex};
             is_built = true;
             build_condvar.notify_one();

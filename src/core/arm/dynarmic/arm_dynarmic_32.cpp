@@ -7,6 +7,7 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/run_outcome.h"
 #include "common/settings.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_32.h"
@@ -91,6 +92,9 @@ void DynarmicCallbacks32::ExceptionRaised(u32 pc, Dynarmic::A32::Exception excep
         LOG_CRITICAL(Core_ARM,
                         "ExceptionRaised(exception = {}, pc = {:08X}, code = {:08X}, thumb = {})",
                         exception, pc, m_memory.Read32(pc), m_parent.IsInThumbMode());
+        Common::RunOutcome::Request(Common::RunOutcome::Reason::GuestCrash,
+                                    fmt::format("unhandled A32 exception {} at pc {:#x}",
+                                                static_cast<std::size_t>(exception), pc));
     }
 }
 

@@ -39,6 +39,7 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "common/settings.h"
+#include "common/run_outcome.h"
 #include "video_core/nx2_profile.h"
 
 #if defined(__clang__) && defined(NDEBUG)
@@ -446,6 +447,11 @@ GraphicsPipeline::GraphicsPipeline(
                          exception.what(), spv_modules[1] ? 1 : 0, spv_modules[2] ? 1 : 0,
                          spv_modules[3] ? 1 : 0, key.state.patch_control_points_minus_one.Value() + 1,
                          device.GetMaxTessellationPatchSize());
+            Common::RunOutcome::Request(exception.GetResult() == VK_ERROR_DEVICE_LOST
+                                            ? Common::RunOutcome::Reason::DeviceLost
+                                            : Common::RunOutcome::Reason::ShaderFailure,
+                                        fmt::format("graphics pipeline build failed: {}",
+                                                    exception.what()));
             std::scoped_lock lock{build_mutex};
             is_built = true;
             build_condvar.notify_one();

@@ -29,6 +29,7 @@
 #include "common/fs/path_util.h"
 #include "common/literals.h"
 #include "common/memory_accounting.h"
+#include "common/run_outcome.h"
 #include <ranges>
 #include "common/settings.h"
 #include "common/settings_enums.h"
@@ -1006,6 +1007,12 @@ VkFormat Device::GetSupportedFormat(VkFormat wanted_format, VkFormatFeatureFlags
 
 void Device::ReportLoss() const {
     LOG_CRITICAL(Render_Vulkan, "Device loss occurred!");
+    Common::RunOutcome::Request(Common::RunOutcome::Reason::DeviceLost,
+                                "the Vulkan device was lost");
+    if (Common::RunOutcome::Active()) {
+        // An unattended run ends now; there is no Aftermath dump to wait for.
+        return;
+    }
 
     // Wait for the log to flush and for Nsight Aftermath to dump the results
     std::this_thread::sleep_for(std::chrono::seconds{15});

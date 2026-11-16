@@ -8,6 +8,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cctype>
+#include "common/run_outcome.h"
 #include "core/core.h"
 #include "core/debugger/debugger.h"
 #include "core/debugger/trace_hooks.h"
@@ -108,6 +109,9 @@ void Break(Core::System& system, BreakReason reason, u64 info1, u64 info2) {
             Debug_Emulated,
             "Emulated program broke execution! reason={:#016x}, info1={:#016x}, info2={:#016x}",
             reason, info1, info2);
+        Common::RunOutcome::Request(Common::RunOutcome::Reason::GuestCrash,
+                                    fmt::format("svcBreak reason={:#x} info1={:#x} info2={:#x}",
+                                                static_cast<u32>(reason), info1, info2));
 
         handle_debug_buffer(info1, info2);
 

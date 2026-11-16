@@ -20,6 +20,7 @@
 #include "common/cpu_features.h"
 #include "common/nx2_bottleneck.h"
 #include "common/nx2_sampler.h"
+#include "common/run_outcome.h"
 #include "common/settings.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
@@ -161,6 +162,9 @@ void DynarmicCallbacks64::ExceptionRaised(u64 pc, Dynarmic::A64::Exception excep
         } else {
             m_parent.LogBacktrace(m_process);
             LOG_CRITICAL(Core_ARM, "ExceptionRaised(exception = {}, pc = {:08X}, code = {:08X})", static_cast<std::size_t>(exception), pc, m_memory.Read32(pc));
+            Common::RunOutcome::Request(Common::RunOutcome::Reason::GuestCrash,
+                                        fmt::format("unhandled A64 exception {} at pc {:#x}",
+                                                    static_cast<std::size_t>(exception), pc));
         }
     }
 }
