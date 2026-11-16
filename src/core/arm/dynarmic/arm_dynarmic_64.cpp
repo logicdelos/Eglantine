@@ -468,7 +468,46 @@ static void SnapshotGuestModules(System& system) {
     Nx2Sampler::SetGuestModules(std::move(modules));
 }
 
+namespace {
+
+/// Commit windows shorter than this did no work (the common case is a compare that finds the
+/// code space already committed): they are not worth a span each.
+constexpr u64 MinCommitSpanNs = 5'000;
+
+/// Turns the JIT's phase callback into an attribution span. Runs on the compiling guest thread
+/// inside GetBlock, takes no lock and does not throw. It is only installed while a session
+/// records (SyncJitPhaseHook); the check covers the slice a session ends in.
+void RecordJitPhase(Dynarmic::JitPhase phase, u64 begin_ns, u64 end_ns) {
+    namespace Spikes = VideoCommon::Nx2Spikes;
+    if (!Spikes::AttributionEnabled()) {
+        return;
+    }
+    if (phase == Dynarmic::JitPhase::MemoryCommit) {
+        if (end_ns < begin_ns || end_ns - begin_ns < MinCommitSpanNs) {
+            return;
+        }
+        Spikes::RecordSpan(Spikes::Cause::CodeTranslation, begin_ns, end_ns);
+        return;
+    }
+    Spikes::RecordSpan(Spikes::Cause::CodeTranslation, begin_ns, end_ns, 0, 1);
+}
+
+/// Makes the JIT's hook non-null exactly while attribution records, so that with it off a cache
+/// miss pays only the JIT's null test (no clock read, no call). Called when a core is built and
+/// when a guest thread starts a run slice (two relaxed loads and a compare, no store unless the
+/// session state changed); a session that starts or ends mid-slice is picked up by the next one.
+void SyncJitPhaseHook() {
+    const Dynarmic::JitPhaseHook wanted =
+        VideoCommon::Nx2Spikes::AttributionEnabled() ? &RecordJitPhase : nullptr;
+    if (Dynarmic::g_jit_phase_hook.load(std::memory_order_relaxed) != wanted) {
+        Dynarmic::g_jit_phase_hook.store(wanted, std::memory_order_relaxed);
+    }
+}
+
+} // namespace
+
 HaltReason ArmDynarmic64::RunThread(Kernel::KThread* thread) {
+    SyncJitPhaseHook();
     if (Nx2Sampler::GuestTracking()) [[unlikely]] {
         SnapshotGuestModules(m_system);
     }
@@ -505,31 +544,6 @@ void ArmDynarmic64::RewindBreakpointInstruction() {
     this->SetContext(m_breakpoint_context);
 }
 
-namespace {
-
-/// Commit windows shorter than this did no work (the common case is a compare that finds the
-/// code space already committed): they are not worth a span each.
-constexpr u64 MinCommitSpanNs = 5'000;
-
-/// Turns the JIT's phase callback into an attribution span. Runs on the compiling guest thread
-/// inside GetBlock, takes no lock and does not throw; one relaxed load when no session runs.
-void RecordJitPhase(Dynarmic::JitPhase phase, u64 begin_ns, u64 end_ns) {
-    namespace Spikes = VideoCommon::Nx2Spikes;
-    if (!Spikes::AttributionEnabled()) {
-        return;
-    }
-    if (phase == Dynarmic::JitPhase::MemoryCommit) {
-        if (end_ns < begin_ns || end_ns - begin_ns < MinCommitSpanNs) {
-            return;
-        }
-        Spikes::RecordSpan(Spikes::Cause::CodeTranslation, begin_ns, end_ns);
-        return;
-    }
-    Spikes::RecordSpan(Spikes::Cause::CodeTranslation, begin_ns, end_ns, 0, 1);
-}
-
-} // namespace
-
 ArmDynarmic64::ArmDynarmic64(System& system, bool uses_wall_clock, Kernel::KProcess* process, DynarmicExclusiveMonitor& exclusive_monitor, std::size_t core_index)
     : ArmInterface{uses_wall_clock}, m_system{system}, m_exclusive_monitor{exclusive_monitor}
     , m_cb(std::make_optional<DynarmicCallbacks64>(*this, process))
@@ -538,6 +552,7 @@ ArmDynarmic64::ArmDynarmic64(System& system, bool uses_wall_clock, Kernel::KProc
     auto& page_table = process->GetPageTable().GetBasePageTable();
     auto& page_table_impl = page_table.GetImpl();
     MakeJit(&page_table_impl, page_table.GetAddressSpaceWidth());
+    SyncJitPhaseHook();
     static std::once_flag polled;
     static std::once_flag bottleneck_source;
     std::call_once(polled, [] {
@@ -550,7 +565,7 @@ ArmDynarmic64::ArmDynarmic64(System& system, bool uses_wall_clock, Kernel::KProc
             Event::JitFastmemRecompile,
             [] { return u64{Dynarmic::g_jit_stats.fastmem_recompiles.load(std::memory_order_relaxed)}; },
             nullptr);
-        Dynarmic::g_jit_phase_hook.store(&RecordJitPhase, std::memory_order_relaxed);
+        // The phase hook itself is published by SyncJitPhaseHook, only while a session records.
     });
     std::call_once(bottleneck_source, [] {
         Nx2Bottleneck::SetJitSource([] {
