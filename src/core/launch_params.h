@@ -41,6 +41,17 @@ struct LaunchParams {
     std::optional<std::string> edit_nup_icon{};
     std::optional<std::string> edit_nup_version{};
     std::optional<std::string> edit_nup_publisher{};
+    // Unattended runs (SDL frontend): --report <file.json>, --run-seconds <n>, --run-frames <n>.
+    std::optional<std::string> report_path{};
+    std::optional<double> run_seconds{};
+    std::optional<u64> run_frames{};
+    // --report was given twice: no destination is trustworthy, so no report is written.
+    bool report_conflict = false;
+    // The first problem with those options (bad value, duplicate, mixed with a command that
+    // exits at once); empty when there is none. Only the SDL frontend refuses to start on it.
+    std::string parse_error{};
+    // The first argument getopt did not understand; refused only by unattended runs.
+    std::string unknown_option{};
     u16 port = Network::DefaultRoomPort;
     bool use_multiplayer = false;
     bool fullscreen = false;

@@ -6,6 +6,9 @@
 
 #include <regex>
 #include <cctype>
+#include <cerrno>
+#include <cmath>
+#include <utility>
 
 #include "common/assert.h"
 #include "common/logging.h"
@@ -32,6 +35,40 @@ static std::optional<u16> ParsePort(const char* text) {
         return std::nullopt;
     }
     return static_cast<u16>(port);
+}
+
+/// Parses a whole positive, finite number of seconds; nullopt for anything else.
+static std::optional<double> ParseSeconds(const char* text) {
+    if (text[0] == '\0' || std::isspace(static_cast<unsigned char>(text[0])) != 0) {
+        return std::nullopt;
+    }
+    char* end = nullptr;
+    errno = 0;
+    const double seconds = std::strtod(text, &end);
+    if (end == text || *end != '\0' || errno == ERANGE || !std::isfinite(seconds) ||
+        seconds <= 0.0) {
+        return std::nullopt;
+    }
+    return seconds;
+}
+
+/// Parses a whole positive decimal count that fits in 64 bits; nullopt for anything else.
+static std::optional<u64> ParseFrames(const char* text) {
+    if (text[0] == '\0') {
+        return std::nullopt;
+    }
+    for (const char* c = text; *c != '\0'; ++c) {
+        if (std::isdigit(static_cast<unsigned char>(*c)) == 0) {
+            return std::nullopt;
+        }
+    }
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long long frames = std::strtoull(text, &end, 10);
+    if (end == text || *end != '\0' || errno == ERANGE || frames == 0) {
+        return std::nullopt;
+    }
+    return static_cast<u64>(frames);
 }
 
 /// Parses the command line options into a LaunchParams.
@@ -68,8 +105,18 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
         {"clear-nup-icon", no_argument, 0, 0x105},
         {"clear-nup-version", no_argument, 0, 0x106},
         {"clear-nup-publisher", no_argument, 0, 0x107},
+        {"report", required_argument, 0, 0x108},
+        {"run-seconds", required_argument, 0, 0x109},
+        {"run-frames", required_argument, 0, 0x10A},
         {0, 0, 0, 0},
         // clang-format on
+    };
+
+    // The first problem with the automation options is the one reported (see LaunchParams).
+    const auto fail = [&p](std::string message) {
+        if (p.parse_error.empty()) {
+            p.parse_error = std::move(message);
+        }
     };
 
     while (optind < argc) {
@@ -214,6 +261,43 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
                 p.log_filter = argv[optind];
                 ++optind;
                 break;
+            case 0x108:
+                if (optarg[0] == '\0') {
+                    fail("--report needs a file name");
+                } else if (p.report_path.has_value()) {
+                    p.report_conflict = true;
+                    fail("--report was given more than once");
+                } else {
+                    p.report_path = std::string(optarg);
+                }
+                break;
+            case 0x109:
+                if (p.run_seconds.has_value()) {
+                    fail("--run-seconds was given more than once");
+                } else if (const auto seconds = ParseSeconds(optarg)) {
+                    p.run_seconds = *seconds;
+                } else {
+                    fail(std::string("invalid --run-seconds '") + optarg +
+                         "': expected a positive number of seconds");
+                }
+                break;
+            case 0x10A:
+                if (p.run_frames.has_value()) {
+                    fail("--run-frames was given more than once");
+                } else if (const auto frames = ParseFrames(optarg)) {
+                    p.run_frames = *frames;
+                } else {
+                    fail(std::string("invalid --run-frames '") + optarg +
+                         "': expected a positive whole number");
+                }
+                break;
+            case '?':
+                // An unknown option, or one without its argument. Only an automated run
+                // (--report, --run-seconds, --run-frames) refuses it, so nothing else changes.
+                if (p.unknown_option.empty()) {
+                    p.unknown_option = optind > 0 ? argv[optind - 1] : argv[0];
+                }
+                break;
             }
         } else {
             // only kept due to shortcuts made by Qt frontend which use "-qlaunch"
@@ -235,6 +319,12 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
             }
             optind++;
         }
+    }
+    if ((p.report_path || p.run_seconds || p.run_frames) &&
+        (p.print_help || p.print_version || p.pack_nup_source || p.unpack_nup_source ||
+         p.edit_nup_source)) {
+        fail("--report, --run-seconds and --run-frames cannot be combined with --help, "
+             "--version, --pack-nup, --unpack-nup or --edit-nup");
     }
     p.argv0 = argv[0];
     return p;
@@ -295,7 +385,15 @@ void ApplyLaunchParams(LaunchParams const& lp) noexcept {
             "--edit-nup <file.nup> [--nup-name NAME --nup-icon PATH --nup-version VER"
             " --nup-publisher NAME --clear-nup-name --clear-nup-icon --clear-nup-version"
             " --clear-nup-publisher]"
-            " Rewrite default-language NUP metadata in place and exit\n",
+            " Rewrite default-language NUP metadata in place and exit\n"
+            "--report <file.json>  Write one JSON report (frame rate, thread time, waits, errors,\n"
+            "                      build, settings, outcome) when the run ends; the file must not exist\n"
+            "--run-seconds <n>     End the run after n seconds (exit code 124)\n"
+            "--run-frames <n>      End the run after n frames (exit code 0)\n"
+            "Exit codes: 0 normal or frame limit, 1 startup failure, 64 bad arguments, 70 guest crash,\n"
+            "71 device lost, 72 shader or pipeline failure, 74 report not written, 75 restart,\n"
+            "124 --run-seconds reached, 130 interrupted. The codes after 1 apply only to runs that\n"
+            "use --report, --run-seconds or --run-frames.\n",
             lp.argv0
         );
     }
