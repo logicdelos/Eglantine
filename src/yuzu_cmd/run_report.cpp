@@ -65,6 +65,7 @@ struct State {
     bool published_ok = true;
     fs::path destination;
     fs::path temporary;
+    fs::path crash_temporary;
     Json tunables = Json::object();
     Json initial_settings = Json::object();
     std::optional<u64> title_id;
@@ -343,6 +344,19 @@ bool Fail(const std::string& message) {
     return false;
 }
 
+/// Moves `from` to `to`, never over an existing file (the report is never overwritten).
+bool RenameNoReplace(const fs::path& from, const fs::path& to) {
+#ifdef _WIN32
+    return MoveFileExW(from.c_str(), to.c_str(), 0) != 0;
+#else
+    if (link(from.c_str(), to.c_str()) != 0) {
+        return false;
+    }
+    unlink(from.c_str());
+    return true;
+#endif
+}
+
 bool WriteReportFile(State& state, const std::string& text) {
     std::error_code ec;
     {
@@ -365,12 +379,10 @@ bool WriteReportFile(State& state, const std::string& text) {
         return Fail(Common::FS::ToUTF8String(state.destination.u8string()) +
                     " appeared while the run was going");
     }
-    fs::rename(state.temporary, state.destination, ec);
-    if (ec) {
-        const std::string reason = ec.message();
+    if (!RenameNoReplace(state.temporary, state.destination)) {
         fs::remove(state.temporary, ec);
         return Fail("renaming to " + Common::FS::ToUTF8String(state.destination.u8string()) +
-                    " failed: " + reason);
+                    " failed (the destination exists, or cannot be written)");
     }
     return true;
 }
@@ -469,18 +481,20 @@ public:
     size_t size = 0;
 };
 
-void CloseCrashFile() noexcept {
+bool CloseCrashFile() noexcept {
+    bool ok = true;
 #ifdef _WIN32
     if (crash_file != INVALID_HANDLE_VALUE) {
-        CloseHandle(crash_file);
+        ok = CloseHandle(crash_file) != 0;
         crash_file = INVALID_HANDLE_VALUE;
     }
 #else
     if (crash_file >= 0) {
-        close(crash_file);
+        ok = close(crash_file) == 0;
         crash_file = -1;
     }
 #endif
+    return ok;
 }
 
 bool WriteCrashPart(const char* data, size_t size) noexcept {
@@ -507,14 +521,45 @@ bool WriteCrashPart(const char* data, size_t size) noexcept {
     return true;
 }
 
-void WriteCrashReport(std::string_view detail) noexcept {
+bool FlushCrashFile() noexcept {
+#ifdef _WIN32
+    return FlushFileBuffers(crash_file) != 0;
+#else
+    return fsync(crash_file) == 0;
+#endif
+}
+
+/// Moves the crash report to its destination, never over an existing file.
+bool PublishCrashFile() noexcept {
+#ifdef _WIN32
+    return MoveFileExW(crash_temporary, crash_destination, 0) != 0;
+#else
+    if (link(crash_temporary, crash_destination) != 0) {
+        return false;
+    }
+    unlink(crash_temporary);
+    return true;
+#endif
+}
+
+bool CrashDestinationExists() noexcept {
+#ifdef _WIN32
+    return GetFileAttributesW(crash_destination) != INVALID_FILE_ATTRIBUTES;
+#else
+    return access(crash_destination, F_OK) == 0;
+#endif
+}
+
+/// Writes the crash report. False when a report was meant and could not be written; true when it
+/// was written, was not armed, or the normal report is already at the destination.
+bool WriteCrashReport(std::string_view detail) noexcept {
     const int index = crash_document.load(std::memory_order_acquire);
     if (index < 0) {
-        return;
+        return true;
     }
     int expected = CrashArmed;
     if (!crash_phase.compare_exchange_strong(expected, CrashWriting, std::memory_order_acq_rel)) {
-        return;
+        return true;
     }
     const CrashDocument& document = crash_documents[index];
 
@@ -542,28 +587,16 @@ void WriteCrashReport(std::string_view detail) noexcept {
     text.AddEscaped(detail, 64);
     text.Add("\"}");
 
-    // Seeking is not needed: the file was empty when it was opened.
-    const bool ok = WriteCrashPart(document.head, document.head_size) &&
-                    WriteCrashPart(middle, text.size) &&
-                    WriteCrashPart(document.tail, document.tail_size);
-#ifdef _WIN32
-    if (ok) {
-        FlushFileBuffers(crash_file);
+    // Seeking is not needed: the file was empty when it was created.
+    const bool written = WriteCrashPart(document.head, document.head_size) &&
+                         WriteCrashPart(middle, text.size) &&
+                         WriteCrashPart(document.tail, document.tail_size) && FlushCrashFile();
+    const bool closed = CloseCrashFile();
+    if (written && closed && PublishCrashFile()) {
+        return true;
     }
-    CloseCrashFile();
-    if (ok) {
-        // Not replacing: an existing destination is never overwritten.
-        MoveFileExW(crash_temporary, crash_destination, 0);
-    }
-#else
-    if (ok) {
-        fsync(crash_file);
-    }
-    CloseCrashFile();
-    if (ok) {
-        rename(crash_temporary, crash_destination);
-    }
-#endif
+    // The normal report can have been put in place in the meantime, which is as good.
+    return CrashDestinationExists();
 }
 
 /// Formats the fixed parts of the crash report from what is known now. Called with the state
@@ -615,32 +648,36 @@ void RebuildCrashDocument(State& state) {
     crash_document.store(next, std::memory_order_release);
 }
 
-/// Opens the temporary file for the crash writer and hands the writer to RunOutcome. A path that
-/// does not fit the static buffers, or a file that does not open, leaves the crash report off:
-/// the run still ends with the host-crash exit code.
+/// Creates the file of the crash report (a second one, so that the normal report is written
+/// without giving up the crash report) and hands the writer to RunOutcome. A path that does not
+/// fit the static buffers, or a file that cannot be created, leaves the crash report off: the run
+/// still ends with the host-crash exit code, without a report.
 void ArmCrashReport(State& state) {
 #ifdef _WIN32
-    const std::wstring& temporary = state.temporary.native();
+    const std::wstring& temporary = state.crash_temporary.native();
     const std::wstring& destination = state.destination.native();
 #else
-    const std::string& temporary = state.temporary.native();
+    const std::string& temporary = state.crash_temporary.native();
     const std::string& destination = state.destination.native();
 #endif
     if (temporary.size() >= CrashPathCapacity || destination.size() >= CrashPathCapacity) {
+        LOG_WARNING(Frontend, "The report path is too long for a crash report: crash report off");
         return;
     }
 #ifdef _WIN32
     crash_file = CreateFileW(temporary.c_str(), GENERIC_WRITE,
                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                             CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (crash_file == INVALID_HANDLE_VALUE) {
+        LOG_WARNING(Frontend, "Cannot create the crash report file: crash report off");
         return;
     }
     std::wmemcpy(crash_temporary, temporary.c_str(), temporary.size() + 1);
     std::wmemcpy(crash_destination, destination.c_str(), destination.size() + 1);
 #else
-    crash_file = open(temporary.c_str(), O_WRONLY | O_CLOEXEC);
+    crash_file = open(temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
     if (crash_file < 0) {
+        LOG_WARNING(Frontend, "Cannot create the crash report file: crash report off");
         return;
     }
     std::memcpy(crash_temporary, temporary.c_str(), temporary.size() + 1);
@@ -648,16 +685,27 @@ void ArmCrashReport(State& state) {
 #endif
     crash_phase.store(CrashArmed, std::memory_order_release);
     RebuildCrashDocument(state);
+    if (crash_document.load(std::memory_order_acquire) < 0) {
+        // The fixed text did not fit its buffers.
+        crash_phase.store(CrashUnarmed, std::memory_order_release);
+        CloseCrashFile();
+        std::error_code ec;
+        fs::remove(state.crash_temporary, ec);
+        LOG_WARNING(Frontend, "The crash report text does not fit its buffer: crash report off");
+        return;
+    }
     Common::RunOutcome::SetCrashReportWriter(&WriteCrashReport);
 }
 
-/// The normal report is about to be written: the crash report is off, and its file closed so
-/// the normal write can replace the contents. False when a crash is writing its report instead.
-bool DisarmCrashReport() {
+/// The normal report is on disk (or its writing failed): the crash report is off, and its file
+/// is closed and removed. False when a crash is writing its report at this moment.
+bool FinishCrashReport(State& state) {
     int expected = CrashArmed;
     if (crash_phase.compare_exchange_strong(expected, CrashPublishing,
                                             std::memory_order_acq_rel)) {
         CloseCrashFile();
+        std::error_code ec;
+        fs::remove(state.crash_temporary, ec);
         return true;
     }
     return expected != CrashWriting;
@@ -689,6 +737,8 @@ PrepareResult Prepare(const std::string& destination, std::string& message) {
     }
     fs::path temporary = path;
     temporary += "." + std::to_string(ProcessId()) + ".tmp";
+    fs::path crash_temporary = path;
+    crash_temporary += "." + std::to_string(ProcessId()) + ".crash.tmp";
     {
         std::ofstream probe{temporary, std::ios::binary | std::ios::out | std::ios::trunc};
         if (!probe) {
@@ -698,6 +748,7 @@ PrepareResult Prepare(const std::string& destination, std::string& message) {
     }
     state.destination = path;
     state.temporary = std::move(temporary);
+    state.crash_temporary = std::move(crash_temporary);
     state.prepared = true;
     ArmCrashReport(state);
     return PrepareResult::Ready;
@@ -729,7 +780,7 @@ bool Publish(Common::RunOutcome::Reason reason, int code, bool shutdown_complete
         return state.published_ok;
     }
     state.published = true;
-    if (!DisarmCrashReport()) {
+    if (crash_phase.load(std::memory_order_acquire) == CrashWriting) {
         // A crash is writing its own report, which is the report of this run.
         return true;
     }
@@ -740,6 +791,10 @@ bool Publish(Common::RunOutcome::Reason reason, int code, bool shutdown_complete
         std::error_code ec;
         fs::remove(state.temporary, ec);
         state.published_ok = Fail(e.what());
+    }
+    // The crash report stayed armed until now: the normal one is on disk, or has failed.
+    if (!FinishCrashReport(state)) {
+        return true;
     }
     return state.published_ok;
 }

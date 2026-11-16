@@ -60,6 +60,7 @@ std::atomic<u64> frame_target{};
 std::atomic<u32> reason_bits{static_cast<u32>(Reason::None)};
 std::atomic<CrashReportWriter> crash_writer{};
 std::atomic_flag crash_reported;
+std::atomic<bool> crash_report_failed{};
 std::stop_source& GetStopSource() {
     static auto* source = new std::stop_source;
     return *source;
@@ -350,7 +351,9 @@ void ReportHostCrash(std::string_view detail) noexcept {
         return;
     }
     if (const CrashReportWriter writer = crash_writer.load(std::memory_order_acquire)) {
-        writer(detail);
+        if (!writer(detail)) {
+            crash_report_failed.store(true, std::memory_order_release);
+        }
     }
 }
 
@@ -359,7 +362,9 @@ void ExitAfterHostCrash() noexcept {
         crash_writer.load(std::memory_order_acquire) == nullptr) {
         return;
     }
-    const int code = ExitCode(Reason::HostCrash);
+    const int code = ExitCode(crash_report_failed.load(std::memory_order_acquire)
+                                  ? Reason::ReportIoError
+                                  : Reason::HostCrash);
 #ifdef _WIN32
     // Not exit(): the crashed process may hold the loader lock or a CRT lock.
     TerminateProcess(GetCurrentProcess(), static_cast<UINT>(code));

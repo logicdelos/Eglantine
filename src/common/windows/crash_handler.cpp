@@ -59,9 +59,89 @@ CodeAddress Locate(const void* address) {
     return result;
 }
 
+/// Text appended to a fixed buffer without any call into the C runtime that can allocate.
+class RawText {
+public:
+    RawText(char* data_, std::size_t capacity_) noexcept : data{data_}, capacity{capacity_} {}
+
+    void Add(const char* text) noexcept {
+        while (*text != '\0' && size + 1 < capacity) {
+            data[size++] = *text++;
+        }
+    }
+
+    void AddHex(unsigned long long value, int least_digits) noexcept {
+        char digits[16];
+        int count = 0;
+        do {
+            digits[count++] = "0123456789ABCDEF"[value & 15];
+            value >>= 4;
+        } while (value != 0 || count < least_digits);
+        while (count != 0 && size + 1 < capacity) {
+            data[size++] = digits[--count];
+        }
+    }
+
+    void AddDecimal(unsigned long long value) noexcept {
+        char digits[20];
+        int count = 0;
+        do {
+            digits[count++] = static_cast<char>('0' + value % 10);
+            value /= 10;
+        } while (value != 0);
+        while (count != 0 && size + 1 < capacity) {
+            data[size++] = digits[--count];
+        }
+    }
+
+    char* data;
+    std::size_t capacity;
+    std::size_t size = 0;
+};
+
+/// Hands the run report the code, the address and the thread, and nothing that has to be looked
+/// up. `pointers` is null for a fail-fast, which is named by `fail_fast` instead.
+void PublishMinimalReport(const EXCEPTION_POINTERS* pointers, const char* fail_fast) noexcept {
+    char detail[256];
+    RawText text{detail, sizeof(detail)};
+    if (fail_fast == nullptr && pointers != nullptr) {
+        text.Add("unhandled exception 0x");
+        text.AddHex(static_cast<unsigned long>(pointers->ExceptionRecord->ExceptionCode), 8);
+        text.Add(" at 0x");
+        text.AddHex(reinterpret_cast<uintptr_t>(pointers->ExceptionRecord->ExceptionAddress), 1);
+    } else {
+        text.Add(fail_fast != nullptr ? fail_fast : "unknown failure");
+    }
+    text.Add(" on thread ");
+    text.AddDecimal(GetCurrentThreadId());
+    detail[text.size] = '\0';
+    Common::RunOutcome::ReportHostCrash(std::string_view{detail, text.size});
+}
+
+// A thread started at install. When a crash is being reported it gives the optional part of the
+// report (log line, dump) a time, then ends the process, so that a diagnostic that blocks cannot
+// keep a crashed run alive.
+HANDLE crash_started{};
+constexpr DWORD OptionalWorkMilliseconds = 15000;
+
+DWORD WINAPI CrashWatchdog(void*) {
+    if (WaitForSingleObject(crash_started, INFINITE) == WAIT_OBJECT_0) {
+        Sleep(OptionalWorkMilliseconds);
+        Common::RunOutcome::ExitAfterHostCrash();
+    }
+    return 0;
+}
+
 // `fail_fast` names a failure that ends in a fail-fast (abort() or a CRT invalid-parameter
 // failure), and is null for an unhandled exception.
 void Report(EXCEPTION_POINTERS* pointers, const char* fail_fast) {
+    // The report of an unattended run first, from fixed buffers only, and then the watchdog's
+    // clock: everything below can allocate, take a lock or block (module lookup, thread name,
+    // the log, the dump), and is optional.
+    PublishMinimalReport(pointers, fail_fast);
+    if (crash_started) {
+        SetEvent(crash_started);
+    }
     // Called on the crashed thread's stack, which the dispatcher's frames sit on top of: the
     // stack from the faulting frame on is the part after the exception address.
     void* frames[40];
@@ -89,24 +169,6 @@ void Report(EXCEPTION_POINTERS* pointers, const char* fail_fast) {
                             nullptr, nullptr);
         LocalFree(description);
     }
-
-    // The run report of an unattended run goes first: the log and the dump below can block.
-    {
-        char detail[1536];
-        if (!fail_fast) {
-            const EXCEPTION_RECORD& record = *pointers->ExceptionRecord;
-            const CodeAddress at = Locate(fault);
-            std::snprintf(detail, sizeof(detail),
-                          "unhandled exception 0x%08lX at %s+0x%llx on thread %lu \"%s\"; stack:%s",
-                          static_cast<unsigned long>(record.ExceptionCode), at.module, at.offset,
-                          static_cast<unsigned long>(GetCurrentThreadId()), thread_name, stack);
-        } else {
-            std::snprintf(detail, sizeof(detail), "%s on thread %lu \"%s\"; stack:%s", fail_fast,
-                          static_cast<unsigned long>(GetCurrentThreadId()), thread_name, stack);
-        }
-        Common::RunOutcome::ReportHostCrash(detail);
-    }
-
     if (!fail_fast) {
         const EXCEPTION_RECORD& record = *pointers->ExceptionRecord;
         const CodeAddress at = Locate(fault);
@@ -168,9 +230,10 @@ bool BeginReport() {
 LONG WINAPI OnUnhandledException(EXCEPTION_POINTERS* pointers) {
     if (BeginReport()) {
         Report(pointers, nullptr);
-        // An unattended run leaves with the host-crash code; any other run takes its usual course.
-        Common::RunOutcome::ExitAfterHostCrash();
     }
+    // An unattended run leaves with the host-crash code, also when the diagnostics above fail with
+    // a second exception on this thread (that one comes back here): other runs take their course.
+    Common::RunOutcome::ExitAfterHostCrash();
     return previous_filter ? previous_filter(pointers) : EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -179,8 +242,8 @@ LONG WINAPI OnUnhandledException(EXCEPTION_POINTERS* pointers) {
 void OnAbort(int) {
     if (BeginReport()) {
         ReportFailFast("abort()", _ReturnAddress());
-        Common::RunOutcome::ExitAfterHostCrash();
     }
+    Common::RunOutcome::ExitAfterHostCrash();
 }
 
 // A CRT function given an invalid parameter (a bad file descriptor or a null format string, for
@@ -189,8 +252,8 @@ void OnInvalidParameter(const wchar_t* expression, const wchar_t* function, cons
                         unsigned int line, std::uintptr_t reserved) {
     if (BeginReport()) {
         ReportFailFast("CRT invalid-parameter failure", _ReturnAddress());
-        Common::RunOutcome::ExitAfterHostCrash();
     }
+    Common::RunOutcome::ExitAfterHostCrash();
     // What the C runtime does without a handler.
     _invoke_watson(expression, function, file, line, reserved);
 }
@@ -208,6 +271,13 @@ void InstallCrashHandler(const std::filesystem::path& dump_directory) {
     }
     get_thread_description = reinterpret_cast<GetThreadDescriptionFn>(reinterpret_cast<void*>(
         GetProcAddress(GetModuleHandleW(L"KernelBase.dll"), "GetThreadDescription")));
+    // Started before any crash: creating a thread from a crashed process can wait on the loader.
+    crash_started = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (crash_started) {
+        if (const HANDLE watchdog = CreateThread(nullptr, 0, CrashWatchdog, nullptr, 0, nullptr)) {
+            CloseHandle(watchdog);
+        }
+    }
     previous_filter = SetUnhandledExceptionFilter(OnUnhandledException);
     std::signal(SIGABRT, OnAbort);
     _set_invalid_parameter_handler(OnInvalidParameter);
