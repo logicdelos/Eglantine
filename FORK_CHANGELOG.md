@@ -12,6 +12,22 @@ Where a fix is described as a "likely fix", it was written to remove a cause fou
 
 All runs were made on one Windows 11 laptop: AMD Ryzen 9 8940HX, NVIDIA GeForce RTX 5070 Ti Laptop GPU, 16 GB RAM. Only Fire Emblem: Fortune's Weave and Xenoblade Chronicles 2 were run. Fixes marked "Orchid" or "Lichii" were ported from those forks, with the original author named in the commit message.
 
+## 0.4.0 (unreleased)
+
+Milestone 0.4, "Measured speed work": every speed change ships off by default behind an `EDEN_NX2_*` switch and is measured on and off before it is recommended. None of the switches below has been measured yet; the results are to be filled from the measurement table. Each is described in `dist/nx2_switches.txt`; `=1` turns it on.
+
+### Experiments
+
+- `EDEN_NX2_PIN_GPU_THREADS`: pins the front and back GPU threads to physical performance cores of their own and keeps the emulated CPU cores off them (Windows only). Results: to be filled from the measurement table.
+- `EDEN_NX2_SKIP_EMPTY_FLUSH`: a fence flush skips its Vulkan queue submit when nothing was recorded since the last submit. Results: to be filled from the measurement table.
+- `EDEN_NX2_HIRES_TIMER`: the host timer thread waits on a high resolution waitable timer (Windows 10 1803 or later only). Results: to be filled from the measurement table.
+- `EDEN_NX2_ASTC_ONE_SUBMIT`: the GPU ASTC to BC transcode records the decode and the encode in one submit. Results: to be filled from the measurement table.
+- `EDEN_NX2_SPLIT_AT_HIGH`: the GPU front/back thread split also runs at GPU accuracy High and with safe DMA. Results: to be filled from the measurement table.
+- `EDEN_NX2_ZERO_PAGE_TRIM`: a background thread takes all-zero guest memory pages out of the process working set (Windows only). Results: to be filled from the measurement table.
+- `EDEN_NX2_PROTECT_NO_LOCK`: guest memory protection changes first try the range without the map/unmap lock (Windows only). Results: to be filled from the measurement table.
+- `EDEN_NX2_WARM_ADDON`: the shader precache build also reads the add-on packages of a `.nup`. Results: to be filled from the measurement table.
+- `EDEN_NX2_ASTC_CHEAP_UPLOAD`: cheaper per-block set-up in the Vulkan GPU ASTC decoder, and the opaque-ASTC scan reads guest data in place. Results: to be filled from the measurement table.
+
 ## 0.3.0 (2026-11-16)
 
 Milestone 0.3, "Unattended runs": a scripted run ends by itself, says why in its exit code, and leaves one report file. Verified on the as-shipped folder: the release gate passed against the `fork-v0.2.0` baseline (three runs, no new error lines, pictures within the limit), and the unattended exit test passed 10 of 10 cases (bad arguments, frame limit, time limit and forced crash on Fire Emblem: Fortune's Weave and Xenoblade Chronicles 2). Other error paths were read from the code, not provoked.
