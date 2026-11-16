@@ -69,6 +69,11 @@ EDEN_NX2_FENCE_BATCH=1
 # results), and the opaque-ASTC scan reads the guest data in place when it is in one piece.
 #EDEN_NX2_ASTC_CHEAP_UPLOAD=1
 
+# Attribution of long frames (over 100 ms) and of the first minutes to causes (disk, shader
+# compilation, translation, decompression, waits), written into the run report. On by default;
+# 0 turns it off and the report then says so.
+#EDEN_NX2_ATTRIBUTION=0
+
 # --- Workarounds / Debug ---
 # Terrain/indirect drawing fix for Donkey Kong Bananza: enabled by default. Set to 0 only to leave to GPU.
 #EDEN_NX2_RESETFIX=0
@@ -91,3 +96,8 @@ EDEN_NX2_FENCE_BATCH=1
 # Used to test that a crash during a scripted run (eden-cli --report ...) leaves a report with
 # exit.reason "host_crash" and the process exit code 73. Off unless set.
 #EDEN_NX2_TEST_CRASH_AFTER_FRAMES=300
+
+# A control directory for unattended-run tests (tools/nx2/shader_lab.py). The emulator writes
+# <dir>/session.txt (the title id and a nonce of this run) there and reads the interactive marker
+# "interactive <scene> <pass|fail> <title id> <nonce> [<origin>]" from <dir>/keys.txt.
+#EDEN_NX2_DIAG_DIR=C:\path\to\dir
