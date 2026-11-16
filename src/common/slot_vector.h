@@ -135,6 +135,22 @@ public:
         return SlotId{index};
     }
 
+    /// insert() for a constructor that may throw: on a throw the slot is released, nothing is
+    /// stored and the exception propagates.
+    template <typename... Args>
+    [[nodiscard]] SlotId try_insert(Args&&... args) {
+        const u32 index = FreeValueIndex();
+        try {
+            new (&values[index].object) T(std::forward<Args>(args)...);
+        } catch (...) {
+            free_list.push_back(index);
+            throw;
+        }
+        SetStorageBit(index);
+
+        return SlotId{index};
+    }
+
     void erase(SlotId id) noexcept {
         values[id.Value()].object.~T();
         free_list.push_back(id.Value());

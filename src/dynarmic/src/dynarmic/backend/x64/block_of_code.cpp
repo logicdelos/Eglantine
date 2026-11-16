@@ -28,6 +28,7 @@
 #include <cstring>
 
 #include "common/assert.h"
+#include "common/memory_accounting.h"
 #include "dynarmic/mcl/bit.hpp"
 #include "dynarmic/backend/x64/xbyak.h"
 
@@ -190,6 +191,12 @@ BlockOfCode::BlockOfCode(RunCodeCallbacks cb, JitStateInfo jsi, size_t total_cod
     GenRunCode(rcp);
 }
 
+BlockOfCode::~BlockOfCode() {
+#ifdef _WIN32
+    ::Common::MemoryAccounting::Sub(::Common::MemoryAccounting::Owner::JitCode, committed_size);
+#endif
+}
+
 bool BlockOfCode::HasHostFeature(HostFeature feature) const noexcept {
     return (GetHostFeatures() & feature) == feature;
 }
@@ -239,7 +246,9 @@ void BlockOfCode::EnsureMemoryCommitted([[maybe_unused]] size_t codesize) {
     if (committed_size < size_ + codesize) {
         // The code space is only reserved (CodeAllocator), so everything up to the end of the next
         // emission has to be committed; in steps, as each VirtualAlloc call is a kernel call.
+        const size_t previously_committed = committed_size;
         committed_size = std::min<size_t>(maxSize_, (std::max)(committed_size + COMMIT_STEP, size_ + codesize));
+        ::Common::MemoryAccounting::Add(::Common::MemoryAccounting::Owner::JitCode, committed_size - previously_committed);
 #    ifdef DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT
         VirtualAlloc(top_, committed_size, MEM_COMMIT, PAGE_READWRITE);
 #    else

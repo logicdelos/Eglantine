@@ -27,6 +27,7 @@
 
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 
 #include "video_core/engines/fermi_2d.h"
@@ -42,6 +43,7 @@
 #include "video_core/texture_cache/samples_helper.h"
 #include "video_core/texture_cache/util.h"
 #include "video_core/vulkan_common/vulkan_device.h"
+#include "video_core/vulkan_common/unbacked_image_policy.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #ifdef EGLANTINE_STREAMLINE
 #include "video_core/vulkan_common/streamline.h"
@@ -71,6 +73,10 @@ constexpr bool ENABLE_MSAA_TILER_RESOLVE = true;
 constexpr bool ENABLE_MSAA_RESOLVE_CONSUME = true;
 constexpr bool ENABLE_MSAA_COLOR_DISCARD = true;
 constexpr bool ENABLE_MSAA_DEPTH_STENCIL_DISCARD = true;
+
+[[nodiscard]] bool AdmissionOn() {
+    return VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::ImageAdmission);
+}
 
 [[nodiscard]] constexpr bool NeedsExplicitBorderColorFormat(VkFormat format) {
     switch (format) {
@@ -415,6 +421,23 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
     const auto [samples_x, samples_y] = VideoCommon::SamplesLog2(info.num_samples);
     const bool allow_storage =
         info.num_samples == 1 || device.IsStorageImageMultisampleSupported();
+    u32 width = info.size.width >> samples_x;
+    u32 height = info.size.height >> samples_y;
+    u32 depth = info.size.depth;
+    if (AdmissionOn() && (width == 0 || height == 0 || depth == 0)) {
+        // A positive guest size can shift to zero with MSAA; Vulkan rejects zero extents.
+        static u32 clamped{};
+        if (++clamped <= 16) {
+            LOG_WARNING(Render_Vulkan,
+                        "Host image extent {}x{}x{} from guest {}x{}x{} ({} samples, format {}) "
+                        "raised to at least 1 (#{})",
+                        width, height, depth, info.size.width, info.size.height, info.size.depth,
+                        info.num_samples, static_cast<u32>(info.format), clamped);
+        }
+        width = (std::max)(width, 1U);
+        height = (std::max)(height, 1U);
+        depth = (std::max)(depth, 1U);
+    }
     return VkImageCreateInfo{
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .pNext = nullptr,
@@ -422,9 +445,9 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
         .imageType = ConvertImageType(info.type),
         .format = format_info.format,
         .extent{
-            .width = info.size.width >> samples_x,
-            .height = info.size.height >> samples_y,
-            .depth = info.size.depth,
+            .width = width,
+            .height = height,
+            .depth = depth,
         },
         .mipLevels = static_cast<u32>(info.resources.levels),
         .arrayLayers = static_cast<u32>(info.resources.layers),
@@ -453,7 +476,8 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
 [[nodiscard]] vk::Image MakeImage(const Device& device, const MemoryAllocator& allocator,
                                   const ImageInfo& info, std::span<const VkFormat> view_formats,
                                   std::optional<VkFormat> format_override = {},
-                                  bool unbacked = false, bool aliased = false) {
+                                  bool unbacked = false, bool aliased = false,
+                                  VkResult* strict_result = nullptr) {
     if (info.type == ImageType::Buffer) {
         return vk::Image{};
     }
@@ -485,6 +509,9 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
         if (vk::Image image = allocator.CreateUnbackedImage(image_ci, aliased)) {
             return image;
         }
+    }
+    if (strict_result != nullptr) {
+        return allocator.TryCreateImage(image_ci, *strict_result);
     }
     return allocator.CreateImage(image_ci);
 }
@@ -2619,6 +2646,25 @@ u64 TextureCacheRuntime::GetDeviceMemorySlack() const {
     return device.GetDeviceMemorySlack();
 }
 
+u64 TextureCacheRuntime::ImmediateBackingBytes(const VideoCommon::ImageInfo& info,
+                                               GPUVAddr gpu_addr, u64 bytes) const {
+    // Built unbacked: memory comes later (by sparse block or layer, or when a write replaces it).
+    if (UsesSparseLayers(device, info, gpu_addr) || UsesSparseTiles(device, info, gpu_addr) ||
+        IsUnwrittenSparse(device, info, gpu_addr)) {
+        return 0;
+    }
+    if (IsHugeAstcArray(device, info)) {
+        // The host keeps only the mip levels that fit (TrimmedHostInfo).
+        bytes = (std::min)(bytes, TrimmedAstcArrayLimit(device));
+    }
+    const u64 texels = u64{info.size.width} * info.size.height * info.size.depth *
+                       static_cast<u64>(info.resources.layers);
+    if (Vulkan::ShouldLeaveImageUnbacked(texels, bytes, device.GetDeviceLocalMemory())) {
+        return 0; // MemoryAllocator::CreateImage leaves it unbacked
+    }
+    return bytes;
+}
+
 bool TextureCacheRuntime::CanDownloadMsaa(const VideoCommon::ImageInfo& info) const {
     const VkImageAspectFlags aspect_mask = ImageAspectMask(info.format);
     if ((aspect_mask & VK_IMAGE_ASPECT_COLOR_BIT) != 0) {
@@ -2964,6 +3010,10 @@ void TextureCacheRuntime::RecycleImage(Image& image, u64 completed_tick) {
 }
 
 void TextureCacheRuntime::TickFrame() {
+    if (AdmissionOn()) {
+        // One budget refresh per frame keeps the admission headroom close to the driver's.
+        device.RefreshMemoryBudget();
+    }
     if (PlainGpuUnswizzleEnabled()) {
         static const bool log_plain = std::getenv("EDEN_NX2_TC_LOG") != nullptr;
         if (++plain_unswizzle_frames % 600 == 0 && log_plain) {
@@ -4198,6 +4248,7 @@ bool Image::IsRescaled() const noexcept {
 }
 
 bool Image::ScaleUp(bool ignore) {
+    scale_alloc_failed = false;
     const auto& resolution = runtime->resolution;
     if (!resolution.active) {
         return false;
@@ -4206,8 +4257,6 @@ bool Image::ScaleUp(bool ignore) {
         return false;
     }
     ASSERT(info.type != ImageType::Linear);
-    flags |= ImageFlagBits::Rescaled;
-    has_scaled = true;
     if (!scaled_image) {
         const bool is_2d = info.type == ImageType::e2D;
         const u32 scaled_width = resolution.ScaleUp(info.size.width);
@@ -4215,10 +4264,24 @@ bool Image::ScaleUp(bool ignore) {
         auto scaled_info = info;
         scaled_info.size.width = scaled_width;
         scaled_info.size.height = scaled_height;
-        scaled_image = MakeImage(runtime->device, runtime->memory_allocator, scaled_info,
-                                 runtime->ViewFormats(info.format));
+        if (AdmissionOn()) {
+            // Inside the heap budget or not at all: the caller frees memory and retries, then
+            // keeps the image native. No flag changes before the image exists.
+            VkResult result{};
+            scaled_image = MakeImage(runtime->device, runtime->memory_allocator, scaled_info,
+                                     runtime->ViewFormats(info.format), {}, false, false, &result);
+            if (!scaled_image) {
+                scale_alloc_failed = true;
+                return false;
+            }
+        } else {
+            scaled_image = MakeImage(runtime->device, runtime->memory_allocator, scaled_info,
+                                     runtime->ViewFormats(info.format));
+        }
         ignore = false;
     }
+    flags |= ImageFlagBits::Rescaled;
+    has_scaled = true;
     current_image = &Image::scaled_image;
     if (ignore) {
         return true;

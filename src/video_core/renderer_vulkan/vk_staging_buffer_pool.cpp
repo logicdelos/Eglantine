@@ -18,6 +18,7 @@
 #include "common/bit_util.h"
 #include "common/common_types.h"
 #include "common/literals.h"
+#include "common/memory_accounting.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -119,9 +120,20 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
     }
     stream_pointer = stream_buffer.Mapped();
     ASSERT_MSG(!stream_pointer.empty(), "Stream buffer must be host visible!");
+    Common::MemoryAccounting::Add(Common::MemoryAccounting::Owner::Staging,
+                                  stream_buffer_size + STREAM_BUFFER_TAIL);
 }
 
-StagingBufferPool::~StagingBufferPool() = default;
+StagingBufferPool::~StagingBufferPool() {
+    u64 pooled{};
+    for (const StagingBuffersCache* const cache : {&device_local_cache, &upload_cache, &download_cache}) {
+        for (size_t log2 = 0; log2 < NUM_LEVELS; ++log2) {
+            pooled += static_cast<u64>((*cache)[log2].entries.size()) << log2;
+        }
+    }
+    Common::MemoryAccounting::Sub(Common::MemoryAccounting::Owner::Staging,
+                                  pooled + stream_buffer_size + STREAM_BUFFER_TAIL);
+}
 
 StagingBufferRef StagingBufferPool::Request(size_t size, MemoryUsage usage, bool deferred) {
     if (!deferred && usage == MemoryUsage::Upload && size <= region_size) {
@@ -256,6 +268,7 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
         device.IsBufferDeviceAddressSupported()
             ? device.GetLogical().GetBufferDeviceAddress(*buffer)
             : VkDeviceAddress{};
+    Common::MemoryAccounting::Add(Common::MemoryAccounting::Owner::Staging, u64{1} << log2_size);
     StagingBuffer& entry = GetCache(usage)[log2_size].entries.emplace_back(StagingBuffer{
         .buffer = std::move(buffer),
         .device_address = buffer_address,
@@ -303,6 +316,8 @@ void StagingBufferPool::ReleaseLevel(StagingBuffersCache& cache, size_t log2) {
     entries.erase(std::remove_if(begin, end, is_deletable), end);
 
     const size_t new_size = entries.size();
+    Common::MemoryAccounting::Sub(Common::MemoryAccounting::Owner::Staging,
+                                  static_cast<u64>(old_size - new_size) << log2);
     staging.delete_index += deletions_per_tick;
     if (staging.delete_index >= new_size) {
         staging.delete_index = 0;

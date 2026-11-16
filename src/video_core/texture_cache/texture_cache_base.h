@@ -582,6 +582,33 @@ private:
     bool ImageCanRescale(ImageBase& image);
     void InvalidateScale(Image& image);
     bool ScaleUp(Image& image);
+    /// Frees device memory now after a failed or unaffordable allocation (ImageAdmission).
+    u64 EmergencyEvict(u64 wanted_bytes, const ImageBase* keep, bool admission);
+    /// Makes an image slot; an invalid id when the host image can't be created even after an
+    /// emergency eviction (ImageAdmission). Without it a failure is fatal as before.
+    [[nodiscard]] ImageId CreateImageSlot(const ImageInfo& info, GPUVAddr gpu_addr,
+                                          DAddr cpu_addr);
+    /// True while scaled images are not attempted: the last one did not fit even after eviction.
+    [[nodiscard]] bool ScaleAllocBlocked() const noexcept;
+    bool RetryScaleUp(Image& image);
+
+    /// While alive EmergencyEvict frees nothing: the operation holds image pointers or ids
+    /// (alias lists, blit endpoints) that a deletion would leave dangling.
+    class EvictionBlock {
+    public:
+        explicit EvictionBlock(u32& depth_) noexcept : depth{depth_} {
+            ++depth;
+        }
+        ~EvictionBlock() {
+            --depth;
+        }
+        EvictionBlock(const EvictionBlock&) = delete;
+        EvictionBlock& operator=(const EvictionBlock&) = delete;
+
+    private:
+        u32& depth;
+    };
+
     bool ScaleDown(Image& image);
     u64 GetScaledImageSizeBytes(const ImageBase& image);
 
@@ -704,6 +731,13 @@ private:
     u64 modification_tick = 0;
     u64 frame_start_modification_tick = 0;
     u64 frame_tick = 0;
+
+    // Image admission (Nx2Perf::ImageAdmission)
+    u64 emergency_evict_frame{~0ULL};
+    u32 emergency_evicts_in_frame{};
+    u64 emergency_idle_until{};
+    u64 scale_blocked_until{};
+    u32 eviction_block_depth{};
 
     Common::ThreadWorker texture_decode_worker{1, "TextureDecoder", {},
                                                Common::ThreadPlacement::Efficiency};

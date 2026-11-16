@@ -113,6 +113,10 @@ namespace Vulkan {
         /// images would otherwise leave holes in the shared blocks).
         vk::Image CreateImage(const VkImageCreateInfo &ci, bool dedicated = false) const;
 
+        /// One device-local allocation inside the heap budget: no over-budget retry, host memory
+        /// or unbacked substitute. A null image, with the VkResult in `result`, when it fails.
+        vk::Image TryCreateImage(const VkImageCreateInfo &ci, VkResult &result) const;
+
         /// A sparse resident image with nothing bound (reads return zero, writes are dropped), or
         /// a null image when the device can't make one.
         /// aliased: its sparse blocks may share memory (VK_IMAGE_CREATE_SPARSE_ALIASED_BIT).

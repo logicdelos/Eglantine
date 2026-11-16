@@ -20,6 +20,7 @@
 #include <vector>
 #include <fmt/ranges.h>
 
+#include "common/memory_accounting.h"
 #include "common/range_sets.inc"
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/buffer_cache/storage_buffer_size.h"
@@ -74,7 +75,9 @@ BufferCache<P>::BufferCache(Tegra::MaxwellDeviceMemoryManager& device_memory_, R
 }
 
 template <class P>
-BufferCache<P>::~BufferCache() = default;
+BufferCache<P>::~BufferCache() {
+    Common::MemoryAccounting::Set(Common::MemoryAccounting::Owner::BufferScratch, 0);
+}
 
 template <class P>
 void BufferCache<P>::RunGarbageCollector(bool aggressive_gc) {
@@ -121,6 +124,8 @@ void BufferCache<P>::TickFrame() {
         return;
     }
     runtime.TickFrame(slot_buffers);
+    Common::MemoryAccounting::Set(Common::MemoryAccounting::Owner::BufferScratch,
+                                  immediate_buffer_alloc.capacity() + tmp_buffer.capacity());
     if (nx2_buffer_deps && frame_tick % 600 == 0) {
         LOG_INFO(HW_GPU, "nx2 buffer deps snapshot: frame {} rows {}", frame_tick,
                  nx2_buffer_deps->Edges().size());

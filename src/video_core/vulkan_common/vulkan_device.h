@@ -12,6 +12,7 @@
 #include <array>
 #include <atomic>
 #include <cstdlib>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -1089,6 +1090,17 @@ FN_MAX_LIMIT_LIST
     /// yet the driver does: with the heap at its budget it is not available to new images.
     u64 GetDeviceMemorySlack() const;
 
+    /// What the main device-local heap had left under its budget at the last
+    /// RefreshMemoryBudget (a snapshot, no allocator or driver call); the maximum value without
+    /// VK_EXT_memory_budget or before the first refresh.
+    u64 GetDeviceMemoryHeadroom() const {
+        return memory_headroom.load(std::memory_order_relaxed);
+    }
+
+    /// Re-reads the driver's heap budgets and stores the main heap's headroom (one driver
+    /// query; once a frame and after an allocation failure).
+    void RefreshMemoryBudget() const;
+
     u32 GetSetsPerPool() const {
         return sets_per_pool;
     }
@@ -1390,6 +1402,8 @@ private:
     std::vector<size_t> valid_heap_memory;                   ///< Heaps used.
     size_t main_heap{};       ///< Largest device-local heap, where images live.
     u64 heap_size_limit{};    ///< EDEN_NX2_VRAM_LIMIT_MIB for device-local heaps, 0 if unset.
+    /// Main heap's room under its budget at the last RefreshMemoryBudget; max until then.
+    mutable std::atomic<u64> memory_headroom{(std::numeric_limits<u64>::max)()};
 
     /// Format properties dictionary.
     ::Common::unordered_map<VkFormat, VkFormatProperties> format_properties;

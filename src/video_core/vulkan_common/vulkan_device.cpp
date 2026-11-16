@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <optional>
 #include <thread>
 #include "common/container/unordered_map.h"
@@ -27,6 +28,7 @@
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/literals.h"
+#include "common/memory_accounting.h"
 #include <ranges>
 #include "common/settings.h"
 #include "common/settings_enums.h"
@@ -1820,13 +1822,47 @@ u64 Device::GetDeviceMemorySlack() const {
     return statistics.blockBytes - (std::min)(statistics.blockBytes, statistics.allocationBytes);
 }
 
+void Device::RefreshMemoryBudget() const {
+    if (!extensions.memory_budget || allocator == nullptr) {
+        return;
+    }
+    // A new frame index makes VMA re-read the driver's budgets; vmaGetHeapBudgets alone only
+    // does so every 30 allocation operations, so the read below is the fresh one.
+    static u32 frame_index{};
+    vmaSetCurrentFrameIndex(allocator, ++frame_index);
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> heap_budgets{};
+    vmaGetHeapBudgets(allocator, heap_budgets.data());
+    u64 budget = heap_budgets[main_heap].budget;
+    if (heap_size_limit != 0) {
+        budget = (std::min)(budget, heap_size_limit);
+    }
+    memory_headroom.store(budget - (std::min)(budget, u64{heap_budgets[main_heap].usage}),
+                          std::memory_order_relaxed);
+}
+
 u64 Device::GetDeviceMemoryBudget() const {
     if (!extensions.memory_budget) {
         return 0;
     }
     VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
     budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
-    physical.GetMemoryProperties(&budget);
+    const VkPhysicalDeviceMemoryProperties2 mem_info = physical.GetMemoryProperties(&budget);
+    const VkPhysicalDeviceMemoryProperties& heaps = mem_info.memoryProperties;
+    {
+        // The memory line of Nx2Bottleneck: the driver's use and budget of each kind of heap.
+        u64 used[2]{};
+        u64 limit[2]{};
+        for (u32 heap = 0; heap < heaps.memoryHeapCount; ++heap) {
+            const size_t kind = (heaps.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) ? 0 : 1;
+            used[kind] += budget.heapUsage[heap];
+            limit[kind] += budget.heapBudget[heap];
+        }
+        using Common::MemoryAccounting::Owner;
+        Common::MemoryAccounting::Set(Owner::GpuLocalHeap, used[0]);
+        Common::MemoryAccounting::Set(Owner::GpuLocalBudget, limit[0]);
+        Common::MemoryAccounting::Set(Owner::GpuHostHeap, used[1]);
+        Common::MemoryAccounting::Set(Owner::GpuHostBudget, limit[1]);
+    }
     std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> heap_budgets{};
     if (allocator != nullptr) {
         vmaGetHeapBudgets(allocator, heap_budgets.data());

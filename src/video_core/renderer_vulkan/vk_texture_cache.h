@@ -104,6 +104,21 @@ public:
 
     void LogMemoryStatistics() const;
 
+    /// Main heap's room under its budget (see Device::GetDeviceMemoryHeadroom).
+    u64 GetDeviceMemoryHeadroom() const {
+        return device.GetDeviceMemoryHeadroom();
+    }
+
+    /// Device memory a new image takes at once, given the generic size estimate `bytes`: zero
+    /// for an image built unbacked or sparse, whose memory comes later.
+    u64 ImmediateBackingBytes(const VideoCommon::ImageInfo& info, GPUVAddr gpu_addr,
+                              u64 bytes) const;
+
+    /// Re-reads the driver's heap budgets (one driver query).
+    void RefreshMemoryBudget() const {
+        device.RefreshMemoryBudget();
+    }
+
     /// True when ASTC is re-compressed to BC3 and opaque images may use BC1 instead.
     bool UseOpaqueAstcFormat() const;
 
@@ -567,6 +582,11 @@ public:
 
     bool ScaleDown(bool ignore = false);
 
+    /// True when the last ScaleUp returned false because the scaled image did not fit.
+    [[nodiscard]] bool ScaleAllocationFailed() const noexcept {
+        return scale_alloc_failed;
+    }
+
     u64 allocation_tick;
 
     friend class BlockLinearUnswizzle3DPass;
@@ -692,6 +712,8 @@ private:
     std::vector<vk::ImageView> storage_layer_views; ///< By host level * layers + layer
     VkImageAspectFlags aspect_mask = 0;
     bool initialized = false;
+    /// The last ScaleUp could not allocate the scaled image and left the image native.
+    bool scale_alloc_failed = false;
 
     std::optional<Framebuffer> scale_framebuffer;
     std::optional<Framebuffer> normal_framebuffer;

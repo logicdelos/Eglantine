@@ -70,6 +70,7 @@
 #include "common/free_region_manager.h"
 #include "common/host_memory.h"
 #include "common/logging.h"
+#include "common/memory_accounting.h"
 #include "common/settings.h"
 
 #if defined(__ANDROID__) && __ANDROID_API__ < 30
@@ -197,6 +198,9 @@ public:
                 }
             }
         }
+        if (!lazy_commit) {
+            Account(backing_size);
+        }
         LOG_INFO(HW_Memory, "Guest RAM: {} MiB of backing memory, {}", backing_size >> 20,
                  lazy_commit ? "committed as it is used" : "committed now");
         // Allocate virtual address placeholder
@@ -248,7 +252,7 @@ public:
                 return false;
             }
             for (; chunk < run_end; ++chunk) {
-                committed_chunks[chunk].store(true, std::memory_order_release);
+                MarkCommitted(chunk);
             }
         }
         return true;
@@ -315,6 +319,19 @@ private:
     static constexpr size_t CommitChunkShift = 21; ///< Backing is committed 2 MiB at a time
     static constexpr size_t CommitChunkSize = size_t{1} << CommitChunkShift;
 
+    /// Counts backing as committed (the fault handler runs this too: atomics only).
+    void Account(u64 bytes) noexcept {
+        accounted.fetch_add(bytes, std::memory_order_relaxed);
+        Common::MemoryAccounting::Add(Common::MemoryAccounting::Owner::GuestRam, bytes);
+    }
+
+    /// Flags a chunk committed and counts it once, whichever threads commit it.
+    void MarkCommitted(size_t chunk) noexcept {
+        if (!committed_chunks[chunk].exchange(true, std::memory_order_acq_rel)) {
+            Account((std::min)(CommitChunkSize, backing_size - (chunk << CommitChunkShift)));
+        }
+    }
+
     /// First read or write of backing memory nobody committed: emulator code using
     /// backing_base directly (kernel slabs, memory manager metadata, shared buffers).
     static LONG CALLBACK CommitOnFault(EXCEPTION_POINTERS* info) noexcept {
@@ -340,7 +357,7 @@ private:
         if (!VirtualAlloc(self->backing_base + begin, size, MEM_COMMIT, PAGE_READWRITE)) {
             return EXCEPTION_CONTINUE_SEARCH;
         }
-        self->committed_chunks[offset >> CommitChunkShift].store(true, std::memory_order_release);
+        self->MarkCommitted(offset >> CommitChunkShift);
         return EXCEPTION_CONTINUE_EXECUTION;
     }
 
@@ -350,6 +367,9 @@ private:
             RemoveVectoredExceptionHandler(fault_handler);
             fault_handler = nullptr;
             commit_owner.store(nullptr, std::memory_order_release);
+        }
+        if (const u64 bytes = accounted.exchange(0)) {
+            Common::MemoryAccounting::Sub(Common::MemoryAccounting::Owner::GuestRam, bytes);
         }
         if (!placeholders.empty()) {
             for (const auto& placeholder : placeholders) {
@@ -499,6 +519,7 @@ private:
     bool lazy_commit{};      ///< Backing is committed as it is used, not all at once
     void* fault_handler{};   ///< CommitOnFault's registration
     std::unique_ptr<std::atomic<bool>[]> committed_chunks; ///< Per CommitChunkSize of backing
+    std::atomic<u64> accounted{}; ///< Bytes this instance added to the guest RAM counter
     static inline std::atomic<Impl*> commit_owner{}; ///< The instance CommitOnFault serves
 
     DynamicLibrary kernelbase_dll;

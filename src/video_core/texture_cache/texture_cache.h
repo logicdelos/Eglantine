@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <bit>
 #include <cstdlib>
+#include <exception>
 #include <limits>
 #include <map>
 #include <numeric>
@@ -22,6 +23,7 @@
 #include "common/container/unordered_map.h"
 
 #include "common/alignment.h"
+#include "common/memory_accounting.h"
 #include "common/settings.h"
 #include "common/slot_vector.h"
 #include "video_core/control/channel_state.h"
@@ -33,6 +35,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/texture_cache/memory_budget.h"
 #include "video_core/texture_cache/samples_helper.h"
@@ -382,6 +385,199 @@ void TextureCache<P>::RunGarbageCollector() {
 }
 
 template <class P>
+u64 TextureCache<P>::EmergencyEvict(u64 wanted_bytes, const ImageBase* keep, bool admission) {
+    static u32 evictions_logged{};
+    // Bounded: at most two a frame, and an admission pass that frees nothing pauses the next.
+    constexpr u64 MinAgeFrames = 8;
+    constexpr size_t MaxVictims = 32;
+    constexpr u64 IdleFrames = 60;
+    if (emergency_evict_frame != frame_tick) {
+        emergency_evict_frame = frame_tick;
+        emergency_evicts_in_frame = 0;
+    }
+    if (emergency_evicts_in_frame >= 2 || (admission && frame_tick < emergency_idle_until)) {
+        return 0;
+    }
+    if (eviction_block_depth != 0) {
+        // An operation up the stack holds images or alias entries that a deletion would leave
+        // dangling.
+        return 0;
+    }
+    ++emergency_evicts_in_frame;
+    u64 headroom_before{};
+    if constexpr (requires { runtime.RefreshMemoryBudget(); runtime.GetDeviceMemoryHeadroom(); }) {
+        runtime.RefreshMemoryBudget();
+        headroom_before = runtime.GetDeviceMemoryHeadroom();
+    }
+    // Images the current draw or join works on stay.
+    boost::container::small_vector<ImageId, 48> pinned;
+    const auto pin_view = [&](ImageViewId view_id) {
+        if (view_id != NULL_IMAGE_VIEW_ID && view_id != ImageViewId{}) {
+            pinned.push_back(slot_image_views[view_id].image_id);
+        }
+    };
+    for (const ImageViewId view_id : render_targets.color_buffer_ids) {
+        pin_view(view_id);
+    }
+    pin_view(render_targets.depth_buffer_id);
+    pinned.insert(pinned.end(), rt_image_id.begin(), rt_image_id.end());
+    pinned.push_back(rt_depth_image_id);
+    pinned.insert(pinned.end(), join_overlap_ids.begin(), join_overlap_ids.end());
+    pinned.insert(pinned.end(), join_left_aliased_ids.begin(), join_left_aliased_ids.end());
+    pinned.insert(pinned.end(), join_right_aliased_ids.begin(), join_right_aliased_ids.end());
+    pinned.insert(pinned.end(), join_bad_overlap_ids.begin(), join_bad_overlap_ids.end());
+    pinned.insert(pinned.end(), join_overlaps_found.begin(), join_overlaps_found.end());
+    pinned.insert(pinned.end(), join_ignore_textures.begin(), join_ignore_textures.end());
+    for (const JoinCopy& copy : join_copies_to_do) {
+        pinned.push_back(copy.id);
+    }
+    // The images are recorded first and the GPU is waited for once (as in the collector); images
+    // the GPU wrote are copied back to guest memory, others whose data would be lost stay.
+    struct Victim {
+        ImageId image_id;
+        std::optional<AsyncBuffer> map;
+    };
+    std::vector<Victim> victims;
+    u64 victim_bytes{};
+    for (const bool allow_costly : {false, true}) {
+        lru_cache.ForEachItemBelow(frame_tick - MinAgeFrames, [&](ImageId image_id) {
+            if (victim_bytes >= wanted_bytes || victims.size() >= MaxVictims) {
+                return true;
+            }
+            Image& image = slot_images[image_id];
+            if (keep == &image || True(image.flags & ImageFlagBits::IsDecoding) ||
+                (!allow_costly && True(image.flags & ImageFlagBits::CostlyLoad)) ||
+                std::ranges::find(pinned, image_id) != pinned.end() ||
+                std::ranges::any_of(victims, [&](const Victim& victim) {
+                    return victim.image_id == image_id;
+                })) {
+                return false;
+            }
+            const bool gpu_only = True(image.flags & ImageFlagBits::GpuModified) &&
+                                  False(image.flags & ImageFlagBits::CpuModified);
+            const bool must_download =
+                IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap);
+            const u64 bytes = ImageMemoryBytes(image) +
+                              (image.HasScaled() ? GetScaledImageSizeBytes(image) : 0);
+            if ((gpu_only && !must_download) || bytes == 0) {
+                return false;
+            }
+            std::optional<AsyncBuffer> map;
+            if (must_download) {
+                map.emplace(runtime.DownloadStagingBuffer(image.unswizzled_size_bytes, true));
+                const auto copies = FullDownloadCopies(image.info);
+                image.DownloadMemory(*map, copies);
+            }
+            victim_bytes += bytes;
+            victims.push_back({image_id, std::move(map)});
+            return false;
+        });
+        if (victim_bytes >= wanted_bytes || victims.size() >= MaxVictims) {
+            break;
+        }
+    }
+    u64 freed = victim_bytes;
+    u32 sentenced_freed{};
+    if (!victims.empty() || !gpu_sentenced_images.empty()) {
+        runtime.Finish();
+        for (Victim& victim : victims) {
+            Image& image = slot_images[victim.image_id];
+            if (victim.map) {
+                const auto copies = FullDownloadCopies(image.info);
+                SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies,
+                             victim.map->mapped_span, swizzle_data_buffer);
+                runtime.FreeDeferredStagingBuffer(*victim.map);
+            }
+            if (True(image.flags & ImageFlagBits::Tracked)) {
+                UntrackImage(image, victim.image_id);
+            }
+            UnregisterImage(victim.image_id);
+            DeleteImage(victim.image_id, true);
+        }
+        if constexpr (requires { runtime.CurrentTick(); }) {
+            // Deleted images that were waiting for the GPU are past it now.
+            while (!gpu_sentenced_images.empty() &&
+                   runtime.IsFree(gpu_sentenced_images.front().tick)) {
+                freed += gpu_sentenced_images.front().bytes;
+                gpu_sentenced_bytes -= gpu_sentenced_images.front().bytes;
+                gpu_sentenced_images.pop_front();
+                ++sentenced_freed;
+            }
+        }
+    }
+    u64 headroom_after{};
+    if constexpr (requires { runtime.RefreshMemoryBudget(); runtime.GetDeviceMemoryHeadroom(); }) {
+        runtime.RefreshMemoryBudget();
+        headroom_after = runtime.GetDeviceMemoryHeadroom();
+    }
+    if (freed == 0 && admission) {
+        emergency_idle_until = frame_tick + IdleFrames;
+    }
+    if (++evictions_logged <= 16) {
+        LOG_WARNING(Render_Vulkan,
+                    "Emergency eviction ({}): {} images and {} deleted copies, ~{} MiB freed for "
+                    "~{} MiB wanted, heap headroom {} -> {} MiB (#{})",
+                    admission ? "image does not fit" : "allocation failed", victims.size(),
+                    sentenced_freed, freed >> 20, wanted_bytes >> 20, headroom_before >> 20,
+                    headroom_after >> 20, evictions_logged);
+    }
+    return freed;
+}
+
+template <class P>
+ImageId TextureCache<P>::CreateImageSlot(const ImageInfo& info, GPUVAddr gpu_addr,
+                                         DAddr cpu_addr) {
+    if (!Nx2Perf::On(Nx2Perf::Opt::ImageAdmission)) {
+        return slot_images.insert(runtime, info, gpu_addr, cpu_addr);
+    }
+    static u32 failures_logged{};
+    u64 bytes = (std::max)(CalculateGuestSizeInBytes(info),
+                           u64{CalculateUnswizzledSizeBytes(info)});
+    if constexpr (requires { runtime.ImmediateBackingBytes(info, gpu_addr, bytes); }) {
+        // Sparse and unbacked images get no memory now: neither admission nor a retry after a
+        // failed allocation should free memory for their full size.
+        bytes = runtime.ImmediateBackingBytes(info, gpu_addr, bytes);
+    }
+    if constexpr (requires { runtime.GetDeviceMemoryHeadroom(); }) {
+        // Big images are checked against the heap budget first (the headroom read at the last
+        // refresh); smaller ones only react to a failure.
+        constexpr u64 AdmitMinBytes = 16_MiB;
+        constexpr u64 Reserve = 128_MiB;
+        if (bytes >= AdmitMinBytes) {
+            u64 headroom = runtime.GetDeviceMemoryHeadroom();
+            if constexpr (requires { runtime.RefreshMemoryBudget(); }) {
+                if (headroom < bytes + Reserve) {
+                    // The reading can be a frame old: look again before freeing anything.
+                    runtime.RefreshMemoryBudget();
+                    headroom = runtime.GetDeviceMemoryHeadroom();
+                }
+            }
+            if (headroom < bytes + Reserve) {
+                EmergencyEvict(bytes + Reserve - headroom, nullptr, true);
+            }
+        }
+    }
+    for (bool retried = false;; retried = true) {
+        try {
+            return slot_images.try_insert(runtime, info, gpu_addr, cpu_addr);
+        } catch (const std::exception& e) {
+            if (!retried && bytes != 0 && EmergencyEvict(bytes, nullptr, false) != 0) {
+                continue;
+            }
+            if (++failures_logged <= 16) {
+                LOG_ERROR(Render_Vulkan,
+                          "Image creation failed after retry: {}x{}x{} format {} ({} samples, ~{} "
+                          "MiB) at {:#x}: {} (#{})",
+                          info.size.width, info.size.height, info.size.depth,
+                          static_cast<u32>(info.format), info.num_samples, bytes >> 20, gpu_addr,
+                          e.what(), failures_logged);
+            }
+            return ImageId{};
+        }
+    }
+}
+
+template <class P>
 void TextureCache<P>::ApplyThresholdOverrides(bool log) {
     // Past what a frame needs, more device memory only keeps the textures of earlier scenes
     // (title 1 filled 6.7 GB of an 8 GB card and draws its races in ~5 GB), so collect from
@@ -446,11 +642,16 @@ void TextureCache<P>::TickFrame() {
     frame_start_modification_tick = modification_tick;
     // Upload buffers grown for one huge image (title 1's 341 MiB terrain layer pools) are freed
     // rather than kept for the rest of the session.
+    // Published before the release below so the peak includes a huge upload's scratch.
+    Common::MemoryAccounting::Set(Common::MemoryAccounting::Owner::TextureScratch,
+                                  swizzle_data_buffer.capacity() + unswizzle_data_buffer.capacity());
     for (auto* const scratch : {&swizzle_data_buffer, &unswizzle_data_buffer}) {
         if (scratch->capacity() > LargeScratchCapacity) {
             scratch->release();
         }
     }
+    Common::MemoryAccounting::Set(Common::MemoryAccounting::Owner::TextureScratch,
+                                  swizzle_data_buffer.capacity() + unswizzle_data_buffer.capacity());
     if constexpr (HAS_DEVICE_MEMORY_INFO) {
         // Switch 2 titles (native tiling) stream far more texture data than Eden's thresholds
         // were tuned for: title 1's attract loop alone keeps ~5.3 GB resident, so the collector
@@ -837,7 +1038,10 @@ void TextureCache<P>::ReplaceColorFeedbackViews(std::span<ImageViewInOut> views)
         if (it == feedback_shadows.end()) {
             const ImageInfo info = slot_images[image_id].info;
             const DAddr cpu_addr = slot_images[image_id].cpu_addr;
-            const ImageId id = slot_images.insert(runtime, info, gpu_addr, cpu_addr);
+            const ImageId id = CreateImageSlot(info, gpu_addr, cpu_addr);
+            if (!id) {
+                continue;
+            }
             total_used_memory += ImageMemoryBytes(slot_images[id]);
             feedback_shadows.push_back({id, frame_tick});
             LOG_INFO(HW_GPU, "Colour target {}x{} format {} sampled by its own draw: copying it",
@@ -1077,6 +1281,18 @@ bool TextureCache<P>::RescaleRenderTargets() {
         }
         check_rescale(render_targets.depth_buffer_id, tmp_depth_image);
 
+        const auto scale_down_all = [&] {
+            const auto scale_down = [this](ImageId image_id) {
+                if (image_id != CORRUPT_ID) {
+                    Image& image = slot_images[image_id];
+                    ScaleDown(image);
+                }
+            };
+            for (size_t index = 0; index < NUM_RT; ++index) {
+                scale_down(tmp_color_images[index]);
+            }
+            scale_down(tmp_depth_image);
+        };
         if (can_rescale) {
             rescaled = any_rescaled || scale_rating >= 2;
             const auto scale_up = [this](ImageId image_id) {
@@ -1091,19 +1307,23 @@ bool TextureCache<P>::RescaleRenderTargets() {
                 }
                 scale_up(tmp_depth_image);
                 scale_rating = 2;
+                if (ScaleAllocBlocked()) {
+                    // A scaled copy did not fit: the whole set renders at native resolution.
+                    const auto is_scaled = [this](ImageId image_id) {
+                        return image_id == CORRUPT_ID ||
+                               True(slot_images[image_id].flags & ImageFlagBits::Rescaled);
+                    };
+                    if (!std::ranges::all_of(tmp_color_images, is_scaled) ||
+                        !is_scaled(tmp_depth_image)) {
+                        rescaled = false;
+                        scale_down_all();
+                        scale_rating = 1;
+                    }
+                }
             }
         } else {
             rescaled = false;
-            const auto scale_down = [this](ImageId image_id) {
-                if (image_id != CORRUPT_ID) {
-                    Image& image = slot_images[image_id];
-                    ScaleDown(image);
-                }
-            };
-            for (size_t index = 0; index < NUM_RT; ++index) {
-                scale_down(tmp_color_images[index]);
-            }
-            scale_down(tmp_depth_image);
+            scale_down_all();
             scale_rating = 1;
         }
     } while (has_deleted_images);
@@ -1504,6 +1724,8 @@ bool TextureCache<P>::BlitImage(const Tegra::Engines::Fermi2D::Surface& dst,
     if (!result) {
         return false;
     }
+    // Preparing the source must not evict the destination (or the reverse).
+    const EvictionBlock eviction_block{eviction_block_depth};
     runtime.FlushDeferredClear();
     const BlitImages images = *result;
     const ImageId dst_id = images.dst_id;
@@ -1634,6 +1856,7 @@ std::optional<VideoCore::GameDlssProbe> TextureCache<P>::ProbeGameDlssOutput(
         if (!result) {
             return std::nullopt;
         }
+        const EvictionBlock eviction_block{eviction_block_depth};
         const ImageId dst_id = result->dst_id;
         const ImageId src_id = result->src_id;
         PrepareImage(src_id, false, false);
@@ -1695,6 +1918,7 @@ bool TextureCache<P>::CameraMotionUpscale(const Tegra::Engines::Fermi2D::Surface
         if (!result) {
             return false;
         }
+        const EvictionBlock eviction_block{eviction_block_depth};
         has_deleted_images = false;
         const ImageId depth_id = FindImage(depth_info, depth_address, RelaxedOptions{});
         if (has_deleted_images || !depth_id) {
@@ -1792,6 +2016,8 @@ bool TextureCache<P>::TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& ds
         if (!result) {
             return false;
         }
+        // Both endpoints (and the images found next) must survive until the pass is done.
+        const EvictionBlock eviction_block{eviction_block_depth};
         const ImageInfo motion_info(motion_vectors);
         has_deleted_images = false;
         const ImageId motion_id =
@@ -2836,6 +3062,9 @@ bool TextureCache<P>::ImageCanRescale(ImageBase& image) {
     if (!image.info.rescaleable) {
         return false;
     }
+    if (!image.HasScaled() && ScaleAllocBlocked()) {
+        return false;
+    }
     if (Settings::values.resolution_info.downscale && !image.info.downscaleable) {
         return false;
     }
@@ -3118,7 +3347,12 @@ void TextureCache<P>::TickAsyncUnswizzle() {
 template <class P>
 bool TextureCache<P>::ScaleUp(Image& image) {
     const bool has_copy = image.HasScaled();
-    const bool rescaled = image.ScaleUp();
+    bool rescaled = image.ScaleUp();
+    if constexpr (requires { image.ScaleAllocationFailed(); }) {
+        if (!rescaled && image.ScaleAllocationFailed()) {
+            rescaled = RetryScaleUp(image);
+        }
+    }
     if (!has_copy && image.HasScaled()) {
         total_used_memory += GetScaledImageSizeBytes(image);
     }
@@ -3127,6 +3361,33 @@ bool TextureCache<P>::ScaleUp(Image& image) {
     }
     InvalidateScale(image);
     return true;
+}
+
+template <class P>
+bool TextureCache<P>::RetryScaleUp(Image& image) {
+    static u32 fallbacks{};
+    // One retry after freeing memory; else the image stays native and scaled images pause.
+    constexpr u64 ScaleBlockFrames = 900;
+    EmergencyEvict(GetScaledImageSizeBytes(image), &image, false);
+    if (image.ScaleUp()) {
+        return true;
+    }
+    scale_blocked_until = frame_tick + ScaleBlockFrames;
+    if (++fallbacks <= 16) {
+        LOG_WARNING(Render_Vulkan,
+                    "Scaled image {}x{} (format {}, ~{} MiB) did not fit the device heap after an "
+                    "emergency eviction: kept at native resolution, scaled images paused for {} "
+                    "frames (#{})",
+                    image.info.size.width, image.info.size.height,
+                    static_cast<u32>(image.info.format), GetScaledImageSizeBytes(image) >> 20,
+                    ScaleBlockFrames, fallbacks);
+    }
+    return false;
+}
+
+template <class P>
+bool TextureCache<P>::ScaleAllocBlocked() const noexcept {
+    return Nx2Perf::On(Nx2Perf::Opt::ImageAdmission) && frame_tick < scale_blocked_until;
 }
 
 template <class P>
@@ -3181,6 +3442,9 @@ ImageId TextureCache<P>::InsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
                   info.block.height, info.block.depth);
     }
     const ImageId image_id = JoinImages(storage_info, gpu_addr, *cpu_addr, options);
+    if (!image_id) {
+        return ImageId{};
+    }
     const Image& image = slot_images[image_id];
     // Using "image.gpu_addr" instead of "gpu_addr" is important because it might be different
     const auto [it, is_new] = image_allocs_table.try_emplace(image.gpu_addr);
@@ -3290,7 +3554,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     ForEachSparseImageInRegion(channel_state->gpu_memory.GetID(), gpu_addr, size_bytes,
                                region_check_gpu);
 
-    bool can_rescale = info.rescaleable;
+    bool can_rescale = info.rescaleable && !ScaleAllocBlocked();
     bool any_rescaled = false;
     for (const auto& copy : join_copies_to_do) {
         if (!can_rescale) {
@@ -3307,6 +3571,16 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         for (const auto& copy : join_copies_to_do) {
             Image& sibling = slot_images[copy.id];
             ScaleUp(sibling);
+        }
+        if (ScaleAllocBlocked() &&
+            !std::ranges::all_of(join_copies_to_do, [this](const JoinCopy& copy) {
+                return True(slot_images[copy.id].flags & ImageFlagBits::Rescaled);
+            })) {
+            // A scaled copy did not fit: every image of the join stays native.
+            can_rescale = false;
+            for (const auto& copy : join_copies_to_do) {
+                ScaleDown(slot_images[copy.id]);
+            }
         }
     } else {
         for (const auto& copy : join_copies_to_do) {
@@ -3329,7 +3603,17 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             }
         }
     }
-    const ImageId new_image_id = slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
+    const ImageId new_image_id = CreateImageSlot(new_info, gpu_addr, cpu_addr);
+    if (!new_image_id) {
+        // Nothing was registered or deleted: only the alias marks set above are left to undo.
+        for (const ImageId aliased_id : join_left_aliased_ids) {
+            slot_images[aliased_id].CheckAliasState();
+        }
+        for (const ImageId aliased_id : join_right_aliased_ids) {
+            slot_images[aliased_id].CheckAliasState();
+        }
+        return ImageId{};
+    }
     Image& new_image = slot_images[new_image_id];
 
     // EDEN_NX2_TC_TRACE=<first frame>: one line per created image (at most 6000) with what it
@@ -3639,6 +3923,13 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
 
     if (can_rescale) {
         ScaleUp(new_image);
+        if (ScaleAllocBlocked() && False(new_image.flags & ImageFlagBits::Rescaled)) {
+            // The scaled copy did not fit: the siblings go back to native to match the new image.
+            can_rescale = false;
+            for (const auto& copy : join_copies_to_do) {
+                ScaleDown(slot_images[copy.id]);
+            }
+        }
     } else {
         ScaleDown(new_image);
     }
@@ -3754,6 +4045,10 @@ std::optional<typename TextureCache<P>::BlitImages> TextureCache<P>::GetBlitImag
             dst_id = InsertImage(dst_info, dst_addr, RelaxedOptions{});
         }
     } while (has_deleted_images);
+    if (!src_id || !dst_id) {
+        // An image could not be created (no device memory left): the blit is not accelerated.
+        return std::nullopt;
+    }
     const ImageBase& src_image = slot_images[src_id];
     const ImageBase& dst_image = slot_images[dst_id];
     const bool native_bgr = runtime.HasNativeBgr();
@@ -3769,6 +4064,9 @@ std::optional<typename TextureCache<P>::BlitImages> TextureCache<P>::GetBlitImag
             src_id = FindOrInsertImage(src_info, src_addr, RelaxedOptions{});
             dst_id = FindOrInsertImage(dst_info, dst_addr, RelaxedOptions{});
         } while (has_deleted_images);
+        if (!src_id || !dst_id) {
+            return std::nullopt;
+        }
     }
     return {BlitImages{
         .dst_id = dst_id,
@@ -4347,7 +4645,7 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
         }
     }
     if (image.HasScaled()) {
-        total_used_memory -= GetScaledImageSizeBytes(image);
+        total_used_memory -= (std::min)(total_used_memory, GetScaledImageSizeBytes(image));
     }
     // TickFrame sets the total from the driver, which can be under the sum of these estimates.
     total_used_memory -= (std::min)(total_used_memory, ImageMemoryBytes(slot_images[image_id]));
@@ -4518,7 +4816,10 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
     if (aliased_images.empty()) {
         return;
     }
+    // Alias entries and images are read until the copies are done: nothing may be evicted.
+    const EvictionBlock eviction_block{eviction_block_depth};
     const bool can_rescale = ImageCanRescale(image);
+    bool rescale_group = any_rescaled && can_rescale;
     if (any_rescaled) {
         if (can_rescale) {
             ScaleUp(image);
@@ -4536,18 +4837,35 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
         return lhs_image.modification_tick < rhs_image.modification_tick;
     });
     const auto& resolution = Settings::values.resolution_info;
+    if (resolution.active && any_rescaled) {
+        if (rescale_group && Nx2Perf::On(Nx2Perf::Opt::ImageAdmission)) {
+            // A scaled copy can fail to allocate: copies need every image of the group at one
+            // scale, so when one stays native the whole group goes back to native.
+            bool all_scaled = True(image.flags & ImageFlagBits::Rescaled);
+            for (const AliasedImage* const aliased : aliased_images) {
+                if (!all_scaled) {
+                    break;
+                }
+                Image& aliased_image = slot_images[aliased->id];
+                ScaleUp(aliased_image);
+                all_scaled = True(aliased_image.flags & ImageFlagBits::Rescaled);
+            }
+            if (!all_scaled) {
+                rescale_group = false;
+                ScaleDown(image);
+            }
+        } else if (rescale_group) {
+            for (const AliasedImage* const aliased : aliased_images) {
+                ScaleUp(slot_images[aliased->id]);
+            }
+        }
+        if (!rescale_group) {
+            for (const AliasedImage* const aliased : aliased_images) {
+                ScaleDown(slot_images[aliased->id]);
+            }
+        }
+    }
     for (const AliasedImage* const aliased : aliased_images) {
-        if (!resolution.active || !any_rescaled) {
-            CopyImage(image_id, aliased->id, aliased->copies);
-            continue;
-        }
-        Image& aliased_image = slot_images[aliased->id];
-        if (!can_rescale) {
-            ScaleDown(aliased_image);
-            CopyImage(image_id, aliased->id, aliased->copies);
-            continue;
-        }
-        ScaleUp(aliased_image);
         CopyImage(image_id, aliased->id, aliased->copies);
     }
 }

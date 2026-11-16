@@ -19,6 +19,7 @@
 
 #include "common/cpu_features.h"
 #include "common/logging.h"
+#include "common/memory_accounting.h"
 #include "common/thread.h"
 
 #ifdef _WIN32
@@ -341,6 +342,69 @@ std::string Memory(bool& low) {
 #endif
 }
 
+/// One line with the process's memory and what each owner reports (Common::MemoryAccounting).
+/// An owner that never reported is left out.
+void ReportMemory() {
+    namespace Accounting = Common::MemoryAccounting;
+    using Accounting::Owner;
+    constexpr u64 MiB = u64{1} << 20;
+    std::string text;
+    const auto item = [&text]<typename... Args>(fmt::format_string<Args...> format, Args&&... args) {
+        if (!text.empty()) {
+            text += ", ";
+        }
+        fmt::format_to(std::back_inserter(text), format, std::forward<Args>(args)...);
+    };
+    const auto owner = [&item](const char* name, Owner which) {
+        if (Accounting::Peak(which) != 0) {
+            item("{} {} MiB (peak {})", name, Accounting::Bytes(which) / MiB,
+                 Accounting::Peak(which) / MiB);
+        }
+    };
+    u64 private_bytes = 0;
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS_EX counters{};
+    counters.cb = sizeof(counters);
+    if (GetProcessMemoryInfo(GetCurrentProcess(),
+                             reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+                             sizeof(counters))) {
+        private_bytes = counters.PrivateUsage;
+        item("private {} MiB, working set {} MiB", private_bytes / MiB,
+             static_cast<u64>(counters.WorkingSetSize) / MiB);
+    }
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    if (GlobalMemoryStatusEx(&status)) {
+        item("system commit free {} MiB", status.ullAvailPageFile / MiB);
+    }
+#endif
+    owner("guest RAM committed", Owner::GuestRam);
+    owner("JIT code", Owner::JitCode);
+    if (Accounting::Peak(Owner::GpuLocalBudget) != 0 || Accounting::Peak(Owner::GpuHostBudget) != 0) {
+        item("GPU heap {} MiB (peak {}) of {} MiB (device-local) + {} MiB (peak {}) of {} MiB "
+             "(host-visible)",
+             Accounting::Bytes(Owner::GpuLocalHeap) / MiB, Accounting::Peak(Owner::GpuLocalHeap) / MiB,
+             Accounting::Bytes(Owner::GpuLocalBudget) / MiB,
+             Accounting::Bytes(Owner::GpuHostHeap) / MiB, Accounting::Peak(Owner::GpuHostHeap) / MiB,
+             Accounting::Bytes(Owner::GpuHostBudget) / MiB);
+    }
+    owner("staging", Owner::Staging);
+    owner("buffer cache scratch", Owner::BufferScratch);
+    owner("texture scratch", Owner::TextureScratch);
+    if (private_bytes != 0) {
+        // The owners that sit in private memory. Guest RAM is a mapped section, the GPU heaps are
+        // driver memory and staging may be either, so they are not taken off.
+        const u64 listed = Accounting::Bytes(Owner::JitCode) +
+                           Accounting::Bytes(Owner::BufferScratch) +
+                           Accounting::Bytes(Owner::TextureScratch);
+        item("other {} MiB", (static_cast<s64>(private_bytes) - static_cast<s64>(listed)) /
+                                 static_cast<s64>(MiB));
+    }
+    if (!text.empty()) {
+        LOG_INFO(Core, "{}", text);
+    }
+}
+
 void Report(const Window& window) {
     std::string text;
     const auto add = [&text]<typename... Args>(fmt::format_string<Args...> format, Args&&... args) {
@@ -413,6 +477,7 @@ void ReportLoop() {
         const u32 run = run_count.load(std::memory_order_relaxed);
         if (guest_running.load(std::memory_order_relaxed) && run == run_seen) {
             Report(window);
+            ReportMemory();
         }
         run_seen = run;
     }
