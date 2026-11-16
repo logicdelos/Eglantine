@@ -1104,11 +1104,12 @@ bool BufferCache<P>::Nx2VerifyDownloadBatch(const Nx2Downloads& downloads,
     // PopAsyncBuffers writes back the exact ranges inside each batched region: the same bytes as
     // the unbatched copies, each once, and nothing from the gaps.
     Common::RangeSet<DAddr> exact;
-    u64 exact_bytes = 0;
     for (const auto& [copy, buffer_id] : downloads) {
         exact.Add(slot_buffers[buffer_id].CpuAddr() + copy.src_offset, copy.size);
-        exact_bytes += copy.size;
     }
+    // Overlapping copies count once: compare the union of the copies with the union written.
+    u64 exact_bytes = 0;
+    exact.ForEach([&](DAddr start, DAddr end) { exact_bytes += end - start; });
     u64 written_bytes = 0;
     u64 staging_end = 0;
     for (const auto& [region, buffer_id] : batched) {
@@ -3179,7 +3180,8 @@ bool BufferCache<P>::BindMemoHit(const BindMemo& memo, Buffer& buffer, BufferId 
         if (!Nx2Perf::Verify()) {
             return true;
         }
-        // Verify: the skipped sync must find nothing to upload, and the skipped usage mark must
+        // Verify: the skipped sync must find nothing to upload (hot pages already uploaded this
+        // frame stay CPU-modified but the sync skips them), and the skipped usage mark must
         // already be in place. The full path runs either way.
         const auto mismatch = [&](std::string_view what) {
             if (bind_memo_mismatches++ < 64) {
@@ -3189,7 +3191,7 @@ bool BufferCache<P>::BindMemoHit(const BindMemo& memo, Buffer& buffer, BufferId 
                           kind, what, stage, index, device_addr, size, bind_memo_mismatches);
             }
         };
-        if (memory_tracker.IsRegionCpuModified(device_addr, size)) {
+        if (memory_tracker.IsRegionUploadPending(device_addr, size)) {
             mismatch("sync would upload");
         }
         if (memo.usage_marked && size != 0 && !buffer.IsRegionUsed(offset, size)) {

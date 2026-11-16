@@ -725,20 +725,25 @@ size_t Maxwell3D::CallStateMethodRun(const u64* entry, size_t max_words) {
 }
 
 void Maxwell3D::CallMethodSlow(Core::System& system, u32 method, u32 method_argument, bool is_last_call) {
-    // It is an error to write to a register other than the current macro's ARG register before
-    // it has finished execution.
-    if (executing_macro != 0 && method != executing_macro + 1) {
+    // While a macro collects parameters its words arrive as the macro method itself (first word),
+    // then the ARG register (executing_macro + 1: IncreaseOnce / non-incrementing headers), or,
+    // when an incrementing header started the macro, one method higher per word: DmaPusher does
+    // `method += 1` after every word. Only an incrementing header sends its first word through
+    // here alone (non-incrementing ones go through CallMultiMethod), so macro_next_method is set
+    // only when the macro started in this function and follows that run. Anything else is unexpected.
+    if (executing_macro != 0 && method != executing_macro + 1 &&
+        (macro_next_method == 0 || method != macro_next_method)) {
         DumpRecentWrites(method);
-    }
-    if (executing_macro != 0) {
-        ASSERT(method == executing_macro + 1);
+        ASSERT(false && "Write outside the running macro's argument registers");
     }
     RecordWrite(method, method_argument, 1, is_last_call ? 1 : 2);
 
     // Methods after 0xE00 are special, they're actually triggers for some microcode that was
     // uploaded to the GPU during initialization.
     if (method >= MacroRegistersStart) {
+        const bool incrementing = executing_macro == 0 || method == macro_next_method;
         ProcessMacro(system, method, &method_argument, 1, is_last_call);
+        macro_next_method = incrementing && executing_macro != 0 ? method + 1 : 0;
         return;
     }
     if (g_trace_first_method_writes) [[unlikely]] {
@@ -801,6 +806,7 @@ void Maxwell3D::CallMultiMethod(Core::System& system, u32 method, const u32* bas
     // Methods after 0xE00 are special, they're actually triggers for some microcode that was
     // uploaded to the GPU during initialization.
     if (method >= MacroRegistersStart) {
+        macro_next_method = 0; // a non-incrementing run, or the rest of an IncreaseOnce header
         ProcessMacro(system, method, base_start, amount, amount == methods_pending);
         return;
     }
@@ -1524,6 +1530,7 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
         front->parameters = std::move(macro_params);
         macro_params.clear();
         executing_macro = 0;
+        macro_next_method = 0;
         front_macros = true;
     }
     return *front;
@@ -1534,6 +1541,7 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
 // goes stale from now on, and a restart copies the registers again (Front).
 void Maxwell3D::ReleaseFront() {
     executing_macro = front->executing_macro;
+    macro_next_method = 0;
     macro_params = std::move(front->parameters);
     std::memcpy(shadow_state.reg_array.data(), front->shadow.data(), sizeof(front->shadow));
     shadow_state.shadow_ram_control = front->control;

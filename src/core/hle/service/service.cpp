@@ -446,4 +446,36 @@ void ClearUnimplementedCommands() {
     registry.records.clear();
 }
 
+void LogUnimplementedCommandCounts() {
+    constexpr size_t MaxEntries = 60;
+    auto records = GetUnimplementedCommands();
+    if (records.empty()) {
+        return;
+    }
+    std::ranges::stable_sort(records, [](const auto& a, const auto& b) { return a.count > b.count; });
+    const size_t shown = (std::min)(records.size(), MaxEntries);
+    // One line per service, its commands busiest first; services ordered by their busiest command.
+    std::vector<std::pair<std::string, std::string>> lines;
+    for (size_t i = 0; i < shown; ++i) {
+        const auto& r = records[i];
+        auto it = std::ranges::find(lines, r.service, &std::pair<std::string, std::string>::first);
+        if (it == lines.end()) {
+            it = lines.emplace(lines.end(), r.service, std::string{});
+        }
+        fmt::format_to(std::back_inserter(it->second), " {}{}{}{}={}", r.command,
+                       r.function.empty() ? "" : "(", r.function, r.function.empty() ? "" : ")",
+                       r.count);
+        if (!r.auto_stubbed) {
+            it->second += " unstubbed";
+        }
+        it->second += ',';
+    }
+    LOG_INFO(Service, "Unimplemented command call counts at shutdown ({} of {} commands):", shown,
+             records.size());
+    for (auto& [service, text] : lines) {
+        text.pop_back();
+        LOG_INFO(Service, "  {}:{}", service, text);
+    }
+}
+
 } // namespace Service

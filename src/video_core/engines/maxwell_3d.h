@@ -3401,6 +3401,10 @@ private:
 
     /// Macro method that is currently being executed / being fed parameters.
     u32 executing_macro = 0;
+    /// Method the next word of the running macro must have if it continues the incrementing header
+    /// that started it (one CallMethod per word, method + 1 each); 0 when the macro was not
+    /// started that way, so a separate call to a higher macro method is not taken as an argument.
+    u32 macro_next_method = 0;
 
     struct RecentWrite {
         u32 method;

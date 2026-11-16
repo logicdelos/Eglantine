@@ -69,6 +69,7 @@
 #include "core/hle/service/services.h"
 #include "core/hle/service/set/system_settings_server.h"
 #include "core/hle/service/sm/sm.h"
+#include "core/hle/service/unimplemented_registry.h"
 #include "core/internal_network/network.h"
 #include "core/loader/loader.h"
 #include "core/memory.h"
@@ -591,6 +592,7 @@ struct System::Impl {
         kernel.SuspendEmulation(true);
         kernel.CloseServices();
         kernel.ShutdownCores();
+        Service::LogUnimplementedCommandCounts();
         services.reset();
         service_manager.reset();
         fs_controller.Reset();

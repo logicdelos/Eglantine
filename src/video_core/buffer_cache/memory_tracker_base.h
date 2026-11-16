@@ -59,6 +59,14 @@ public:
         });
     }
 
+    /// True when ForEachUploadRange over the region would upload something: CPU-modified pages
+    /// minus the hot pages already uploaded this frame (those stay CPU-modified, word_manager.h).
+    [[nodiscard]] bool IsRegionUploadPending(VAddr query_cpu_addr, u64 query_size) noexcept {
+        return IteratePages<true>(query_cpu_addr, query_size, [](Manager* manager, u64 offset, size_t size) {
+            return manager->IsUploadPending(offset, size);
+        });
+    }
+
     /// Returns true if a region has been modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr query_cpu_addr, u64 query_size) noexcept {
         return IteratePages<false>(query_cpu_addr, query_size, [](Manager* manager, u64 offset, size_t size) {

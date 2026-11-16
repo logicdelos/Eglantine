@@ -313,6 +313,24 @@ struct WordManager {
         return result;
     }
 
+    /// @brief Returns true when ForEachModifiedRange(CPU, clear) over the region would report a
+    /// page: the CPU-modified pages that are not hot pages already uploaded this frame.
+    [[nodiscard]] bool IsUploadPending(u64 offset, u64 size) noexcept {
+        const bool hot_pages = HotPagesEnabled();
+        if (hot_pages) {
+            RefreshHotEpoch();
+        }
+        const std::span<const u64> cpu_words = Span(Type::CPU);
+        const std::span<const u64> hot_words = Span(Type::Hot);
+        const std::span<const u64> hot_clean_words = Span(Type::HotClean);
+        bool result = false;
+        IterateWords(offset, size, [&](size_t index, u64 mask) {
+            const u64 hot_clean = hot_pages ? hot_words[index] & hot_clean_words[index] & mask : 0;
+            return (cpu_words[index] & mask & ~hot_clean) != 0 ? (result = true) : false;
+        });
+        return result;
+    }
+
     /// @brief Returns a begin end pair with the inclusive modified region
     /// @param offset Offset in bytes from the start of the buffer
     /// @param size   Size in bytes of the region to query for modifications

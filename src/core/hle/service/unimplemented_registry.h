@@ -44,5 +44,7 @@ inline std::atomic<UnimplementedHook> g_unimplemented_hook{nullptr};
 std::vector<UnimplementedCommandRecord> GetUnimplementedCommands();
 /// Drops all records (thread-safe), so the next call of each command counts as first seen again.
 void ClearUnimplementedCommands();
+/// Logs the per-command call counts (busiest first, at most 60 commands) once. Called at shutdown.
+void LogUnimplementedCommandCounts();
 
 } // namespace Service
