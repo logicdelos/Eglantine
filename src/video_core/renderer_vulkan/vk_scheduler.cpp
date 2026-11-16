@@ -20,7 +20,6 @@
 
 #include "common/logging.h"
 #include "common/nx2_bottleneck.h"
-#include "common/run_outcome.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "video_core/gpu_logging/gpu_logging.h"
