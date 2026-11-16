@@ -241,7 +241,7 @@ LONG WINAPI OnUnhandledException(EXCEPTION_POINTERS* pointers) {
 // asserts end in abort(), which the C runtime turns into a fail-fast that skips the filter above.
 void OnAbort(int) {
     if (BeginReport()) {
-        ReportFailFast("abort()", _ReturnAddress());
+        ReportFailFast("abort()", __builtin_return_address(0));
     }
     Common::RunOutcome::ExitAfterHostCrash();
 }
@@ -251,7 +251,7 @@ void OnAbort(int) {
 void OnInvalidParameter(const wchar_t* expression, const wchar_t* function, const wchar_t* file,
                         unsigned int line, std::uintptr_t reserved) {
     if (BeginReport()) {
-        ReportFailFast("CRT invalid-parameter failure", _ReturnAddress());
+        ReportFailFast("CRT invalid-parameter failure", __builtin_return_address(0));
     }
     Common::RunOutcome::ExitAfterHostCrash();
     // What the C runtime does without a handler.
