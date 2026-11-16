@@ -622,13 +622,22 @@ public:
     /// Indirectly read banks of native programs already uploaded this frame.
     std::unordered_set<DAddr> native_indirect_uniforms_this_frame;
     struct NativeUniformBankShadow {
+        explicit NativeUniformBankShadow(bool lean = false) {
+            if (!lean) {
+                bytes.fill(0);
+            }
+        }
+
         u64 last_draw_ticket{};
         u64 last_frame_tick{~u64{0}};
         u64 last_skipped_draw_ticket{~u64{0}}; ///< Profiler only: bank_once_per_frame skips
         u32 initialized_mask{};
-        std::array<u8, 0x10000> bytes{};
+        u32 initialized_size{}; ///< Valid prefix, including a partially copied last page.
+        std::array<u8, 0x10000> bytes;
     };
     std::unordered_map<DAddr, NativeUniformBankShadow> native_indirect_uniform_shadow;
+    std::array<DAddr, 256> native_indirect_uniform_fifo{};
+    size_t native_indirect_uniform_fifo_next{};
     std::array<std::pair<DAddr, NativeUniformBankShadow*>, 8> native_indirect_uniform_cache{};
     DAddr native_indirect_uniform_last_bank = ~DAddr{0};
     NativeUniformBankShadow* native_indirect_uniform_last_ptr = nullptr;
@@ -1000,19 +1009,19 @@ private:
     /// The guest CPU read [begin, end): `marked` when GetFlushArea marked it Preflushable after a
     /// flush, else (PreflushAging) a trapped read of a marked range.
     void Nx2StampPreflushBlocks(DAddr begin, DAddr end, bool marked);
-    /// PreflushAging, every 60 frames: drops the marks of blocks the CPU stopped reading.
+    /// PreflushAging, every 60 frames: drops idle blocks unless a previous drop caused a flush.
     void Nx2AgePreflushBlocks();
 
     static constexpr u64 NX2_PREFLUSH_BLOCK_BITS = 16; ///< 64 KiB blocks
-    static constexpr u32 NX2_PREFLUSH_MIN_LIMIT = 120;  ///< Frames unread before a drop
-    static constexpr u32 NX2_PREFLUSH_MAX_LIMIT = 3600;
+    static constexpr u32 NX2_PREFLUSH_IDLE_FRAMES = 120; ///< Frames unread before a first drop
+    static constexpr u32 NX2_PREFLUSH_FORGET_FRAMES = 3600; ///< Forget unused dropped candidates
     /// A 64 KiB block with Preflushable marks. Without PreflushAging reads of marked ranges are
     /// not trapped, so `last_read_frame` is when the block was first marked. Guarded by `mutex`.
     struct Nx2PreflushBlock {
         u64 last_read_frame{};
-        u64 limit_frame{};  ///< Dropped: start of the decay period (the drop or the last halving)
-        u32 limit_frames{NX2_PREFLUSH_MIN_LIMIT};
-        bool dropped{};     ///< Marks dropped (PreflushAging) and not marked again since
+        u64 dropped_frame{};
+        bool dropped{};  ///< Marks dropped (PreflushAging) and not marked again since
+        bool retained{}; ///< A drop caused a reactive flush: preserve this block's marks
     };
     std::unordered_map<u64, Nx2PreflushBlock> nx2_preflush_blocks;
     u64 nx2_preflush_drops{};   ///< Blocks dropped since start

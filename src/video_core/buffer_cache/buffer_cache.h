@@ -154,7 +154,8 @@ void BufferCache<P>::TickFrame() {
                      nx2_buffer_deps->Resets(), nx2_buffer_deps->Drops());
         }
     }
-    if (native_indirect_uniform_shadow.size() > 256) {
+    if (!Nx2Perf::On(Nx2Perf::Opt::UniformShadowLean) &&
+        native_indirect_uniform_shadow.size() > 256) {
         native_indirect_uniform_shadow.clear();
         native_indirect_uniform_cache.fill({~DAddr{0}, nullptr});
         native_indirect_uniform_last_bank = ~DAddr{0};
@@ -1184,23 +1185,23 @@ void BufferCache<P>::Nx2StampPreflushBlocks(DAddr begin, DAddr end, bool marked)
             continue;
         }
         Nx2PreflushBlock& entry = it->second;
+        const u64 last_read_frame = entry.last_read_frame;
         entry.last_read_frame = frame_tick;
         if (!entry.dropped) {
             continue;
         }
-        // Dropped too early: the read flushed (stalled). Keep the mark twice as long next time.
+        // Sparse reads while moving can outlive any useful idle limit. Do not drop this block again.
         entry.dropped = false;
-        entry.limit_frames = (std::min)(entry.limit_frames * 2, NX2_PREFLUSH_MAX_LIMIT);
-        entry.limit_frame = frame_tick;
+        entry.retained = true;
         ++nx2_preflush_remarks;
         if (Nx2Perf::Verify()) {
             static u64 reports{};
             if (++reports <= 64) {
-                LOG_ERROR(HW_GPU,
-                          "Nx2Perf preflush_aging: read of dropped block {:#x} stalled (read "
-                          "{:#x}-{:#x}, new limit {} frames; {} stalls in {} drops)",
-                          block << NX2_PREFLUSH_BLOCK_BITS, begin, end, entry.limit_frames,
-                          nx2_preflush_remarks, nx2_preflush_drops);
+                LOG_DEBUG(HW_GPU,
+                          "Nx2Perf preflush_aging: retaining block {:#x} after reactive read "
+                          "{:#x}-{:#x} at frame {} ({} frames unread; {} stalls in {} drops)",
+                          block << NX2_PREFLUSH_BLOCK_BITS, begin, end, frame_tick,
+                          frame_tick - last_read_frame, nx2_preflush_remarks, nx2_preflush_drops);
             }
         }
     }
@@ -1215,23 +1216,23 @@ void BufferCache<P>::Nx2AgePreflushBlocks() {
     // for the GPU's data, and marks the block again.
     constexpr u64 block_size = u64{1} << NX2_PREFLUSH_BLOCK_BITS;
     size_t marked = 0;
+    size_t retained = 0;
     for (auto it = nx2_preflush_blocks.begin(); it != nx2_preflush_blocks.end();) {
         Nx2PreflushBlock& entry = it->second;
         if (entry.dropped) {
-            // The limit halves per 3600 frames unread; back at the minimum the block is forgotten.
-            if (frame_tick - entry.limit_frame >= NX2_PREFLUSH_MAX_LIMIT) {
-                if (entry.limit_frames <= NX2_PREFLUSH_MIN_LIMIT) {
-                    it = nx2_preflush_blocks.erase(it);
-                    continue;
-                }
-                entry.limit_frames = (std::max)(entry.limit_frames / 2, NX2_PREFLUSH_MIN_LIMIT);
-                entry.limit_frame = frame_tick;
+            // Forget unused candidates, but never erase the history of a retained block.
+            if (frame_tick - entry.dropped_frame >= NX2_PREFLUSH_FORGET_FRAMES) {
+                it = nx2_preflush_blocks.erase(it);
+                continue;
             }
             ++it;
             continue;
         }
-        if (frame_tick - entry.last_read_frame <= entry.limit_frames) {
+        if (entry.retained || frame_tick - entry.last_read_frame <= NX2_PREFLUSH_IDLE_FRAMES) {
             ++marked;
+            if (entry.retained) {
+                ++retained;
+            }
             ++it;
             continue;
         }
@@ -1241,15 +1242,15 @@ void BufferCache<P>::Nx2AgePreflushBlocks() {
             ArmReadTraps(start, end - start);
         });
         entry.dropped = true;
-        entry.limit_frame = frame_tick;
+        entry.dropped_frame = frame_tick;
         ++nx2_preflush_drops;
         ++it;
     }
     if (frame_tick % 3600 == 0) {
         LOG_INFO(HW_GPU,
-                 "Nx2Perf preflush_aging: {} blocks marked, {} dropped; {} drops and {} stalled "
-                 "reads of dropped blocks since start",
-                 marked, nx2_preflush_blocks.size() - marked, nx2_preflush_drops,
+                 "Nx2Perf preflush_aging: {} blocks marked ({} retained), {} dropped; {} drops "
+                 "and {} stalled reads of dropped blocks since start",
+                 marked, retained, nx2_preflush_blocks.size() - marked, nx2_preflush_drops,
                  nx2_preflush_remarks);
     }
 }
@@ -1721,6 +1722,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         // The bank size is only an upper limit: stop at the end of the mapped memory.
         // Only mark 4 KiB pages whose guest bytes actually changed since the last upload so
         // unchanged banks do not toggle VirtualProtect or break the Vulkan render pass on every draw.
+        const bool lean_shadow = Nx2Perf::On(Nx2Perf::Opt::UniformShadowLean);
         NativeUniformBankShadow* shadow = nullptr;
         if (device_addr == native_indirect_uniform_last_bank &&
             native_indirect_uniform_last_ptr != nullptr) [[likely]] {
@@ -1731,11 +1733,54 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
             if (cached.first == device_addr && cached.second != nullptr) [[likely]] {
                 shadow = cached.second;
             } else {
-                shadow = &native_indirect_uniform_shadow[device_addr];
+                if (lean_shadow) {
+                    auto it = native_indirect_uniform_shadow.find(device_addr);
+                    if (it == native_indirect_uniform_shadow.end()) {
+                        if (native_indirect_uniform_shadow.size() ==
+                            native_indirect_uniform_fifo.size()) {
+                            const DAddr oldest =
+                                native_indirect_uniform_fifo[native_indirect_uniform_fifo_next];
+                            for (auto& entry : native_indirect_uniform_cache) {
+                                if (entry.first == oldest) {
+                                    entry = {~DAddr{0}, nullptr};
+                                }
+                            }
+                            if (native_indirect_uniform_last_bank == oldest) {
+                                native_indirect_uniform_last_bank = ~DAddr{0};
+                                native_indirect_uniform_last_ptr = nullptr;
+                            }
+                            // Reuse the allocation without copying or clearing the old bank.
+                            auto node = native_indirect_uniform_shadow.extract(oldest);
+                            node.key() = device_addr;
+                            auto& reused = node.mapped();
+                            reused.last_draw_ticket = 0;
+                            reused.last_frame_tick = ~u64{0};
+                            reused.last_skipped_draw_ticket = ~u64{0};
+                            reused.initialized_mask = 0;
+                            reused.initialized_size = 0;
+                            it = native_indirect_uniform_shadow.insert(std::move(node)).position;
+                        } else {
+                            it = native_indirect_uniform_shadow.try_emplace(device_addr, true).first;
+                        }
+                        native_indirect_uniform_fifo[native_indirect_uniform_fifo_next] = device_addr;
+                        native_indirect_uniform_fifo_next =
+                            (native_indirect_uniform_fifo_next + 1) %
+                            native_indirect_uniform_fifo.size();
+                    }
+                    shadow = &it->second;
+                } else {
+                    shadow = &native_indirect_uniform_shadow[device_addr];
+                }
                 cached = {device_addr, shadow};
             }
             native_indirect_uniform_last_bank = device_addr;
             native_indirect_uniform_last_ptr = shadow;
+        }
+        if (lean_shadow && Nx2Perf::Verify()) {
+            const auto it = native_indirect_uniform_shadow.find(device_addr);
+            ASSERT_MSG(it != native_indirect_uniform_shadow.end() && &it->second == shadow,
+                       "Nx2Perf uniform_shadow_lean: stale shadow cache for bank {:#x}",
+                       device_addr);
         }
         // Nx2Perf bank_once_per_frame: compare the guest bytes on the frame's first bind only.
         // Verify (which always takes the per-draw path) reports changes that path would have
@@ -1778,7 +1823,12 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                         break;
                     }
                     const u32 page_bit = 1U << (page_idx & 31);
-                    const bool page_initialized = (shadow->initialized_mask & page_bit) != 0;
+                    // A bank may first be bound with a short final page, then grow. Its mask
+                    // alone does not prove those additional bytes were ever copied.
+                    const bool page_initialized =
+                        (shadow->initialized_mask & page_bit) != 0 &&
+                        (!lean_shadow ||
+                         offset_in_bank + chunk_size <= shadow->initialized_size);
                     const bool already_cpu_modified =
                         memory_tracker.IsRegionCpuModified(cur_addr, chunk_size);
                     u8* const shadow_dst = shadow->bytes.data() + offset_in_bank;
@@ -1804,6 +1854,10 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                         }
                         std::memcpy(shadow_dst, ptr, chunk_size);
                         shadow->initialized_mask |= page_bit;
+                        if (lean_shadow) {
+                            shadow->initialized_size = (std::max)(
+                                shadow->initialized_size, offset_in_bank + chunk_size);
+                        }
                         if (!already_cpu_modified) {
                             memory_tracker.MarkRegionAsCpuModified(cur_addr, chunk_size);
                             last_synced_count = 0;
