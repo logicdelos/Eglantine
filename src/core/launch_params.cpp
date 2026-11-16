@@ -391,9 +391,10 @@ void ApplyLaunchParams(LaunchParams const& lp) noexcept {
             "--run-seconds <n>     End the run after n seconds (exit code 124)\n"
             "--run-frames <n>      End the run after n frames (exit code 0)\n"
             "Exit codes: 0 normal or frame limit, 1 startup failure, 64 bad arguments, 70 guest crash,\n"
-            "71 device lost, 72 shader or pipeline failure, 74 report not written, 75 restart,\n"
-            "124 --run-seconds reached, 130 interrupted. The codes after 1 apply only to runs that\n"
-            "use --report, --run-seconds or --run-frames.\n",
+            "71 device lost, 72 shader or pipeline failure, 73 emulator crash, 74 report not written,\n"
+            "75 restart, 124 --run-seconds reached, 130 interrupted. The codes after 1 apply only to\n"
+            "runs that use --report, --run-seconds or --run-frames. After an emulator crash the report\n"
+            "has exit.reason host_crash and only the frame count of the summary.\n",
             lp.argv0
         );
     }

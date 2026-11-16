@@ -12,6 +12,30 @@ Where a fix is described as a "likely fix", it was written to remove a cause fou
 
 All runs were made on one Windows 11 laptop: AMD Ryzen 9 8940HX, NVIDIA GeForce RTX 5070 Ti Laptop GPU, 16 GB RAM. Only Fire Emblem: Fortune's Weave and Xenoblade Chronicles 2 were run. Fixes marked "Orchid" or "Lichii" were ported from those forks, with the original author named in the commit message.
 
+## 0.3.0 (unreleased)
+
+Milestone 0.3, "Unattended runs": a scripted run ends by itself, says why in its exit code, and leaves one report file. Not run on a build yet at the time of writing; each line below says what was checked once it was.
+
+### New
+
+- `yuzu-cmd` options for unattended runs: `--report <file.json>` writes one JSON report when the run ends (the file must not exist, its directory must), `--run-seconds <n>` ends the run after n seconds, `--run-frames <n>` ends it after n presented frames. Any of the three makes the run unattended. `--run-frames` alone also gets a safety limit of 900 s.
+- Exit codes of an unattended run: 0 normal end or frame limit, 1 startup failure, 64 bad arguments, 70 guest crash (a break without notification, a fatal error with a screen, an unhandled CPU exception), 71 Vulkan device lost, 72 pipeline build failure, 73 emulator crash, 74 report not written, 75 restart requested by the game, 124 `--run-seconds` reached, 130 interrupted by Ctrl+C, Ctrl+Break or SIGTERM. A run with none of the three options keeps its old exit codes. `--help` lists them.
+- The report (schema version 1) holds the build (revision, branch, description, build id and date, compiler, product name, version, display version and flavour), the title id, the limits, the elapsed time, a summary of the whole run and one entry per 10 s window (frame rate, frame time mean, 50th, 95th and 99th percentile and maximum, frames over 25, 50 and 100 ms, time of the GPU thread, back thread and Vulkan worker split into work, idle and waits, guest waits for the GPU, shader build waits, busy time per guest core, and the limiter verdict of the log), the count of Error and Critical log lines, how the run ended (`exit.reason`, `exit.code`, `exit.detail`, `shutdown_complete`, `metrics_complete`), the `EDEN_*`, `NX2*` and `EGLANTINE_*` variables that were set, and the settings that affect speed, at start and at the end.
+- An emulator crash during an unattended run with `--report` leaves a report with `exit.reason` `host_crash`, `shutdown_complete` false and `metrics_complete` false, and the process exits with 73. The summary of that report holds only the frame count, and `windows` is empty; `settings.final` is null. The report writer takes no lock and allocates nothing: the file is opened and the text formatted before the run.
+- If a stop was asked for and the shutdown does not finish in 30 s, the report is written with `shutdown_complete` false and the process exits with the code of the reason.
+- Test switch `EDEN_NX2_TEST_CRASH_AFTER_FRAMES=<N>` crashes the emulator on purpose after N presented frames, to test the crash path. Off unless set. See `dist/nx2_switches.txt`.
+
+### Fixes
+
+- Crash handler on Windows: an unhandled exception, `abort()` or a failed CRT parameter check writes one Critical "Host crash" line with the code, the faulting address and the stack as module and offset, and the thread, then writes `eden_crash.dmp` in the log directory (`EDEN_NX2_CRASH_DUMP=<dir>` moves it). The dump is now always written, and the earlier `eden-crash-<pid>.dmp` name and the stderr stack print are gone. Ported from Lichii #1453 (zortos293), with the later fixes of #1710 and #1728. Not run in a crash yet at the time of writing.
+- Log file: a thread flushes it once a second, so lines below Error no longer wait in the buffer until a hang or kill. Rotation renames the log over the previous one in one step; if the log cannot be moved, the session writes to `eden_log_2.txt`, and if that cannot be moved either it appends. A failed flush no longer recurses. Ported from Lichii #1771 (zortos293) and #889 (Eduardo Gomes).
+
+### Internal
+
+- `Common::RunOutcome` keeps the reason a run ended, with a precedence so that a late "window closed" never hides a crash. It does nothing until an unattended run begins.
+- The per-window figures of the log line are kept as numbers for the report. The text of the log line is unchanged.
+- Not in this version: a registry of tunables with `--set` and `--list-tunables`, and a control channel. The report lists only the variables that were set.
+
 ## 0.2.0 (2026-11-16)
 
 Fixes ported from other forks. The original author and the source are named in each commit message and in the release notes. No fix in this section was confirmed in a game on its own: the release test ran with all of them together, and its results are in the release notes.
