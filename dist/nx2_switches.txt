@@ -91,3 +91,8 @@ EDEN_NX2_FENCE_BATCH=1
 # Edition keeps its game data there), so their shaders are in the precache too. Read when the
 # precache is built; rebuild the precache after changing it. =1 turns it on.
 #EDEN_NX2_WARM_ADDON=1
+
+# Cheaper ASTC uploads: the GPU ASTC decoder does its per-block set-up once per block instead of
+# once per texel (same results), and the opaque-ASTC scan reads the guest data in place when it is
+# in one piece instead of copying it first. Read once at start; =1 turns it on.
+#EDEN_NX2_ASTC_CHEAP_UPLOAD=1

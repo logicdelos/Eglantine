@@ -221,6 +221,23 @@ foreach(VARIANT IN ITEMS ${SHADER_TYPE_VARIANTS})
     set(SHADER_HEADERS ${SHADER_HEADERS} ${VARIANT_HEADER_FILE})
 endforeach()
 
+# The ASTC decoder again with ASTC_CHEAP defined (cheaper block set-up, same results). The
+# Vulkan runtime picks it when EDEN_NX2_ASTC_CHEAP_UPLOAD=1; OpenGL keeps the plain source.
+set(ASTC_CHEAP_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/astc_decoder.comp)
+set(ASTC_CHEAP_HEADER_FILE ${SHADER_DIR}/astc_decoder_cheap_comp_spv.h)
+add_custom_command(
+    OUTPUT
+        ${ASTC_CHEAP_HEADER_FILE}
+    COMMAND
+        ${GLSLANGVALIDATOR} -V ${QUIET_FLAG} -I"${FIDELITYFX_INCLUDE_DIR}" ${GLSL_FLAGS}
+        -DASTC_CHEAP=1
+        --variable-name ASTC_DECODER_CHEAP_COMP_SPV -o ${ASTC_CHEAP_HEADER_FILE}
+        ${ASTC_CHEAP_SOURCE} --target-env ${SPIR_V_VERSION}
+    MAIN_DEPENDENCY
+        ${ASTC_CHEAP_SOURCE}
+)
+set(SHADER_HEADERS ${SHADER_HEADERS} ${ASTC_CHEAP_HEADER_FILE})
+
 # AMD FidelityFX Super Resolution 3.1 upscaler (externals/FidelityFX-SDK, unmodified): the SDK's
 # Vulkan pass files, compiled with one set of options (render-size motion vectors, reversed depth,
 # HDR colour, reference Lanczos), plus the sharpening and the no-wave-operation SPD variants.

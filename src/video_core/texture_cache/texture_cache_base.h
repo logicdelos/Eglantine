@@ -152,6 +152,7 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 astc_opaque_images{};
     u64 astc_alpha_images{};
     std::vector<u8> astc_scan_buffer;
+    Common::ScratchBuffer<u8> astc_scan_scratch{"texture ASTC scan scratch"};
     u64 images_deleted{};
     std::map<u64, std::pair<u32, GPUVAddr>> created_shapes;
     std::unordered_map<GPUVAddr, u32> created_addresses;
