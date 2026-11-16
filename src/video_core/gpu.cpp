@@ -161,6 +161,8 @@ struct GPU::Impl {
     }
 
     void WaitForSyncOperation(const u64 fence) {
+        // Waits for the GPU thread to run the request: waiting with no recorded producer.
+        const VideoCommon::Nx2Spikes::SpanScope sync_wait{VideoCommon::Nx2Spikes::Cause::Waiting};
         std::unique_lock lck{sync_request_mutex};
         // After shutdown the GPU thread is gone and the fence will not move again.
         sync_request_cv.wait(lck, [this, fence] {
