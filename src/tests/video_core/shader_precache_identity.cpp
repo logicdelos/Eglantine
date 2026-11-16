@@ -32,6 +32,7 @@
 #include "shader_recompiler/host_translate_info.h"
 #include "shader_recompiler/object_pool.h"
 #include "shader_recompiler/profile.h"
+#include "video_core/cache_envelope.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/shader_environment.h"
 #include "video_core/stage_cache.h"
@@ -39,6 +40,7 @@
 namespace {
 
 using Key = Vulkan::ComputePipelineCacheKey;
+namespace CE = VideoCommon::CacheEnvelope;
 
 struct KeyLess {
     bool operator()(const Key& lhs, const Key& rhs) const {
@@ -124,37 +126,70 @@ std::string FirstGuessDifference(std::span<const VideoCommon::StageCache::Transl
     return {};
 }
 
-/// Reads the compute entries of a pipeline cache file (vulkan.bin or warm-compute.bin) without
-/// the loader, which deletes a file it rejects.
+/// The identity a file states about itself: the test opens it for exactly that, so it reads the
+/// file whatever driver, build or title wrote it.
+CE::CacheIdentity StatedIdentity(const std::vector<u8>& header) {
+    const auto get = [&](size_t offset, auto& value) {
+        std::memcpy(&value, header.data() + offset, sizeof(value));
+    };
+    CE::CacheIdentity identity;
+    u32 kind{};
+    get(16, kind);
+    identity.kind = static_cast<CE::PayloadKind>(kind);
+    get(8, identity.envelope_version);
+    get(20, identity.shader_format_version);
+    get(24, identity.host.build_id);
+    get(32, identity.device.vendor_id);
+    get(36, identity.device.device_id);
+    get(40, identity.device.driver_id);
+    get(44, identity.device.driver_version);
+    std::memcpy(identity.device.pipeline_cache_uuid.data(), header.data() + 48, 16);
+    get(64, identity.host.title_id);
+    get(72, identity.host.game_version);
+    get(80, identity.host.content_stamp);
+    get(88, identity.host.settings_hash);
+    return identity;
+}
+
+/// Reads the compute records of a cache file (vulkan.bin or warm-compute.bin), keyed by the 24
+/// byte compute pipeline key (hash, shared memory, workgroup) the records carry.
 ComputeEntries ReadCompute(const std::filesystem::path& path) {
     ComputeEntries out;
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    std::ifstream file(path, std::ios::binary);
     if (!file.is_open()) {
         return out;
     }
-    file.exceptions(std::ifstream::failbit);
-    const auto end{file.tellg()};
-    file.seekg(8 + sizeof(u32));
-    try {
-        while (file.tellg() != end) {
-            u32 num_envs{};
-            file.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
-            std::vector<VideoCommon::FileEnvironment> envs(num_envs);
-            for (auto& env : envs) {
-                env.Deserialize(file);
-            }
-            if (envs.size() == 1 && envs.front().ShaderStage() == Shader::Stage::Compute) {
-                Key key;
-                file.read(reinterpret_cast<char*>(&key), sizeof(key));
-                // A program rebuilt for a filled pointer slot has a later record: keep the last.
-                out.insert_or_assign(key, std::move(envs.front()));
-            } else {
-                Vulkan::GraphicsPipelineCacheKey key;
-                file.read(reinterpret_cast<char*>(&key), sizeof(key));
-            }
+    std::vector<u8> header(CE::HeaderBytes);
+    file.read(reinterpret_cast<char*>(header.data()), static_cast<std::streamsize>(header.size()));
+    if (static_cast<size_t>(file.gcount()) != header.size()) {
+        std::printf("warm identity: %s has no header\n", path.string().c_str());
+        return out;
+    }
+    file.close();
+    const CE::CacheIdentity identity = StatedIdentity(header);
+    CE::CacheLoadResult result;
+    const auto reader = CE::EnvelopeReader::Open(path, identity, result);
+    if (!reader) {
+        std::printf("warm identity: %s\n", CE::CacheRejectLine(result).c_str());
+        return out;
+    }
+    const bool with_mesh_state = identity.kind == CE::PayloadKind::TransferableMesh;
+    std::vector<u8> payload;
+    for (size_t i = 0; i < reader->Index().size(); ++i) {
+        VideoCommon::PipelineRecord record;
+        if (reader->ReadRecord(i, payload) != CE::RejectReason::None ||
+            VideoCommon::DecodePipelineRecord(payload, with_mesh_state, record) !=
+                CE::RejectReason::None) {
+            std::printf("warm identity: %s record %zu does not read\n", path.string().c_str(), i);
+            continue;
         }
-    } catch (const std::ios_base::failure&) {
-        std::printf("warm identity: %s ends early\n", path.string().c_str());
+        if (record.envs.size() != 1 || !record.is_compute || record.key.size() != sizeof(Key)) {
+            continue;
+        }
+        Key key{};
+        std::memcpy(&key, record.key.data(), sizeof(key));
+        // A program rebuilt for a filled pointer slot has a later record: keep the last.
+        out.insert_or_assign(key, std::move(record.envs.front()));
     }
     return out;
 }
