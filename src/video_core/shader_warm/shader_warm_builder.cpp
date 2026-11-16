@@ -451,8 +451,8 @@ bool RefreshWarmFiles(Core::System& system, u64 title_id, std::stop_token stop) 
     if (title_id == 0 || !Settings::CurrentProgramIsSwitch2()) {
         return false;
     }
-    CacheEnvelope::HostIdentity host = CacheEnvelope::GetHostIdentity();
-    host.title_id = title_id; // The file is the title's, whatever the host identity holds
+    // The running title's identity, published by the frontend before this call.
+    const CacheEnvelope::HostIdentity host = CacheEnvelope::GetHostIdentity();
     CacheEnvelope::CacheLoadResult rejection;
     const auto reason = WarmStaleReason(ComputeWarmPath(title_id),
                                         WarmFileIdentity(host, WarmAddonsEnabled()), rejection);
@@ -473,18 +473,19 @@ bool RefreshWarmFiles(Core::System& system, u64 title_id, std::stop_token stop) 
         game_path /= "main";
     }
     LOG_INFO(Render_Vulkan, "Shader precache for {:016x}: {}, building it", title_id, *reason);
-    return BuildWarmFiles(system, game_path, title_id, {}, std::move(stop)).ok;
+    return BuildWarmFiles(system, game_path, title_id, host, {}, std::move(stop)).ok;
 }
 
 Result BuildWarmFiles(Core::System& system, const fs::path& game_path, u64 title_id,
+                      const CacheEnvelope::HostIdentity& host,
                       const std::function<void(const Progress&)>& progress,
                       std::stop_token stop) {
-    return BuildWarmFilesWith(system, game_path, title_id, BuildOptions{}, progress,
+    return BuildWarmFilesWith(system, game_path, title_id, host, BuildOptions{}, progress,
                               std::move(stop));
 }
 
 Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 title_id,
-                          const BuildOptions& options,
+                          const CacheEnvelope::HostIdentity& host, const BuildOptions& options,
                           const std::function<void(const Progress&)>& progress,
                           std::stop_token stop) {
     Result result;
@@ -522,6 +523,14 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
     const auto begin = std::chrono::steady_clock::now();
     report(StageReading, 0, 0);
 
+    if (const auto error = WarmHostIdentityError(host, title_id)) {
+        // Nothing is created: a file stamped with an identity no launch compares against would
+        // only be rejected and built again.
+        result.error = *error;
+        LOG_WARNING(Render_Vulkan, "Shader precache build for {:016x} refused: {}", title_id,
+                    result.error);
+        return result;
+    }
     const fs::path output_dir = options.output_dir.empty() ? TitleDir(title_id) : options.output_dir;
     std::error_code ec;
     fs::create_directories(output_dir, ec);
@@ -617,9 +626,8 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
     LOG_INFO(Render_Vulkan, "Shader precache build: {} archives, {} zstd dictionaries",
              archives.size(), dictionary_count);
 
-    // The title is the one being built, whatever the host identity holds.
-    CacheEnvelope::HostIdentity host = CacheEnvelope::GetHostIdentity();
-    host.title_id = title_id;
+    // Stamped with the identity the caller assembled for this title, never with whatever the
+    // process published for a title that ran before.
     writer = CacheEnvelope::EnvelopeWriter::Create(
         compute_path, WarmFileIdentity(host, WarmAddonsEnabled()), CacheEnvelope::MaxWarmBytes);
     if (!writer) {

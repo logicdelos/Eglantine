@@ -75,4 +75,11 @@ bool WarmAddonsEnabled();
 CacheEnvelope::CacheIdentity WarmFileIdentity(const CacheEnvelope::HostIdentity& host,
                                               bool with_addons);
 
+/// Why `host` cannot stamp the precache file of `title_id`, empty when it can. The builder takes
+/// the identity of the title it builds from its caller and refuses one that was never assembled
+/// (no build or content stamp) or that names another title: a file stamped with zeros, or with
+/// the title that happened to run before, is rejected at the next launch and built again.
+std::optional<std::string> WarmHostIdentityError(const CacheEnvelope::HostIdentity& host,
+                                                 u64 title_id);
+
 } // namespace VideoCommon::ShaderWarm

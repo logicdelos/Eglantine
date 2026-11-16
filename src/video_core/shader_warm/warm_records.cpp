@@ -172,4 +172,15 @@ CacheEnvelope::CacheIdentity WarmFileIdentity(const CacheEnvelope::HostIdentity&
     return identity;
 }
 
+std::optional<std::string> WarmHostIdentityError(const CacheEnvelope::HostIdentity& host,
+                                                 u64 title_id) {
+    if (host.build_id == 0 || host.content_stamp == 0) {
+        return "No host identity was assembled for this title";
+    }
+    if (host.title_id != title_id) {
+        return "The host identity is of another title";
+    }
+    return std::nullopt;
+}
+
 } // namespace VideoCommon::ShaderWarm
