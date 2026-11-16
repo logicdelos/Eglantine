@@ -12,6 +12,35 @@ Where a fix is described as a "likely fix", it was written to remove a cause fou
 
 All runs were made on one Windows 11 laptop: AMD Ryzen 9 8940HX, NVIDIA GeForce RTX 5070 Ti Laptop GPU, 16 GB RAM. Only Fire Emblem: Fortune's Weave and Xenoblade Chronicles 2 were run. Fixes marked "Orchid" or "Lichii" were ported from those forks, with the original author named in the commit message.
 
+## 0.5.0 (unreleased)
+
+Milestone 0.5, "Smoother first minutes": the report says where the first minutes and every long frame went, and the shader caches are checked files that a changed game, update, add-on or setting no longer silently reuses. Not run on a build yet at the time of writing. No speed change is claimed.
+
+### New
+
+- The unattended-run report is schema version 2. It keeps every schema 1 field and adds `startup` (process start to the first present and to an interactive marker, with the boot phases), `first_120s` (frames and frames over 100 ms in the first 120 s after the first present), `cache` and `attribution`. `attribution` lists every frame over 100 ms with its causes (disk, shader compile, translation, decompression, waits and others) and the share of wall time that has no cause (`Unknown`).
+- `cache` lists each cache file as accepted, rejected or missing, with the reason, and counts recorded, prepared and adopted pipelines, evictions, checkpoints and bytes committed. A rejected cache changes no exit code. Translation time is not measured on its own: it is part of the build time of a record, and the report says `not_separately_measured`.
+- Host file reads, NUP decompression, JIT translation and guest present waits are attributed to causes. `attribution.dropped_boundaries` and `lost_events` count what the instrumentation could not record, and `complete` is false when any was lost.
+- `EDEN_NX2_ATTRIBUTION=0` turns the attribution off. The report then says it is off and shows no zero for it. See `dist/nx2_switches.txt`.
+- A scripted run can mark the interactive point: with `EDEN_NX2_DIAG_DIR` set, the emulator writes `session.txt` (title and a nonce of the run) and reads `interactive <scene> <pass|fail> <title> <nonce> [<origin>]` from `keys.txt`. A marker of another title or run is refused and counted.
+
+### Changes
+
+- Shader caches (the pipeline record file and the warm file) are envelope files with a format version, the identity of the build, game, content and device, and checksums. A file that does not match is ignored and the reason is logged and reported (`Nx2Cache reject kind=... reason=... action=ignore`). The legacy pipeline file is kept as `.legacy.bak`.
+- The content stamp covers the update and add-on files and every file of an enabled mod or loose dump (size and write time). The settings hash covers the shader-affecting `EDEN_NX2_*` switches.
+- Recorded pipelines are prepared on background threads at boot.
+- `--build-warm` and the Qt "Pre-compile Shaders" dialog stamp the identity of the title they build. The command line can only match a launch with no update, add-on or mod enabled.
+
+### Removed
+
+- The legacy pipeline cache upgrade path (`RewritePipelines`, `CacheUpgrade`) and the `replay_disk_recordings` performance option. The legacy file reader stays for OpenGL only.
+
+### Known limits
+
+- The content stamp does not detect a change that keeps both file size and write time.
+- The Qt frontend does not report `process_created` or `frontend_load`.
+- The `Unknown` share of wall time is reported, not bounded: a run can have many frames whose cause is not known.
+
 ## 0.4.0 (unreleased)
 
 Milestone 0.4, "Measured speed work": every speed change ships off by default behind an `EDEN_NX2_*` switch and is measured on and off before it is recommended. None of the switches below has been measured yet; the results are to be filled from the measurement table. Each is described in `dist/nx2_switches.txt`; `=1` turns it on.

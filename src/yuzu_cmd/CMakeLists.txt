@@ -28,6 +28,7 @@ else()
 endif()
 
 add_executable(yuzu-cmd
+    content_manifest.h
     emu_window/emu_window_sdl3.cpp
     emu_window/emu_window_sdl3.h
     emu_window/emu_window_sdl3_null.cpp
