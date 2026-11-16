@@ -9,6 +9,7 @@
 
 #include <chrono>
 #include <span>
+#include <string>
 
 #include "audio_core/adsp/apps/audio_renderer/audio_renderer.h"
 #include "audio_core/adsp/apps/audio_renderer/command_buffer.h"
@@ -116,7 +117,34 @@ Result System::Initialize(const AudioRendererParameterInternal& params,
                           Kernel::KProcess* process_handle_, u64 applet_resource_user_id_,
                           s32 session_id_) {
     if (!CheckValidRevision(params.revision)) {
+        LOG_ERROR(Service_Audio,
+                  "AudioRenderer revision {:#010x} ({}) rejected (EDEN_NX2_AUDREN_REV18 accepts up "
+                  "to revision {})",
+                  params.revision, GetRevisionNum(params.revision), MaxDocumentedRevision);
         return Service::Audio::ResultInvalidRevision;
+    }
+
+    {
+        const u32 revision = GetRevisionNum(params.revision);
+        constexpr std::array<std::pair<SupportTags, const char*>, 4> unimplemented{{
+            {SupportTags::SplitterDepopBugFix, "SplitterDepopBugFix"},
+            {SupportTags::VoiceBiquadFilterCrossFadeCurve, "VoiceBiquadFilterCrossFadeCurve"},
+            {SupportTags::FinalMixSubMixVolumeRamp, "FinalMixSubMixVolumeRamp"},
+            {SupportTags::BufferMixerVolumeRamp, "BufferMixerVolumeRamp"},
+        }};
+        std::string missing;
+        for (const auto& [tag, name] : unimplemented) {
+            if (CheckFeatureSupported(tag, params.revision)) {
+                missing += missing.empty() ? name : fmt::format(", {}", name);
+            }
+        }
+        LOG_INFO(Service_Audio, "AudioRenderer revision {} ({:#010x}) requested", revision,
+                 params.revision);
+        if (!missing.empty()) {
+            LOG_WARNING(Service_Audio,
+                        "AudioRenderer revision {} requested; features not implemented: {}",
+                        revision, missing);
+        }
     }
 
     if (GetWorkBufferSize(params) > transfer_memory_size) {

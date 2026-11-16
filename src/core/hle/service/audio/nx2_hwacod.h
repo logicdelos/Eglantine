@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <map>
 #include <opus.h>
@@ -69,9 +70,16 @@ private:
             return;
         }
         std::memcpy(p.data(), bytes.data(), sizeof(p));
-        LOG_INFO(Service_Audio, "hwacod initialize id={} kind={} rate={} channels={}", id, p[0],
-                 p[2], p[3]);
+        LOG_DEBUG(Service_Audio, "hwacod initialize id={} kind={} rate={} channels={}", id, p[0],
+                  p[2], p[3]);
         if (id >= layout[14] || p[0] != 1 || p[1] != 0) {
+            static std::atomic_bool warned{};
+            if (!warned.exchange(true)) {
+                LOG_WARNING(Service_Audio,
+                            "hwacod initialize id={} kind={} codec={} rejected: only Opus "
+                            "(kind 1, codec 0) with id < {} decodes",
+                            id, p[0], p[1], layout[14]);
+            }
             Reply(ctx, ResultNotSupported);
             return;
         }

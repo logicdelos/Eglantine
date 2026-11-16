@@ -12,6 +12,7 @@
 #include <map>
 #include <ranges>
 #include <tuple>
+#include <cstdlib>
 
 #include "common/assert.h"
 #include "common/common_funcs.h"
@@ -21,6 +22,7 @@
 namespace AudioCore {
 constexpr u32 CurrentRevision = 15;
 constexpr u32 NativeCurrentRevision = 16;
+constexpr u32 MaxDocumentedRevision = 18;
 
 constexpr bool IsNativeRevision(u32 revision) {
     return (revision & 0xffffff) == Common::MakeMagic('R', 'E', 'v', '\0');
@@ -64,6 +66,10 @@ enum class SupportTags {
     SplitterBiquadFilterParameter,
     SplitterDestinationV2b,
     VoiceInParameterV2,
+    SplitterDepopBugFix,
+    VoiceBiquadFilterCrossFadeCurve,
+    FinalMixSubMixVolumeRamp,
+    BufferMixerVolumeRamp,
 
     // Not a real tag, just here to get the count.
     Size
@@ -108,13 +114,18 @@ constexpr bool CheckFeatureSupported(SupportTags tag, u32 user_revision) {
             {SupportTags::EffectInfoVer2, 9},
             {SupportTags::CommandProcessingTimeEstimatorVersion4, 10},
             {SupportTags::MultiTapBiquadFilterProcessing, 10},
+            {SupportTags::DeviceApiVersion2, 10},
             {SupportTags::DelayChannelMappingChange, 11},
             {SupportTags::ReverbChannelMappingChange, 11},
             {SupportTags::I3dl2ReverbChannelMappingChange, 11},
             {SupportTags::SplitterBiquadFilterParameter, 12},
             {SupportTags::SplitterPrevVolumeReset, 13},
+            {SupportTags::SplitterDepopBugFix, 14},
             {SupportTags::SplitterDestinationV2b, 15},
             {SupportTags::VoiceInParameterV2, 15},
+            {SupportTags::VoiceBiquadFilterCrossFadeCurve, 16},
+            {SupportTags::FinalMixSubMixVolumeRamp, 17},
+            {SupportTags::BufferMixerVolumeRamp, 18},
         }};
 
     const auto& feature =
@@ -127,9 +138,21 @@ constexpr bool CheckFeatureSupported(SupportTags tag, u32 user_revision) {
     return user_revision != ~u32{0} && (*feature).second <= user_revision;
 }
 
-constexpr bool CheckValidRevision(u32 user_revision) {
+/// Revisions up to MaxDocumentedRevision (REV18, firmware 23.0.0) are documented on switchbrew;
+/// EDEN_NX2_AUDREN_REV18 makes the renderer accept them (read once), otherwise the legacy caps
+/// apply.
+inline bool AcceptDocumentedRevisions() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_AUDREN_REV18");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+inline bool CheckValidRevision(u32 user_revision) {
+    const u32 legacy_cap = IsNativeRevision(user_revision) ? NativeCurrentRevision : CurrentRevision;
     return GetRevisionNum(user_revision) <=
-           (IsNativeRevision(user_revision) ? NativeCurrentRevision : CurrentRevision);
-};
+           (AcceptDocumentedRevisions() ? MaxDocumentedRevision : legacy_cap);
+}
 
 } // namespace AudioCore
