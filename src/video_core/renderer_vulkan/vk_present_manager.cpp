@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -242,6 +243,19 @@ Frame* PresentManager::TryGetRenderFrame() {
 void PresentManager::Present(Frame* frame) {
     if (use_present_thread) {
         scheduler.Record([this, frame](vk::CommandBuffer) {
+            namespace Spikes = VideoCommon::Nx2Spikes;
+            if (Spikes::AttributionEnabled()) {
+                // The worker run since the previous enqueue produced this frame: close its span
+                // (it holds the pipeline waits and builds of that run) and open the next one.
+                if (worker_span.Valid()) {
+                    Spikes::EndSpan(worker_span);
+                }
+                frame->producer_work = worker_work;
+                worker_work = Spikes::NewWorkId();
+                worker_span = Spikes::BeginSpan(Spikes::Cause::Waiting, worker_work);
+            } else {
+                frame->producer_work = 0;
+            }
             std::unique_lock lock{queue_mutex};
             present_queue.push_back(frame);
             frame_cv.notify_one();
@@ -411,7 +425,10 @@ void PresentManager::PresentThread(std::stop_token token) {
     bool device_lost = false;
     while (!token.stop_requested()) {
         std::unique_lock lock{queue_mutex};
-        // Wait for presentation frames
+        // Wait for presentation frames. The wait ends when the scheduler worker enqueues the next
+        // frame, so it is linked to the worker run that produced that frame.
+        std::optional<VideoCommon::Nx2Spikes::SpanScope> frame_wait;
+        frame_wait.emplace(VideoCommon::Nx2Spikes::Cause::Waiting);
         frame_cv.wait(lock, token, [this] { return !present_queue.empty(); });
         if (!token.stop_requested()) {
             // Take the frame and notify anyone waiting
@@ -419,6 +436,11 @@ void PresentManager::PresentThread(std::stop_token token) {
             present_queue.pop_front();
             presenting_frame = true;
             frame_cv.notify_one();
+            if (frame_wait->Token().Valid() && frame->producer_work != 0) {
+                VideoCommon::Nx2Spikes::LinkWait(frame_wait->Token(), frame->producer_work,
+                                                 VideoCommon::Nx2Spikes::DependencyKind::Job);
+            }
+            frame_wait.reset();
 
             const auto now = Clock::now();
             if (!frame->is_generated) {

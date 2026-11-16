@@ -16,6 +16,7 @@
 
 #include "common/common_types.h"
 #include "common/polyfill_thread.h"
+#include "video_core/nx2_spikes.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -46,6 +47,8 @@ struct Frame {
     /// The guest frame this host frame shows (the renderer's count of composited guest frames),
     /// 0 when frame attribution is off. Generated frames carry the id of their source frame.
     u64 guest_frame_id{};
+    /// The worker run that produced this frame (its work id), 0 when attribution is off.
+    VideoCommon::Nx2Spikes::WorkId producer_work{};
     u32 generation_count{};
 };
 
@@ -120,6 +123,10 @@ private:
     bool storage_supported;
     bool use_present_thread;
     bool presenting_frame{};
+    /// Scheduler worker only: the open span of the worker's run up to the next frame enqueue, and
+    /// its work id (the producer the presentation thread's wait links to).
+    VideoCommon::Nx2Spikes::SpanToken worker_span{};
+    VideoCommon::Nx2Spikes::WorkId worker_work{};
     bool wake_present_hold{};
     std::atomic<std::size_t> image_count{};
     std::atomic<std::size_t> swapchain_image_count{};
