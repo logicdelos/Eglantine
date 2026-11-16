@@ -43,3 +43,8 @@ EDEN_NX2_FENCE_BATCH=1
 # Used to test that a crash during a scripted run (eden-cli --report ...) leaves a report with
 # exit.reason "host_crash" and the process exit code 73. Off unless set.
 #EDEN_NX2_TEST_CRASH_AFTER_FRAMES=300
+# --- Speed experiments (off by default; each is measured on and off before it is recommended) ---
+# Pin the GPU threads to their own physical performance cores and keep the emulated CPU cores off
+# them (Windows only; ignored on CPUs with fewer than 6 physical performance cores, or with
+# EDEN_HYBRID_CORES=0). Can hurt performance on CPUs with few cores. Set to 1 to turn on.
+#EDEN_NX2_PIN_GPU_THREADS=1

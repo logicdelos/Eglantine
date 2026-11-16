@@ -115,6 +115,14 @@ void SetCurrentThreadToAllCores();
 /// Physical cores of the host: the hardware thread count where the platform cannot tell.
 [[nodiscard]] size_t PhysicalCoreCount();
 
+enum class PinnedRole : u32 { GpuFront, GpuBack, GuestCore };
+
+/// Run-time switch EDEN_NX2_PIN_GPU_THREADS=1 (default off, read once), Windows only: the split
+/// GPU thread's front and back each get a physical performance core of their own and the guest
+/// cores keep off those two. Does nothing while the switch is off. Skipped, with one log line, on
+/// CPUs with too few cores, with EDEN_HYBRID_CORES=0, and on other hosts.
+void PinCurrentThread(PinnedRole role);
+
 void RefreshThreadPolicies();
 void PollThreadPolicies();
 
