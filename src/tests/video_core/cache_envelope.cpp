@@ -16,6 +16,16 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 #include "shader_recompiler/exception.h"
 #include "video_core/cache_envelope.h"
 #include "video_core/shader_environment.h"
@@ -955,18 +965,24 @@ TEST_CASE("CacheEnvelope: a commit that fails keeps the previous file and leaves
         REQUIRE_FALSE(writer->Commit());
     }
 #ifdef _WIN32
-    SECTION("the old file is held open by another process") {
-        // A handle without delete sharing keeps Windows from replacing the file.
+    SECTION("the old file is held open without delete sharing") {
+        // A handle that does not share DELETE keeps Windows from replacing the file: the commit
+        // fails, keeps the previous generation and leaves no temporary file. The handle is made
+        // with CreateFileW, so the sharing is stated here and not left to a C++ stream.
         const auto path = dir.path / "cache.bin";
         WriteGeneration(path, identity, records);
         const auto before = ReadFile(path);
         {
-            std::ifstream holder(path, std::ios::binary);
-            REQUIRE(holder.is_open());
+            const HANDLE holder = CreateFileW(path.c_str(), GENERIC_READ,
+                                              FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            REQUIRE(holder != INVALID_HANDLE_VALUE);
             auto writer = CE::EnvelopeWriter::Create(path, identity, CE::MaxTransferableBytes);
             REQUIRE(writer);
             REQUIRE(writer->Append(records[0].meta, Payload(9, 9)) == CE::AppendResult::Ok);
-            REQUIRE_FALSE(writer->Commit());
+            const bool committed = writer->Commit();
+            CloseHandle(holder);
+            REQUIRE_FALSE(committed);
             REQUIRE_FALSE(fs::exists(fs::path(path).concat(".tmp")));
         }
         REQUIRE(ReadFile(path) == before);
@@ -974,7 +990,66 @@ TEST_CASE("CacheEnvelope: a commit that fails keeps the previous file and leaves
         REQUIRE(opened.reader);
         REQUIRE(opened.result.records == 3);
     }
+    SECTION("the old file is held open with delete sharing") {
+        // What the platform does here is the finding: either the replace goes through or it
+        // fails whole. The test pins the invariant (never a half state) and reports which it was.
+        const auto path = dir.path / "cache.bin";
+        WriteGeneration(path, identity, records);
+        const auto before = ReadFile(path);
+        const HANDLE holder = CreateFileW(
+            path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        REQUIRE(holder != INVALID_HANDLE_VALUE);
+        auto writer = CE::EnvelopeWriter::Create(path, identity, CE::MaxTransferableBytes);
+        REQUIRE(writer);
+        REQUIRE(writer->Append(records[0].meta, Payload(9, 9)) == CE::AppendResult::Ok);
+        const bool committed = writer->Commit();
+        CloseHandle(holder);
+        WARN(std::string("replace over a file open with FILE_SHARE_DELETE: ") +
+             (committed ? "replaced" : "refused, old generation kept"));
+        REQUIRE_FALSE(fs::exists(fs::path(path).concat(".tmp")));
+        auto opened = TryOpen(path, identity);
+        REQUIRE(opened.reader);
+        if (committed) {
+            REQUIRE(opened.result.records == 1);
+        } else {
+            REQUIRE(ReadFile(path) == before);
+        }
+    }
 #endif
+}
+
+TEST_CASE("CacheEnvelope: a reader opened before a replacement never returns the new bytes",
+          "[video_core]") {
+    // A reader keeps the path and its index, not the file: after the file is replaced it does not
+    // serve the old generation. What it must never do is hand out bytes of the new generation as
+    // the old record, and the stored checksum of each indexed record is what guarantees that.
+    TempDir dir;
+    const auto path = dir.path / "cache.bin";
+    const auto identity = MakeIdentity();
+    auto records = ThreeRecords();
+    WriteGeneration(path, identity, records);
+    auto old_reader = TryOpen(path, identity);
+    REQUIRE(old_reader.reader);
+
+    // The same layout with the middle record's bytes changed, so every offset still lines up.
+    records[1].bytes = Payload(records[1].bytes.size(), 99);
+    WriteGeneration(path, identity, records);
+
+    std::vector<u8> payload;
+    REQUIRE(old_reader.reader->ReadRecord(0, payload) == CE::RejectReason::None);
+    REQUIRE(payload == ThreeRecords()[0].bytes);
+    payload.clear();
+    REQUIRE(old_reader.reader->ReadRecord(1, payload) == CE::RejectReason::BadChecksum);
+    REQUIRE(payload != records[1].bytes);
+    REQUIRE(old_reader.reader->ReadRecord(2, payload) == CE::RejectReason::None);
+    REQUIRE(payload == ThreeRecords()[2].bytes);
+
+    // A new open sees the new generation.
+    auto new_reader = TryOpen(path, identity);
+    REQUIRE(new_reader.reader);
+    REQUIRE(new_reader.reader->ReadRecord(1, payload) == CE::RejectReason::None);
+    REQUIRE(payload == records[1].bytes);
 }
 
 TEST_CASE("CacheEnvelope: records are read from several threads at once", "[video_core]") {
