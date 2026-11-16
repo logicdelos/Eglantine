@@ -5,6 +5,7 @@
 
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "common/common_types.h"
 #include "common/run_outcome.h"
@@ -32,7 +33,9 @@ enum class PrepareResult {
 
 /// Records what is only known at the start: the environment variables that tune the emulator and
 /// the settings as they are (after the config file and the command line were applied).
-void CaptureStart();
+/// `overridden_settings` are the names set with --set; they appear in `settings.overrides` with
+/// the value they have now.
+void CaptureStart(const std::vector<std::string>& overridden_settings);
 
 /// The program id of the loaded game, for the report's title_id.
 void SetTitleId(u64 program_id);

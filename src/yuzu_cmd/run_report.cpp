@@ -37,6 +37,7 @@ extern char** environ;
 #include "common/scm_rev.h"
 #include "common/settings.h"
 #include "common/settings_common.h"
+#include "common/settings_secret.h"
 #include "yuzu_cmd/run_report.h"
 
 // After the others: windows.h defines min and max.
@@ -70,6 +71,7 @@ struct State {
     bool temporary_created = false; // Prepare created `temporary` (it did not exist before)
     Json tunables = Json::object();
     Json initial_settings = Json::object();
+    Json overridden_settings = Json::object();
     std::optional<u64> title_id;
 };
 
@@ -325,6 +327,7 @@ std::string Document(State& state, Common::RunOutcome::Reason reason, int code,
 
     Json settings = Json::object();
     settings["initial"] = state.initial_settings;
+    settings["overrides"] = state.overridden_settings;
     settings["final"] = ReportedSettings();
 
     Json document = Json::object();
@@ -655,6 +658,7 @@ void RebuildCrashDocument(State& state) {
 
     const auto make_tail = [&state](bool with_settings) {
         Json settings = Json::object();
+        settings["overrides"] = state.overridden_settings;
         settings["initial"] = with_settings ? state.initial_settings : Json::object();
         settings["final"] = nullptr;
         Json rest = Json::object();
@@ -804,11 +808,21 @@ PrepareResult Prepare(const std::string& destination, std::string& message) {
     return PrepareResult::Ready;
 }
 
-void CaptureStart() {
+void CaptureStart(const std::vector<std::string>& overridden_settings) {
     State& state = GetState();
     std::scoped_lock lock{state.mutex};
     state.tunables = SetTunables();
     state.initial_settings = ReportedSettings();
+    state.overridden_settings = Json::object();
+    for (const std::string& name : overridden_settings) {
+        if (const auto found = Settings::values.linkage.by_key.find(name);
+            found != Settings::values.linkage.by_key.end()) {
+            // A credential is named but its value is never written to the report.
+            state.overridden_settings[name] = Settings::IsSecretSetting(name)
+                                                  ? Json("<redacted>")
+                                                  : ScalarOf(*found->second);
+        }
+    }
     RebuildCrashDocument(state);
 }
 

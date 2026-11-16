@@ -8,6 +8,8 @@
 
 #include <string>
 #include <optional>
+#include <utility>
+#include <vector>
 #include "common/common_types.h"
 #include "network/room.h"
 
@@ -64,6 +66,11 @@ struct LaunchParams {
     bool print_version = false;
     // --json (with --version): the build identity as one JSON object on standard output.
     bool print_json = false;
+    // --list-settings: every setting with its value, type and default as JSON lines, then exit.
+    bool list_settings = false;
+    // --set name=value, in the order given, split at the first '='. Not checked here: the names
+    // and the types belong to the settings registry.
+    std::vector<std::pair<std::string, std::string>> setting_overrides{};
     bool print_help = false;
     // qt
     bool launch_hlaunch = false;

@@ -150,6 +150,8 @@ add_library(
     settings_enums.h
     settings_input.cpp
     settings_input.h
+    settings_secret.cpp
+    settings_secret.h
     settings_setting.h
     slot_vector.h
     socket_types.h

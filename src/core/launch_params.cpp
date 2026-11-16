@@ -5,8 +5,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <regex>
+#include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <cstring>
 #include <cmath>
 #include <utility>
 #include <string_view>
@@ -72,11 +74,55 @@ static std::optional<u64> ParseFrames(const char* text) {
     return static_cast<u64>(frames);
 }
 
-/// See EarlyOptions. Mirrors only what getopt would find for the spelled-out option names; an
-/// abbreviation is left to ParseLaunchParams. The values of -p, -x and --user-dir are skipped:
-/// they take the next argument whatever it says.
+/// The options of the command line, shared by ParseLaunchParams and ScanEarlyOptions so that both
+/// see the same operand boundaries.
+static constexpr char kShortOptions[] = "d::c:fhg:m:p:u:vi:nsx";
+static struct option kLongOptions[] = {
+    // clang-format off
+    {"debug", optional_argument, 0, 'd'},
+    {"config", required_argument, 0, 'c'},
+    {"fullscreen", no_argument, 0, 'f'},
+    {"help", no_argument, 0, 'h'},
+    {"game", required_argument, 0, 'g'},
+    {"multiplayer", required_argument, 0, 'm'},
+    {"program", optional_argument, 0, 'p'},
+    {"user", required_argument, 0, 'u'},
+    {"version", no_argument, 0, 'v'},
+    {"input-profile", required_argument, 0, 'i'},
+    {"null-render", no_argument, 0, 'n'},
+    {"singlecore", no_argument, 0, 's'},
+    {"filter", no_argument, 0, 'x'},
+    {"mcp", no_argument, 0, 'M'},
+    {"mcp-port", required_argument, 0, 'P'},
+    {"mcp-allow-writes", no_argument, 0, 'W'},
+    {"pack-nup", required_argument, 0, 'N'},
+    {"unpack-nup", required_argument, 0, 'U'},
+    {"edit-nup", required_argument, 0, 'E'},
+    {"nup-name", required_argument, 0, 0x100},
+    {"nup-icon", required_argument, 0, 0x101},
+    {"nup-version", required_argument, 0, 0x102},
+    {"nup-publisher", required_argument, 0, 0x103},
+    {"clear-nup-name", no_argument, 0, 0x104},
+    {"clear-nup-icon", no_argument, 0, 0x105},
+    {"clear-nup-version", no_argument, 0, 0x106},
+    {"clear-nup-publisher", no_argument, 0, 0x107},
+    {"report", required_argument, 0, 0x108},
+    {"run-seconds", required_argument, 0, 0x109},
+    {"run-frames", required_argument, 0, 0x10A},
+    {"json", no_argument, 0, 0x10B},
+    {"user-dir", required_argument, 0, 0x10C},
+    {"list-settings", no_argument, 0, 0x10D},
+    {"set", required_argument, 0, 0x10E},
+    {0, 0, 0, 0},
+    // clang-format on
+};
+
+/// See EarlyOptions. Walks the arguments the way getopt will, using the same tables: an option that
+/// takes an operand takes the next argument whatever it says, so a path or a --set value that
+/// starts with "--" is never read as an option. -p, -x and --program also take the argument after
+/// the one getopt consumes (ParseLaunchParams reads argv[optind] for them). Only the spelled-out
+/// --version, -v, --json and --user-dir count; an abbreviation is left to ParseLaunchParams.
 EarlyOptions ScanEarlyOptions(int argc, char* argv[]) noexcept {
-    constexpr std::string_view user_dir_equals = "--user-dir=";
     bool version = false;
     bool json = false;
     EarlyOptions early{};
@@ -85,34 +131,88 @@ EarlyOptions ScanEarlyOptions(int argc, char* argv[]) noexcept {
             early.error = std::move(message);
         }
     };
+    const auto take_user_dir = [&](const std::optional<std::string>& value) {
+        if (!value || value->empty()) {
+            fail("--user-dir needs a directory");
+        } else if (early.user_dir) {
+            fail("--user-dir was given more than once");
+        } else {
+            early.user_dir = *value;
+        }
+    };
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg{argv[i]};
         if (arg == "--") {
             break;
         }
-        if (arg == "-p" || arg == "--program" || arg == "-x" || arg == "--filter") {
-            ++i;
-        } else if (arg == "-v" || arg == "--version") {
-            version = true;
-        } else if (arg == "--json") {
-            json = true;
-        } else if (arg == "--user-dir" || arg.starts_with(user_dir_equals)) {
-            std::string value;
-            if (arg == "--user-dir") {
-                if (i + 1 < argc) {
-                    value = argv[++i];
+        int extra_operands = 0;
+        if (arg.starts_with("--")) {
+            const std::string_view body = arg.substr(2);
+            const std::size_t equals = body.find('=');
+            const std::string_view name = body.substr(0, equals);
+            const bool attached = equals != std::string_view::npos;
+            const struct option* found = nullptr;
+            bool exact = false;
+            int matches = 0;
+            for (const struct option* entry = kLongOptions; entry->name != nullptr; ++entry) {
+                const std::string_view candidate{entry->name};
+                if (candidate == name) {
+                    found = entry;
+                    exact = true;
+                    matches = 1;
+                    break;
                 }
-            } else {
-                value = std::string{arg.substr(user_dir_equals.size())};
+                if (candidate.starts_with(name)) {
+                    found = entry;
+                    ++matches;
+                }
             }
-            if (value.empty()) {
-                fail("--user-dir needs a directory");
-            } else if (early.user_dir) {
-                fail("--user-dir was given more than once");
-            } else {
-                early.user_dir = std::move(value);
+            if (matches != 1) {
+                // Unknown or ambiguous: getopt reports it and takes no operand.
+                continue;
+            }
+            std::optional<std::string> value;
+            if (attached && found->has_arg != no_argument) {
+                value = std::string{body.substr(equals + 1)};
+            } else if (!attached && found->has_arg == required_argument && i + 1 < argc) {
+                value = std::string{argv[++i]};
+            }
+            if (found->val == 'p' || found->val == 'x') {
+                extra_operands = 1;
+            }
+            if (exact) {
+                if (found->val == 'v') {
+                    version = true;
+                } else if (found->val == 0x10B) {
+                    json = true;
+                } else if (found->val == 0x10C) {
+                    take_user_dir(value);
+                }
+            }
+        } else if (arg.size() > 1 && arg[0] == '-') {
+            for (std::size_t k = 1; k < arg.size(); ++k) {
+                const char letter = arg[k];
+                const char* spec = letter == ':' ? nullptr : std::strchr(kShortOptions, letter);
+                if (spec == nullptr) {
+                    continue;
+                }
+                if (letter == 'v') {
+                    version = true;
+                }
+                if (letter == 'p' || letter == 'x') {
+                    ++extra_operands;
+                }
+                if (spec[1] == ':') {
+                    // Optional operands are attached only; a required one is the rest of this
+                    // argument or else the next argument.
+                    if (spec[2] != ':' && k + 1 == arg.size() && i + 1 < argc) {
+                        ++i;
+                    }
+                    break;
+                }
             }
         }
+        i += extra_operands;
     }
     early.version_json = version && json;
     return early;
@@ -123,43 +223,6 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
     LaunchParams p{};
 
     int option_index = 0;
-    static struct option long_options[] = {
-        // clang-format off
-        {"debug", optional_argument, 0, 'd'},
-        {"config", required_argument, 0, 'c'},
-        {"fullscreen", no_argument, 0, 'f'},
-        {"help", no_argument, 0, 'h'},
-        {"game", required_argument, 0, 'g'},
-        {"multiplayer", required_argument, 0, 'm'},
-        {"program", optional_argument, 0, 'p'},
-        {"user", required_argument, 0, 'u'},
-        {"version", no_argument, 0, 'v'},
-        {"input-profile", required_argument, 0, 'i'},
-        {"null-render", no_argument, 0, 'n'},
-        {"singlecore", no_argument, 0, 's'},
-        {"filter", no_argument, 0, 'x'},
-        {"mcp", no_argument, 0, 'M'},
-        {"mcp-port", required_argument, 0, 'P'},
-        {"mcp-allow-writes", no_argument, 0, 'W'},
-        {"pack-nup", required_argument, 0, 'N'},
-        {"unpack-nup", required_argument, 0, 'U'},
-        {"edit-nup", required_argument, 0, 'E'},
-        {"nup-name", required_argument, 0, 0x100},
-        {"nup-icon", required_argument, 0, 0x101},
-        {"nup-version", required_argument, 0, 0x102},
-        {"nup-publisher", required_argument, 0, 0x103},
-        {"clear-nup-name", no_argument, 0, 0x104},
-        {"clear-nup-icon", no_argument, 0, 0x105},
-        {"clear-nup-version", no_argument, 0, 0x106},
-        {"clear-nup-publisher", no_argument, 0, 0x107},
-        {"report", required_argument, 0, 0x108},
-        {"run-seconds", required_argument, 0, 0x109},
-        {"run-frames", required_argument, 0, 0x10A},
-        {"json", no_argument, 0, 0x10B},
-        {"user-dir", required_argument, 0, 0x10C},
-        {0, 0, 0, 0},
-        // clang-format on
-    };
 
     // The first problem with the automation options is the one reported (see LaunchParams).
     const auto fail = [&p](std::string message) {
@@ -171,7 +234,7 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
     while (optind < argc) {
         // -d takes an optional port (-d1234); -i takes the input profile. Both read optarg but
         // were declared without arguments, so optarg was null and they crashed.
-        if (int arg = getopt_long(argc, argv, "d::c:fhg:m:p:u:vi:nsx", long_options, &option_index); arg != -1) {
+        if (int arg = getopt_long(argc, argv, kShortOptions, kLongOptions, &option_index); arg != -1) {
             switch (arg) {
             case 'd':
                 // Without a port, the configured one is used (the config is not loaded yet).
@@ -352,6 +415,29 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
                     p.user_dir = std::string(optarg);
                 }
                 break;
+            case 0x10D:
+                p.list_settings = true;
+                break;
+            case 0x10E: {
+                const std::string_view request{optarg};
+                const size_t equals = request.find('=');
+                if (equals == std::string_view::npos || equals == 0) {
+                    // The text is not repeated: it may be a value, and the value may be a credential.
+                    fail("--set expects name=value, with a name and an equals sign");
+                    break;
+                }
+                std::string name{request.substr(0, equals)};
+                const bool repeated = std::any_of(
+                    p.setting_overrides.begin(), p.setting_overrides.end(),
+                    [&name](const auto& earlier) { return earlier.first == name; });
+                if (repeated) {
+                    fail("--set " + name + " was given more than once");
+                } else {
+                    p.setting_overrides.emplace_back(std::move(name),
+                                                     std::string{request.substr(equals + 1)});
+                }
+                break;
+            }
             case '?':
                 // An unknown option, or one without its argument. Only an automated run
                 // (--report, --run-seconds, --run-frames) refuses it, so nothing else changes.
@@ -385,10 +471,10 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
         fail("--json is only valid together with --version");
     }
     if ((p.report_path || p.run_seconds || p.run_frames) &&
-        (p.print_help || p.print_version || p.pack_nup_source || p.unpack_nup_source ||
-         p.edit_nup_source)) {
+        (p.print_help || p.print_version || p.list_settings || p.pack_nup_source ||
+         p.unpack_nup_source || p.edit_nup_source)) {
         fail("--report, --run-seconds and --run-frames cannot be combined with --help, "
-             "--version, --pack-nup, --unpack-nup or --edit-nup");
+             "--version, --list-settings, --pack-nup, --unpack-nup or --edit-nup");
     }
     p.argv0 = argv[0];
     return p;
@@ -458,6 +544,10 @@ void ApplyLaunchParams(LaunchParams const& lp) noexcept {
             "                      build, settings, outcome) when the run ends; the file must not exist\n"
             "--run-seconds <n>     End the run after n seconds (exit code 124)\n"
             "--run-frames <n>      End the run after n frames (exit code 0)\n"
+            "--list-settings       Print every setting (name, type, value, default, range) as JSON lines and exit\n"
+            "--set <name=value>    Set one setting for this run only, after the configuration file is read;\n"
+            "                      never saved. Can be repeated. An unknown name or an invalid value is a\n"
+            "                      bad argument (exit code 64). The other command line options win over it\n"
             "Exit codes: 0 normal or frame limit, 1 startup failure, 64 bad arguments, 70 guest crash,\n"
             "71 device lost, 72 shader or pipeline failure, 73 emulator crash, 74 report not written,\n"
             "75 restart, 124 --run-seconds reached, 130 interrupted. The codes after 1 apply only to\n"

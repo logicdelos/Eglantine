@@ -28,6 +28,7 @@
 #include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/settings.h"
+#include "common/settings_secret.h"
 #include "common/time_zone.h"
 
 #if defined(__linux__ ) && defined(ARCHITECTURE_arm64)
@@ -122,8 +123,8 @@ void LogSettings() {
     std::deque<std::string> settings_list;
     for (auto& [category, settings] : values.linkage.by_category) {
         for (const auto& setting : settings) {
-            // Hide the token secrets, for security reasons.
-            if (setting->Id() != values.eden_token.Id() && setting->Id() != values.mcp_token.Id()) {
+            // Hide the credentials, for security reasons.
+            if (!IsSecretSetting(setting->GetLabel())) {
                 auto const is_default = setting->ToString() == setting->DefaultToString();
                 auto const name = fmt::format(
                     "{:c}{:c} {}.{}",

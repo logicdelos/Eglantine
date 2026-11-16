@@ -65,6 +65,7 @@
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_warm/shader_warm_builder.h"
+#include "yuzu_cmd/cli_settings.h"
 #include "yuzu_cmd/run_report.h"
 #include "yuzu_cmd/user_dir.h"
 #include "yuzu_cmd/version_info.h"
@@ -618,6 +619,11 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     if (argument_error.empty() && unattended && !lp.unknown_option.empty()) {
         argument_error = "unknown option, or an option without its argument: " + lp.unknown_option;
     }
+    // --set: every name and value is checked before anything starts; the settings change below.
+    std::vector<CliSettings::Resolved> setting_overrides;
+    if (argument_error.empty()) {
+        argument_error = CliSettings::Resolve(lp.setting_overrides, setting_overrides);
+    }
     if (lp.report_path && !lp.report_conflict) {
         std::string report_error;
         const RunReport::PrepareResult prepared =
@@ -649,7 +655,15 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         Common::RunOutcome::InstallSignalHandlers();
         Nx2Bottleneck::BeginRecording(Nx2Bottleneck::Now());
     }
-    SdlConfig config{lp.config_path};
+    std::optional<SdlConfig> config;
+    config.emplace(lp.config_path);
+    if (!setting_overrides.empty()) {
+        // The configuration file is written when the object ends: do that now, so what --set
+        // changes for this run is never saved. The overrides come before everything below reads
+        // a setting, and the other command line options still have the last word.
+        config.reset();
+        CliSettings::Apply(setting_overrides);
+    }
     // Before anything loads a GPU driver.
     Common::ConfigureDriverShaderCache(Settings::values.private_driver_shader_cache.GetValue(),
                                        Settings::values.driver_shader_cache_size.GetValue());
@@ -657,7 +671,11 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
 
     Core::ApplyLaunchParams(lp);
     if (Common::RunOutcome::Active()) {
-        RunReport::CaptureStart();
+        std::vector<std::string> overridden_settings;
+        for (const auto& request : lp.setting_overrides) {
+            overridden_settings.push_back(request.first);
+        }
+        RunReport::CaptureStart(overridden_settings);
     }
 
     // The early scan missed --version --json (an abbreviated option): the same text, a little later.
@@ -670,6 +688,13 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     // Informational options already printed by ApplyLaunchParams; handle them before any
     // archive operation so --help/--version never packs, unpacks or edits.
     if (lp.print_help || lp.print_version) {
+        return SDL_APP_SUCCESS;
+    }
+
+    // The settings as they are now: the configuration file, then --set, then the other options.
+    if (lp.list_settings) {
+        fmt::print("{}", CliSettings::ListJsonLines());
+        std::fflush(stdout);
         return SDL_APP_SUCCESS;
     }
 
