@@ -34,9 +34,9 @@ void SetEnabled(bool enabled);
 void Configure(double min_ms, double ratio);
 
 /// Called at every guest present: when the present began, when the GPU fence wait, composite and
-/// vblank pacing ended.
+/// vblank pacing ended, and the guest thread that presented (its own SVC waits are kept apart).
 void OnPresent(Clock::time_point entered, Clock::time_point waited, Clock::time_point composited,
-               Clock::time_point paced);
+               Clock::time_point paced, u64 guest_thread);
 
 enum class Event : u32 {
     DriverBuild,     ///< A vkCreate*Pipelines call (any thread)
@@ -58,14 +58,45 @@ enum class Event : u32 {
     SvcMutexCondvar,    ///< ArbitrateLock/Unlock, WaitProcessWideKeyAtomic, SignalProcessWideKey
     SvcAddressArbiter,  ///< WaitForAddress, SignalToAddress
     SvcIpc,             ///< SendSyncRequest(WithUserBuffer), ReplyAndReceive(WithUserBuffer)
+    FileRead,           ///< A host file read for the guest (amount: bytes asked for)
+    NupDecompress,      ///< A NUP member decompressed to serve a read (amount: bytes out)
+    CpuReadSync,        ///< A guest CPU read of GPU-written memory waiting for the GPU thread
     Count,
 };
 
 /// True while the recorder or a Window counts events: callers can skip timing work otherwise.
 [[nodiscard]] bool Counting();
 
+/// A cheap host time stamp in nanoseconds (unfenced TSC) for timing short scopes such as SVCs,
+/// and the time since one. Not related to Clock.
+[[nodiscard]] u64 Stamp();
+[[nodiscard]] Clock::duration Since(u64 stamp);
+
 /// Counts an event (any thread), with the time it took and an amount when there is one.
 void Note(Event event, Clock::duration time = {}, u64 amount = 0);
+
+/// Counts an SVC wait of one guest thread (svc.cpp, with the SvcSleep, SvcWaitSync, SvcMutexCondvar,
+/// SvcAddressArbiter and SvcIpc events only): OnPresent reports the presenting thread's own.
+void NoteGuestThread(u64 guest_thread, Event event, Clock::duration time);
+
+/// Times a scope into Note(event, time, amount); free when nothing counts.
+class Scope {
+public:
+    explicit Scope(Event event_, u64 amount_ = 0)
+        : event{event_}, amount{amount_}, start{Counting() ? Clock::now() : Clock::time_point{}} {}
+    ~Scope() {
+        if (start != Clock::time_point{}) {
+            Note(event, Clock::now() - start, amount);
+        }
+    }
+    Scope(const Scope&) = delete;
+    Scope& operator=(const Scope&) = delete;
+
+private:
+    Event event;
+    u64 amount;
+    Clock::time_point start;
+};
 
 /// An event counted elsewhere (the JIT's own totals): read at each present and window instead of
 /// counted with Note. The functions return running totals.
@@ -149,6 +180,13 @@ struct Spike {
     u64 read_kib{};
     std::vector<EventTimes> events;
     std::vector<GuestThreadTimes> guest; ///< Busiest guest threads first
+    // The guest thread that presented this frame: what it did itself. Its CPU time plus its SVC
+    // waits against game_ms says whether the game ran, waited on other guest threads, or sat in
+    // service calls; what is left over is time it was not scheduled or ran off the host.
+    u64 presenter{};                 ///< 0 when there is no per-thread data
+    std::string presenter_name;
+    double presenter_cpu_ms{-1.0};   ///< Guest CPU time over the frame; negative when unknown
+    std::vector<EventTimes> presenter_waits; ///< Its own SVC waits over the frame
     std::vector<std::string> log; ///< Log lines written during the frame (the last ones)
 };
 

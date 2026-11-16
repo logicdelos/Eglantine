@@ -32,6 +32,22 @@ static inline u64 FencedRDTSC() {
 }
 #endif
 
+/// The TSC without the serialising fences: a few cycles instead of tens, but not ordered against
+/// neighbouring instructions (readings may be off by about the pipeline's depth). For timing many
+/// short scopes, not for ordering.
+#ifdef _MSC_VER
+__forceinline static u64 UnfencedRDTSC() {
+    return __rdtsc();
+}
+#else
+static inline u64 UnfencedRDTSC() {
+    u64 eax;
+    u64 edx;
+    asm volatile("rdtsc" : "=a"(eax), "=d"(edx));
+    return (edx << 32) | eax;
+}
+#endif
+
 u64 EstimateRDTSCFrequency();
 
 } // namespace Common::X64

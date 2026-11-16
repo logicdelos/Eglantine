@@ -19,6 +19,7 @@
 #include "common/nx2_bottleneck.h"
 #include "core/file_sys/vfs/vfs.h"
 #include "core/file_sys/vfs/vfs_real.h"
+#include "video_core/nx2_spikes.h"
 
 // For FileTimeStampRaw
 #include <sys/stat.h>
@@ -369,6 +370,7 @@ bool RealVfsFile::IsReadable() const {
 
 std::size_t RealVfsFile::Read(u8* data, std::size_t length, std::size_t offset) const {
     Nx2Bottleneck::WaitScope wait{Nx2Bottleneck::Wait::FileRead};
+    const VideoCommon::Nx2Spikes::Scope spike_read{VideoCommon::Nx2Spikes::Event::FileRead, length};
     if (ModeFlagsToFileAccessMode(perms) != FS::FileAccessMode::Read) {
         // A file that may be written keeps the original behaviour: the list lock covers the whole
         // access, so a write buffered in the FILE* is never left behind by an eviction.

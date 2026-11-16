@@ -29,6 +29,7 @@
 #include "common/swap.h"
 #include "core/file_sys/vfs/vfs_offset.h"
 #include "core/file_sys/common_funcs.h"
+#include "video_core/nx2_spikes.h"
 
 namespace FileSys {
 namespace {
@@ -310,6 +311,8 @@ private:
         std::scoped_lock lock{spill->mutex};
         if (!spill->attempted) {
             spill->attempted = true;
+            const VideoCommon::Nx2Spikes::Scope spike{VideoCommon::Nx2Spikes::Event::NupDecompress,
+                                                      uncompressed_size};
             DecompressToFile(*spill);
         }
         if (!spill->file.IsOpen() || !spill->file.Seek(static_cast<s64>(offset))) {

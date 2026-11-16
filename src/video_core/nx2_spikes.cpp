@@ -70,10 +70,14 @@ constexpr std::array<const char*, NumEvents> event_names{
     "SVC WaitSynchronization",
     "SVC mutex/condvar",
     "SVC address arbiter",
-    "SVC IPC"};
+    "SVC IPC",
+    "file reads",
+    "NUP members decompressed",
+    "guest CPU reads waiting for the GPU thread"};
 constexpr std::array<const char*, NumEvents> event_units{
     nullptr, nullptr, nullptr, nullptr, "bytes", "bytes", nullptr, "pages", nullptr, nullptr,
-    nullptr, "bytes", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+    nullptr, "bytes", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, "bytes",
+    "bytes", nullptr};
 constexpr size_t GuestThreadsPerSpike = 8;
 
 double Ms(Clock::duration d) {
@@ -104,6 +108,41 @@ struct Polled {
     std::atomic<u64 (*)()> ns{};
 };
 std::array<Polled, NumEvents> g_polled{};
+
+// The SVC waits of single guest threads, in slot id % NumThreadSlots: the present's own thread is
+// what a frame spike needs, not every thread's total. Counted while recording only. Two live
+// threads with ids a multiple of the slot count apart would spoil each other's figures; for a
+// diagnostic that is accepted.
+constexpr size_t NumThreadSlots = 1024;
+constexpr std::array<Event, 5> thread_wait_events{Event::SvcSleep, Event::SvcWaitSync,
+                                                  Event::SvcMutexCondvar,
+                                                  Event::SvcAddressArbiter, Event::SvcIpc};
+struct ThreadSlot {
+    std::atomic<u64> id{};
+    std::array<std::atomic<u64>, thread_wait_events.size()> count{};
+    std::array<std::atomic<u64>, thread_wait_events.size()> ns{};
+};
+std::array<ThreadSlot, NumThreadSlots> g_thread_slots{};
+
+struct ThreadWaits {
+    u64 id{}; ///< 0: the thread has no slot yet
+    std::array<u64, thread_wait_events.size()> count{};
+    std::array<u64, thread_wait_events.size()> ns{};
+};
+
+ThreadWaits ReadThreadWaits(u64 id) {
+    ThreadWaits waits;
+    const ThreadSlot& slot = g_thread_slots[id % NumThreadSlots];
+    if (id == 0 || slot.id.load(std::memory_order_relaxed) != id) {
+        return waits;
+    }
+    waits.id = id;
+    for (size_t i = 0; i < thread_wait_events.size(); ++i) {
+        waits.count[i] = slot.count[i].load(std::memory_order_relaxed);
+        waits.ns[i] = slot.ns[i].load(std::memory_order_relaxed);
+    }
+    return waits;
+}
 
 struct EventTotals {
     std::array<u64, NumEvents> count{};
@@ -199,6 +238,49 @@ std::vector<GuestThreadTimes> GuestDifference(const GuestSnapshot& before,
                                ? g_guest_source.name(g_guest_source.user, thread->id)
                                : std::string{};
         result.push_back({thread->id, std::move(name), thread->core, ms});
+    }
+    return result;
+}
+
+u64 GuestThreadTicksOf(const GuestSnapshot& snap, u64 id) {
+    const auto it = std::find_if(snap.threads.begin(), snap.threads.end(),
+                                 [id](const GuestThreadTicks& t) { return t.id == id; });
+    return it != snap.threads.end() ? it->ticks : u64{};
+}
+
+/// One guest thread's CPU time between two snapshots in host ms; negative when unknown.
+double GuestThreadCpuMs(const GuestSnapshot& before, const GuestSnapshot& after, u64 id) {
+    if (!before.valid || !after.valid || after.clock <= before.clock || after.when <= before.when) {
+        return -1.0;
+    }
+    const u64 old_ticks = GuestThreadTicksOf(before, id);
+    const u64 new_ticks = GuestThreadTicksOf(after, id);
+    if (new_ticks < old_ticks) {
+        return -1.0;
+    }
+    const double ms_per_tick =
+        Ms(after.when - before.when) / static_cast<double>(after.clock - before.clock);
+    return static_cast<double>(new_ticks - old_ticks) * ms_per_tick;
+}
+
+std::string GuestThreadName(u64 id) {
+    std::scoped_lock lock{g_guest_mutex};
+    return g_guest_source.name != nullptr ? g_guest_source.name(g_guest_source.user, id)
+                                          : std::string{};
+}
+
+/// What one thread waited for between two reads of its slot; empty unless both have it.
+std::vector<EventTimes> ThreadWaitDifference(const ThreadWaits& before, const ThreadWaits& after) {
+    std::vector<EventTimes> result;
+    if (after.id == 0 || before.id != after.id) {
+        return result;
+    }
+    for (size_t i = 0; i < thread_wait_events.size(); ++i) {
+        const u64 count = after.count[i] - before.count[i];
+        if (count != 0) {
+            result.push_back({event_names[static_cast<size_t>(thread_wait_events[i])], count,
+                              static_cast<double>(after.ns[i] - before.ns[i]) / 1e6, 0, nullptr});
+        }
     }
     return result;
 }
@@ -373,6 +455,7 @@ struct State {
     std::vector<GpuSnapshot> last_gpu;
     EventTotals last_events;
     GuestSnapshot last_guest;
+    std::array<ThreadWaits, NumThreadSlots> last_thread_waits{};
     u64 last_log_sequence{};
     std::vector<PendingSpike> pending;
     std::deque<Spike> recent;
@@ -578,6 +661,11 @@ void SetEnabled(bool enabled) {
         state.turned_profiler_on = !Profile::Enabled();
         if (state.turned_profiler_on) {
             Profile::SetEnabled(true);
+            // The recorder's own profiler samples the busiest zone (see Profile::g_sampled);
+            // EDEN_NX2_SPIKES_EXACT=1 times every call, as before.
+            const char* const exact = std::getenv("EDEN_NX2_SPIKES_EXACT");
+            Profile::g_sampled.store(exact == nullptr || exact[0] == '\0' || exact[0] == '0',
+                                     std::memory_order_relaxed);
         }
         Profile::g_publish.store(true, std::memory_order_relaxed);
         g_counting.fetch_add(1, std::memory_order_relaxed);
@@ -602,6 +690,7 @@ void SetEnabled(bool enabled) {
     lock.lock();
     Profile::g_publish.store(false, std::memory_order_relaxed);
     if (state.turned_profiler_on) {
+        Profile::g_sampled.store(false, std::memory_order_relaxed);
         Profile::SetEnabled(false);
     }
     if (state.turned_ring_on) {
@@ -622,6 +711,15 @@ bool Counting() {
     return g_counting.load(std::memory_order_relaxed) > 0;
 }
 
+u64 Stamp() {
+    return static_cast<u64>(Common::g_wall_clock.GetTimeNSUnfenced().count());
+}
+
+Clock::duration Since(u64 stamp) {
+    const u64 now = Stamp();
+    return std::chrono::nanoseconds{static_cast<s64>(now > stamp ? now - stamp : 0)};
+}
+
 void Note(Event event, Clock::duration time, u64 amount) {
     if (!Counting()) {
         return;
@@ -638,6 +736,28 @@ void Note(Event event, Clock::duration time, u64 amount) {
     }
 }
 
+void NoteGuestThread(u64 guest_thread, Event event, Clock::duration time) {
+    if (!Counting()) {
+        return;
+    }
+    const auto it = std::find(thread_wait_events.begin(), thread_wait_events.end(), event);
+    if (it == thread_wait_events.end()) {
+        return;
+    }
+    const auto kind = static_cast<size_t>(it - thread_wait_events.begin());
+    ThreadSlot& slot = g_thread_slots[guest_thread % NumThreadSlots];
+    if (slot.id.load(std::memory_order_relaxed) != guest_thread) {
+        slot.id.store(guest_thread, std::memory_order_relaxed);
+        for (size_t i = 0; i < thread_wait_events.size(); ++i) {
+            slot.count[i].store(0, std::memory_order_relaxed);
+            slot.ns[i].store(0, std::memory_order_relaxed);
+        }
+    }
+    slot.count[kind].fetch_add(1, std::memory_order_relaxed);
+    slot.ns[kind].fetch_add(static_cast<u64>(std::chrono::nanoseconds{time}.count()),
+                            std::memory_order_relaxed);
+}
+
 void SetPolled(Event event, u64 (*count)(), u64 (*ns)()) {
     const auto index = static_cast<size_t>(event);
     g_polled[index].count.store(count, std::memory_order_relaxed);
@@ -650,7 +770,7 @@ void SetGuestThreadSource(GuestThreadSource source) {
 }
 
 void OnPresent(Clock::time_point entered, Clock::time_point waited, Clock::time_point composited,
-               Clock::time_point paced) {
+               Clock::time_point paced, u64 guest_thread) {
     StartFromEnvironment();
     if (!Enabled()) {
         return;
@@ -658,6 +778,7 @@ void OnPresent(Clock::time_point entered, Clock::time_point waited, Clock::time_
     auto gpu = TakeGpuSnapshot();
     const EventTotals events = ReadEvents();
     GuestSnapshot guest = TakeGuestSnapshot();
+    const ThreadWaits presenter_waits = ReadThreadWaits(guest_thread);
     const u64 log_sequence = Common::Log::RingNewestSequence();
 
     auto& state = GetState();
@@ -683,6 +804,11 @@ void OnPresent(Clock::time_point entered, Clock::time_point waited, Clock::time_
             s.gpu = GpuDifference(state.last_gpu, gpu, frame);
             s.events = EventDifference(state.last_events, events);
             s.guest = GuestDifference(state.last_guest, guest, GuestThreadsPerSpike);
+            s.presenter = guest_thread;
+            s.presenter_name = GuestThreadName(guest_thread);
+            s.presenter_cpu_ms = GuestThreadCpuMs(state.last_guest, guest, guest_thread);
+            s.presenter_waits = ThreadWaitDifference(
+                state.last_thread_waits[guest_thread % NumThreadSlots], presenter_waits);
             if (log_sequence > state.last_log_sequence) {
                 const auto lines = Common::Log::ReadRing(state.last_log_sequence);
                 const size_t first = lines.size() > LogLinesPerSpike ? lines.size() - LogLinesPerSpike : 0;
@@ -724,6 +850,11 @@ void OnPresent(Clock::time_point entered, Clock::time_point waited, Clock::time_
     state.last_gpu = std::move(gpu);
     state.last_events = events;
     state.last_guest = std::move(guest);
+    // Every slot, not only this presenter's: the next present may come from another thread.
+    for (size_t i = 0; i < NumThreadSlots; ++i) {
+        state.last_thread_waits[i] =
+            ReadThreadWaits(g_thread_slots[i].id.load(std::memory_order_relaxed));
+    }
     state.last_log_sequence = log_sequence;
 }
 
@@ -780,6 +911,18 @@ std::string Summary(const Spike& s) {
         line += " | guest threads:";
         for (size_t i = 0; i < s.guest.size() && i < 4; ++i) {
             line += fmt::format(" {} ({}) {:.1f}", s.guest[i].name, s.guest[i].id, s.guest[i].cpu_ms);
+        }
+    }
+    if (s.presenter != 0) {
+        line += fmt::format(" | presenting thread {} ({}):", s.presenter_name, s.presenter);
+        if (s.presenter_cpu_ms >= 0.0) {
+            line += fmt::format(" guest CPU {:.1f} ms;", s.presenter_cpu_ms);
+        }
+        if (s.presenter_waits.empty()) {
+            line += " no SVC waits";
+        }
+        for (const EventTimes& wait : s.presenter_waits) {
+            line += fmt::format(" {} x{} {:.1f} ms;", wait.event, wait.count, wait.ms);
         }
     }
     for (const EventTimes& event : s.events) {

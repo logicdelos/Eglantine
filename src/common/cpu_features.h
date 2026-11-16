@@ -45,6 +45,11 @@ public:
     /// @returns The time in nanoseconds since the construction of this clock.
     std::chrono::nanoseconds GetTimeNS() const;
 
+    /// @returns GetTimeNS() with the TSC read unfenced where the clock reads it directly (x86):
+    /// cheaper, but readings of two close calls may differ from the true gap by some tens of
+    /// cycles. For timing many short scopes (the GPU profiler); the same time base as GetTimeNS.
+    std::chrono::nanoseconds GetTimeNSUnfenced() const;
+
     /// @returns The time in microseconds since the construction of this clock.
     std::chrono::microseconds GetTimeUS() const;
 

@@ -45,6 +45,7 @@
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_perf.h"
+#include "video_core/nx2_spikes.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
 
@@ -307,6 +308,7 @@ struct GPU::Impl {
                      raster_area.start_address, raster_area.end_address,
                      reads.load(std::memory_order_relaxed));
         }
+        const VideoCommon::Nx2Spikes::Scope spike_wait{VideoCommon::Nx2Spikes::Event::CpuReadSync};
         const u64 fence = RequestSyncOperation([this, raster_area]() {
             // Apply collected guest writes before downloading GPU data over guest memory.
             InvalidateGPUCache();

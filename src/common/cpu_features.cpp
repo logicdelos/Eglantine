@@ -265,6 +265,14 @@ std::chrono::nanoseconds WallClock::GetTimeNS() const {
     return std::chrono::nanoseconds{MultiplyHigh(GetUptime(), ns_rdtsc_factor)};
 }
 
+std::chrono::nanoseconds WallClock::GetTimeNSUnfenced() const {
+    if (!invariant) {
+        return GetTimeNS();
+    }
+    return std::chrono::nanoseconds{
+        MultiplyHigh(Common::X64::UnfencedRDTSC() - base_rdtsc, ns_rdtsc_factor)};
+}
+
 std::chrono::microseconds WallClock::GetTimeUS() const {
     if (!invariant)
         return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch());
@@ -391,6 +399,10 @@ std::chrono::nanoseconds WallClock::GetTimeNS() const {
     return std::chrono::nanoseconds{MultiplyHigh(GetUptime(), ns_cntfrq_factor)};
 }
 
+std::chrono::nanoseconds WallClock::GetTimeNSUnfenced() const {
+    return GetTimeNS();
+}
+
 std::chrono::microseconds WallClock::GetTimeUS() const {
     return std::chrono::microseconds{MultiplyHigh(GetUptime(), us_cntfrq_factor)};
 }
@@ -435,6 +447,10 @@ WallClock::WallClock(bool invariant_, u64 rdtsc_frequency_) noexcept {}
 
 std::chrono::nanoseconds WallClock::GetTimeNS() const {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch());
+}
+
+std::chrono::nanoseconds WallClock::GetTimeNSUnfenced() const {
+    return GetTimeNS();
 }
 
 std::chrono::microseconds WallClock::GetTimeUS() const {

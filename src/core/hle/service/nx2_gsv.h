@@ -1959,7 +1959,8 @@ private:
             PaceToVblank(w[12]);
         }
         const auto paced = std::chrono::steady_clock::now();
-        VideoCommon::Nx2Spikes::OnPresent(entered, waited, composited, paced);
+        VideoCommon::Nx2Spikes::OnPresent(entered, waited, composited, paced,
+                                          ctx.GetThread().GetThreadId());
         Nx2Sampler::NotePresent();
         if (const auto* const process = system.ApplicationProcess(); process != nullptr) {
             if (const u64 address = process->GetOotDeltaAddress(); address != 0) {

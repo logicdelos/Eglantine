@@ -136,9 +136,40 @@ inline std::map<std::string, Snapshot>& Snapshots() {
 }
 
 // Nanoseconds; from the host's own counter where the wall clock reads it directly (the zones
-// run ~150,000 times a second, and QueryPerformanceCounter cost ~5% of the GPU thread).
+// run millions of times a second: QueryPerformanceCounter cost ~5% of the GPU thread at 150,000,
+// and the fenced TSC read of GetTimeNS() ~15 ns). The read is unfenced and kept monotonic per
+// thread, so a scope never measures a negative time.
+inline thread_local u64 t_last_now{};
 inline u64 Now() {
-    return static_cast<u64>(Common::g_wall_clock.GetTimeNS().count());
+    const auto now = static_cast<u64>(Common::g_wall_clock.GetTimeNSUnfenced().count());
+    if (now < t_last_now) {
+        return t_last_now;
+    }
+    t_last_now = now;
+    return now;
+}
+
+/// The frame spike recorder (nx2_spikes.h) turns this on when it owns the profiler: the zone that
+/// runs millions of times a second (Method, ~4.7 M/s in Fire Emblem) is then timed one call in
+/// SampleEvery, at random, and scaled; its calls are counted the same way. The time of the calls
+/// not timed stays in their parent's zone, so each timed call also takes SampleEvery - 1 times
+/// its own time out of the parent: the zones still add up to the wall time, within the noise of
+/// the sample. Zones nested in a Method call are always timed exactly. EDEN_NX2_SPIKES_EXACT=1
+/// (and a profiler turned on by EDEN_NX2_GPU_PROFILE or the MCP tool first) times every call.
+inline std::atomic<bool> g_sampled{false};
+inline constexpr u32 SampleEvery = 32;
+static_assert((SampleEvery & (SampleEvery - 1)) == 0);
+inline thread_local u32 t_sample_state{2463534242u};
+
+/// True one call in SampleEvery (xorshift32: a fixed stride could line up with the frame's
+/// repeating pattern of register writes).
+inline bool TakeSample() {
+    u32 x = t_sample_state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    t_sample_state = x;
+    return (x & (SampleEvery - 1)) == 0;
 }
 
 /// One 3D macro start id's ((method - 0xe00) / 2) calls on the split front (FrontRunMacro).
@@ -246,6 +277,13 @@ public:
         if (!enabled) {
             return;
         }
+        if (zone == Zone::Method && g_sampled.load(std::memory_order_relaxed)) {
+            if (!TakeSample()) {
+                enabled = false;
+                return;
+            }
+            scale = SampleEvery;
+        }
         parent_child_ns = t_data.child_ns;
         t_data.child_ns = 0;
         start = Now();
@@ -258,11 +296,15 @@ public:
         const u64 elapsed = Now() - start;
         auto& data = t_data;
         const auto index = static_cast<size_t>(zone);
-        data.exclusive_ns[index] += elapsed - data.child_ns;
-        ++data.count[index];
-        t_totals.exclusive_ns[index] += elapsed - data.child_ns;
-        ++t_totals.count[index];
-        data.child_ns = parent_child_ns + elapsed;
+        // A parent can measure a few cycles less than its children (unfenced reads, sampled
+        // children's scaling): no negative zone.
+        const u64 exclusive = elapsed > data.child_ns ? elapsed - data.child_ns : 0;
+        const u64 scaled = exclusive * scale;
+        data.exclusive_ns[index] += scaled;
+        data.count[index] += scale;
+        t_totals.exclusive_ns[index] += scaled;
+        t_totals.count[index] += scale;
+        data.child_ns = parent_child_ns + elapsed + (scaled - exclusive);
     }
 
     Scope(const Scope&) = delete;
@@ -271,6 +313,7 @@ public:
 private:
     Zone zone;
     bool enabled;
+    u32 scale{1};
     u64 start{};
     u64 parent_child_ns{};
 };

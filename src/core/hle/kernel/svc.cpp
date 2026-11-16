@@ -2591,40 +2591,45 @@ void Call(Core::System& system, u32 imm) {
     } else {
         namespace Spikes = VideoCommon::Nx2Spikes;
         const bool spikes = Spikes::Counting();
-        const auto started = spikes ? Spikes::Clock::now() : Spikes::Clock::time_point{};
+        const u64 started = spikes ? Spikes::Stamp() : 0;
         if (process.Is64Bit()) {
             Call64(system, imm, args);
         } else {
             Call32(system, imm, args);
         }
         if (spikes) {
-            const auto time = Spikes::Clock::now() - started;
+            const auto time = Spikes::Since(started);
             Spikes::Note(Spikes::Event::Svc, time);
+            auto kind = Spikes::Event::Count;
             switch (imm) {
             case 0x0B:
-                Spikes::Note(Spikes::Event::SvcSleep, time);
+                kind = Spikes::Event::SvcSleep;
                 break;
             case 0x18:
-                Spikes::Note(Spikes::Event::SvcWaitSync, time);
+                kind = Spikes::Event::SvcWaitSync;
                 break;
             case 0x1A:
             case 0x1B:
             case 0x1C:
             case 0x1D:
-                Spikes::Note(Spikes::Event::SvcMutexCondvar, time);
+                kind = Spikes::Event::SvcMutexCondvar;
                 break;
             case 0x34:
             case 0x35:
-                Spikes::Note(Spikes::Event::SvcAddressArbiter, time);
+                kind = Spikes::Event::SvcAddressArbiter;
                 break;
             case 0x21:
             case 0x22:
             case 0x43:
             case 0x44:
-                Spikes::Note(Spikes::Event::SvcIpc, time);
+                kind = Spikes::Event::SvcIpc;
                 break;
             default:
                 break;
+            }
+            if (kind != Spikes::Event::Count) {
+                Spikes::Note(kind, time);
+                Spikes::NoteGuestThread(GetCurrentThread(kernel).GetThreadId(), kind, time);
             }
         }
     }
