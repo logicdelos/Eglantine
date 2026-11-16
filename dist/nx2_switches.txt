@@ -79,3 +79,10 @@ EDEN_NX2_FENCE_BATCH=1
 # backs off to every 5 minutes, and waits while the game is mapping memory in bulk. The log line
 # "Trimmed ... MiB of all-zero guest pages" shows what it did. Set to 1 to turn on.
 #EDEN_NX2_ZERO_PAGE_TRIM=1
+
+# Windows only. Changing the protection of guest memory (the write traps of the GPU caches) first tries
+# the whole range without the lock that mapping and unmapping hold, and takes the lock only when the
+# range is not inside one mapped view. Helps when a game maps memory in bulk and the protection calls
+# queue behind it (compare "nx2 protect: ... ms/s" in the log with EDEN_NX2_PROTECT_STATS=1). Set to 1
+# to turn on.
+#EDEN_NX2_PROTECT_NO_LOCK=1
