@@ -19,6 +19,10 @@ namespace Core {
 class System;
 }
 
+namespace VideoCommon::CacheEnvelope {
+struct HostIdentity;
+}
+
 namespace VideoCommon::ShaderWarm {
 
 /// Where the shader precache file of a title lives: next to its pipeline cache
@@ -107,8 +111,12 @@ bool RefreshWarmFiles(Core::System& system, u64 title_id, std::stop_token stop);
 /// Builds the precache file for the game at `game_path` (any format the loader opens, Switch 2
 /// .nup first), from the user's own copy and keys, with no external tools. Runs on the calling
 /// thread; `progress` is called from it, at most every 50 ms; stops early when `stop` is
-/// requested.
+/// requested. `host` is the identity of the title being built (title_id, build, game version,
+/// content stamp), assembled by the caller for that title and stamped into the file as given;
+/// it is not read from the process-wide identity. An unassembled identity (zero build or content
+/// stamp) or one of another title fails the build with an error, writing nothing.
 Result BuildWarmFiles(Core::System& system, const std::filesystem::path& game_path, u64 title_id,
+                      const CacheEnvelope::HostIdentity& host,
                       const std::function<void(const Progress&)>& progress,
                       std::stop_token stop);
 
@@ -122,7 +130,8 @@ struct BuildOptions {
 
 /// BuildWarmFiles with an explicit output folder.
 Result BuildWarmFilesWith(Core::System& system, const std::filesystem::path& game_path,
-                          u64 title_id, const BuildOptions& options,
+                          u64 title_id, const CacheEnvelope::HostIdentity& host,
+                          const BuildOptions& options,
                           const std::function<void(const Progress&)>& progress,
                           std::stop_token stop);
 
