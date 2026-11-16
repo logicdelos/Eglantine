@@ -1307,11 +1307,35 @@ void AddGuestRun(size_t core, u64 ns) {
     }
 }
 
+/// EDEN_NX2_TEST_CRASH_AFTER_FRAMES=<N>, a test switch: crash on purpose when the Nth frame is
+/// presented. 0, for unset or not a positive whole number, is off.
+static u64 TestCrashAfterFrames() {
+    static const u64 configured = [] {
+        const char* const text = std::getenv("EDEN_NX2_TEST_CRASH_AFTER_FRAMES");
+        if (text == nullptr || text[0] < '0' || text[0] > '9') {
+            return u64{0};
+        }
+        char* end = nullptr;
+        const unsigned long long value = std::strtoull(text, &end, 10);
+        return *end == '\0' ? static_cast<u64>(value) : u64{0};
+    }();
+    return configured;
+}
+
+static std::atomic<u64> test_crash_frames{};
+
 void NoteFrame() {
     const u64 now = Now();
     const u64 previous = last_frame.exchange(now, std::memory_order_relaxed);
     frames.fetch_add(1, std::memory_order_relaxed);
     Common::RunOutcome::NoteFrame();
+    if (const u64 crash_after = TestCrashAfterFrames();
+        crash_after != 0 &&
+        test_crash_frames.fetch_add(1, std::memory_order_relaxed) + 1 == crash_after) {
+        // The crash is the point: a write through a null pointer that the compiler cannot see.
+        volatile int* volatile target = nullptr;
+        *target = 1;
+    }
     if (previous == 0) {
         return;
     }

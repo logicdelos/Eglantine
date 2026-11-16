@@ -37,3 +37,9 @@ EDEN_NX2_FENCE_BATCH=1
 #EDEN_NX2_SPLIT_SKIP=1
 #EDEN_NX2_AUTO_STUB=1
 #EDEN_NX2_KEEP_ASTC=1
+
+# --- Test switches (for unattended-run tests; never set these in normal use) ---
+# Crash the emulator on purpose after N presented frames (a null write on the thread that presents).
+# Used to test that a crash during a scripted run (yuzu-cmd --report ...) leaves a report with
+# exit.reason "host_crash" and the process exit code 73. Off unless set.
+#EDEN_NX2_TEST_CRASH_AFTER_FRAMES=300
