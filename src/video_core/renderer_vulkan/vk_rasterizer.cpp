@@ -2586,6 +2586,12 @@ void RasterizerVulkan::FlushCommands() {
         return;
     }
     draw_counter = 0;
+    // A fence with a download is submitted by InnerFence::Queue, and SignalFence then comes here
+    // with nothing recorded since: an empty submit followed by a full rebind (Lichii #1329, from
+    // Fritchii c338269b92). EDEN_NX2_SKIP_EMPTY_FLUSH=1 skips it (off by default, for A/B runs).
+    if (scheduler.SkipEmptyFlush() && !scheduler.RecordedSinceSubmit()) {
+        return;
+    }
     // Fences with downloads or queries come here right after queueing: ~9,400 a second in
     // Hyrule Warriors: Age of Imprisonment fights. Batched like the fences themselves.
     if (!scheduler.DeferFlush()) {

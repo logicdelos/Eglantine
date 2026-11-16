@@ -48,3 +48,8 @@ EDEN_NX2_FENCE_BATCH=1
 # them (Windows only; ignored on CPUs with fewer than 6 physical performance cores, or with
 # EDEN_HYBRID_CORES=0). Can hurt performance on CPUs with few cores. Set to 1 to turn on.
 #EDEN_NX2_PIN_GPU_THREADS=1
+
+# Skip the Vulkan queue submit a fence flush makes when nothing was recorded since the last submit
+# (fewer submits per second; compare "submits by origin: fence" in the EDEN_NX2_GPU_PROFILE log
+# line, written every 10 seconds). Set to 1 to turn on.
+#EDEN_NX2_SKIP_EMPTY_FLUSH=1
