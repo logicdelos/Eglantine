@@ -40,7 +40,7 @@ Status: released as [fork-v0.1.0](https://github.com/logicdelos/Eglantine/releas
 Done when: both tested games boot to their reference scenes on a clean build.
 
 ### 0.2: Fixes from sibling forks
-Status: in progress.
+Status: released as [fork-v0.2.0](https://github.com/logicdelos/Eglantine/releases/tag/fork-v0.2.0) on 2026-11-16. The exit test below passed; the individual fixes were not each confirmed in a game, as the release notes state.
 
 **Significant change:** correctness fixes ported from other Eglantine forks, each credited to its author.
 

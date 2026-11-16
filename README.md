@@ -23,6 +23,8 @@ This is an independent fork. It is not an official Eglantine release, and it is 
 |---|---|---|---|
 | Fire Emblem: Fortune's Weave | [fork-v0.1.0](https://github.com/logicdelos/Eglantine/releases/tag/fork-v0.1.0) | 2026-11-16 | Boots from a save into the reference scene at 1x and 2x resolution scale. 30.0 fps with the speed limit on, longest frame 76 ms at 1x and 69 ms at 2x, no error lines in the log, clean exit. |
 | Xenoblade Chronicles 2 | [fork-v0.1.0](https://github.com/logicdelos/Eglantine/releases/tag/fork-v0.1.0) | 2026-11-16 | Boots to the title screen at 1x resolution scale. 60.0 fps with the speed limit on, longest frame 59 ms, no error lines in the log, clean exit. Play past the title screen was not part of this test. |
+| Fire Emblem: Fortune's Weave | [fork-v0.2.0](https://github.com/logicdelos/Eglantine/releases/tag/fork-v0.2.0) | 2026-11-16 | Same test as fork-v0.1.0, same result: reference scene reached at 1x and 2x. 30.0 fps with the speed limit on, longest frame 57 ms at 1x and 72 ms at 2x, no error lines in the log, clean exit. End picture differs from the fork-v0.1.0 one by 0.019 at 1x and 0.009 at 2x (limit 0.06). |
+| Xenoblade Chronicles 2 | [fork-v0.2.0](https://github.com/logicdelos/Eglantine/releases/tag/fork-v0.2.0) | 2026-11-16 | Same test as fork-v0.1.0, same result: title screen reached at 1x. 60.0 fps with the speed limit on, longest frame 41 ms, no error lines in the log, clean exit. End picture differs from the fork-v0.1.0 one by 0.002. |
 
 Each run lasted about 3 minutes with Vulkan, GPU accuracy High, SMAA, the BUF scaling filter and docked mode. The release notes of each build carry the full table.
 
