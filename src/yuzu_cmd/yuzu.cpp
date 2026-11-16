@@ -39,7 +39,9 @@
 #include "common/fs/fs_util.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
+#include "common/nx2_bottleneck.h"
 #include "common/nx2_sampler.h"
+#include "common/run_outcome.h"
 #include "common/scm_rev.h"
 #include "common/settings.h"
 #include "common/string_util.h"
@@ -63,6 +65,7 @@
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_warm/shader_warm_builder.h"
+#include "yuzu_cmd/run_report.h"
 #include "yuzu_cmd/emu_window/emu_window_sdl3.h"
 #ifdef HAS_OPENGL
 #include "yuzu_cmd/emu_window/emu_window_sdl3_gl.h"
@@ -278,6 +281,29 @@ constexpr int kRestartExitCode = 75;
 static std::atomic_bool restart_requested{false};
 // Set by a "quit" line in the live keys file: the main loop ends and the system shuts down in order.
 static bool live_quit_requested = false;
+
+// Why the process is leaving when it never got as far as an unattended run (bad arguments, a
+// report that cannot be written); read by SDL_AppQuit.
+static Common::RunOutcome::Reason startup_reason = Common::RunOutcome::Reason::None;
+static std::string startup_detail;
+
+// Called by the run clock's thread when a stop was requested and the shutdown has not finished
+// within Common::RunOutcome::StopGraceSeconds: writes the report with what is known and ends the
+// process without waiting for the rest.
+static void ForceFinish() noexcept {
+    using Common::RunOutcome::Reason;
+    Reason reason = Common::RunOutcome::CurrentReason();
+    if (reason == Reason::None) {
+        reason = Reason::StartupError;
+    }
+    int code = Common::RunOutcome::ExitCode(reason);
+    const std::string detail =
+        Common::RunOutcome::Detail() + " (the shutdown did not finish in time)";
+    if (!RunReport::Publish(reason, code, false, detail)) {
+        code = Common::RunOutcome::ExitCode(Reason::ReportIoError);
+    }
+    std::_Exit(code);
+}
 
 // ExecuteProgram state for the restarted process: what the Qt frontend keeps in-process when it
 // reboots a game. Only read when the launcher sets EDEN_CLI_RESTART_HANDOFF, so a leftover file
@@ -623,6 +649,43 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
 #ifdef _WIN32
     LocalFree(argv_w);
 #endif
+
+    // --report, --run-seconds and --run-frames make this an unattended run: it ends by itself, in
+    // order, and says how (Common::RunOutcome, RunReport). Without them none of that is active.
+    const bool unattended = lp.report_path || lp.run_seconds || lp.run_frames;
+    std::string argument_error = lp.parse_error;
+    if (argument_error.empty() && unattended && !lp.unknown_option.empty()) {
+        argument_error = "unknown option, or an option without its argument: " + lp.unknown_option;
+    }
+    if (lp.report_path && !lp.report_conflict) {
+        std::string report_error;
+        const RunReport::PrepareResult prepared =
+            RunReport::Prepare(*lp.report_path, report_error);
+        if (prepared != RunReport::PrepareResult::Ready) {
+            fmt::print(stderr, "{}\n", report_error);
+            if (argument_error.empty() && prepared == RunReport::PrepareResult::IoError) {
+                startup_reason = Common::RunOutcome::Reason::ReportIoError;
+                startup_detail = report_error;
+                return SDL_APP_FAILURE;
+            }
+            if (argument_error.empty()) {
+                argument_error = report_error;
+            }
+        }
+    }
+    if (!argument_error.empty()) {
+        fmt::print(stderr, "{}\n", argument_error);
+        startup_reason = Common::RunOutcome::Reason::BadArguments;
+        startup_detail = argument_error;
+        return SDL_APP_FAILURE;
+    }
+    if (unattended) {
+        // SDL turns SIGINT and SIGTERM into a closed window; this run tells them apart.
+        SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
+        Common::RunOutcome::Begin({.seconds = lp.run_seconds, .frames = lp.run_frames},
+                                  &ForceFinish);
+        Nx2Bottleneck::BeginRecording(Nx2Bottleneck::Now());
+    }
     SdlConfig config{lp.config_path};
     // Before anything loads a GPU driver.
     Common::ConfigureDriverShaderCache(Settings::values.private_driver_shader_cache.GetValue(),
@@ -630,6 +693,9 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     Common::CreateDriverShaderCacheFolder();
 
     Core::ApplyLaunchParams(lp);
+    if (Common::RunOutcome::Active()) {
+        RunReport::CaptureStart();
+    }
 
     // Informational options already printed by ApplyLaunchParams; handle them before any
     // archive operation so --help/--version never packs, unpacks or edits.
@@ -683,6 +749,11 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     default:
         LOG_CRITICAL(Frontend, "Invalid renderer backend");
         return SDL_APP_FAILURE;
+    }
+
+    if (Common::RunOutcome::Active()) {
+        // After SDL started: the window and the renderer must not replace these handlers.
+        Common::RunOutcome::InstallSignalHandlers();
     }
 
 #ifdef _WIN32
@@ -746,6 +817,15 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
             loader_id, error_id, Loader::ResultStatus(error_id));
         return SDL_APP_FAILURE;
     }
+    if (Common::RunOutcome::Active()) {
+        if (const u64 program_id = state->system.GetApplicationProcessProgramID();
+            program_id != 0) {
+            RunReport::SetTitleId(program_id);
+        }
+        if (Common::RunOutcome::StopRequested()) {
+            return SDL_APP_SUCCESS;
+        }
+    }
 
     if (lp.use_multiplayer) {
         if (auto member = Network::GetRoomMember().lock()) {
@@ -769,12 +849,14 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         VideoCommon::ShaderWarm::RefreshWarmFiles(
             state->system, state->system.GetApplicationProcessProgramID(), {});
         state->system.Renderer().ReadRasterizer()->LoadDiskResources(
-            state->system.GetApplicationProcessProgramID(), std::stop_token{},
+            state->system.GetApplicationProcessProgramID(), Common::RunOutcome::StopToken(),
             [](VideoCore::LoadCallbackStage, size_t value, size_t total) {});
     }
 
-    // don't do anything, SDL3 already exists for us :D
-    state->system.RegisterExitCallback([] {});
+    // The game leaving ends an unattended run (inert otherwise: SDL3 quits for us with the window).
+    state->system.RegisterExitCallback([] {
+        Common::RunOutcome::Request(Common::RunOutcome::Reason::GuestExit, "the game exited");
+    });
 
     // A game executing a program (e.g. restarting after a settings change) writes its launch state
     // to the restart handoff and quits with kRestartExitCode; the launcher boots the same file again
@@ -799,6 +881,8 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         LOG_INFO(Frontend, "ExecuteProgram: program index {}, exiting with code {} to restart",
                  program_index, kRestartExitCode);
         restart_requested = true;
+        Common::RunOutcome::Request(Common::RunOutcome::Reason::Restart,
+                                    "the game asked to be restarted");
     });
 
     // QLaunch launched applications (should) now reload shader cache.
@@ -823,6 +907,11 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         state->system.GPU().ReleaseContext();
         state->system.Run();
     });
+
+    if (Common::RunOutcome::StopRequested()) {
+        // A stop during loading (a signal, the time limit): the game never ran.
+        return SDL_APP_SUCCESS;
+    }
 
     void(state->system.Run());
     if (state->system.DebuggerEnabled())
@@ -899,6 +988,8 @@ static void RunLiveKeys(InputCommon::InputSubsystem& input_subsystem, Core::Syst
         if (line == "quit") {
             LOG_INFO(Frontend, "Live keys: quit");
             live_quit_requested = true;
+            Common::RunOutcome::Request(Common::RunOutcome::Reason::Requested,
+                                        "quit requested through the live keys file");
             continue;
         }
         int code = 0, milliseconds = -1;
@@ -974,11 +1065,16 @@ static void RunKeyScript(InputCommon::InputSubsystem& input_subsystem, Core::Sys
 
 extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
     SdlState *state = (SdlState *)appstate;
+    if (Common::RunOutcome::StopRequested()) {
+        return SDL_APP_SUCCESS;
+    }
     RunKeyScript(state->input_subsystem, state->system);
 #ifdef YUZU_ENABLE_MCP
     if (state->mcp_host) {
         state->mcp_host->DrainMainThread();
         if (state->mcp_host->QuitRequested()) {
+            Common::RunOutcome::Request(Common::RunOutcome::Reason::Requested,
+                                        "quit requested through the MCP server");
             return SDL_APP_SUCCESS;
         }
     }
@@ -997,6 +1093,35 @@ extern "C" SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
         state->emu_window->OnEvent(*event);
     return SDL_APP_CONTINUE;
 }
+// How an unattended run ended: the reason on record (or the one the frontend can tell), the exit
+// code, and the report. Returns the exit code the process must leave with.
+static int EndUnattendedRun(SDL_AppResult result) {
+    using Common::RunOutcome::Reason;
+    Common::RunOutcome::Finish();
+    Reason reason = Common::RunOutcome::CurrentReason();
+    std::string detail = Common::RunOutcome::Detail();
+    if (reason == Reason::None) {
+        if (startup_reason != Reason::None) {
+            reason = startup_reason;
+            detail = startup_detail;
+        } else if (restart_requested) {
+            reason = Reason::Restart;
+            detail = "the game asked to be restarted";
+        } else if (result == SDL_APP_FAILURE) {
+            reason = Reason::StartupError;
+            detail = "the game did not start";
+        } else {
+            reason = Reason::WindowClosed;
+            detail = "the window was closed";
+        }
+    }
+    int code = Common::RunOutcome::ExitCode(reason);
+    if (!RunReport::Publish(reason, code, true, detail)) {
+        code = Common::RunOutcome::ExitCode(Reason::ReportIoError);
+    }
+    return code;
+}
+
 extern "C" void SDL_AppQuit(void *appstate, SDL_AppResult result) {
     SdlState *state = (SdlState *)appstate;
     if (!state) {
@@ -1018,6 +1143,15 @@ extern "C" void SDL_AppQuit(void *appstate, SDL_AppResult result) {
     delete state;
     if (network_initialized) {
         Network::Shutdown();
+    }
+    if (Common::RunOutcome::Active() || startup_reason != Common::RunOutcome::Reason::None) {
+        const int code = EndUnattendedRun(result);
+        if (code != (result == SDL_APP_FAILURE ? 1 : 0)) {
+            // SDL maps SDL_APP_SUCCESS to 0 and SDL_APP_FAILURE to 1; leave with the real code.
+            SDL_Quit();
+            std::exit(code);
+        }
+        return;
     }
     if (restart_requested) {
         // SDL3 maps SDL_APP_SUCCESS to exit code 0; quit SDL ourselves to return the restart code.
