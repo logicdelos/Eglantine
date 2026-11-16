@@ -65,6 +65,7 @@
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_warm/shader_warm_builder.h"
+#include "yuzu_cmd/run_control.h"
 #include "yuzu_cmd/run_report.h"
 #include "yuzu_cmd/emu_window/emu_window_sdl3.h"
 #ifdef HAS_OPENGL
@@ -215,6 +216,9 @@ static bool live_quit_requested = false;
 // report that cannot be written); read by SDL_AppQuit.
 static Common::RunOutcome::Reason startup_reason = Common::RunOutcome::Reason::None;
 static std::string startup_detail;
+// Attribution (Nx2Spikes::BeginSession) is running; SDL_AppQuit ends it.
+static bool attribution_session_started = false;
+namespace Spikes = VideoCommon::Nx2Spikes;
 
 // Called by the run clock's thread when a stop was requested and the shutdown has not finished
 // within Common::RunOutcome::StopGraceSeconds: writes the report with what is known and ends the
@@ -521,6 +525,9 @@ static bool BuildWarm(Core::System& system, int argc, char** argv) {
 }
 
 extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
+    // The first thing: the creation time of the process is mapped onto the attribution clock.
+    const std::optional<RunControl::ProcessCreation> process_created =
+        RunControl::CaptureProcessCreation();
     Nx2Sampler::StartFromEnvironment();
     // SDL calls SDL_AppIterate back to back by default, which kept a host core at 100% polling
     // input; 240 Hz is plenty for input and the key script.
@@ -620,6 +627,25 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         // At once: a signal during the set-up below ends the run as interrupted (130).
         Common::RunOutcome::InstallSignalHandlers();
         Nx2Bottleneck::BeginRecording(Nx2Bottleneck::Now());
+    }
+    // Attribution runs from here (a bad argument above never starts it) so that the cold start,
+    // from the creation of the process to the first frame, is accounted for. The spool the long
+    // frames are written to belongs to the report, which was prepared above.
+    std::optional<RunControl::BootPhaseScope> frontend_load;
+    if (RunControl::AttributionRequested()) {
+        std::string spool_error;
+        if (!RunReport::Schema2::OpenLongFrameSpool(spool_error)) {
+            LOG_WARNING(Frontend, "Long frame spool: {} (attribution will be incomplete)",
+                        spool_error);
+        }
+        attribution_session_started = Spikes::BeginSession({});
+        if (attribution_session_started) {
+            if (process_created) {
+                Spikes::SetProcessCreated(process_created->created_ns,
+                                          process_created->uncertainty_ns);
+            }
+            frontend_load.emplace(Spikes::BootPhase::FrontendLoad);
+        }
     }
     SdlConfig config{lp.config_path};
     // Before anything loads a GPU driver.
@@ -752,6 +778,9 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
             loader_id, error_id, Loader::ResultStatus(error_id));
         return SDL_APP_FAILURE;
     }
+    if (frontend_load) {
+        frontend_load->End(Spikes::PhaseOutcome::Ok);
+    }
     if (Common::RunOutcome::Active()) {
         if (const u64 program_id = state->system.GetApplicationProcessProgramID();
             program_id != 0) {
@@ -780,13 +809,27 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     state->system.GPU().Start();
     state->system.GetCpuManager().OnGpuReady();
 
+    // The caches are tied to this build, title, content and settings: said before any of them loads.
+    const u64 application_program_id = state->system.GetApplicationProcessProgramID();
+    RunControl::PublishHostIdentity(state->system, application_program_id);
     if (Settings::values.use_disk_shader_cache.GetValue()) {
-        VideoCommon::ShaderWarm::RefreshWarmFiles(
-            state->system, state->system.GetApplicationProcessProgramID(), {});
+        {
+            RunControl::BootPhaseScope warm_refresh{Spikes::BootPhase::WarmRefresh};
+            VideoCommon::ShaderWarm::RefreshWarmFiles(state->system, application_program_id,
+                                                      Common::RunOutcome::StopToken());
+            warm_refresh.End(Common::RunOutcome::StopRequested() ? Spikes::PhaseOutcome::Cancelled
+                                                                 : Spikes::PhaseOutcome::Ok);
+        }
+        RunControl::DiskLoadPhases load_phases;
         state->system.Renderer().ReadRasterizer()->LoadDiskResources(
-            state->system.GetApplicationProcessProgramID(), Common::RunOutcome::StopToken(),
-            [](VideoCore::LoadCallbackStage, size_t value, size_t total) {});
+            application_program_id, Common::RunOutcome::StopToken(),
+            [&load_phases](VideoCore::LoadCallbackStage stage, size_t, size_t) {
+                load_phases.OnStage(stage);
+            });
+        load_phases.Finish(Common::RunOutcome::StopRequested() ? Spikes::PhaseOutcome::Cancelled
+                                                               : Spikes::PhaseOutcome::Ok);
     }
+    RunControl::BootPhaseScope game_run{Spikes::BootPhase::GameRun};
 
     // The game leaving ends an unattended run (inert otherwise: SDL3 quits for us with the window).
     state->system.RegisterExitCallback([] {
@@ -835,9 +878,14 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         state->system.GPU().WaitForIdle();
         state->system.GPU().ObtainContext();
 
+        RunControl::PublishHostIdentity(state->system, changed_program_id);
+        RunControl::DiskLoadPhases load_phases;
         state->system.Renderer().ReadRasterizer()->LoadDiskResources(
             changed_program_id, std::stop_token{},
-            [](VideoCore::LoadCallbackStage, size_t, size_t) {});
+            [&load_phases](VideoCore::LoadCallbackStage stage, size_t, size_t) {
+                load_phases.OnStage(stage);
+            });
+        load_phases.Finish(Spikes::PhaseOutcome::Ok);
 
         state->system.GPU().ReleaseContext();
         state->system.Run();
@@ -845,10 +893,12 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
 
     if (Common::RunOutcome::StopRequested()) {
         // A stop during loading (a signal, the time limit): the game never ran.
+        game_run.End(Spikes::PhaseOutcome::Cancelled);
         return SDL_APP_SUCCESS;
     }
 
     void(state->system.Run());
+    game_run.End(Spikes::PhaseOutcome::Ok);
     if (state->system.DebuggerEnabled())
         state->system.InitializeDebugger();
 
@@ -879,6 +929,8 @@ double Nx2KeyClockSeconds(); // emu_window_sdl3.cpp
 // control (tools/nx2/lab_ctl.py press). One entry per line: "<code>" press, "-<code>" release,
 // "<code> <milliseconds>" press and release after that long, "gpu low|high", or "quit" (orderly
 // shutdown, so the reports written at shutdown reach the log). Codes are SDL scancodes.
+// "interactive <scene_id> <pass|fail> [<origin>]": the lab saw the reference scene respond; the
+// time of the line's reading is the interactive marker of the run (yuzu_cmd/run_control.h).
 static void RunLiveKeys(InputCommon::InputSubsystem& input_subsystem, Core::System& system) {
     static const std::filesystem::path file = [] {
         const char* dir = std::getenv("EDEN_NX2_DIAG_DIR");
@@ -911,6 +963,10 @@ static void RunLiveKeys(InputCommon::InputSubsystem& input_subsystem, Core::Syst
     std::ifstream in{taken};
     std::string line;
     while (std::getline(in, line)) {
+        if (line.starts_with(RunControl::MarkerKeyword)) {
+            RunControl::HandleMarkerLine(line);
+            continue;
+        }
         // "gpu low|high": sets the GPU accuracy, as the Qt app's Change GPU Mode hotkey.
         if (line.starts_with("gpu ")) {
             const bool high = line.substr(4) == "high";
@@ -1089,6 +1145,11 @@ extern "C" void SDL_AppQuit(void *appstate, SDL_AppResult result) {
     delete state;
     if (network_initialized) {
         Network::Shutdown();
+    }
+    if (attribution_session_started) {
+        // Every producer was joined above: the recorder finishes and the report can read its
+        // final snapshot. Not in Publish: a stuck shutdown publishes without it, incomplete.
+        Spikes::EndSession();
     }
     if (Common::RunOutcome::Active() || startup_reason != Common::RunOutcome::Reason::None) {
         const int code = EndUnattendedRun();

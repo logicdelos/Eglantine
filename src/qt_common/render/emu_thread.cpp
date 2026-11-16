@@ -8,6 +8,7 @@
 #include "core/core.h"
 #include "core/cpu_manager.h"
 #include "emu_thread.h"
+#include "yuzu_cmd/run_control.h"
 #include "qt_common/qt_common.h"
 #include "video_core/gpu.h"
 #include "video_core/rasterizer_interface.h"
@@ -24,6 +25,13 @@ void EmuThread::run() {
     auto& gpu = QtCommon::system->GPU();
     auto stop_token = m_stop_source.get_token();
 
+    // Attribution (EGLANTINE_ATTRIBUTION=0 turns it off) runs for the life of this thread.
+    const bool attribution =
+        RunControl::AttributionRequested() && VideoCommon::Nx2Spikes::BeginSession({});
+    if (attribution) {
+        VideoCommon::Nx2Spikes::RegisterThread("EmuControlThread");
+    }
+
     QtCommon::system->RegisterHostThread();
 
     // Main process has been loaded. Make the context current to this thread and begin GPU and CPU
@@ -31,16 +39,36 @@ void EmuThread::run() {
     gpu.ObtainContext();
 
     emit LoadProgress(VideoCore::LoadCallbackStage::Prepare, 0, 0);
+    // The caches are tied to this build, title, content and settings: said before any of them
+    // loads.
+    const u64 application_program_id = QtCommon::system->GetApplicationProcessProgramID();
+    RunControl::PublishHostIdentity(*QtCommon::system, application_program_id);
     if (Settings::values.use_disk_shader_cache.GetValue()) {
-        VideoCommon::ShaderWarm::RefreshWarmFiles(
-            *QtCommon::system, QtCommon::system->GetApplicationProcessProgramID(), stop_token);
+        {
+            RunControl::BootPhaseScope warm_refresh{VideoCommon::Nx2Spikes::BootPhase::WarmRefresh};
+            VideoCommon::ShaderWarm::RefreshWarmFiles(*QtCommon::system, application_program_id,
+                                                      stop_token);
+            warm_refresh.End(stop_token.stop_requested()
+                                 ? VideoCommon::Nx2Spikes::PhaseOutcome::Cancelled
+                                 : VideoCommon::Nx2Spikes::PhaseOutcome::Ok);
+        }
+        RunControl::DiskLoadPhases load_phases;
         QtCommon::system->Renderer().ReadRasterizer()->LoadDiskResources(
-            QtCommon::system->GetApplicationProcessProgramID(), stop_token,
-            [this](VideoCore::LoadCallbackStage stage, std::size_t value, std::size_t total) {
+            application_program_id, stop_token,
+            [this, &load_phases](VideoCore::LoadCallbackStage stage, std::size_t value,
+                                 std::size_t total) {
+                load_phases.OnStage(stage);
                 emit LoadProgress(stage, value, total);
             });
+        load_phases.Finish(stop_token.stop_requested()
+                               ? VideoCommon::Nx2Spikes::PhaseOutcome::Cancelled
+                               : VideoCommon::Nx2Spikes::PhaseOutcome::Ok);
     }
     emit LoadProgress(VideoCore::LoadCallbackStage::Complete, 0, 0);
+    std::optional<RunControl::BootPhaseScope> game_run;
+    if (attribution) {
+        game_run.emplace(VideoCommon::Nx2Spikes::BootPhase::GameRun);
+    }
 
     gpu.ReleaseContext();
     gpu.Start();
@@ -55,6 +83,10 @@ void EmuThread::run() {
         std::unique_lock lk{m_should_run_mutex};
         if (m_should_run) {
             QtCommon::system->Run();
+            if (game_run) {
+                game_run->End(VideoCommon::Nx2Spikes::PhaseOutcome::Ok);
+                game_run.reset();
+            }
             m_stopped.Reset();
 
             m_should_run_cv.wait(lk, stop_token, [&] {
@@ -82,6 +114,13 @@ void EmuThread::run() {
     // Shutdown the main emulated process
     QtCommon::system->DetachDebugger();
     QtCommon::system->ShutdownMainProcess();
+    if (game_run) {
+        game_run->End(VideoCommon::Nx2Spikes::PhaseOutcome::Cancelled); // never ran
+    }
+    if (attribution) {
+        // The recorder finishes; the Qt frontend has no report, its long frames are in the log.
+        VideoCommon::Nx2Spikes::EndSession();
+    }
 }
 
 void EmuThread::ReloadDiskShaderCache(u64 program_id) {
@@ -98,12 +137,19 @@ void EmuThread::ReloadDiskShaderCache(u64 program_id) {
     gpu.WaitForIdle();
     gpu.ObtainContext();
 
+    RunControl::PublishHostIdentity(system, program_id);
+    RunControl::DiskLoadPhases load_phases;
     emit ShaderCacheReloadStarted();
     emit LoadProgress(VideoCore::LoadCallbackStage::Prepare, 0, 0);
-    system.Renderer().ReadRasterizer()->LoadDiskResources(program_id, m_stop_source.get_token(),
-        [this](VideoCore::LoadCallbackStage stage, std::size_t value, std::size_t total) {
+    const auto stop_token = m_stop_source.get_token();
+    system.Renderer().ReadRasterizer()->LoadDiskResources(program_id, stop_token,
+        [this, &load_phases](VideoCore::LoadCallbackStage stage, std::size_t value,
+                             std::size_t total) {
+            load_phases.OnStage(stage);
             emit LoadProgress(stage, value, total);
         });
+    load_phases.Finish(stop_token.stop_requested() ? VideoCommon::Nx2Spikes::PhaseOutcome::Cancelled
+                                                   : VideoCommon::Nx2Spikes::PhaseOutcome::Ok);
     emit LoadProgress(VideoCore::LoadCallbackStage::Complete, 0, 0);
     emit ShaderCacheReloadFinished();
 
