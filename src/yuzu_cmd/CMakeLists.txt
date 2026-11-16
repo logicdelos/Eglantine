@@ -34,6 +34,9 @@ add_executable(yuzu-cmd
     emu_window/emu_window_sdl3_null.h
     emu_window/emu_window_sdl3_vk.cpp
     emu_window/emu_window_sdl3_vk.h
+    report_schema2.cpp
+    run_control.cpp
+    run_control.h
     run_report.cpp
     run_report.h
     sdl_config.cpp

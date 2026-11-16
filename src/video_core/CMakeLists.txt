@@ -25,6 +25,8 @@ add_library(video_core STATIC
     buffer_cache/usage_tracker.h
     buffer_cache/virtual_range_cache.h
     buffer_cache/word_manager.h
+    cache_envelope.cpp
+    cache_envelope.h
     cache_types.h
     capture.h
     cdma_pusher.cpp
@@ -122,6 +124,7 @@ add_library(video_core STATIC
     nx2_gpu_latency.h
     nx2_method_census.h
     nx2_profile.h
+    nx2_attribution.cpp
     nx2_spikes.cpp
     nx2_spikes.h
     nx2_timeline.cpp
@@ -129,6 +132,8 @@ add_library(video_core STATIC
     nx2_perf.cpp
     nx2_perf.h
     ocarina_upscale.h
+    pipeline_prepare.cpp
+    pipeline_prepare.h
     present.h
     pte_kind.h
     query_cache/bank_base.h

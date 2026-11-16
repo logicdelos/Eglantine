@@ -82,6 +82,11 @@ add_executable(tests
     video_core/shader_bench.cpp
     video_core/shader_precache.cpp
     video_core/shader_precache_identity.cpp
+    video_core/cache_envelope.cpp
+    video_core/nx2_attribution.cpp
+    video_core/pipeline_prepare.cpp
+    video_core/report_schema2.cpp
+    ../yuzu_cmd/report_schema2.cpp
     video_core/h264_packet.cpp
     video_core/vertex_repack.cpp
     video_core/virtual_range_cache.cpp
