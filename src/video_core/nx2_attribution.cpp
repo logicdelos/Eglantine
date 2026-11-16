@@ -1239,6 +1239,7 @@ AttributionSnapshot Session::Snapshot() {
     result.enabled = true; // a session was recorded; AttributionEnabled() says if it still runs
     result.threshold_ns = config.threshold_ns;
     result.lost_events = TotalLost();
+    result.dropped_boundaries = boundaries_dropped.load(std::memory_order_relaxed);
     result.sink_write_errors = sink_errors.load(std::memory_order_relaxed);
     result.rejected_presents = rejected.load(std::memory_order_relaxed);
     result.process_created_ns = process_created_ns.load(std::memory_order_relaxed);

@@ -664,6 +664,7 @@ TEST_CASE("Dropped present boundaries never merge into an invented long frame",
     CHECK(snap.first_120s.frames_over_threshold == 1);
     CHECK(snap.first_120s.max_ns == 60 * Ms);
     CHECK(snap.lost_events == Dropped); // the lost boundaries are counted, never silent
+    CHECK(snap.dropped_boundaries == Dropped); // and reported on their own for the report
     CHECK_FALSE(snap.complete);
 }
 
