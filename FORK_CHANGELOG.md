@@ -12,6 +12,41 @@ Where a fix is described as a "likely fix", it was written to remove a cause fou
 
 All runs were made on one Windows 11 laptop: AMD Ryzen 9 8940HX, NVIDIA GeForce RTX 5070 Ti Laptop GPU, 16 GB RAM. Only Fire Emblem: Fortune's Weave and Xenoblade Chronicles 2 were run. Fixes marked "Orchid" or "Lichii" were ported from those forks, with the original author named in the commit message.
 
+## 0.2.0 (2026-11-16)
+
+Fixes ported from other forks. The original author and the source are named in each commit message and in the release notes. No fix in this section was confirmed in a game on its own: the release test ran with all of them together, and its results are in the release notes.
+
+Game-specific:
+
+- Fire Emblem: Fortune's Weave: texture arrays indexed by a found bit are limited to 32 elements instead of 1024 (Lichii #1914).
+- Fire Emblem: Fortune's Weave: a depth target padded to whole GOBs is created as the square texture the game samples, so one image serves both (Lichii #1868).
+- Xenoblade Chronicles 2: in handheld mode the 3D scene is no longer zoomed in 2x; the upscale stand-in copies only the regions the game names (Orchid).
+
+Graphics:
+
+- Vulkan: a render target that got no memory is left out of the framebuffer instead of binding a null view (Lichii #1766).
+- Vulkan: the zero fill of the null buffer is ordered before every read of it (Lichii-TGM, via Orchid).
+- Resolution scaling: an image whose scaled size would pass the GPU's image or framebuffer limits stays at native resolution (Lichii #1890).
+- Texture cache: a CPU write to a page without images no longer waits for the texture cache lock (Lichii #1789).
+- Texture cache: a copy between depth and color formats that spans several layers is done one layer at a time (Orchid).
+- Software 2D blit: Switch 2 surfaces use the Switch 2 tile order (Eglantine-steamdeck, via Orchid).
+- Shaders: FFMA and HFMA2 apply FMZ before SAT, and half-precision FMZ translates (Lichii #745, via Orchid).
+
+Audio and input:
+
+- Audio: ADPCM samples are decoded with the correct sign (Lichii #1196).
+- Input: vibration amplitudes are kept between 0 and 1, and a bad frequency becomes the default (Anka).
+
+Core and services:
+
+- Kernel: a 64-bit address arbiter read whose end wraps around is rejected (lichii-m5s, via Orchid).
+- Kernel: a process joins the kernel object list only after it loads (Lichii #1574).
+- Stop: guest threads are suspended before power-off, so stopping a game should no longer end in a Userspace PANIC (2010-0212) (Lichii #1450).
+- JIT: on Windows the code space commit is retried for up to about 10 seconds instead of ignoring a failure (Lichii #310).
+- File system: file and storage reads and writes longer than their IPC buffer return an error, as on the console (Orchid).
+- Services: bytes a service handler does not write in an out buffer keep the guest's values (Lichii #1802).
+- Services: an unknown command answered by the automatic stub is logged instead of asserting (Lichii #1919).
+
 ## 0.1.0 (2026-11-16)
 
 Based on upstream build daily-20261116.
