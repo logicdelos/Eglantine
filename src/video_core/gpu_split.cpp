@@ -32,6 +32,7 @@
 #include "core/core.h"
 #include "video_core/engines/engine_interface.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
@@ -118,6 +119,14 @@ void GpuSplit::CheckOwner(const char* where) {
 
 GpuSplit GpuSplit::instance;
 
+bool GpuSplit::AtHighAccuracy() {
+    static const bool at_high = [] {
+        const char* const value = std::getenv("EDEN_NX2_SPLIT_AT_HIGH");
+        return value != nullptr && value[0] == '1';
+    }();
+    return at_high;
+}
+
 void GpuSplit::MaybeStart(Core::System& system_) {
     static const char mode = [] {
         const char* value = std::getenv("EDEN_NX2_SPLIT");
@@ -131,10 +140,29 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     // The front reads command lists straight from guest memory; a read that flushes the caches
     // first (safe DMA, accurate GPU) would touch back-owned state. The settings can change
     // mid-game: hand the engines back to the front (and start again when they allow it).
-    const bool safe_reads = Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh()
-                                                          : Settings::IsDMALevelSafe();
-    const bool allowed = !safe_reads && !Settings::IsGPULevelHigh() &&
+    // EDEN_NX2_SPLIT_AT_HIGH=1 (Lichii #1808, off by default) lets the split run at accurate GPU
+    // and safe DMA too: the back then writes out what the texture and query caches hold of a
+    // command list before the front reads it (DmaPusher::FlushCachedCommands).
+    const bool at_high = AtHighAccuracy();
+    const bool high = Settings::IsGPULevelHigh();
+    const bool safe_reads = Settings::IsDMALevelDefault() ? high : Settings::IsDMALevelSafe();
+    const bool allowed = (at_high || (!safe_reads && !high)) &&
                          Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan;
+    // The accuracy settings the front decided under. When they change the split is stopped and
+    // started again under the new ones: the work sent under the old runs first (Stop), and
+    // whether the macros run on the front is decided again (they stay on the back at High).
+    const u8 accuracy = at_high ? static_cast<u8>(static_cast<u8>(Settings::values.current_gpu_accuracy) |
+                                                  (static_cast<u8>(Settings::values.dma_accuracy.GetValue()) << 4))
+                                : u8{0};
+    if (at_high && active && accuracy != started_accuracy) {
+        Drain();
+        Stop();
+        // Stop empties the split, not the engines: the front's mirrors, partial macro parameters
+        // and macro bindings go back to them here, before the new back thread runs their methods
+        // (the engines only hand them back themselves on a thread other than the back).
+        system_.GPU().ReleaseFrontMacros();
+        LOG_INFO(HW_GPU, "GPU thread split: restarting, the accuracy settings changed");
+    }
     if (active && !allowed) {
         Drain();
         Stop();
@@ -144,6 +172,7 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     if (active || !allowed) {
         return;
     }
+    started_accuracy = accuracy;
     system = &system_;
     check_owner = std::getenv("EDEN_NX2_SPLIT_CHECK") != nullptr;
     ring = std::make_unique<u64[]>(RingWords);
@@ -154,10 +183,14 @@ void GpuSplit::MaybeStart(Core::System& system_) {
 #ifdef ARCHITECTURE_x86_64
     // Front macros run compiled (macro_turing_jit.h) only.
     const char* jit = std::getenv("EDEN_NX2_MME_JIT");
-    front_macros = mode == '2' && (jit == nullptr || jit[0] != '0');
+    // With EDEN_NX2_SPLIT_AT_HIGH=1 at accurate GPU the macros stay on the back: accurate GPU
+    // re-reads a macro's parameters from flushed memory (Maxwell3D::RefreshParametersImpl), which
+    // the front's macros do not do.
+    front_macros = mode == '2' && (jit == nullptr || jit[0] != '0') && !(at_high && high);
 #endif
-    LOG_INFO(HW_GPU, "GPU thread split: engine methods run on a second thread{}",
-             front_macros ? ", macros on the first" : "");
+    LOG_INFO(HW_GPU, "GPU thread split: engine methods run on a second thread{}{}",
+             front_macros ? ", macros on the first" : "",
+             at_high && high ? " (EDEN_NX2_SPLIT_AT_HIGH, accurate GPU)" : "");
 }
 
 void GpuSplit::Stop() {
