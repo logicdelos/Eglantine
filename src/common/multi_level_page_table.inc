@@ -8,6 +8,7 @@
 #endif
 
 #include "common/assert.h"
+#include "common/memory_accounting.h"
 #include "common/multi_level_page_table.h"
 
 namespace Common {
@@ -35,6 +36,7 @@ MultiLevelPageTable<BaseAddr>::MultiLevelPageTable(std::size_t address_space_bit
 #endif
     ASSERT(base);
     base_ptr = reinterpret_cast<BaseAddr*>(base);
+    Common::MemoryAccounting::Register("GPU page table", base, alloc_size);
 }
 
 template <typename BaseAddr>
@@ -42,6 +44,7 @@ MultiLevelPageTable<BaseAddr>::~MultiLevelPageTable() noexcept {
     if (!base_ptr) {
         return;
     }
+    Common::MemoryAccounting::Unregister(base_ptr);
 #ifdef _WIN32
     ASSERT(VirtualFree(base_ptr, 0, MEM_RELEASE));
 #else

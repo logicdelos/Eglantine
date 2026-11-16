@@ -58,7 +58,7 @@ MemoryManager::MemoryManager(Core::System& system_, MaxwellDeviceMemoryManager& 
     page_table_mask = page_table_size - 1;
     big_page_table_mask = big_page_table_size - 1;
 
-    big_page_table_dev.ResizeAndClear(big_page_table_size);
+    big_page_table_dev.ResizeAndClear(big_page_table_size, "GPU big page table");
     big_entries.resize(big_page_table_size / 32, 0);
     big_page_continuous.resize(big_page_table_size / continuous_bits, 0);
     entries.resize(page_table_size / 32, 0);

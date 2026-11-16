@@ -16,6 +16,7 @@
 #include <sys/mman.h>
 #endif
 
+#include "common/memory_accounting.h"
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/sparse_large_vector.h"
@@ -113,7 +114,7 @@ bool CommitVectorPage(uintptr_t addr, bool write) noexcept {
 #define MAP_NOCORE 0
 #endif
 
-void* AllocateMemoryPages(std::size_t size) noexcept {
+void* AllocateMemoryPages(std::size_t size, const char* name) noexcept {
     if (auto page = HostPageSize; size % page != 0) {
         LOG_WARNING(HW_Memory, "Allocating unaligned large vector with size {:#x}; aligning to {} page size", size, page);
         size = AlignUp(size, page);
@@ -141,6 +142,9 @@ void* AllocateMemoryPages(std::size_t size) noexcept {
         base = nullptr;
     ASSERT_MSG(base, "Failed to allocate {:#x} sized region with error {}", size, strerror(errno));
 #endif
+    if (base != nullptr && size >= (std::size_t{32} << 20)) {
+        Common::MemoryAccounting::Register(name, base, size);
+    }
     return base;
 }
 
@@ -150,6 +154,7 @@ void FreeMemoryPages(void* base, [[maybe_unused]] std::size_t size) noexcept {
     }
     if (!base)
         return;
+    Common::MemoryAccounting::Unregister(base);
 #ifdef _WIN32
     std::lock_guard lock(vector_regions_mutex);
     // Regions are kept in host pages.

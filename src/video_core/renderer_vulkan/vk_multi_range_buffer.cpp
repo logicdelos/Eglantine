@@ -8,6 +8,7 @@
 #include <mutex>
 #include <utility>
 
+#include "common/nx2_bottleneck.h"
 #include "video_core/renderer_vulkan/vk_multi_range_buffer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -167,6 +168,7 @@ SparseBuffer MultiRangeBufferCache::CreateSparse(const Device& device, Scheduler
     if (bind_result != VK_SUCCESS) {
         return SparseBuffer{};
     }
+    Nx2Bottleneck::WaitScope wait{Nx2Bottleneck::Wait::HostGpu};
     fence.Wait();
     return handle;
 }

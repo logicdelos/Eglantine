@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
+#include <limits>
 #include <cstring>
 #include <list>
 #include <map>
@@ -22,6 +24,7 @@
 
 #include "common/fs/path_util.h"
 #include "common/logging.h"
+#include "common/memory_accounting.h"
 #include "common/settings.h"
 #include "common/swap.h"
 #include "core/file_sys/vfs/vfs_offset.h"
@@ -43,6 +46,18 @@ constexpr std::array<u8, 4> ZstdMagic{0x28, 0xB5, 0x2F, 0xFD};
 constexpr u8 CodecZstd = 1;
 constexpr u8 PackageFlagStandaloneUpdate = 0x01;
 constexpr u32 MaxDirDepth = 128;
+
+std::size_t CacheCapFromEnv(const char* name, std::size_t fallback) {
+    const char* const value = std::getenv(name);
+    if (!value || value[0] < '0' || value[0] > '9') {
+        return fallback;
+    }
+    char* end{};
+    const auto mib = std::strtoull(value, &end, 10);
+    return end != value && *end == '\0' && mib > 0 && mib <= 16384
+               ? static_cast<std::size_t>(mib) << 20
+               : fallback;
+}
 
 #pragma pack(push, 1)
 struct Superblock {
@@ -222,18 +237,54 @@ public:
                 return length;
             }
         }
+        if (cache->limits_enabled) {
+            bool spill_member{};
+            {
+                std::scoped_lock lock{cache->mutex};
+                spill_member = cache->spills.contains(cache_index) ||
+                               uncompressed_size > NupDecompressCache::GlobalCap() -
+                                                       NupDecompressCache::global_bytes.load();
+                if (spill_member) {
+                    cache->GetSpill(cache_index);
+                }
+            }
+            if (spill_member) {
+                return ReadSpilled(data, length, offset);
+            }
+        }
 
         // Decompress without holding the cache lock, then publish and copy.
-        std::vector<u8> scratch = Decompress();
+        std::vector<u8> scratch;
+        {
+            const VideoCommon::Nx2Spikes::Scope spike{VideoCommon::Nx2Spikes::Event::NupDecompress,
+                                                      uncompressed_size};
+            scratch = Decompress();
+        }
         if (scratch.empty()) {
             return 0;
         }
-        {
+        if (!cache->limits_enabled) {
             std::scoped_lock lock{cache->mutex};
             cache->Insert(cache_index, scratch);
+            std::memcpy(data, cache->Find(cache_index)->data() + offset, length);
+            return length;
+        }
+        std::shared_ptr<NupSpillFile> fallback_spill;
+        {
+            std::scoped_lock lock{cache->mutex};
+            if (!cache->Insert(cache_index, scratch)) {
+                fallback_spill = cache->GetSpill(cache_index);
+            }
             if (const auto* cached = cache->Find(cache_index)) {
                 std::memcpy(data, cached->data() + offset, length);
                 return length;
+            }
+        }
+        if (fallback_spill) {
+            std::scoped_lock lock{fallback_spill->mutex};
+            if (!fallback_spill->attempted) {
+                fallback_spill->attempted = true;
+                DecompressToFile(*fallback_spill, std::span<const u8>{scratch});
             }
         }
         std::memcpy(data, scratch.data() + offset, length);
@@ -267,7 +318,7 @@ private:
         return spill->file.ReadSpan(std::span{data, length});
     }
 
-    void DecompressToFile(NupSpillFile& spill) const {
+    void DecompressToFile(NupSpillFile& spill, std::span<const u8> decompressed = {}) const {
         const auto fail = [&](const char* reason) {
             LOG_ERROR(Loader, "NUP zstd decompression of {} to a temporary file failed: {}", name,
                       reason);
@@ -291,44 +342,55 @@ private:
             return fail("cannot create the temporary file");
         }
 
-        std::unique_ptr<ZSTD_DCtx, decltype(&ZSTD_freeDCtx)> dctx{ZSTD_createDCtx(),
-                                                                  &ZSTD_freeDCtx};
-        std::vector<u8> in_buffer(ZSTD_DStreamInSize());
-        std::vector<u8> out_buffer(ZSTD_DStreamOutSize());
-        u64 read = 0;
-        u64 written = 0;
-        bool frame_done = false;
-        while (!frame_done && read < extent_size) {
-            const auto chunk =
-                static_cast<std::size_t>(std::min<u64>(in_buffer.size(), extent_size - read));
-            if (backing->Read(in_buffer.data(), chunk,
-                              static_cast<std::size_t>(extent_offset + read)) != chunk) {
-                return fail("short read of the compressed data");
+        if (!decompressed.empty()) {
+            if (decompressed.size() != uncompressed_size ||
+                out.WriteSpan(decompressed) != decompressed.size()) {
+                return fail("cannot write the decompressed member");
             }
-            read += chunk;
-            ZSTD_inBuffer input{in_buffer.data(), chunk, 0};
-            ZSTD_outBuffer output{};
-            do {
-                output = {out_buffer.data(), out_buffer.size(), 0};
-                const std::size_t result = ZSTD_decompressStream(dctx.get(), &output, &input);
-                if (ZSTD_isError(result) || output.pos > uncompressed_size - written) {
-                    return fail("corrupt or oversized data");
+        } else {
+            std::unique_ptr<ZSTD_DCtx, decltype(&ZSTD_freeDCtx)> dctx{ZSTD_createDCtx(),
+                                                                    &ZSTD_freeDCtx};
+            std::vector<u8> in_buffer(ZSTD_DStreamInSize());
+            std::vector<u8> out_buffer(ZSTD_DStreamOutSize());
+            u64 read = 0;
+            u64 written = 0;
+            bool frame_done = false;
+            while (!frame_done && read < extent_size) {
+                const auto chunk =
+                    static_cast<std::size_t>(std::min<u64>(in_buffer.size(), extent_size - read));
+                if (backing->Read(in_buffer.data(), chunk,
+                                  static_cast<std::size_t>(extent_offset + read)) != chunk) {
+                    return fail("short read of the compressed data");
                 }
-                if (out.WriteSpan(std::span<const u8>{out_buffer.data(), output.pos}) !=
-                    output.pos) {
-                    return fail("cannot write the temporary file");
-                }
-                written += output.pos;
-                frame_done = result == 0;
-            } while (!frame_done && (input.pos < input.size || output.pos == output.size));
-        }
-        if (!frame_done || written != uncompressed_size) {
-            return fail("size mismatch");
+                read += chunk;
+                ZSTD_inBuffer input{in_buffer.data(), chunk, 0};
+                ZSTD_outBuffer output{};
+                do {
+                    output = {out_buffer.data(), out_buffer.size(), 0};
+                    const std::size_t result = ZSTD_decompressStream(dctx.get(), &output, &input);
+                    if (ZSTD_isError(result) || output.pos > uncompressed_size - written) {
+                        return fail("corrupt or oversized data");
+                    }
+                    if (out.WriteSpan(std::span<const u8>{out_buffer.data(), output.pos}) !=
+                        output.pos) {
+                        return fail("cannot write the temporary file");
+                    }
+                    written += output.pos;
+                    frame_done = result == 0;
+                } while (!frame_done && (input.pos < input.size || output.pos == output.size));
+            }
+            if (!frame_done || written != uncompressed_size) {
+                return fail("size mismatch");
+            }
         }
         out.Close();
         spill.file.Open(spill.path, Common::FS::FileAccessMode::Read);
         if (!spill.file.IsOpen()) {
             fail("cannot reopen the temporary file");
+        }
+        if (cache->limits_enabled && spill.file.IsOpen()) {
+            LOG_INFO(Loader, "NUP spill: {} retained 0 MiB, avoided {:.2f} MiB of cache RAM",
+                     name, static_cast<double>(uncompressed_size) / 1048576.0);
         }
     }
 
@@ -371,6 +433,67 @@ NupSpillFile::~NupSpillFile() {
     }
 }
 
+std::size_t NupDecompressCache::GlobalCap() {
+    static const std::size_t limit = CacheCapFromEnv(
+        "EDEN_NX2_NUP_GLOBAL_MIB", (std::numeric_limits<std::size_t>::max)());
+    return limit;
+}
+
+NupDecompressCache::~NupDecompressCache() {
+    for (const auto& entry : lru) {
+        Common::MemoryAccounting::Unregister(entry.second.data());
+    }
+    if (limits_enabled) {
+        global_bytes.fetch_sub(bytes);
+    }
+}
+
+void NupDecompressCache::EvictOldest() {
+    const auto released = lru.back().second.size();
+    Common::MemoryAccounting::Unregister(lru.back().second.data());
+    bytes -= released;
+    index.erase(lru.back().first);
+    lru.pop_back();
+    if (limits_enabled) {
+        global_bytes.fetch_sub(released);
+        LOG_INFO(Loader, "NUP cache: released {:.2f} MiB, container {:.2f} MiB, global {:.2f} MiB",
+                 static_cast<double>(released) / 1048576.0, static_cast<double>(bytes) / 1048576.0,
+                 static_cast<double>(global_bytes.load()) / 1048576.0);
+    }
+}
+
+bool NupDecompressCache::Insert(std::size_t file_index, std::vector<u8>& data) {
+    if (index.contains(file_index)) {
+        return true;
+    }
+    while (data.size() > cap - bytes && !lru.empty()) {
+        EvictOldest();
+    }
+    if (limits_enabled) {
+        if (data.size() > cap - bytes || data.size() > GlobalCap()) {
+            return false;
+        }
+        auto total = global_bytes.load();
+        for (;;) {
+            if (data.size() > GlobalCap() - total) {
+                if (lru.empty()) {
+                    return false;
+                }
+                EvictOldest();
+                total = global_bytes.load();
+            } else if (global_bytes.compare_exchange_weak(total, total + data.size())) {
+                break;
+            }
+        }
+    }
+    bytes += data.size();
+    lru.emplace_front(file_index, std::move(data));
+    index.emplace(file_index, lru.begin());
+    Common::MemoryAccounting::Register("NUP decompression LRU", lru.front().second.data(),
+                                       lru.front().second.capacity());
+    return true;
+}
+
 bool NupContainer::IsNupFile(const VirtualFile& file) {
     if (file == nullptr || file->GetSize() < SuperblockSize) {
         return false;
@@ -383,7 +506,23 @@ bool NupContainer::IsNupFile(const VirtualFile& file) {
 NupContainer::NupContainer(VirtualFile file_, std::size_t memory_cache_cap,
                            std::filesystem::path spill_dir_)
     : file(std::move(file_)), cache(std::make_shared<NupDecompressCache>()) {
+    static const auto default_cap =
+        CacheCapFromEnv("EDEN_NX2_NUP_CACHE_MIB", NupDecompressCache::DefaultCap);
+    static const bool limits_enabled = CacheCapFromEnv("EDEN_NX2_NUP_CACHE_MIB", 0) != 0 ||
+                                       CacheCapFromEnv("EDEN_NX2_NUP_GLOBAL_MIB", 0) != 0;
+    cache->limits_enabled = limits_enabled;
     cache->cap = memory_cache_cap;
+    if (limits_enabled) {
+        cache->cap = (std::min)(memory_cache_cap == NupDecompressCache::DefaultCap
+                                   ? default_cap
+                                   : memory_cache_cap,
+                               NupDecompressCache::GlobalCap());
+        LOG_INFO(Loader, "NUP cache: container cap {} MiB, global cap {} MiB (0 = unlimited)",
+                 cache->cap >> 20,
+                 NupDecompressCache::GlobalCap() == (std::numeric_limits<std::size_t>::max)()
+                     ? 0
+                     : NupDecompressCache::GlobalCap() >> 20);
+    }
     cache->spill_dir = spill_dir_.empty()
                            ? Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) / "nup"
                            : std::move(spill_dir_);

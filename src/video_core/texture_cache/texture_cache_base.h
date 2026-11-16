@@ -76,7 +76,7 @@ struct ImageViewInOut {
 
 struct AsyncDecodeContext {
     ImageId image_id;
-    Common::ScratchBuffer<u8> decoded_data;
+    Common::ScratchBuffer<u8> decoded_data{"texture async decode scratch"};
     boost::container::small_vector<BufferImageCopy, 16> copies;
     std::mutex mutex;
     std::atomic_bool complete;
@@ -725,8 +725,8 @@ private:
 
     ::Common::unordered_map<GPUVAddr, ImageAllocId> image_allocs_table;
 
-    Common::ScratchBuffer<u8> swizzle_data_buffer;
-    Common::ScratchBuffer<u8> unswizzle_data_buffer;
+    Common::ScratchBuffer<u8> swizzle_data_buffer{"texture swizzle scratch"};
+    Common::ScratchBuffer<u8> unswizzle_data_buffer{"texture unswizzle scratch"};
 
     u64 modification_tick = 0;
     u64 frame_start_modification_tick = 0;

@@ -15,6 +15,7 @@
 #include <fmt/ostream.h>
 #include "common/assert.h"
 #include "common/common_types.h"
+#include "common/memory_accounting.h"
 #include "common/nx2_sampler.h"
 #include "dynarmic/ir/terminal.h"
 #include "dynarmic/mcl/integer_of_size.hpp"
@@ -69,6 +70,8 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
         Nx2Sampler::NoteJitCode(code.getCode(), code.GetTotalCodeSize());
     }
     ClearFastDispatchTable();
+    ::Common::MemoryAccounting::Register("A64 fast dispatch table", fast_dispatch_table.data(),
+                                       sizeof(fast_dispatch_table));
 
     if (conf.fastmem_pointer.has_value()) {
         exception_handler.SetFastmemCallback([this](u64 rip_) {
@@ -77,7 +80,9 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
     }
 }
 
-A64EmitX64::~A64EmitX64() = default;
+A64EmitX64::~A64EmitX64() {
+    ::Common::MemoryAccounting::Unregister(fast_dispatch_table.data());
+}
 
 A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) noexcept {
     if (conf.very_verbose_debugging_output) [[unlikely]] {

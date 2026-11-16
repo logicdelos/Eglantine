@@ -187,11 +187,13 @@ BlockOfCode::BlockOfCode(RunCodeCallbacks cb, JitStateInfo jsi, size_t total_cod
     , cb(std::move(cb))
 {
     EnableWriting();
+    ::Common::MemoryAccounting::Register("JIT code", getCode(), total_code_size);
     EnsureMemoryCommitted(PRELUDE_COMMIT_SIZE);
     GenRunCode(rcp);
 }
 
 BlockOfCode::~BlockOfCode() {
+    ::Common::MemoryAccounting::Unregister(getCode());
 #ifdef _WIN32
     ::Common::MemoryAccounting::Sub(::Common::MemoryAccounting::Owner::JitCode, committed_size);
 #endif

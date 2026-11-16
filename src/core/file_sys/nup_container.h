@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <filesystem>
 #include <functional>
 #include <list>
@@ -42,6 +43,9 @@ struct NupSpillFile {
 struct NupDecompressCache {
     static constexpr std::size_t DefaultCap = 512 * 1024 * 1024;
 
+    ~NupDecompressCache();
+    static std::size_t GlobalCap();
+    inline static std::atomic<std::size_t> global_bytes{};
     using Entry = std::pair<std::size_t, std::vector<u8>>;
 
     std::mutex mutex;
@@ -49,6 +53,7 @@ struct NupDecompressCache {
     std::unordered_map<std::size_t, std::list<Entry>::iterator> index;
     std::size_t bytes{};
     std::size_t cap{DefaultCap};
+    bool limits_enabled{};
     std::filesystem::path spill_dir;
     std::unordered_map<std::size_t, std::shared_ptr<NupSpillFile>> spills;
     std::unordered_map<std::size_t, std::shared_ptr<std::mutex>> decompress_locks;
@@ -62,23 +67,9 @@ struct NupDecompressCache {
         return &it->second->second;
     }
 
-    /// Takes ownership of `data` only when it is inserted.
-    void Insert(std::size_t file_index, std::vector<u8>& data) {
-        if (index.contains(file_index)) {
-            return;
-        }
-        while (bytes + data.size() > cap && !lru.empty()) {
-            bytes -= lru.back().second.size();
-            index.erase(lru.back().first);
-            lru.pop_back();
-        }
-        if (bytes + data.size() > cap) {
-            return;
-        }
-        bytes += data.size();
-        lru.emplace_front(file_index, std::move(data));
-        index.emplace(file_index, lru.begin());
-    }
+    /// Takes ownership of `data` only when it is inserted. Caller holds mutex.
+    bool Insert(std::size_t file_index, std::vector<u8>& data);
+    void EvictOldest();
 
     std::shared_ptr<NupSpillFile> GetSpill(std::size_t file_index) {
         auto& spill = spills[file_index];

@@ -523,6 +523,7 @@ public:
     void Nx2TraceBufferInput(DAddr addr, u64 size, BufferDependencyTrace::Input input);
     /// True when it recorded copies, which the GPU completes at `tick` (the caller submits).
     bool Nx2CopyListPages(u64 tick);
+    u64 Nx2RetireListCopies(bool report_released = false);
     enum class Nx2ListRead { Unknown, Copied, Synced, NeedsSync };
     /// Front thread: Synced when guest memory holds the page `device_addr` lies in (flushed and
     /// written by no GPU work since), else Copied with `out` filled from the copy of its last
@@ -1038,7 +1039,7 @@ private:
     std::deque<Async_Buffer> async_buffers_death_ring;
 
     size_t immediate_buffer_capacity = 0;
-    Common::ScratchBuffer<u8> immediate_buffer_alloc;
+    Common::ScratchBuffer<u8> immediate_buffer_alloc{"buffer upload scratch"};
     /// Guest memory large uploads came from since the last cold hint (device address, size).
     std::vector<std::pair<DAddr, u64>> uploaded_buffer_ranges;
 
@@ -1062,7 +1063,7 @@ private:
 
     // Covers the device address space (MaxwellDeviceTraits::device_virtual_bits).
     std::array<BufferId, ((1ULL << 36) >> CACHING_PAGEBITS)> page_table;
-    Common::ScratchBuffer<u8> tmp_buffer;
+    Common::ScratchBuffer<u8> tmp_buffer{"buffer copy scratch"};
 
     /// A command list page (Nx2CopyListPages): the GPU writes noted to it and the last copy.
     using Nx2Staging = decltype(std::declval<Runtime&>().DownloadStagingBuffer(size_t{}, true));

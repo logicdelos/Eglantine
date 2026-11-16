@@ -7,13 +7,17 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cmath>
+#include <cstdint>
+#include <cstdlib>
 #include <iterator>
 #include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include <fmt/format.h>
 
@@ -405,6 +409,295 @@ void ReportMemory() {
     }
 }
 
+/// EDEN_NX2_MEMORY_MAP=1 turns on the region census, ReportMemoryMap.
+bool MemoryMapEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_MEMORY_MAP");
+        return value != nullptr && value[0] != '\0' && std::string_view{value} != "0";
+    }();
+    return enabled;
+}
+
+/// Wakes the report thread for a census (guarded by wake_mutex) and tells the waiter it is done.
+/// Process-lifetime, like the report thread that waits on them: never destroyed at exit.
+std::mutex& wake_mutex = *new std::mutex;
+std::condition_variable& wake = *new std::condition_variable;
+bool census_requested = false;
+bool census_done = false;
+
+/// One line from a VirtualQuery walk of the whole process: committed bytes by kind, the process's
+/// private usage beside the MEM_PRIVATE bytes the walk sees, and the 30 biggest allocations with
+/// how much of each is in the working set (one page in 16 is sampled). Ranges owners registered
+/// with Common::MemoryAccounting::Register are summed under their name, wherever their views lie.
+void ReportMemoryMap() {
+#ifdef _WIN32
+    namespace Accounting = Common::MemoryAccounting;
+    constexpr u64 MiB = u64{1} << 20;
+    constexpr u64 SampleStride = 16;
+    constexpr size_t BatchSize = 4096;
+    constexpr size_t Shown = 30;
+    const auto start = std::chrono::steady_clock::now();
+
+    struct Group {
+        const char* name; ///< Null: an allocation nobody registered
+        uintptr_t base;
+        u64 reserved;
+        u64 committed;
+        u64 sampled; ///< Committed bytes the working-set samples found resident
+        DWORD type;  ///< Of the committed regions
+    };
+    std::vector<Group> groups;
+    for (const Accounting::Range& range : Accounting::ranges) {
+        // A slot read between two equal live states was not unregistered or reused meanwhile.
+        const u64 state = range.state.load();
+        if ((state & 3) != 2) {
+            continue;
+        }
+        const char* const name = range.name.load();
+        const uintptr_t range_base = range.base.load();
+        const size_t range_size = range.size.load();
+        if (range.state.load() == state) {
+            groups.push_back({name, range_base, range_size, 0, 0, 0});
+        }
+    }
+    std::sort(groups.begin(), groups.end(), [](const Group& left, const Group& right) {
+        return left.base < right.base;
+    });
+    const size_t registered = groups.size();
+
+    SYSTEM_INFO system_info{};
+    GetSystemInfo(&system_info);
+    const u64 page_size = system_info.dwPageSize;
+    const auto limit = reinterpret_cast<uintptr_t>(system_info.lpMaximumApplicationAddress);
+    HANDLE const process = GetCurrentProcess();
+    std::vector<PSAPI_WORKING_SET_EX_INFORMATION> batch;
+    std::vector<size_t> batch_group;
+    /// The bytes each sample stands for: a stride, or less at the end of a region.
+    std::vector<u64> batch_bytes;
+    batch.reserve(BatchSize);
+    batch_group.reserve(BatchSize);
+    batch_bytes.reserve(BatchSize);
+    const auto flush = [&] {
+        if (!batch.empty() &&
+            QueryWorkingSetEx(process, batch.data(),
+                              static_cast<DWORD>(batch.size() * sizeof(batch.front())))) {
+            for (size_t i = 0; i < batch.size(); ++i) {
+                groups[batch_group[i]].sampled +=
+                    (batch[i].VirtualAttributes.Flags & 1) != 0 ? batch_bytes[i] : u64{0};
+            }
+        }
+        batch.clear();
+        batch_group.clear();
+        batch_bytes.clear();
+    };
+
+    MEMORY_BASIC_INFORMATION region{};
+    size_t current = ~size_t{0}; ///< The unregistered group the walk is in, none yet
+    uintptr_t address = 0;
+    while (address <= limit &&
+           VirtualQuery(reinterpret_cast<const void*>(address), &region, sizeof(region)) != 0) {
+        const auto begin = reinterpret_cast<uintptr_t>(region.BaseAddress);
+        const u64 size = region.RegionSize;
+        const uintptr_t next = begin + static_cast<uintptr_t>(size);
+        if (region.State != MEM_FREE) {
+            // Heap allocations usually start after the region's allocator header. Split at
+            // registered ranges instead of assigning the whole region from its first byte.
+            uintptr_t segment = begin;
+            while (segment < next) {
+                const auto registered_end =
+                    groups.begin() + static_cast<std::ptrdiff_t>(registered);
+                const auto after = std::upper_bound(
+                    groups.begin(), registered_end, segment,
+                    [](uintptr_t addr, const Group& group) { return addr < group.base; });
+                size_t index = registered;
+                uintptr_t segment_end = next;
+                if (after != groups.begin()) {
+                    const auto before = std::prev(after);
+                    if (segment - before->base < before->reserved) {
+                        index = static_cast<size_t>(before - groups.begin());
+                        segment_end = (std::min)(
+                            segment_end, before->base + static_cast<uintptr_t>(before->reserved));
+                    }
+                }
+                if (after != registered_end) {
+                    segment_end = (std::min)(segment_end, after->base);
+                }
+                if (index == registered) {
+                    const auto allocation = reinterpret_cast<uintptr_t>(region.AllocationBase);
+                    if (current == ~size_t{0} || groups[current].base != allocation) {
+                        groups.push_back({nullptr, allocation, 0, 0, 0, 0});
+                        current = groups.size() - 1;
+                    }
+                    index = current;
+                    groups[index].reserved += segment_end - segment;
+                }
+                if (region.State == MEM_COMMIT) {
+                    groups[index].type = region.Type;
+                    groups[index].committed += segment_end - segment;
+                    for (uintptr_t page = segment; page < segment_end;
+                         page += page_size * SampleStride) {
+                        PSAPI_WORKING_SET_EX_INFORMATION entry{};
+                        entry.VirtualAddress = reinterpret_cast<PVOID>(page);
+                        batch.push_back(entry);
+                        batch_group.push_back(index);
+                        batch_bytes.push_back((std::min)(
+                            page_size * SampleStride, static_cast<u64>(segment_end - page)));
+                        if (batch.size() == BatchSize) {
+                            flush();
+                        }
+                    }
+                }
+                segment = segment_end;
+            }
+        }
+        if (next <= begin) {
+            break;
+        }
+        address = next;
+    }
+    flush();
+
+    // Private, mapped and image
+    std::array<u64, 3> committed_total{};
+    std::array<u64, 3> resident_total{};
+    // Private committed bytes in allocations below 1 MiB, 1-16 MiB, 16-64 MiB and 64 MiB or more
+    std::array<u64, 4> by_size{};
+    std::vector<const Group*> top;
+    const auto resident = [](const Group& group) {
+        return (std::min)(group.sampled, group.committed);
+    };
+    const auto kind_of = [](DWORD type) -> size_t {
+        return type == MEM_MAPPED ? 1U : type == MEM_IMAGE ? 2U : 0U;
+    };
+    for (const Group& group : groups) {
+        if (group.committed == 0) {
+            continue;
+        }
+        const size_t kind = kind_of(group.type);
+        committed_total[kind] += group.committed;
+        resident_total[kind] += resident(group);
+        if (kind == 0) {
+            by_size[group.committed < MiB        ? 0U
+                    : group.committed < 16 * MiB ? 1U
+                    : group.committed < 64 * MiB ? 2U
+                                                 : 3U] += group.committed;
+        }
+        top.push_back(&group);
+    }
+    const size_t shown = (std::min)(top.size(), Shown);
+    std::partial_sort(top.begin(), top.begin() + static_cast<std::ptrdiff_t>(shown), top.end(),
+                      [](const Group* a, const Group* b) { return a->committed > b->committed; });
+
+    std::string text = fmt::format("private committed {} MiB, mapped {} MiB, image {} MiB",
+                                   committed_total[0] / MiB, committed_total[1] / MiB,
+                                   committed_total[2] / MiB);
+    PROCESS_MEMORY_COUNTERS_EX counters{};
+    counters.cb = sizeof(counters);
+    if (GetProcessMemoryInfo(process, reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+                             sizeof(counters))) {
+        fmt::format_to(std::back_inserter(text),
+                       ", process private usage {} MiB (private usage minus MEM_PRIVATE {} MiB; "
+                       "GPU attribution unknown)",
+                       static_cast<u64>(counters.PrivateUsage) / MiB,
+                       (static_cast<s64>(counters.PrivateUsage) -
+                        static_cast<s64>(committed_total[0])) /
+                           static_cast<s64>(MiB));
+    }
+    fmt::format_to(std::back_inserter(text),
+                   "; in the working set (sampled, views of guest RAM counted twice): private ~{} "
+                   "MiB, mapped ~{} MiB, image ~{} MiB",
+                   resident_total[0] / MiB, resident_total[1] / MiB, resident_total[2] / MiB);
+    fmt::format_to(std::back_inserter(text),
+                   "; private by allocation size: under 1 MiB {} MiB, 1-16 MiB {} MiB, 16-64 MiB "
+                   "{} MiB, 64 MiB and more {} MiB",
+                   by_size[0] / MiB, by_size[1] / MiB, by_size[2] / MiB, by_size[3] / MiB);
+    text += "; largest:";
+    constexpr std::array<const char*, 3> KindNames{"private", "mapped", "image"};
+    for (size_t i = 0; i < shown; ++i) {
+        const Group& group = *top[i];
+        fmt::format_to(std::back_inserter(text),
+                       " {}@{:#x} committed {} of {} MiB {} (~{} MiB in the working set);",
+                       group.name != nullptr ? group.name : "?", group.base, group.committed / MiB,
+                       group.reserved / MiB, KindNames[kind_of(group.type)], resident(group) / MiB);
+    }
+    fmt::format_to(
+        std::back_inserter(text), " census took {} ms",
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
+                                                              start)
+            .count());
+    LOG_INFO(Core, "{}", text);
+#endif
+}
+
+/// The SVCs a game calls most often by name, any other by number.
+std::string SvcName(u32 id) {
+    static constexpr std::array<std::pair<u32, std::string_view>, 27> Names{{
+        {0x06, "QueryMemory"},
+        {0x0B, "SleepThread"},
+        {0x10, "GetCurrentProcessorNumber"},
+        {0x11, "SignalEvent"},
+        {0x12, "ClearEvent"},
+        {0x16, "CloseHandle"},
+        {0x17, "ResetSignal"},
+        {0x18, "WaitSynchronization"},
+        {0x1A, "ArbitrateLock"},
+        {0x1B, "ArbitrateUnlock"},
+        {0x1C, "WaitProcessWideKeyAtomic"},
+        {0x1D, "SignalProcessWideKey"},
+        {0x1E, "GetSystemTick"},
+        {0x21, "SendSyncRequest"},
+        {0x22, "SendSyncRequestWithUserBuffer"},
+        {0x34, "WaitForAddress"},
+        {0x35, "SignalToAddress"},
+        {0x36, "SynchronizePreemptionState"},
+        {0x43, "ReplyAndReceive"},
+        {0x44, "ReplyAndReceiveWithUserBuffer"},
+        {0x80, "SetGpuMemoryAttribute"},
+        {0x81, "LockGpuSharableMemory"},
+        {0x82, "UnlockGpuSharableMemory"},
+        {0x84, "MapRemoteMemory"},
+        {0x85, "UnmapRemoteMemory"},
+        {0x87, "(unnamed 0x87)"},
+        {0x88, "(unnamed 0x88)"},
+    }};
+    for (const auto& [number, name] : Names) {
+        if (number == id) {
+            return std::string{name};
+        }
+    }
+    return fmt::format("{:#04x}", id);
+}
+
+/// What the guest's CPU side did in the window: SVCs, fastmem faults, JIT compiling and waits
+/// for the kernel scheduler lock.
+std::string CpuLine(const Window& window) {
+    std::string text;
+    const auto add = [&text]<typename... Args>(fmt::format_string<Args...> format, Args&&... args) {
+        fmt::format_to(std::back_inserter(text), format, std::forward<Args>(args)...);
+    };
+    add("svc {:.0f}/s", static_cast<double>(window.svc_total) / window.seconds);
+    const char* separator = " (top: ";
+    for (const SvcCount& svc : window.svc_top) {
+        if (svc.count == 0) {
+            break;
+        }
+        add("{}{} {}", separator, SvcName(svc.id), svc.count);
+        separator = ", ";
+    }
+    if (window.svc_top.front().count != 0) {
+        add(")");
+    }
+    if (window.jit_known) {
+        add(", fastmem faults {:.1f}/s, JIT compiled {} blocks / {:.1f} ms",
+            static_cast<double>(window.jit.fastmem_faults) / window.seconds,
+            window.jit.blocks_compiled, static_cast<double>(window.jit.compile_ns) / 1e6);
+    }
+    const WaitTotals lock = window.Waited(Wait::KernelLock);
+    add(", scheduler lock wait {:.1f} ms in {} contended takes (longest {:.2f} ms)", lock.ms,
+        lock.count, lock.longest_ms);
+    return text;
+}
+
 void Report(const Window& window) {
     std::string text;
     const auto add = [&text]<typename... Args>(fmt::format_string<Args...> format, Args&&... args) {
@@ -468,8 +761,23 @@ void ReportLoop() {
     Common::SetCurrentThreadName("Nx2Bottleneck");
     u64 begin = Now();
     u32 run_seen = ~u32{0};
+    u32 memory_reports = 0;
     for (;;) {
-        std::this_thread::sleep_for(Period);
+        bool census_now = false;
+        {
+            std::unique_lock lock{wake_mutex};
+            census_now = wake.wait_for(lock, Period, [] { return census_requested; });
+            census_requested = false;
+        }
+        if (census_now) {
+            ReportMemoryMap();
+            {
+                std::lock_guard lock{wake_mutex};
+                census_done = true;
+            }
+            wake.notify_all();
+            continue;
+        }
         const u64 now = Now();
         const Window window = Collect(begin, now);
         begin = now;
@@ -478,6 +786,9 @@ void ReportLoop() {
         if (guest_running.load(std::memory_order_relaxed) && run == run_seen) {
             Report(window);
             ReportMemory();
+            if (MemoryMapEnabled() && ++memory_reports % 6 == 0) {
+                ReportMemoryMap();
+            }
         }
         run_seen = run;
     }
@@ -555,6 +866,14 @@ void SetGuestRunning(bool running) {
         last_frame.store(0, std::memory_order_relaxed);
         run_count.fetch_add(1, std::memory_order_relaxed);
         std::call_once(started, [] { std::thread{ReportLoop}.detach(); });
+    } else if (MemoryMapEnabled() && guest_running.load(std::memory_order_relaxed)) {
+        // The region census at pause or shutdown runs on the report thread, before the guest's
+        // memory goes away; this waits for it.
+        std::unique_lock lock{wake_mutex};
+        census_requested = true;
+        census_done = false;
+        wake.notify_all();
+        wake.wait_for(lock, std::chrono::seconds{5}, [] { return census_done; });
     }
     guest_running.store(running, std::memory_order_relaxed);
 }

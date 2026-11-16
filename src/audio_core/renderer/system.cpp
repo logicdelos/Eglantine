@@ -35,6 +35,7 @@
 #include "audio_core/renderer/voice/voice_info.h"
 #include "audio_core/renderer/voice/voice_state.h"
 #include "common/alignment.h"
+#include "common/memory_accounting.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_event.h"
@@ -106,6 +107,10 @@ System::System(Core::System& core_, Kernel::KEvent* adsp_rendered_event_)
     : core{core_}, audio_renderer{core.AudioCore().ADSP().AudioRenderer()},
       adsp_rendered_event{adsp_rendered_event_} {}
 
+System::~System() {
+    Common::MemoryAccounting::Unregister(workbuffer.get());
+}
+
 Result System::Initialize(const AudioRendererParameterInternal& params,
                           Kernel::KTransferMemory* transfer_memory, u64 transfer_memory_size,
                           Kernel::KProcess* process_handle_, u64 applet_resource_user_id_,
@@ -142,8 +147,11 @@ Result System::Initialize(const AudioRendererParameterInternal& params,
 
     // Note: We're not actually using the transfer memory because it's a pain to code for.
     // Allocate the memory normally instead and hope the game doesn't try to read anything back
+    Common::MemoryAccounting::Unregister(workbuffer.get());
     workbuffer = std::make_unique<u8[]>(transfer_memory_size);
     workbuffer_size = transfer_memory_size;
+    Common::MemoryAccounting::Register("audio renderer workbuffer", workbuffer.get(),
+                                       static_cast<size_t>(workbuffer_size));
 
     PoolMapper pool_mapper(process_handle, false);
     pool_mapper.InitializeSystemPool(memory_pool_info, workbuffer.get(), workbuffer_size);

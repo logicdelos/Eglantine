@@ -57,6 +57,7 @@ class System {
 
 public:
     explicit System(Core::System& core, Kernel::KEvent* adsp_rendered_event);
+    ~System();
 
     /**
      * Calculate the total size required for all audio render workbuffers.

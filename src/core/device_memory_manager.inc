@@ -180,8 +180,8 @@ DeviceMemoryManager<Traits>::DeviceMemoryManager(const DeviceMemory& device_memo
     : physical_base{uintptr_t(device_memory_.buffer.BackingBasePointer())}
     , device_memory_ptr{&device_memory_}
     , device_inter{nullptr}
-    , compressed_device_addr(1ULL << ((Settings::values.memory_layout_mode.GetValue() == Settings::MemoryLayout::Memory_4Gb ? physical_min_bits : physical_max_bits) - Memory::YUZU_PAGEBITS))
-    , tracked_entries(device_as_size >> Memory::YUZU_PAGEBITS)
+    , compressed_device_addr(1ULL << ((Settings::values.memory_layout_mode.GetValue() == Settings::MemoryLayout::Memory_4Gb ? physical_min_bits : physical_max_bits) - Memory::YUZU_PAGEBITS), "device compressed addresses")
+    , tracked_entries(device_as_size >> Memory::YUZU_PAGEBITS, "device tracked entries")
 {
     impl = std::make_unique<DeviceMemoryManagerAllocator<Traits>>();
     cached_pages = std::make_unique<CachedPages>();

@@ -62,6 +62,7 @@ private:
         u64 tick = 0;
         bool deferred{};
 
+        u64 last_frame{};
         StagingBufferRef Ref() const noexcept {
             return {
                 .buffer = *buffer,
@@ -85,6 +86,8 @@ private:
     using StagingBuffersCache = std::array<StagingBuffers, NUM_LEVELS>;
 
     StagingBufferRef GetStreamBuffer(size_t size);
+    void CreateStreamBuffer();
+    void TrimIdle();
 
     bool AreRegionsActive(size_t region_begin, size_t region_end) const;
 
@@ -105,6 +108,10 @@ private:
     }
 
     const Device& device;
+    const u64 idle_frame_limit;
+    u64 frame_tick{};
+    u64 last_stream_frame{};
+    u64 last_stream_tick{};
     MemoryAllocator& memory_allocator;
     Scheduler& scheduler;
 

@@ -39,6 +39,9 @@ class StageCache {
 public:
     /// What a reused stage stands in for: the program's metadata, without its IR.
     struct Emitted {
+        ~Emitted();
+        void RegisterRanges() const;
+
         std::vector<u8> runtime_key; ///< Serialized runtime info and incoming bindings
         std::vector<u32> spirv;
         Shader::IR::Program program; ///< After emission, without IR
@@ -46,6 +49,9 @@ public:
     };
 
     struct Translation {
+        ~Translation();
+        void RegisterRanges() const;
+
         std::vector<u8> signature;
         struct Read {
             u8 kind;

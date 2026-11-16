@@ -6,9 +6,14 @@
 
 #pragma once
 
+#include <cstdlib>
 #include <memory>
 #include <type_traits>
 #include <utility>
+#include <vector>
+
+#include "common/logging.h"
+#include "common/memory_accounting.h"
 
 namespace Shader {
 
@@ -29,6 +34,28 @@ public:
     void ReleaseContents() {
         if (chunks.empty()) {
             return;
+        }
+        static const size_t retain_bytes = [] {
+            const char* const value = std::getenv("EDEN_NX2_SHADER_POOL_RETAIN_MIB");
+            if (!value || value[0] < '0' || value[0] > '9') {
+                return size_t{0};
+            }
+            char* end{};
+            const auto mib = std::strtoull(value, &end, 10);
+            return *end == '\0' && mib <= 4096 ? static_cast<size_t>(mib) << 20 : size_t{0};
+        }();
+        if (retain_bytes != 0) {
+            size_t held{};
+            for (const auto& chunk : chunks) {
+                held += chunk.num_objects * sizeof(Storage);
+            }
+            if (held > retain_bytes && held > new_chunk_size * sizeof(Storage)) {
+                chunks.clear();
+                node = &chunks.emplace_back(new_chunk_size);
+                LOG_INFO(Render_Vulkan, "Shader pool trim: released {:.2f} MiB of idle capacity",
+                         static_cast<double>(held - new_chunk_size * sizeof(Storage)) / 1048576.0);
+                return;
+            }
         }
         Chunk& root{chunks.front()};
         if (root.used_objects == root.num_objects) {
@@ -60,10 +87,17 @@ private:
     struct Chunk {
         explicit Chunk() = default;
         explicit Chunk(size_t size)
-            : num_objects{size}, storage{std::make_unique<Storage[]>(size)} {}
+            : num_objects{size}, storage{std::make_unique<Storage[]>(size)} {
+            if (Common::MemoryAccounting::RegistrationEnabled() &&
+                size * sizeof(Storage) >= (size_t{1} << 20)) {
+                Common::MemoryAccounting::Register("shader IR pool", storage.get(),
+                                                   size * sizeof(Storage));
+            }
+        }
 
         Chunk& operator=(Chunk&& rhs) noexcept {
             Release();
+            Unregister();
             used_objects = std::exchange(rhs.used_objects, 0);
             num_objects = std::exchange(rhs.num_objects, 0);
             storage = std::move(rhs.storage);
@@ -76,6 +110,7 @@ private:
 
         ~Chunk() {
             Release();
+            Unregister();
         }
 
         // Destroys the objects themselves: Storage's destructor is empty on purpose (the union
@@ -86,6 +121,13 @@ private:
                 std::destroy_at(&storage[index].object);
             }
             used_objects = 0;
+        }
+
+        void Unregister() {
+            if (Common::MemoryAccounting::RegistrationEnabled() &&
+                num_objects * sizeof(Storage) >= (size_t{1} << 20)) {
+                Common::MemoryAccounting::Unregister(storage.get());
+            }
         }
 
         size_t used_objects{};

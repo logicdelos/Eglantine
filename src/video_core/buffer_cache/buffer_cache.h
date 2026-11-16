@@ -124,6 +124,20 @@ void BufferCache<P>::TickFrame() {
         return;
     }
     runtime.TickFrame(slot_buffers);
+    static const bool idle_trim = [] {
+        const char* const value = std::getenv("EDEN_NX2_MEMORY_IDLE_TRIM");
+        return value && value[0] == '1';
+    }();
+    if (idle_trim) {
+        const u64 released = Nx2RetireListCopies(true);
+        if (released != 0) {
+            LOG_INFO(HW_GPU,
+                     "Memory idle trim: retired command copies returned {:.2f} MiB to staging pool",
+                     static_cast<double>(released) / 1048576.0);
+        }
+    }
+    immediate_buffer_alloc.TickFrame();
+    tmp_buffer.TickFrame();
     Common::MemoryAccounting::Set(Common::MemoryAccounting::Owner::BufferScratch,
                                   immediate_buffer_alloc.capacity() + tmp_buffer.capacity());
     if (nx2_buffer_deps && frame_tick % 600 == 0) {
@@ -2740,7 +2754,18 @@ bool BufferCache<P>::Nx2CopyListPages(u64 tick) {
             entry.copy_end = static_cast<u32>(end - page);
         }
         nx2_list_copy_requests.clear();
-        std::erase_if(nx2_retired_list_copies, [this](auto& retired) {
+        Nx2RetireListCopies();
+        return recorded;
+    }
+}
+
+template <class P>
+u64 BufferCache<P>::Nx2RetireListCopies(bool report_released) {
+    if constexpr (IS_OPENGL) {
+        return 0;
+    } else {
+        u64 released{};
+        std::erase_if(nx2_retired_list_copies, [this, &released, report_released](auto& retired) {
             if (!runtime.IsFree(retired.first)) {
                 return false;
             }
@@ -2764,10 +2789,13 @@ bool BufferCache<P>::Nx2CopyListPages(u64 tick) {
                     }
                 }
             }
+            if (report_released) {
+                released += retired.second.mapped_span.size();
+            }
             runtime.FreeDeferredStagingBuffer(retired.second);
             return true;
         });
-        return recorded;
+        return released;
     }
 }
 

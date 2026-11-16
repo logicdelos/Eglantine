@@ -15,7 +15,9 @@
 
 #include <boost/context/detail/fcontext.hpp>
 
+#include "common/memory_accounting.h"
 namespace Common {
+
 
 #ifdef __OPENORBIS__
 constexpr size_t DEFAULT_STACK_SIZE = 128 * 4096;
@@ -54,6 +56,7 @@ void Fiber::SetRewindPoint(std::function<void()>&& rewind_func) {
 Fiber::Fiber(std::function<void()>&& entry_point_func) : impl{std::make_unique<FiberImpl>()} {
     impl->entry_point = std::move(entry_point_func);
     impl->stack.reset(new u8[DEFAULT_STACK_SIZE]);
+    MemoryAccounting::Register("fiber stack", impl->stack.get(), DEFAULT_STACK_SIZE);
     impl->stack_limit = impl->stack.get();
     u8* stack_base = impl->stack_limit + DEFAULT_STACK_SIZE;
     impl->context = boost::context::detail::make_fcontext(stack_base, DEFAULT_STACK_SIZE, [](boost::context::detail::transfer_t transfer) -> void {
@@ -72,6 +75,7 @@ Fiber::Fiber(std::function<void()>&& entry_point_func) : impl{std::make_unique<F
 Fiber::Fiber() : impl{std::make_unique<FiberImpl>()} {}
 
 Fiber::~Fiber() {
+    MemoryAccounting::Unregister(impl->stack.get());
     if (!impl->released) {
         // Make sure the Fiber is not being used
         const bool locked = impl->guard.try_lock();

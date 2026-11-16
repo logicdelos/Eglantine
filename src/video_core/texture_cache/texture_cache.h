@@ -650,6 +650,8 @@ void TextureCache<P>::TickFrame() {
             scratch->release();
         }
     }
+    swizzle_data_buffer.TickFrame();
+    unswizzle_data_buffer.TickFrame();
     Common::MemoryAccounting::Set(Common::MemoryAccounting::Owner::TextureScratch,
                                   swizzle_data_buffer.capacity() + unswizzle_data_buffer.capacity());
     if constexpr (HAS_DEVICE_MEMORY_INFO) {

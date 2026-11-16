@@ -20,6 +20,7 @@
 #include "common/assert.h"
 #include "dynarmic/mcl/bit.hpp"
 #include "common/common_types.h"
+#include "common/memory_accounting.h"
 #include <boost/container/static_vector.hpp>
 
 #include "dynarmic/backend/x64/a32_jitstate.h"
@@ -90,6 +91,8 @@ A32EmitX64::A32EmitX64(BlockOfCode& code, A32::UserConfig conf, A32::Jit* jit_in
     GenTerminalHandlers();
     code.PreludeComplete();
     ClearFastDispatchTable();
+    ::Common::MemoryAccounting::Register("A32 fast dispatch table", fast_dispatch_table.data(),
+                                       sizeof(fast_dispatch_table));
 
     if (conf.fastmem_pointer.has_value()) {
         exception_handler.SetFastmemCallback([this](u64 rip_) {
@@ -98,7 +101,9 @@ A32EmitX64::A32EmitX64(BlockOfCode& code, A32::UserConfig conf, A32::Jit* jit_in
     }
 }
 
-A32EmitX64::~A32EmitX64() = default;
+A32EmitX64::~A32EmitX64() {
+    ::Common::MemoryAccounting::Unregister(fast_dispatch_table.data());
+}
 
 A32EmitX64::BlockDescriptor A32EmitX64::Emit(IR::Block& block) {
     if (conf.very_verbose_debugging_output) {

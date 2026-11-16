@@ -8,6 +8,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <utility>
 #include <vector>
 
@@ -18,6 +19,7 @@
 #include "common/bit_util.h"
 #include "common/common_types.h"
 #include "common/literals.h"
+#include "common/logging.h"
 #include "common/memory_accounting.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
@@ -50,7 +52,22 @@ constexpr VkDeviceSize MAX_STREAM_BUFFER_SIZE = 128_MiB;
 // length(65536)"). The tail is never handed out, so every binding has the full 64 KiB behind it.
 constexpr VkDeviceSize STREAM_BUFFER_TAIL = 64_KiB;
 
-size_t GetStreamBufferSize(const Device& device) {
+size_t MemorySetting(const char* name, size_t fallback, size_t maximum) {
+    const char* const value = std::getenv(name);
+    if (!value || value[0] < '0' || value[0] > '9') {
+        return fallback;
+    }
+    char* end{};
+    const auto parsed = std::strtoull(value, &end, 10);
+    return *end == '\0' && parsed <= maximum ? static_cast<size_t>(parsed) : fallback;
+}
+
+u64 IdleFrameLimit() {
+    static const u64 limit = MemorySetting("EDEN_NX2_STAGING_IDLE_FRAMES", 0, 36000);
+    return limit;
+}
+
+size_t GetDefaultStreamBufferSize(const Device& device) {
     if (!device.HasDebuggingToolAttached()) {
         if (device.IsIntegrated()) {
             // An integrated GPU's device-local host-visible heap can be no bigger than the stream
@@ -87,13 +104,33 @@ size_t GetStreamBufferSize(const Device& device) {
     }
     return (std::min)(Common::AlignUp(size, MAX_ALIGNMENT), MAX_STREAM_BUFFER_SIZE);
 }
+
+size_t GetStreamBufferSize(const Device& device) {
+    static const size_t stream_mib = MemorySetting("EDEN_NX2_STREAM_MIB", 0, 128);
+    const size_t original = GetDefaultStreamBufferSize(device);
+    return stream_mib != 0 ? (std::min)(original, stream_mib << 20) : original;
+}
 } // Anonymous namespace
 
 StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& memory_allocator_,
                                      Scheduler& scheduler_)
-    : device{device_}, memory_allocator{memory_allocator_}, scheduler{scheduler_},
+    : device{device_}, idle_frame_limit{IdleFrameLimit()},
+      memory_allocator{memory_allocator_}, scheduler{scheduler_},
       stream_buffer_size{GetStreamBufferSize(device)}, region_size{stream_buffer_size /
                                                                    StagingBufferPool::NUM_SYNCS} {
+    CreateStreamBuffer();
+    if (stream_buffer_size != GetDefaultStreamBufferSize(device)) {
+        LOG_INFO(Render_Vulkan, "Staging stream cap: reduced capacity by {} MiB to {} MiB",
+                 (GetDefaultStreamBufferSize(device) - stream_buffer_size) >> 20,
+                 stream_buffer_size >> 20);
+    }
+}
+
+void StagingBufferPool::CreateStreamBuffer() {
+    iterator = 0;
+    used_iterator = 0;
+    free_iterator = 0;
+    sync_ticks.fill(0);
     VkBufferCreateInfo stream_ci = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .pNext = nullptr,
@@ -122,6 +159,8 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
     ASSERT_MSG(!stream_pointer.empty(), "Stream buffer must be host visible!");
     Common::MemoryAccounting::Add(Common::MemoryAccounting::Owner::Staging,
                                   stream_buffer_size + STREAM_BUFFER_TAIL);
+    Common::MemoryAccounting::Register("staging stream", stream_pointer.data(),
+                                       stream_pointer.size());
 }
 
 StagingBufferPool::~StagingBufferPool() {
@@ -129,10 +168,16 @@ StagingBufferPool::~StagingBufferPool() {
     for (const StagingBuffersCache* const cache : {&device_local_cache, &upload_cache, &download_cache}) {
         for (size_t log2 = 0; log2 < NUM_LEVELS; ++log2) {
             pooled += static_cast<u64>((*cache)[log2].entries.size()) << log2;
+            for (const auto& entry : (*cache)[log2].entries) {
+                Common::MemoryAccounting::Unregister(entry.mapped_span.data());
+            }
         }
     }
     Common::MemoryAccounting::Sub(Common::MemoryAccounting::Owner::Staging,
-                                  pooled + stream_buffer_size + STREAM_BUFFER_TAIL);
+                                  pooled + (stream_pointer.empty()
+                                                ? 0
+                                                : stream_buffer_size + STREAM_BUFFER_TAIL));
+    Common::MemoryAccounting::Unregister(stream_pointer.data());
 }
 
 StagingBufferRef StagingBufferPool::Request(size_t size, MemoryUsage usage, bool deferred) {
@@ -155,6 +200,10 @@ void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
 }
 
 void StagingBufferPool::TickFrame() {
+    if (idle_frame_limit != 0) {
+        ++frame_tick;
+        TrimIdle();
+    }
     current_delete_level = (current_delete_level + 1) % NUM_LEVELS;
 
     ReleaseCache(MemoryUsage::DeviceLocal);
@@ -163,6 +212,13 @@ void StagingBufferPool::TickFrame() {
 }
 
 StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
+    if (idle_frame_limit != 0) {
+        if (stream_pointer.empty()) {
+            CreateStreamBuffer();
+        }
+        last_stream_frame = frame_tick;
+        last_stream_tick = scheduler.CurrentTick();
+    }
     if (AreRegionsActive(Region(free_iterator) + 1,
                          (std::min)(Region(iterator + size) + 1, NUM_SYNCS))) {
         // Avoid waiting for the previous usages to be free
@@ -232,6 +288,9 @@ std::optional<StagingBufferRef> StagingBufferPool::TryGetReservedBuffer(size_t s
     }
     cache_level.iterate_index = std::distance(entries.begin(), it) + 1;
     it->tick = deferred ? (std::numeric_limits<u64>::max)() : scheduler.CurrentTick();
+    if (idle_frame_limit != 0) {
+        it->last_frame = frame_tick;
+    }
     ASSERT(!it->deferred);
     it->deferred = deferred;
     return it->Ref();
@@ -269,6 +328,7 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
             ? device.GetLogical().GetBufferDeviceAddress(*buffer)
             : VkDeviceAddress{};
     Common::MemoryAccounting::Add(Common::MemoryAccounting::Owner::Staging, u64{1} << log2_size);
+    Common::MemoryAccounting::Register("staging pool", mapped_span.data(), mapped_span.size());
     StagingBuffer& entry = GetCache(usage)[log2_size].entries.emplace_back(StagingBuffer{
         .buffer = std::move(buffer),
         .device_address = buffer_address,
@@ -279,6 +339,9 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
         .tick = deferred ? (std::numeric_limits<u64>::max)() : scheduler.CurrentTick(),
         .deferred = deferred,
     });
+    if (idle_frame_limit != 0) {
+        entry.last_frame = frame_tick;
+    }
     return entry.Ref();
 }
 
@@ -300,6 +363,59 @@ void StagingBufferPool::ReleaseCache(MemoryUsage usage) {
     ReleaseLevel(GetCache(usage), current_delete_level);
 }
 
+void StagingBufferPool::TrimIdle() {
+    const u64 idle_frames = idle_frame_limit;
+    static const size_t cap = MemorySetting("EDEN_NX2_STAGING_IDLE_MIB", 32, 4096) << 20;
+    if (!stream_pointer.empty() && frame_tick - last_stream_frame >= idle_frames &&
+        scheduler.IsFree(last_stream_tick)) {
+        const u64 released = stream_buffer_size + STREAM_BUFFER_TAIL;
+        Common::MemoryAccounting::Unregister(stream_pointer.data());
+        stream_pointer = {};
+        stream_buffer = {};
+        stream_buffer_address = 0;
+        Common::MemoryAccounting::Sub(Common::MemoryAccounting::Owner::Staging, released);
+        LOG_INFO(Render_Vulkan, "Staging idle trim: stream released {:.2f} MiB after {} frames",
+                 static_cast<double>(released) / 1048576.0, idle_frames);
+    }
+    const auto eligible = [&](const StagingBuffer& entry) {
+        return !entry.deferred && frame_tick - entry.last_frame >= idle_frames &&
+               scheduler.IsFree(entry.tick);
+    };
+    u64 total{};
+    for (const auto* cache : {&upload_cache, &download_cache}) {
+        for (size_t level = 0; level < NUM_LEVELS; ++level) {
+            for (const auto& entry : (*cache)[level].entries) {
+                if (eligible(entry)) {
+                    total += u64{1} << level;
+                }
+            }
+        }
+    }
+    const u64 before = total;
+    size_t remaining_deletions = 16;
+    for (size_t level = NUM_LEVELS; level-- > 0 && total > cap && remaining_deletions != 0;) {
+        for (auto* cache : {&upload_cache, &download_cache}) {
+            auto& staging = (*cache)[level];
+            std::erase_if(staging.entries, [&](const StagingBuffer& entry) {
+                if (total <= cap || remaining_deletions == 0 || !eligible(entry)) {
+                    return false;
+                }
+                Common::MemoryAccounting::Unregister(entry.mapped_span.data());
+                total -= u64{1} << level;
+                --remaining_deletions;
+                return true;
+            });
+            staging.iterate_index = 0;
+            staging.delete_index = 0;
+        }
+    }
+    if (before != total) {
+        Common::MemoryAccounting::Sub(Common::MemoryAccounting::Owner::Staging, before - total);
+        LOG_INFO(Render_Vulkan, "Staging idle trim: pools released {:.2f} MiB, idle retained {} MiB",
+                 static_cast<double>(before - total) / 1048576.0, total >> 20);
+    }
+}
+
 void StagingBufferPool::ReleaseLevel(StagingBuffersCache& cache, size_t log2) {
     constexpr size_t deletions_per_tick = 16;
     auto& staging = cache[log2];
@@ -307,7 +423,11 @@ void StagingBufferPool::ReleaseLevel(StagingBuffersCache& cache, size_t log2) {
     const size_t old_size = entries.size();
 
     const auto is_deletable = [this](const StagingBuffer& entry) {
-        return scheduler.IsFree(entry.tick);
+        if (!scheduler.IsFree(entry.tick)) {
+            return false;
+        }
+        Common::MemoryAccounting::Unregister(entry.mapped_span.data());
+        return true;
     };
     const size_t begin_offset = staging.delete_index;
     const size_t end_offset = (std::min)(begin_offset + deletions_per_tick, old_size);

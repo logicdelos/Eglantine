@@ -12,6 +12,7 @@
 
 #include "common/cityhash.h"
 #include "common/logging.h"
+#include "common/memory_accounting.h"
 #include "common/settings.h"
 #include "shader_recompiler/exception.h"
 #include "video_core/stage_cache.h"
@@ -50,6 +51,58 @@ u64 EncodeReplacement(const std::optional<Shader::ReplaceConstant>& value) {
 }
 
 } // Anonymous namespace
+
+StageCache::Emitted::~Emitted() {
+    if (!Common::MemoryAccounting::RegistrationEnabled()) {
+        return;
+    }
+    if (runtime_key.capacity() >= (size_t{1} << 20)) {
+        Common::MemoryAccounting::Unregister(runtime_key.data());
+    }
+    if (spirv.capacity() * sizeof(u32) >= (size_t{1} << 20)) {
+        Common::MemoryAccounting::Unregister(spirv.data());
+    }
+}
+
+void StageCache::Emitted::RegisterRanges() const {
+    if (!Common::MemoryAccounting::RegistrationEnabled()) {
+        return;
+    }
+    if (runtime_key.capacity() >= (size_t{1} << 20)) {
+        Common::MemoryAccounting::Register("shader stage runtime key", runtime_key.data(),
+                                           runtime_key.capacity());
+    }
+    if (spirv.capacity() * sizeof(u32) >= (size_t{1} << 20)) {
+        Common::MemoryAccounting::Register("shader stage SPIR-V", spirv.data(),
+                                           spirv.capacity() * sizeof(u32));
+    }
+}
+
+StageCache::Translation::~Translation() {
+    if (!Common::MemoryAccounting::RegistrationEnabled()) {
+        return;
+    }
+    if (signature.capacity() >= (size_t{1} << 20)) {
+        Common::MemoryAccounting::Unregister(signature.data());
+    }
+    if (reads.capacity() * sizeof(Read) >= (size_t{1} << 20)) {
+        Common::MemoryAccounting::Unregister(reads.data());
+    }
+}
+
+void StageCache::Translation::RegisterRanges() const {
+    if (!Common::MemoryAccounting::RegistrationEnabled()) {
+        return;
+    }
+    if (signature.capacity() >= (size_t{1} << 20)) {
+        Common::MemoryAccounting::Register("shader stage signature", signature.data(),
+                                           signature.capacity());
+    }
+    if (reads.capacity() * sizeof(Read) >= (size_t{1} << 20)) {
+        Common::MemoryAccounting::Register("shader translation reads", reads.data(),
+                                           reads.capacity() * sizeof(Read));
+    }
+}
 
 StageCache::Recorder::Recorder(Shader::Environment& inner_) : inner{inner_} {
     sph = inner.SPH();
@@ -264,6 +317,8 @@ std::shared_ptr<const StageCache::Emitted> StageCache::FindEmitted(
 
 void StageCache::Insert(std::shared_ptr<Translation> translation,
                         std::shared_ptr<const Emitted> emitted) {
+    translation->RegisterRanges();
+    emitted->RegisterRanges();
     const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(translation->signature.data()),
                                         translation->signature.size());
     const size_t size = translation->reads.size() * sizeof(Translation::Read) +
@@ -279,6 +334,7 @@ void StageCache::Insert(std::shared_ptr<Translation> translation,
 }
 
 void StageCache::AddEmitted(const Translation& translation, std::shared_ptr<const Emitted> emitted) {
+    emitted->RegisterRanges();
     const size_t size = emitted->spirv.size() * sizeof(u32) + sizeof(Emitted);
     {
         std::scoped_lock lock{translation.emitted_mutex};

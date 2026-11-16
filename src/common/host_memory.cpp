@@ -179,6 +179,7 @@ public:
             LOG_CRITICAL(HW_Memory, "Failed to map {} MiB of virtual memory", backing_size >> 20);
             return false;
         }
+        Common::MemoryAccounting::Register("guest RAM backing", backing_base, backing_size);
         if (lazy_commit) {
             committed_chunks = std::make_unique<std::atomic<bool>[]>(Common::DivCeil(backing_size, CommitChunkSize));
             Impl* expected = nullptr;
@@ -210,6 +211,7 @@ public:
             LOG_CRITICAL(HW_Memory, "Failed to reserve {} GiB of virtual memory", virtual_size >> 30);
             return false;
         }
+        Common::MemoryAccounting::Register("guest virtual views", virtual_base, virtual_size);
         return true;
     }
 
@@ -371,6 +373,8 @@ private:
         if (const u64 bytes = accounted.exchange(0)) {
             Common::MemoryAccounting::Sub(Common::MemoryAccounting::Owner::GuestRam, bytes);
         }
+        Common::MemoryAccounting::Unregister(backing_base);
+        Common::MemoryAccounting::Unregister(virtual_base);
         if (!placeholders.empty()) {
             for (const auto& placeholder : placeholders) {
                 if (!pfn_UnmapViewOfFile2(process, virtual_base + placeholder.lower(),

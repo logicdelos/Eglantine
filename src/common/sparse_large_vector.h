@@ -36,7 +36,8 @@ inline const u64 HostPageBits = std::countr_zero(HostPageSize);
 inline const u64 HostPageMask = ~(HostPageSize - 1);
 #endif
 
-void* AllocateMemoryPages(std::size_t size) noexcept;
+/// Regions of 32 MiB and more are registered under `name` (Common::MemoryAccounting::Register).
+void* AllocateMemoryPages(std::size_t size, const char* name) noexcept;
 void FreeMemoryPages(void* base, std::size_t size) noexcept;
 
 /// A large page-aligned buffer that has optimized memory usage for zero-writes.
@@ -47,10 +48,10 @@ class SparseLargeVector final {
 public:
     constexpr SparseLargeVector() = default;
 
-    explicit SparseLargeVector(std::size_t count) noexcept
-        : alloc_size{count * sizeof(T)}
+    explicit SparseLargeVector(std::size_t count, const char* name_ = "sparse vector") noexcept
+        : name{name_}, alloc_size{count * sizeof(T)}
     {
-        base_ptr = static_cast<T*>(AllocateMemoryPages(alloc_size));
+        base_ptr = static_cast<T*>(AllocateMemoryPages(alloc_size, name));
 
         // each item in vector holds information for 64 pages
         auto denom = HostPageSize * 64;
@@ -66,11 +67,14 @@ public:
     SparseLargeVector(SparseLargeVector&& other) = delete;
     SparseLargeVector& operator=(SparseLargeVector&& other) = delete;
 
-    void ResizeAndClear(std::size_t count) noexcept {
+    void ResizeAndClear(std::size_t count, const char* new_name = nullptr) noexcept {
+        if (new_name != nullptr) {
+            name = new_name;
+        }
         if (auto const new_size = count * sizeof(T); new_size != alloc_size) {
             FreeMemoryPages(base_ptr, alloc_size);
             alloc_size = new_size;
-            base_ptr = static_cast<T*>(AllocateMemoryPages(alloc_size));
+            base_ptr = static_cast<T*>(AllocateMemoryPages(alloc_size, name));
 
             auto denom = HostPageSize * 64;
             committed_pages = std::vector<std::atomic<u64>>((alloc_size + denom - 1) / denom);
@@ -191,6 +195,7 @@ private:
         return true;
     }
 
+    const char* name{"sparse vector"};
     std::size_t alloc_size{};
     T* base_ptr{};
 
