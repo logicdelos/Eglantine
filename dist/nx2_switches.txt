@@ -86,3 +86,8 @@ EDEN_NX2_FENCE_BATCH=1
 # queue behind it (compare "nx2 protect: ... ms/s" in the log with EDEN_NX2_PROTECT_STATS=1). Set to 1
 # to turn on.
 #EDEN_NX2_PROTECT_NO_LOCK=1
+# --- Speed experiments (off by default; each is measured on and off before it is recommended) ---
+# Shader precache build: also read the add-on packages of a .nup (Xenoblade Chronicles 2 Switch 2
+# Edition keeps its game data there), so their shaders are in the precache too. Read when the
+# precache is built; rebuild the precache after changing it. =1 turns it on.
+#EDEN_NX2_WARM_ADDON=1
