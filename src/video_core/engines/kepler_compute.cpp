@@ -1617,7 +1617,7 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
         LOG_INFO(HW_GPU, "Upscale fallback for program {:#x}: {}", program,
                  known->second ? "decodes sRGB like the program" : "plain copy");
     }
-    const Fermi2D::Config config{
+    Fermi2D::Config config{
         .operation = (shared_exponent_input && output->format == Texture::TextureFormat::B10G11R11)
                          ? Fermi2D::Operation::SrcCopySquare
                      : known->second ? Fermi2D::Operation::SrcCopySrgbToLinear
@@ -1633,6 +1633,32 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
         .src_x1 = static_cast<s32>(input->Width()),
         .src_y1 = static_cast<s32>(input->Height()),
     };
+    // Any program may lead its constants with the compact header (Donkey Kong Bananza through
+    // +0x60/+0x70, Xenoblade Chronicles 2 through the scanned slots). Handheld Xenoblade 2 upscales
+    // 1280x720 into the top-left 1920x1080 of a 3840x2160 image, and stretching it to the whole
+    // image zoomed the frame 2x. Fortune's Weave has its own temporal path and keeps whole images.
+    if (!fortunes_weave) {
+        std::array<u32, 12> parameters{};
+        const size_t words = std::min<size_t>(parameters.size(), cbuf.size.Value() / sizeof(u32));
+        memory_manager.ReadBlock(cbuf_address, parameters.data(), words * sizeof(u32));
+        const auto regions = DecodeNativeUpscaleRegions(
+            std::span{parameters}.first(words),
+            {launch_description.block_dim_x.Value(), launch_description.block_dim_y.Value(),
+             launch_description.block_dim_z.Value()},
+            {launch_description.grid_dim_x.Value(), launch_description.grid_dim_y.Value(),
+             launch_description.grid_dim_z.Value()},
+            {input->Width(), input->Height()}, {output->Width(), output->Height()});
+        if (regions) {
+            config.src_x0 = static_cast<s32>(regions->source[0]);
+            config.src_y0 = static_cast<s32>(regions->source[1]);
+            config.src_x1 = static_cast<s32>(regions->source[2]);
+            config.src_y1 = static_cast<s32>(regions->source[3]);
+            config.dst_x0 = static_cast<s32>(regions->destination[0]);
+            config.dst_y0 = static_cast<s32>(regions->destination[1]);
+            config.dst_x1 = static_cast<s32>(regions->destination[2]);
+            config.dst_y1 = static_cast<s32>(regions->destination[3]);
+        }
+    }
     // Debug: does the input hold anything? Download it once and count non-zero words.
     static const u32 sample_at = [] {
         const char* value = std::getenv("EDEN_NX2_SAMPLE_AT");
