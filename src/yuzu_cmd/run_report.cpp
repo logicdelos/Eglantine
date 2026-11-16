@@ -36,6 +36,7 @@ extern char** environ;
 #include "common/scm_rev.h"
 #include "common/settings.h"
 #include "common/settings_common.h"
+#include "yuzu_cmd/run_control.h"
 #include "yuzu_cmd/run_report.h"
 
 // After the others: windows.h defines min and max.
@@ -55,6 +56,18 @@ namespace {
 
 namespace fs = std::filesystem;
 using Json = nlohmann::json;
+namespace Spikes = VideoCommon::Nx2Spikes;
+
+#ifdef _WIN32
+using NativeFile = HANDLE;
+#else
+using NativeFile = int;
+#endif
+#ifdef _WIN32
+const NativeFile NoFile = INVALID_HANDLE_VALUE;
+#else
+const NativeFile NoFile = -1;
+#endif
 
 /// Held for the life of the process: the stuck-shutdown watchdog can publish while the main
 /// thread is already unwinding static state.
@@ -70,6 +83,12 @@ struct State {
     Json tunables = Json::object();
     Json initial_settings = Json::object();
     std::optional<u64> title_id;
+    // The long frame spool (Schema2::OpenLongFrameSpool): the file the recorder's sink appends to,
+    // guarded against being closed while it writes.
+    std::mutex spool_mutex;
+    NativeFile spool_file = NoFile;
+    fs::path spool_path;
+    bool spool_failed = false; // The spool could not be created: long frames were not stored
 };
 
 State& GetState() {
@@ -289,8 +308,16 @@ Json LimitsJson() {
     return json;
 }
 
-/// Everything in the file, taken in one go (the recording is consumed).
-std::string Document(State& state, Common::RunOutcome::Reason reason, int code,
+/// What the report holds, taken in one go (the recording is consumed): the schema 1 members as
+/// text up to the end of the last one (the document is not closed), and the snapshots the schema 2
+/// members are made from.
+struct ReportParts {
+    std::string base;
+    Spikes::AttributionSnapshot snapshot;
+    VideoCommon::CacheEnvelope::CacheReport cache;
+};
+
+ReportParts Document(State& state, Common::RunOutcome::Reason reason, int code,
                      bool shutdown_complete, std::string_view detail) {
     const Nx2Bottleneck::RunRecording recording = Nx2Bottleneck::EndRecording(!shutdown_complete);
     const Common::Log::LogCounts counts = Common::Log::GetLogCounts();
@@ -322,7 +349,7 @@ std::string Document(State& state, Common::RunOutcome::Reason reason, int code,
     settings["final"] = ReportedSettings();
 
     Json document = Json::object();
-    document["schema_version"] = 1;
+    document["schema_version"] = Schema2::SchemaVersion;
     document["build"] = BuildJson();
     document["title_id"] = state.title_id ? Json(fmt::format("{:016X}", *state.title_id))
                                           : Json(nullptr);
@@ -335,8 +362,14 @@ std::string Document(State& state, Common::RunOutcome::Reason reason, int code,
     document["exit"] = std::move(exit_json);
     document["tunables"] = state.tunables;
     document["settings"] = std::move(settings);
+
+    ReportParts parts;
     // Invalid UTF-8 (a detail quoting a game string) must not cost the whole report.
-    return document.dump(2, ' ', false, Json::error_handler_t::replace) + '\n';
+    parts.base = document.dump(2, ' ', false, Json::error_handler_t::replace);
+    parts.base.resize(parts.base.size() - 2); // the newline and brace that close the object
+    parts.snapshot = Spikes::ReadAttributionSnapshot();
+    parts.cache = VideoCommon::CacheEnvelope::ReadCacheReport();
+    return parts;
 }
 
 bool Fail(const std::string& message) {
@@ -358,7 +391,7 @@ bool RenameNoReplace(const fs::path& from, const fs::path& to) {
 #endif
 }
 
-bool WriteReportFile(State& state, const std::string& text) {
+bool WriteReportFile(State& state, const ReportParts& parts, bool shutdown_complete) {
     std::error_code ec;
     {
         std::ofstream out{state.temporary, std::ios::binary | std::ios::out | std::ios::trunc};
@@ -367,9 +400,22 @@ bool WriteReportFile(State& state, const std::string& text) {
             fs::remove(state.temporary, ec);
             return Fail("cannot open " + Common::FS::ToUTF8String(state.temporary.u8string()));
         }
-        out.write(text.data(), static_cast<std::streamsize>(text.size()));
+        out.write(parts.base.data(), static_cast<std::streamsize>(parts.base.size()));
+        std::ifstream spool;
+        if (!state.spool_path.empty()) {
+            spool.open(state.spool_path, std::ios::binary | std::ios::in);
+        }
+        const Schema2::MembersInput members{
+            .snapshot = parts.snapshot,
+            .cache = parts.cache,
+            .spool = spool.is_open() ? &spool : nullptr,
+            .run_complete = shutdown_complete,
+            .spool_failed = state.spool_failed || (!state.spool_path.empty() && !spool.is_open()),
+        };
+        const bool members_written = Schema2::WriteMembers(out, members);
+        out << "\n}\n";
         out.flush();
-        if (!out) {
+        if (!members_written || !out) {
             out.close();
             fs::remove(state.temporary, ec);
             return Fail("writing " + Common::FS::ToUTF8String(state.temporary.u8string()) +
@@ -418,19 +464,24 @@ struct CrashDocument {
 CrashDocument crash_documents[2];
 std::atomic<int> crash_document{-1};
 std::atomic<int> crash_phase{CrashUnarmed};
+NativeFile crash_file = NoFile;
 #ifdef _WIN32
-HANDLE crash_file = INVALID_HANDLE_VALUE;
 wchar_t crash_temporary[CrashPathCapacity];
 wchar_t crash_destination[CrashPathCapacity];
 wchar_t crash_normal_temporary[CrashPathCapacity];
+wchar_t crash_spool_path[CrashPathCapacity];
 using CrashChar = wchar_t;
 #else
-int crash_file = -1;
 char crash_temporary[CrashPathCapacity];
 char crash_destination[CrashPathCapacity];
 char crash_normal_temporary[CrashPathCapacity];
+char crash_spool_path[CrashPathCapacity];
 using CrashChar = char;
 #endif
+// What the crash report takes of the long frame spool, and the room it has for it.
+constexpr size_t CrashSpoolCapacity = 64 * 1024;
+constexpr size_t CrashMembersCapacity = 1024;
+char crash_spool_buffer[CrashSpoolCapacity];
 
 /// Text appended to a fixed buffer, cut off where it ends.
 class CrashText {
@@ -504,12 +555,11 @@ bool CloseCrashFile() noexcept {
     return ok;
 }
 
-bool WriteCrashPart(const char* data, size_t size) noexcept {
+bool WriteNative(NativeFile file, const char* data, size_t size) noexcept {
 #ifdef _WIN32
     while (size != 0) {
         DWORD written = 0;
-        if (!WriteFile(crash_file, data, static_cast<DWORD>(size), &written, nullptr) ||
-            written == 0) {
+        if (!WriteFile(file, data, static_cast<DWORD>(size), &written, nullptr) || written == 0) {
             return false;
         }
         data += written;
@@ -517,7 +567,7 @@ bool WriteCrashPart(const char* data, size_t size) noexcept {
     }
 #else
     while (size != 0) {
-        const ssize_t written = write(crash_file, data, size);
+        const ssize_t written = write(file, data, size);
         if (written <= 0) {
             return false;
         }
@@ -526,6 +576,10 @@ bool WriteCrashPart(const char* data, size_t size) noexcept {
     }
 #endif
     return true;
+}
+
+bool WriteCrashPart(const char* data, size_t size) noexcept {
+    return WriteNative(crash_file, data, size);
 }
 
 bool FlushCrashFile() noexcept {
@@ -570,6 +624,92 @@ void RemoveCrashFile(const CrashChar* path) noexcept {
 #endif
 }
 
+/// The complete lines of the long frame spool the run has so far, for the crash report: reads
+/// into the caller's buffer, takes no lock and allocates nothing. A line the consumer was writing
+/// is cut and dropped by the caller.
+size_t ReadCrashSpool(char* buffer, size_t capacity) noexcept {
+    if (crash_spool_path[0] == 0) {
+        return 0;
+    }
+    size_t total = 0;
+#ifdef _WIN32
+    const HANDLE file = CreateFileW(crash_spool_path, GENERIC_READ,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                    nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    while (total < capacity) {
+        DWORD count = 0;
+        if (!ReadFile(file, buffer + total, static_cast<DWORD>(capacity - total), &count,
+                      nullptr) ||
+            count == 0) {
+            break;
+        }
+        total += count;
+    }
+    CloseHandle(file);
+#else
+    const int file = open(crash_spool_path, O_RDONLY | O_CLOEXEC);
+    if (file < 0) {
+        return 0;
+    }
+    while (total < capacity) {
+        const ssize_t count = read(file, buffer + total, capacity - total);
+        if (count <= 0) {
+            break;
+        }
+        total += static_cast<size_t>(count);
+    }
+    close(file);
+#endif
+    return total;
+}
+
+NativeFile CreateSpoolFile(const fs::path& path) noexcept {
+#ifdef _WIN32
+    return CreateFileW(path.c_str(), GENERIC_WRITE,
+                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, CREATE_NEW,
+                       FILE_ATTRIBUTE_NORMAL, nullptr);
+#else
+    return open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+#endif
+}
+
+bool CloseNative(NativeFile file) noexcept {
+#ifdef _WIN32
+    return CloseHandle(file) != 0;
+#else
+    return close(file) == 0;
+#endif
+}
+
+/// The recorder's long frame sink: one JSON line per frame. A write that fails closes the spool,
+/// so that no later line can follow a half written one; every later call fails too.
+bool SpoolWrite(void* user, const Spikes::LongFrame& frame) {
+    State& state = *static_cast<State*>(user);
+    std::string line = Schema2::LongFrameJson(frame);
+    line += '\n';
+    std::scoped_lock lock{state.spool_mutex};
+    if (state.spool_file == NoFile) {
+        return false;
+    }
+    if (!WriteNative(state.spool_file, line.data(), line.size())) {
+        CloseNative(state.spool_file);
+        state.spool_file = NoFile;
+        return false;
+    }
+    return true;
+}
+
+void CloseSpool(State& state) {
+    std::scoped_lock lock{state.spool_mutex};
+    if (state.spool_file != NoFile) {
+        CloseNative(state.spool_file);
+        state.spool_file = NoFile;
+    }
+}
+
 /// Writes the crash report. False when a report was meant and could not be written; true when it
 /// was written, was not armed, or the normal report is already at the destination.
 bool WriteCrashReport(std::string_view detail) noexcept {
@@ -607,10 +747,28 @@ bool WriteCrashReport(std::string_view detail) noexcept {
     text.AddEscaped(detail, 64);
     text.Add("\"}");
 
+    // The attribution of a crash: a safe scalar status, and what the long frame spool holds of
+    // complete lines (at most CrashSpoolCapacity bytes of it). Nothing is ever marked complete.
+    char attribution_head[CrashMembersCapacity];
+    char attribution_tail[CrashMembersCapacity];
+    const size_t head_size =
+        Schema2::CrashMembersHead(attribution_head, sizeof(attribution_head),
+                                  Spikes::AttributionEnabled(), Spikes::SessionConfig{}.threshold_ns);
+    const size_t tail_size = Schema2::CrashMembersTail(attribution_tail, sizeof(attribution_tail));
+    const bool attribution = head_size != 0 && tail_size != 0;
+    size_t spool_size = 0;
+    if (attribution) {
+        spool_size = Schema2::JoinSpoolLines(
+            crash_spool_buffer, ReadCrashSpool(crash_spool_buffer, sizeof(crash_spool_buffer)));
+    }
+
     // Seeking is not needed: the file was empty when it was created.
-    const bool written = WriteCrashPart(document.head, document.head_size) &&
-                         WriteCrashPart(middle, text.size) &&
-                         WriteCrashPart(document.tail, document.tail_size) && FlushCrashFile();
+    const bool written =
+        WriteCrashPart(document.head, document.head_size) && WriteCrashPart(middle, text.size) &&
+        (!attribution || (WriteCrashPart(attribution_head, head_size) &&
+                          WriteCrashPart(crash_spool_buffer, spool_size) &&
+                          WriteCrashPart(attribution_tail, tail_size))) &&
+        WriteCrashPart(document.tail, document.tail_size) && FlushCrashFile();
     const bool closed = CloseCrashFile();
     const bool published = written && closed && PublishCrashFile();
     // The report is out (or has failed): the files this run created for it must not stay. A crash
@@ -620,6 +778,7 @@ bool WriteCrashReport(std::string_view detail) noexcept {
         RemoveCrashFile(crash_temporary);
     }
     RemoveCrashFile(crash_normal_temporary);
+    RemoveCrashFile(crash_spool_path);
     if (published) {
         return true;
     }
@@ -635,7 +794,7 @@ void RebuildCrashDocument(State& state) {
     }
     constexpr auto replace = Json::error_handler_t::replace;
     Json fixed = Json::object();
-    fixed["schema_version"] = 1;
+    fixed["schema_version"] = Schema2::SchemaVersion;
     fixed["build"] = BuildJson();
     fixed["title_id"] = state.title_id ? Json(fmt::format("{:016X}", *state.title_id))
                                       : Json(nullptr);
@@ -811,6 +970,36 @@ void SetTitleId(u64 program_id) {
     RebuildCrashDocument(state);
 }
 
+/// Creates the file for the long frames the recorder resolves and hands the recorder the sink that
+/// appends them to it. It is a temporary next to the report: the normal report copies it into the
+/// attribution object and removes it, the crash report copies an excerpt and removes it.
+bool Schema2::OpenLongFrameSpool(std::string& message) {
+    State& state = GetState();
+    std::scoped_lock lock{state.mutex};
+    if (!state.prepared) {
+        return true;
+    }
+    fs::path path = state.destination;
+    path += "." + std::to_string(ProcessId()) + ".spool.tmp";
+    const NativeFile file = CreateSpoolFile(path);
+    if (file == NoFile) {
+        state.spool_failed = true;
+        message = "cannot create " + Common::FS::ToUTF8String(path.u8string());
+        return false;
+    }
+    state.spool_path = std::move(path);
+    state.spool_file = file;
+    const auto& native = state.spool_path.native();
+    if (native.size() < CrashPathCapacity) {
+        // The first character last: a crash reading the path meanwhile sees it empty.
+        for (size_t i = native.size() + 1; i-- > 0;) {
+            crash_spool_path[i] = native[i];
+        }
+    }
+    VideoCommon::Nx2Spikes::SetLongFrameSink({.write = &SpoolWrite, .user = &state});
+    return true;
+}
+
 bool Publish(Common::RunOutcome::Reason reason, int code, bool shutdown_complete,
              std::string_view detail) {
     State& state = GetState();
@@ -827,12 +1016,20 @@ bool Publish(Common::RunOutcome::Reason reason, int code, bool shutdown_complete
         return true;
     }
     try {
-        state.published_ok =
-            WriteReportFile(state, Document(state, reason, code, shutdown_complete, detail));
+        ReportParts parts = Document(state, reason, code, shutdown_complete, detail);
+        // The consumer stopped (or is being given up on): no line can be half written any more.
+        CloseSpool(state);
+        state.published_ok = WriteReportFile(state, parts, shutdown_complete);
     } catch (const std::exception& e) {
         std::error_code ec;
         fs::remove(state.temporary, ec);
         state.published_ok = Fail(e.what());
+    }
+    // The report holds the long frames now (or the run failed to write it): the spool is no use.
+    CloseSpool(state);
+    if (!state.spool_path.empty()) {
+        std::error_code ec;
+        fs::remove(state.spool_path, ec);
     }
     // The crash report stayed armed until now: the normal one is on disk, or has failed.
     if (!FinishCrashReport(state)) {
