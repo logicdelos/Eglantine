@@ -301,48 +301,55 @@ void Apply(const std::vector<Resolved>& resolved) {
     }
 }
 
+Json Describe(const std::string& key, Settings::BasicSetting& setting) {
+    const Kind kind = KindOf(setting);
+    Json line = Json::object();
+    line["name"] = key;
+    const char* const category = Settings::TranslateCategory(setting.GetCategory());
+    line["category"] = category != nullptr ? category : "";
+    line["type"] = KindName(kind);
+    line["saved"] = setting.Save();
+    if (Settings::IsSecretSetting(key)) {
+        // Name, type and category only: neither the value nor the default is printed.
+        line["redacted"] = true;
+        return line;
+    }
+    line["value"] = Typed(kind, setting.ToString());
+    line["default"] = Typed(kind, setting.DefaultToString());
+    if (kind == Kind::Enum) {
+        const Choices choices = EnumChoices(setting);
+        line["value_name"] = setting.Canonicalize();
+        const auto default_index = ParseWhole(setting.DefaultToString());
+        for (const auto& [index, name] : choices) {
+            if (default_index && !default_index->negative &&
+                default_index->magnitude == static_cast<u64>(index)) {
+                line["default_name"] = name;
+            }
+        }
+        Json array = Json::array();
+        for (const auto& [index, name] : choices) {
+            Json choice = Json::object();
+            choice["value"] = index;
+            choice["name"] = name;
+            array.push_back(std::move(choice));
+        }
+        line["choices"] = std::move(array);
+    } else if ((kind == Kind::Integer || kind == Kind::Float) && setting.Ranged()) {
+        line["min"] = Typed(kind, setting.MinVal());
+        line["max"] = Typed(kind, setting.MaxVal());
+    }
+    return line;
+}
+
+std::optional<std::string> CanonicalText(Settings::BasicSetting& setting, const std::string& value,
+                                         std::string& reason) {
+    return ResolveValue(setting, value, reason);
+}
+
 std::string ListJsonLines() {
     std::string lines;
     for (const auto& [key, setting] : Settings::values.linkage.by_key) {
-        const Kind kind = KindOf(*setting);
-        Json line = Json::object();
-        line["name"] = key;
-        const char* const category = Settings::TranslateCategory(setting->GetCategory());
-        line["category"] = category != nullptr ? category : "";
-        line["type"] = KindName(kind);
-        line["saved"] = setting->Save();
-        if (Settings::IsSecretSetting(key)) {
-            // Name, type and category only: neither the value nor the default is printed.
-            line["redacted"] = true;
-            lines += line.dump(-1, ' ', false, Json::error_handler_t::replace);
-            lines += '\n';
-            continue;
-        }
-        line["value"] = Typed(kind, setting->ToString());
-        line["default"] = Typed(kind, setting->DefaultToString());
-        if (kind == Kind::Enum) {
-            const Choices choices = EnumChoices(*setting);
-            line["value_name"] = setting->Canonicalize();
-            const auto default_index = ParseWhole(setting->DefaultToString());
-            for (const auto& [index, name] : choices) {
-                if (default_index && !default_index->negative &&
-                    default_index->magnitude == static_cast<u64>(index)) {
-                    line["default_name"] = name;
-                }
-            }
-            Json array = Json::array();
-            for (const auto& [index, name] : choices) {
-                Json choice = Json::object();
-                choice["value"] = index;
-                choice["name"] = name;
-                array.push_back(std::move(choice));
-            }
-            line["choices"] = std::move(array);
-        } else if ((kind == Kind::Integer || kind == Kind::Float) && setting->Ranged()) {
-            line["min"] = Typed(kind, setting->MinVal());
-            line["max"] = Typed(kind, setting->MaxVal());
-        }
-        lines += line.dump(-1, ' ', false, Json::error_handler_t::replace);
+        lines += Describe(key, *setting).dump(-1, ' ', false, Json::error_handler_t::replace);
         lines += '\n';
     }
     return lines;

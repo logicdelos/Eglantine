@@ -23,8 +23,8 @@ class InputSubsystem;
 
 namespace Control {
 
-/// The commands of `--control`: status, press, release, screenshot and stop. Requests and replies
-/// are one JSON object per line; the argument checks are in the command functions.
+/// The commands of `--control`: status, press, release, screenshot, get, set and stop. Requests and
+/// replies are one JSON object per line; the argument checks are in the command functions.
 ///
 /// `status` is answered on the channel thread from atomics alone. The other commands touch the
 /// emulator, so they wait in the channel's queue until the main loop calls Poll, once per
@@ -50,6 +50,7 @@ private:
     Response Status() const;
     Response Key(const Request& request, bool press);
     Response Screenshot(const Request& request);
+    Response Setting(const Request& request, bool change);
     Response Stop();
     void ReleaseSession(std::uint64_t session);
 

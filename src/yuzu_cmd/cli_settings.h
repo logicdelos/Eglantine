@@ -5,7 +5,10 @@
 
 #include <string>
 #include <utility>
+#include <optional>
 #include <vector>
+
+#include <nlohmann/json.hpp>
 
 #include "common/settings_common.h"
 
@@ -35,5 +38,16 @@ void Apply(const std::vector<Resolved>& resolved);
 /// ending in a newline): name, category, type, value, default, saved, and for a ranged number
 /// min and max, for an enum value_name, default_name and choices.
 [[nodiscard]] std::string ListJsonLines();
+
+/// One line of --list-settings as an object: the same fields, and a credential (see
+/// Settings::IsSecretSetting) is described without its value or default.
+[[nodiscard]] nlohmann::json Describe(const std::string& key, Settings::BasicSetting& setting);
+
+/// The text to give `setting`'s LoadString for `value` (a number or name for an enum, true, false,
+/// 1 or 0 for a boolean, a number inside the range, and so on), or nullopt with `reason` set. The
+/// rules are those of --set.
+[[nodiscard]] std::optional<std::string> CanonicalText(Settings::BasicSetting& setting,
+                                                       const std::string& value,
+                                                       std::string& reason);
 
 } // namespace CliSettings

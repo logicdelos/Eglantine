@@ -545,7 +545,7 @@ void ApplyLaunchParams(LaunchParams const& lp) noexcept {
             "    --control <name>  Open a control channel for one local client: the pipe\n"
             "                      \\\\.\\pipe\\<name> on Windows, <name>.sock in the runtime\n"
             "                      directory elsewhere. One JSON request per line; commands:\n"
-            "                      status, press, release, screenshot, stop\n"
+            "                      status, press, release, screenshot, get, set, stop\n"
             "-h, --help            Display this help and exit\n"
             "-m, --multiplayer=nick:password@address:port"
             " Nickname, password, address and port for multiplayer\n"

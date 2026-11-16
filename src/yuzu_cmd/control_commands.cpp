@@ -13,12 +13,16 @@
 
 #include "common/key_script.h"
 #include "common/logging.h"
+#include "common/settings.h"
+#include "common/settings_common.h"
+#include "common/settings_secret.h"
 #include "common/run_outcome.h"
 #include "core/core.h"
 #include "input_common/drivers/keyboard.h"
 #include "input_common/main.h"
 #include "video_core/gpu.h"
 #include "video_core/shader_notify.h"
+#include "yuzu_cmd/cli_settings.h"
 #include "yuzu_cmd/control_commands.h"
 #include "yuzu_cmd/control_file.h"
 #include "yuzu_cmd/frame_capture.h"
@@ -94,7 +98,7 @@ std::optional<Response> Commands::HandleDirect(const Request& request) {
         return Status();
     }
     if (request.cmd == "press" || request.cmd == "release" || request.cmd == "screenshot" ||
-        request.cmd == "stop") {
+        request.cmd == "get" || request.cmd == "set" || request.cmd == "stop") {
         return std::nullopt; // needs the main thread
     }
     return Response::Error("unknown_command", fmt::format("unknown command \"{}\"", request.cmd));
@@ -109,6 +113,9 @@ Response Commands::HandleMain(const Request& request) {
     }
     if (request.cmd == "screenshot") {
         return Screenshot(request);
+    }
+    if (request.cmd == "get" || request.cmd == "set") {
+        return Setting(request, request.cmd == "set");
     }
     return Stop();
 }
@@ -251,6 +258,69 @@ Response Commands::Screenshot(const Request& request) {
                  path_text);
     };
     return response;
+}
+
+// Main thread, so that the setting is not read or written while Poll is doing something else
+// with the emulator. `get` describes a setting like one line of --list-settings; `set` also
+// changes it, and only when the registry marks the setting as changeable while the guest runs.
+Response Commands::Setting(const Request& request, bool change) {
+    const auto name_arg = request.args.find("name");
+    if (name_arg == request.args.end() || !name_arg->is_string() ||
+        name_arg->get<std::string>().empty()) {
+        return Response::Error("bad_args", "\"name\" is required: the name of a setting "
+                                           "(eden-cli --list-settings shows them)");
+    }
+    const std::string name = name_arg->get<std::string>();
+    const auto found = Settings::values.linkage.by_key.find(name);
+    if (found == Settings::values.linkage.by_key.end()) {
+        return Response::Error("bad_args", fmt::format("{}: unknown setting", name));
+    }
+    Settings::BasicSetting& setting = *found->second;
+
+    if (change) {
+        if (Settings::IsSecretSetting(name)) {
+            return Response::Error("not_modifiable",
+                                   fmt::format("{}: a credential is not read or changed through "
+                                               "the control channel",
+                                               name));
+        }
+        if (!setting.RuntimeModifiable()) {
+            return Response::Error(
+                "not_modifiable",
+                fmt::format("{}: this setting cannot be changed while the emulator runs; start "
+                            "eden-cli with --set {}=<value> instead",
+                            name, name));
+        }
+        const auto value_arg = request.args.find("value");
+        if (value_arg == request.args.end()) {
+            return Response::Error("bad_args", "\"value\" is required");
+        }
+        std::string text;
+        if (value_arg->is_string()) {
+            text = value_arg->get<std::string>();
+        } else if (value_arg->is_boolean()) {
+            text = value_arg->get<bool>() ? "true" : "false";
+        } else if (value_arg->is_number()) {
+            text = value_arg->dump();
+        } else {
+            return Response::Error("bad_args", "\"value\" must be a boolean, a number or a string");
+        }
+        std::string reason;
+        const std::optional<std::string> canonical = CliSettings::CanonicalText(setting, text, reason);
+        if (!canonical) {
+            return Response::Error("bad_args", fmt::format("{}: invalid value: {}", name, reason));
+        }
+        setting.LoadString(*canonical);
+        if (system.IsPoweredOn()) {
+            system.ApplySettings();
+        }
+        // The value itself is not logged.
+        LOG_INFO(Frontend, "Control: set {}", name);
+    }
+
+    Json result = CliSettings::Describe(name, setting);
+    result["runtime_modifiable"] = setting.RuntimeModifiable();
+    return Response::Ok(std::move(result));
 }
 
 Response Commands::Stop() {
