@@ -97,9 +97,18 @@ if (MINGW)
     # Clang: function names and line numbers go to a .pdb next to each executable, which is
     # what dbghelp, WinDbg, the nx2 sampler and tools/nx2/host_threads.py read. The
     # executable itself stays stripped. File names are stored relative to the source tree.
+    # __FILE__, assert text and "(lambda at ...)" carry the absolute build path unless a
+    # macro prefix map is set; -fdebug-prefix-map covers debug info only. Kept outside the
+    # MINGW_PDB branch so a build without a .pdb is scrubbed as well.
+    foreach(lang C CXX)
+        set(CMAKE_${lang}_FLAGS
+            "${CMAKE_${lang}_FLAGS} -fmacro-prefix-map=${CMAKE_BINARY_DIR}=. -fmacro-prefix-map=${CMAKE_SOURCE_DIR}=.")
+    endforeach()
     option(MINGW_PDB "Write a .pdb next to each MinGW Clang executable" ON)
     if (CXX_CLANG AND MINGW_PDB)
-        string(APPEND MINGW_FLAGS " -Wl,--pdb=")
+        # -pdbaltpath:%_PDB% stores the bare file name in the CodeView record; without it
+        # the record holds the absolute path the linker was started with.
+        string(APPEND MINGW_FLAGS " -Wl,--pdb= -Wl,-Xlink=-pdbaltpath:%_PDB%")
         foreach(lang C CXX)
             set(CMAKE_${lang}_FLAGS_RELEASE
                 "${CMAKE_${lang}_FLAGS_RELEASE} -gcodeview -gline-tables-only -fdebug-prefix-map=${CMAKE_SOURCE_DIR}/=")
