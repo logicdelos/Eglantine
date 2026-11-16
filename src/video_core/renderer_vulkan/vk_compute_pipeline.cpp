@@ -95,8 +95,11 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
     }
 
     const auto queued_at = std::chrono::steady_clock::now();
-    auto func{[this, shader_notify, pipeline_statistics, queued_at] {
+    const auto front_end = DriverBuildReport::TakeFrontEnd();
+    auto func{[this, shader_notify, pipeline_statistics, queued_at, front_end] {
+        const DriverBuildReport::BuildScope busy;
         const auto started_at = std::chrono::steady_clock::now();
+        DriverBuildReport::AddQueued(started_at - queued_at);
         const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
             .pNext = nullptr,
@@ -172,6 +175,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         // lives.
         spv_module.reset();
         ReportPipelineBuild("Compute", shader_hash, queued_at, started_at);
+        DriverBuildReport::NoteBuilt(front_end + (std::chrono::steady_clock::now() - started_at));
         std::scoped_lock lock{build_mutex};
         is_built = true;
         build_condvar.notify_one();

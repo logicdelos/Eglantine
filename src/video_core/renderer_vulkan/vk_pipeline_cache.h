@@ -423,6 +423,9 @@ private:
     /// Precache builds wait while the game builds pipelines (queued translations or driver
     /// compiles, or a pipeline built in the last moments): they share the CPU and the driver.
     bool RuntimeBuildsBusy() const;
+    /// RuntimeBuildsBusy plus the disk replay and background pipeline builds: when the shader
+    /// build report counts the builders as idle.
+    bool ShaderBuildsBusy() const;
     void WaitForIdleRuntimeBuilds();
     /// A dispatch needs `key` (GPU thread): a precache build not started yet is dropped, one in
     /// progress is waited for, briefly, so the dispatch's build finds it in the driver's cache.

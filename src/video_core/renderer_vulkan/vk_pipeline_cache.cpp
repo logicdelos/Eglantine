@@ -508,6 +508,9 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
                  num_translation_threads, translation_wait.count() / 1000.0,
                  translation_frame_budget.count() / 1000.0);
     }
+    DriverBuildReport::BeginSession(
+        (device.HasBrokenParallelShaderCompiling() ? 1ULL : GetTotalPipelineWorkers()) +
+        num_translation_threads);
     const auto& float_control{device.FloatControlProperties()};
     const VkDriverId driver_id{device.GetDriverID()};
     const VkShaderStageFlags subgroup_stages{device.GetSubgroupSupportedStages()};
@@ -1216,8 +1219,11 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::ComputePreloadVariants);
     const auto queue_compute{
         [&](const ComputePipelineCacheKey& key, std::vector<FileEnvironment> candidates) {
+            const auto queued_at = std::chrono::steady_clock::now();
             workers.QueueWork([this, key, envs_ = std::move(candidates), preload_variants, &state,
-                               &callback]() mutable {
+                               &callback, queued_at]() mutable {
+                DriverBuildReport::AddQueuedSince(queued_at);
+                const DriverBuildReport::DiskScope from_disk;
                 ShaderPools pools;
                 ComputePipelineCacheEntry entry;
                 std::vector<std::vector<u64>> built_keys;
@@ -1342,7 +1348,11 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         ++queued_graphics;
         boot_graphics.insert(hash);
 
-        workers.QueueWork([this, key, envs_ = std::move(envs), &state, &callback]() mutable {
+        const auto queued_at = std::chrono::steady_clock::now();
+        workers.QueueWork([this, key, envs_ = std::move(envs), &state, &callback,
+                           queued_at]() mutable {
+            DriverBuildReport::AddQueuedSince(queued_at);
+            const DriverBuildReport::DiskScope from_disk;
             ShaderPools pools;
             boost::container::static_vector<Shader::Environment*, 5> env_ptrs;
             for (auto& env : envs_) {
@@ -1475,8 +1485,10 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         background_workers.reset(new Common::ThreadWorker(threads, "VkPipelinePrebuild", {},
                                                           Common::ThreadPlacement::Background));
         for (auto& deferred : deferred_graphics) {
+            const auto queued_at = std::chrono::steady_clock::now();
             background_workers->QueueWork([this, key = deferred.first,
-                                           envs_ = std::move(deferred.second)]() mutable {
+                                           envs_ = std::move(deferred.second),
+                                           queued_at]() mutable {
                 bool build = !background_stop.load(std::memory_order_relaxed);
                 if (build) {
                     std::scoped_lock lock{background_mutex};
@@ -1484,6 +1496,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                 }
                 std::unique_ptr<GraphicsPipeline> pipeline;
                 if (build) {
+                    DriverBuildReport::AddQueuedSince(queued_at);
+                    const DriverBuildReport::DiskScope from_disk;
                     ShaderPools pools;
                     boost::container::static_vector<Shader::Environment*, 5> env_ptrs;
                     for (auto& env : envs_) {
@@ -1943,6 +1957,7 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath(bool is_indexed
     const u64 key_hash = graphics_key.Hash();
     if (in_flight_disk_replays.contains(key_hash)) {
         RecordSkippedGeometry(is_indexed, nullptr);
+        DriverBuildReport::NoteDrawSkipped();
         graphics_miss = "disk-replay-async";
         return nullptr;
     }
@@ -1957,8 +1972,12 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath(bool is_indexed
                 in_flight_disk_replays.insert(key_hash);
                 const bool native_turing =
                     maxwell3d != nullptr && maxwell3d->GetNativeMacroEngine().native_turing;
+                const auto queued_at = std::chrono::steady_clock::now();
                 disk_replay_workers.QueueWork(
-                    [this, key = graphics_key, envs_ = std::move(envs), native_turing]() mutable {
+                    [this, key = graphics_key, envs_ = std::move(envs), native_turing,
+                     queued_at]() mutable {
+                        DriverBuildReport::AddQueuedSince(queued_at);
+                        const DriverBuildReport::DiskScope from_disk;
                         ShaderPools pools;
                         boost::container::static_vector<Shader::Environment*, 5> env_ptrs;
                         for (auto& env : envs_) {
@@ -1971,6 +1990,7 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath(bool is_indexed
                         ready_disk_pipelines_pending.store(true, std::memory_order_release);
                     });
                 RecordSkippedGeometry(is_indexed, nullptr);
+                DriverBuildReport::NoteDrawSkipped();
                 graphics_miss = "disk-replay-async";
                 return nullptr;
             }
@@ -2002,6 +2022,7 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath(bool is_indexed
 }
 
 void PipelineCache::TickFrame() {
+    DriverBuildReport::Tick(DriverBuildReport::DrainArmed() && !ShaderBuildsBusy());
     DrainReadyDiskPipelines();
     if (deferred_candidate_count != 0) {
         const auto span = std::span{deferred_candidates.data(), deferred_candidate_count};
@@ -2278,6 +2299,11 @@ bool PipelineCache::RuntimeBuildsBusy() const {
            workers.PendingWork() != 0 || std::chrono::steady_clock::now() - last < Quiet;
 }
 
+bool PipelineCache::ShaderBuildsBusy() const {
+    return RuntimeBuildsBusy() || background_active.load(std::memory_order_acquire) ||
+           disk_replay_workers.PendingWork() != 0;
+}
+
 void PipelineCache::WaitForIdleRuntimeBuilds() {
     const auto begin = std::chrono::steady_clock::now();
     bool paused = false;
@@ -2360,6 +2386,7 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline,
     // will be used one time.
     if (maxwell3d->regs.zeta_enable) {
         RecordSkippedGeometry(is_indexed, pipeline);
+        DriverBuildReport::NoteDrawSkipped();
         graphics_miss = "async-build";
         return nullptr;
     }
@@ -2373,6 +2400,7 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline,
                    : (draw_state.draw_element_count <= 6);
     if (is_small_draw) {
         if (stale_skip && texture_cache.ColorTargetHasPriorFrameOutput()) {
+            DriverBuildReport::NoteDrawSkipped();
             graphics_miss = "async-build-stale";
             return nullptr;
         }
@@ -2385,6 +2413,7 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline,
     if (Settings::CurrentProgramIsSwitch2()) {
         return pipeline;
     }
+    DriverBuildReport::NoteDrawSkipped();
     graphics_miss = "async-build";
     return nullptr;
 }
@@ -2432,6 +2461,7 @@ bool PipelineCache::BuildNewGraphicsPipeline(bool is_indexed) {
     if (!pipeline) {
         if (DeferRuntimeBuild()) {
             RecordSkippedGeometry(is_indexed, nullptr);
+            DriverBuildReport::NoteDrawSkipped();
             graphics_miss = "build-deferred";
             return false;
         }
@@ -2457,21 +2487,43 @@ bool PipelineCache::BuildNewGraphicsPipeline(bool is_indexed) {
 }
 
 namespace {
-// Where the GPU thread's time goes when it builds a pipeline at run time (ns, summed per 10 s).
+// Where the time of a build goes: the GPU thread's share at run time (ns, summed per 10 s) and,
+// for every build, the phases of the shader build report (DriverBuildReport).
 enum class BuildPhase : size_t { Environments, Translate, Emit, Module, Object, Count };
 std::array<std::atomic<u64>, static_cast<size_t>(BuildPhase::Count)> runtime_phase_ns{};
 
 struct PhaseTimer {
     BuildPhase phase;
-    bool active;
+    bool active; ///< Also counts toward the GPU thread's run time figures
     std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
+
+    PhaseTimer(BuildPhase phase_, bool active_) : phase{phase_}, active{active_} {}
+
     ~PhaseTimer() {
+        const auto elapsed = std::chrono::steady_clock::now() - begin;
         if (active) {
             runtime_phase_ns[static_cast<size_t>(phase)].fetch_add(
-                static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                     std::chrono::steady_clock::now() - begin)
-                                     .count()),
+                static_cast<u64>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()),
                 std::memory_order_relaxed);
+        }
+        // A pipeline object built inline includes its driver build, which is reported on its own.
+        if (phase == BuildPhase::Object && !active) {
+            return;
+        }
+        DriverBuildReport::AddPhase(ReportPhase(), elapsed);
+    }
+
+private:
+    DriverBuildReport::Phase ReportPhase() const {
+        switch (phase) {
+        case BuildPhase::Translate:
+            return DriverBuildReport::Phase::Translate;
+        case BuildPhase::Emit:
+        case BuildPhase::Module:
+            return DriverBuildReport::Phase::Spirv;
+        default:
+            return DriverBuildReport::Phase::Other;
         }
     }
 };
@@ -2481,6 +2533,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     ShaderPools& pools, const GraphicsPipelineCacheKey& key,
     std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
     bool build_in_parallel, bool native_turing, bool parallel_stages) try {
+    const DriverBuildReport::BuildScope busy;
+    const auto build_begin = std::chrono::steady_clock::now();
     auto hash = key.Hash();
     LOG_DEBUG(Render_Vulkan, "{:#016x}", hash);
     size_t env_index{0};
@@ -2530,6 +2584,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         if (missing.size() >= 2) {
             RunInParallel(missing.size(), [&](size_t task) {
+                const DriverBuildReport::BuildScope task_busy;
+                const PhaseTimer ahead_timer{BuildPhase::Translate, false};
                 const size_t index{missing[task]};
                 Shader::Environment& env{*ahead_envs[index]};
                 stage_pools[index] = std::make_unique<ShaderPools>();
@@ -2876,11 +2932,14 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         } else {
             if (reused[index]) {
                 // Emitted for other runtime info only, or verifying: the IR is needed again.
+                emit_timer.reset();
+                const PhaseTimer retranslate_timer{BuildPhase::Translate, false};
                 Shader::Environment& env{*stage_envs[index]};
                 const u32 cfg_offset{
                     static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
                 Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
                 program = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
+                emit_timer.emplace(BuildPhase::Emit, build_in_parallel);
             }
             if (mesh_emulation &&
                 (program.stage == Shader::Stage::Mesh || program.stage == Shader::Stage::Task)) {
@@ -2976,6 +3035,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     for (auto& [new_translation, entry] : new_translations) {
         stage_cache.Insert(std::move(new_translation), std::move(entry));
     }
+    DriverBuildReport::NoteStart(hash);
+    DriverBuildReport::SetFrontEnd(build_begin);
     Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
     PhaseTimer object_timer{BuildPhase::Object, build_in_parallel};
     return std::make_unique<GraphicsPipeline>(
@@ -3020,6 +3081,7 @@ void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_poi
     static auto window = std::chrono::steady_clock::now();
     const auto now = std::chrono::steady_clock::now();
     const auto elapsed = now - begin;
+    DriverBuildReport::NoteGpuBuild(elapsed);
     VideoCommon::Nx2Spikes::Note(VideoCommon::Nx2Spikes::Event::RuntimePipeline, elapsed);
     total += elapsed;
     ++count;
@@ -3078,6 +3140,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     if (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::ReplayDiskRecordings)) {
         if (const auto disk_it = skipped_disk_envs.find(graphics_key);
             disk_it != skipped_disk_envs.end()) {
+            const DriverBuildReport::DiskScope disk_scope;
             auto envs = std::move(disk_it->second);
             skipped_disk_envs.erase(disk_it);
             boost::container::static_vector<Shader::Environment*, 5> env_ptrs;
@@ -3305,11 +3368,11 @@ std::optional<std::shared_future<void>> PipelineCache::QueueGraphicsTranslation(
     }
     auto task{std::make_shared<PendingGraphicsTranslation>()};
     task->envs = std::move(environments.envs);
-    task->queued_at = begin;
     std::shared_future<void> done{task->done.get_future().share()};
     translating_graphics.emplace(graphics_key, QueuedGraphicsTranslation{done, task});
     report.peak_queued = std::max(report.peak_queued, translating_graphics.size());
     last_runtime_build.store(begin.time_since_epoch().count(), std::memory_order_relaxed);
+    task->queued_at = std::chrono::steady_clock::now();
     translation_workers->QueueWork([this, key = graphics_key, task] {
         if (!task->claimed.exchange(true)) {
             TranslateGraphicsPipeline(key, std::move(task->envs), std::move(task->done),
@@ -3337,6 +3400,7 @@ bool PipelineCache::WaitForGraphicsTranslation(const std::shared_future<void>& d
         const auto begin = std::chrono::steady_clock::now();
         ready = done.wait_for(wait) == std::future_status::ready;
         const auto spent{std::chrono::steady_clock::now() - begin};
+        DriverBuildReport::NoteGpuWait(spent);
         translation_frame_left -=
             std::min(translation_frame_left,
                      std::chrono::duration_cast<std::chrono::microseconds>(spent));
@@ -3346,6 +3410,7 @@ bool PipelineCache::WaitForGraphicsTranslation(const std::shared_future<void>& d
     report.skipped += ready ? 0 : 1;
     if (!ready) {
         VideoCommon::Nx2Spikes::Note(VideoCommon::Nx2Spikes::Event::DrawSkipped);
+        DriverBuildReport::NoteDrawSkipped();
     }
     report.Log();
     return ready;
@@ -3354,15 +3419,22 @@ bool PipelineCache::WaitForGraphicsTranslation(const std::shared_future<void>& d
 void PipelineCache::FinishGraphicsTranslation(const QueuedGraphicsTranslation& queued) {
     auto& report{GetTranslationReport()};
     const auto begin = std::chrono::steady_clock::now();
-    if (!queued.task->claimed.exchange(true)) {
+    const bool claimed_here = !queued.task->claimed.exchange(true);
+    if (claimed_here) {
         // Still in the queue, possibly behind hundreds of others: translate it here.
         ++report.claimed;
         TranslateGraphicsPipeline(graphics_key, std::move(queued.task->envs),
                                   std::move(queued.task->done), queued.task->queued_at);
+        DriverBuildReport::NoteGpuBuild(std::chrono::steady_clock::now() - begin);
     }
     // A worker that started it first finishes one translation.
+    const auto wait_begin = std::chrono::steady_clock::now();
     queued.done.wait();
-    report.unskippable += std::chrono::steady_clock::now() - begin;
+    const auto end = std::chrono::steady_clock::now();
+    report.unskippable += end - begin;
+    if (!claimed_here) {
+        DriverBuildReport::NoteGpuWait(end - wait_begin);
+    }
     report.Log();
 }
 
@@ -3371,6 +3443,7 @@ void PipelineCache::TranslateGraphicsPipeline(const GraphicsPipelineCacheKey& ke
                                               std::promise<void> done,
                                               std::chrono::steady_clock::time_point queued_at) {
     const auto begin = std::chrono::steady_clock::now();
+    DriverBuildReport::AddQueued(begin - queued_at);
     std::unique_ptr<GraphicsPipeline> pipeline;
     {
         ShaderPools pools;
@@ -3483,6 +3556,8 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(ShaderPools& pool
                                                                Shader::Environment& env,
                                                                PipelineStatistics* statistics,
                                                                bool build_in_parallel) try {
+    const DriverBuildReport::BuildScope busy;
+    const auto build_begin = std::chrono::steady_clock::now();
     auto hash = key.Hash();
     if (device.HasBrokenCompute()) {
         LOG_ERROR(Render_Vulkan, "Skipping {:#016x}", hash);
@@ -3491,6 +3566,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(ShaderPools& pool
 
     LOG_DEBUG(Render_Vulkan, "{:#016x}", hash);
 
+    std::optional<PhaseTimer> translate_timer{std::in_place, BuildPhase::Translate, false};
     Shader::Maxwell::Flow::CFG cfg{env, pools.flow_block, env.StartAddress()};
 
     // Dump it before error.
@@ -3499,6 +3575,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(ShaderPools& pool
     }
 
     auto program{TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
+    translate_timer.reset();
     const VkDriverIdKHR driver_id = device.GetDriverID();
     const bool needs_shared_mem_clamp = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY ||
                                         driver_id == VK_DRIVER_ID_ARM_PROPRIETARY ||
@@ -3511,9 +3588,11 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(ShaderPools& pool
             key.unique_hash, program.shared_memory_size / 1024, max_shared_memory / 1024);
         program.shared_memory_size = max_shared_memory;
     }
+    std::optional<PhaseTimer> emit_timer{std::in_place, BuildPhase::Emit, false};
     const std::vector<u32> code{EmitSPIRV(profile, program)};
     device.SaveShader(code);
     vk::ShaderModule spv_module{BuildShader(device, code)};
+    emit_timer.reset();
 
     // Text log + .spv dump. Same split as the graphics path.
     const bool should_log = GPU::Logging::IsActive();
@@ -3535,6 +3614,15 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(ShaderPools& pool
         const auto name{fmt::format("Shader {:016x}", key.unique_hash)};
         spv_module.SetObjectNameEXT(name.c_str());
     }
+    std::vector<u64> mapped_pointers{env.IsNativeProgram() ? env.MappedStoragePointerKeys()
+                                                           : std::vector<u64>{}};
+    // Variants of one program with other mapped pointers are builds of their own.
+    u64 identity{hash};
+    for (const u64 mapped : mapped_pointers) {
+        identity = (identity ^ mapped) * 0x9E3779B97F4A7C15ULL;
+    }
+    DriverBuildReport::NoteStart(identity);
+    DriverBuildReport::SetFrontEnd(build_begin);
     Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
     return {.pipeline = std::make_unique<ComputePipeline>(
                 device, scheduler, vulkan_pipeline_cache, descriptor_pool, guest_descriptor_queue,
@@ -3542,8 +3630,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(ShaderPools& pool
                 std::move(spv_module), key.unique_hash),
             .null_pointer_slots = env.IsNativeProgram() ? env.NullStoragePointerSlots()
                                                         : std::vector<std::pair<u32, u32>>{},
-            .mapped_pointers =
-                env.IsNativeProgram() ? env.MappedStoragePointerKeys() : std::vector<u64>{}};
+            .mapped_pointers = std::move(mapped_pointers)};
 
 } catch (const Shader::Exception& exception) {
     LOG_ERROR(Render_Vulkan, "{}", exception.what());

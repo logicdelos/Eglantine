@@ -21,6 +21,7 @@
 #include "common/nx2_bottleneck.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/shader_info.h"
+#include "video_core/renderer_vulkan/vk_driver_build_report.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/surface.h"
@@ -50,6 +51,7 @@ inline void ReportPipelineBuildWait(const char* kind, u64 hash,
                                     std::string_view details = {}) {
     static std::atomic<u32> logged{};
     const auto elapsed = std::chrono::steady_clock::now() - begin;
+    DriverBuildReport::NoteSubmissionWait(elapsed);
     if (elapsed <= std::chrono::milliseconds{2}) {
         return;
     }

@@ -430,8 +430,11 @@ GraphicsPipeline::GraphicsPipeline(
     }
 
     const auto queued_at = std::chrono::steady_clock::now();
-    auto func{[this, shader_notify, &render_pass_cache, pipeline_statistics, queued_at] {
+    const auto front_end = DriverBuildReport::TakeFrontEnd();
+    auto func{[this, shader_notify, &render_pass_cache, pipeline_statistics, queued_at, front_end] {
+        const DriverBuildReport::BuildScope busy;
         const auto started_at = std::chrono::steady_clock::now();
+        DriverBuildReport::AddQueued(started_at - queued_at);
         const VkRenderPass render_pass{render_pass_cache.Get(MakeRenderPassKey(key.state, device))};
         Validate();
         try {
@@ -460,6 +463,7 @@ GraphicsPipeline::GraphicsPipeline(
             module.reset();
         }
         ReportPipelineBuild("Graphics", key.Hash(), queued_at, started_at);
+        DriverBuildReport::NoteBuilt(front_end + (std::chrono::steady_clock::now() - started_at));
 
         std::scoped_lock lock{build_mutex};
         is_built = true;
