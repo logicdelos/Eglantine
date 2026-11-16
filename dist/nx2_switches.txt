@@ -9,37 +9,75 @@
 # Restart the emulator after editing.
 
 # --- Performance tuning defaults for Switch 2 ---
-# Offload GPU method/macro execution to the back thread (SPLIT=2 delivers up to +54% FPS alone).
+# Offload GPU method/macro execution to a second (back) thread.
 EDEN_NX2_SPLIT=2
 
 # Batch GPU fence syncpoints to reduce host driver overhead and smooth frametimes.
 EDEN_NX2_FENCE_BATCH=1
 
 # Leave buffer downloads disabled on Switch 2 (default): forcing downloads (=1) copies back
-# 90-220 MB/s of buffers CPU never touches, causing heavy mutex contention and dropping FPS by ~38-63%.
+# buffers the CPU never touches, which adds mutex contention and lowers FPS (upstream reported a
+# large drop; not measured in this fork).
 #EDEN_NX2_BUFFER_DOWNLOADS=1
 
 # Paces frame submission 2 frames ahead. Reduces frametime spikes, but adds ~1-2 frames of input latency.
 # Enable only if frame pacing stability is preferred over responsive controls.
 #EDEN_NX2_FRAMES_AHEAD=2
 
-# Opt-in (default off): the host timer thread, which delivers the guest's timed events (vsync among
-# them), waits on a high resolution waitable timer instead of a condition variable wait that follows
-# the Windows timer resolution. Windows 10 1803 or later. Read at start; =1 turns it on.
+# --- Speed experiments (0.4) ---
+# These switches are off by default and unmeasured until the 0.4 release table. Each is read once
+# when it is first needed. Values: 1 turns it on; unset or any other value leaves it off.
+
+# Windows only. The front and back GPU threads of the split each get a physical performance core of
+# their own and the emulated CPU cores keep off those two. Skipped, with one log line, on CPUs with
+# too few physical performance cores and with EDEN_HYBRID_CORES=0.
+#EDEN_NX2_PIN_GPU_THREADS=1
+
+# Vulkan. A fence flush skips its queue submit when nothing was recorded since the last submit
+# (compare "submits by origin: fence" in the EDEN_NX2_GPU_PROFILE log line).
+#EDEN_NX2_SKIP_EMPTY_FLUSH=1
+
+# Windows only, multicore CPU emulation. The host timer thread (it delivers the guest's timed events,
+# vsync among them) waits on a high resolution waitable timer instead of a wait that follows the
+# Windows timer resolution. Windows 10 1803 or later.
 #EDEN_NX2_HIRES_TIMER=1
 
-# Opt-in (default off): the GPU ASTC to BC transcode records the decode and the encode in one host
-# GPU submit instead of submitting after the decode. Only has an effect where ASTC textures are
-# transcoded on the GPU (hosts without ASTC support). Read once; =1 turns it on.
+# Vulkan. The GPU ASTC to BC transcode records the decode and the encode in one queue submit instead
+# of submitting after the decode. Only has an effect where ASTC is transcoded on the GPU.
 #EDEN_NX2_ASTC_ONE_SUBMIT=1
+
+# The GPU front/back thread split also runs at GPU accuracy High and with safe DMA (otherwise it only
+# runs below High); the back writes out what the caches hold of a command list before the front
+# reads it. Weaker than a plain High: watch buffer-fed effects such as the sky.
+#EDEN_NX2_SPLIT_AT_HIGH=1
+
+# Windows only. A background thread takes guest memory pages that hold only zeros out of the process
+# working set (the contents stay; a write brings the page back), so a PC low on RAM pages less. The
+# log line "Trimmed ... MiB of all-zero guest pages" shows what it did.
+#EDEN_NX2_ZERO_PAGE_TRIM=1
+
+# Windows only. Changing the protection of guest memory (the GPU caches' write traps) first tries the
+# range without the lock that map and unmap hold, and takes the lock only when the range is not inside
+# one mapped view (EDEN_NX2_PROTECT_STATS=1 logs the protection calls).
+#EDEN_NX2_PROTECT_NO_LOCK=1
+
+# The shader precache build also reads the add-on packages of a .nup (Xenoblade Chronicles 2 Switch 2
+# Edition keeps its game data there). Rebuild the precache after changing it.
+#EDEN_NX2_WARM_ADDON=1
+
+# The Vulkan GPU ASTC decoder does its per-block set-up once per block instead of once per texel (same
+# results), and the opaque-ASTC scan reads the guest data in place when it is in one piece.
+#EDEN_NX2_ASTC_CHEAP_UPLOAD=1
 
 # --- Workarounds / Debug ---
 # Terrain/indirect drawing fix for Donkey Kong Bananza: enabled by default. Set to 0 only to leave to GPU.
 #EDEN_NX2_RESETFIX=0
 
-# Drop reactive-flushing read traps on Switch 2 programs (opt-in; can reduce FPS from 29 to 24 in MKW).
+# Drop reactive-flushing read traps on Switch 2 programs (opt-in; can lower FPS: upstream reported a
+# drop in Mario Kart World; not measured in this fork).
 #EDEN_NX2_NO_REACTIVE=1
 
+# EDEN_NX2_PBFLUSH is kept from upstream's file; this fork's source does not read it.
 #EDEN_NX2_MME_JIT=0
 #EDEN_NX2_PBFLUSH=0
 #EDEN_NX2_SKIP_SAME=0
@@ -53,46 +91,3 @@ EDEN_NX2_FENCE_BATCH=1
 # Used to test that a crash during a scripted run (eden-cli --report ...) leaves a report with
 # exit.reason "host_crash" and the process exit code 73. Off unless set.
 #EDEN_NX2_TEST_CRASH_AFTER_FRAMES=300
-# --- Speed experiments (off by default; each is measured on and off before it is recommended) ---
-# Pin the GPU threads to their own physical performance cores and keep the emulated CPU cores off
-# them (Windows only; ignored on CPUs with fewer than 6 physical performance cores, or with
-# EDEN_HYBRID_CORES=0). Can hurt performance on CPUs with few cores. Set to 1 to turn on.
-#EDEN_NX2_PIN_GPU_THREADS=1
-
-# Skip the Vulkan queue submit a fence flush makes when nothing was recorded since the last submit
-# (fewer submits per second; compare "submits by origin: fence" in the EDEN_NX2_GPU_PROFILE log
-# line, written every 10 seconds). Set to 1 to turn on.
-#EDEN_NX2_SKIP_EMPTY_FLUSH=1
-# --- Speed experiments (off by default; each is measured on and off before it is recommended) ---
-# Keep the GPU front/back thread split running at GPU accuracy High (and safe DMA). Today the split
-# only runs below High. With this on, the back writes out what the texture and query caches hold
-# of a command list before the front reads it, and the macros stay on the back at High. Weaker
-# than a plain High: command lists a draw writes into a buffer are not flushed before they are
-# read. Watch the sky and other buffer-fed effects, especially in long sessions. Compare fps and
-# the "gwait" and "idle" columns of the 10 second EDEN_NX2_GPU_PROFILE line ("safe read" under
-# its drain sites). Set to 1 to turn on.
-#EDEN_NX2_SPLIT_AT_HIGH=1
-# --- Speed experiments (off by default; each is measured on and off before it is recommended) ---
-# Windows only. A background thread takes guest memory pages that hold only zeros out of the process
-# working set (the contents stay, a write brings the page back), so a PC that is nearly out of RAM
-# has more free memory and pages less. A pass comes every 5 s while it keeps finding pages, then
-# backs off to every 5 minutes, and waits while the game is mapping memory in bulk. The log line
-# "Trimmed ... MiB of all-zero guest pages" shows what it did. Set to 1 to turn on.
-#EDEN_NX2_ZERO_PAGE_TRIM=1
-
-# Windows only. Changing the protection of guest memory (the write traps of the GPU caches) first tries
-# the whole range without the lock that mapping and unmapping hold, and takes the lock only when the
-# range is not inside one mapped view. Helps when a game maps memory in bulk and the protection calls
-# queue behind it (compare "nx2 protect: ... ms/s" in the log with EDEN_NX2_PROTECT_STATS=1). Set to 1
-# to turn on.
-#EDEN_NX2_PROTECT_NO_LOCK=1
-# --- Speed experiments (off by default; each is measured on and off before it is recommended) ---
-# Shader precache build: also read the add-on packages of a .nup (Xenoblade Chronicles 2 Switch 2
-# Edition keeps its game data there), so their shaders are in the precache too. Read when the
-# precache is built; rebuild the precache after changing it. =1 turns it on.
-#EDEN_NX2_WARM_ADDON=1
-
-# Cheaper ASTC uploads: the GPU ASTC decoder does its per-block set-up once per block instead of
-# once per texel (same results), and the opaque-ASTC scan reads the guest data in place when it is
-# in one piece instead of copying it first. Read once at start; =1 turns it on.
-#EDEN_NX2_ASTC_CHEAP_UPLOAD=1
