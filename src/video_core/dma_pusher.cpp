@@ -975,10 +975,10 @@ bool DmaPusher::FlushCachedCommands(GPUVAddr address, size_t size, bool live) {
     }
     bool image_written = false;
     split.Run(
-        [memory = &memory_manager, address, size, live, image_written = &image_written] {
+        [memory = &memory_manager, address, size, live, written = &image_written] {
             using VideoCommon::CacheType;
-            *image_written = memory->IsMemoryDirty(address, size, CacheType::TextureCache);
-            if (*image_written) {
+            *written = memory->IsMemoryDirty(address, size, CacheType::TextureCache);
+            if (*written) {
                 memory->FlushRegion(address, size, CacheType::All);
             } else if (live) {
                 memory->FlushRegion(address, size, CacheType::TextureCache | CacheType::QueryCache);
@@ -1008,8 +1008,8 @@ void DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
         // The download records into the Vulkan scheduler, which the split's back owns: a drained
         // back still submits from its idle hook, so the front must not flush these pages itself.
         VideoCommon::GpuSplit::Get().Run(
-            [memory = &memory_manager, first_page, size = end_page - first_page] {
-                memory->FlushRegion(first_page, size, VideoCommon::CacheType::BufferCache);
+            [memory = &memory_manager, first_page, flush_size = end_page - first_page] {
+                memory->FlushRegion(first_page, flush_size, VideoCommon::CacheType::BufferCache);
             },
             VideoCommon::DrainSite::ListFlush);
     }
