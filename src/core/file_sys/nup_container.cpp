@@ -259,7 +259,14 @@ public:
         {
             const VideoCommon::Nx2Spikes::Scope spike{VideoCommon::Nx2Spikes::Event::NupDecompress,
                                                       uncompressed_size};
+            // The reads of the compressed extent are Disk spans nested in this one: the recorder
+            // subtracts them from it, so they are not charged twice.
+            VideoCommon::Nx2Spikes::SpanScope decompress{
+                VideoCommon::Nx2Spikes::Cause::Decompression, 0, uncompressed_size};
             scratch = Decompress();
+            if (scratch.empty()) {
+                decompress.Fail();
+            }
         }
         if (scratch.empty()) {
             return 0;
@@ -313,12 +320,26 @@ private:
             spill->attempted = true;
             const VideoCommon::Nx2Spikes::Scope spike{VideoCommon::Nx2Spikes::Event::NupDecompress,
                                                       uncompressed_size};
+            // Reads of the compressed extent nest inside as Disk spans; the writes to the spill
+            // file stay part of this span.
+            VideoCommon::Nx2Spikes::SpanScope decompress{
+                VideoCommon::Nx2Spikes::Cause::Decompression, 0, uncompressed_size};
             DecompressToFile(*spill);
+            if (!spill->file.IsOpen()) {
+                decompress.Fail();
+            }
         }
-        if (!spill->file.IsOpen() || !spill->file.Seek(static_cast<s64>(offset))) {
+        if (!spill->file.IsOpen()) {
             return 0;
         }
-        return spill->file.ReadSpan(std::span{data, length});
+        VideoCommon::Nx2Spikes::SpanScope disk{VideoCommon::Nx2Spikes::Cause::Disk};
+        if (!spill->file.Seek(static_cast<s64>(offset))) {
+            disk.Fail();
+            return 0;
+        }
+        const std::size_t bytes_read = spill->file.ReadSpan(std::span{data, length});
+        disk.AddAmount(bytes_read);
+        return bytes_read;
     }
 
     void DecompressToFile(NupSpillFile& spill, std::span<const u8> decompressed = {}) const {

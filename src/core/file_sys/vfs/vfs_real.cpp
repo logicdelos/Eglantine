@@ -375,10 +375,18 @@ std::size_t RealVfsFile::Read(u8* data, std::size_t length, std::size_t offset) 
         // A file that may be written keeps the original behaviour: the list lock covers the whole
         // access, so a write buffered in the FILE* is never left behind by an eviction.
         auto lk = base.RefreshReference(path, perms, *reference);
-        if (!reference->file || !reference->file->Seek(static_cast<s64>(offset))) {
+        if (!reference->file) {
             return 0;
         }
-        return reference->file->ReadSpan(std::span{data, length});
+        // From here on the time is the read itself, not the wait for the list lock.
+        VideoCommon::Nx2Spikes::SpanScope disk{VideoCommon::Nx2Spikes::Cause::Disk};
+        if (!reference->file->Seek(static_cast<s64>(offset))) {
+            disk.Fail();
+            return 0;
+        }
+        const std::size_t bytes_read = reference->file->ReadSpan(std::span{data, length});
+        disk.AddAmount(bytes_read);
+        return bytes_read;
     }
 
     // Read-only file: take our own handle under the list lock (so eviction cannot close it under
@@ -392,10 +400,15 @@ std::size_t RealVfsFile::Read(u8* data, std::size_t length, std::size_t offset) 
         return 0;
     }
     std::scoped_lock io{reference->io_mutex};
+    // The span starts once this file's lock is held: it measures the seek and the read.
+    VideoCommon::Nx2Spikes::SpanScope disk{VideoCommon::Nx2Spikes::Cause::Disk};
     if (!file->Seek(static_cast<s64>(offset))) {
+        disk.Fail();
         return 0;
     }
-    return file->ReadSpan(std::span{data, length});
+    const std::size_t bytes_read = file->ReadSpan(std::span{data, length});
+    disk.AddAmount(bytes_read);
+    return bytes_read;
 }
 
 std::size_t RealVfsFile::Write(const u8* data, std::size_t length, std::size_t offset) {
