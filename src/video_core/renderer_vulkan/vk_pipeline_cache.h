@@ -32,6 +32,7 @@
 
 #include "common/common_types.h"
 #include "common/thread_worker.h"
+#include "video_core/cache_envelope.h"
 #include "shader_recompiler/frontend/ir/basic_block.h"
 #include "shader_recompiler/frontend/ir/value.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
@@ -100,6 +101,7 @@ namespace Vulkan {
 class ComputePipeline;
 class DescriptorPool;
 class Device;
+class PipelineCacheSession; ///< The title's cache files and preparation (vk_pipeline_cache.cpp)
 class PipelineStatistics;
 class RenderPassCache;
 class Scheduler;
@@ -188,13 +190,21 @@ private:
     [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline,
                                                   bool is_indexed) noexcept;
 
-    void RecordSkippedGeometry(bool is_indexed, const GraphicsPipeline* pipeline,
-                               u64 replay_hash = 0) noexcept;
+    void RecordSkippedGeometry(bool is_indexed, const GraphicsPipeline* pipeline) noexcept;
     [[nodiscard]] bool ShouldSkipDepthOnlyGeometry(bool is_indexed) noexcept;
     void ClearSkippedGeometryIfDrawn(bool is_indexed) noexcept;
 
-    void DrainReadyDiskPipelines();
-    [[nodiscard]] bool CanSkipForDiskReplay() const noexcept;
+    /// Asks the preparation for graphics_key. True when graphics_cache now holds it.
+    [[nodiscard]] bool TakePreparedGraphics();
+    /// Asks the preparation for the prepared variants of key: the first becomes entry.pipeline
+    /// when entry has none, the others alternates. True when entry got a pipeline.
+    bool TakePreparedCompute(const ComputePipelineCacheKey& key, ComputePipelineCacheEntry& entry);
+    /// A preparation worker: loads and builds records until the generation ends.
+    void RunPreparation(u64 generation);
+    /// Whether a recorded pipeline may be queued for the cache file (counts it as skipped when not).
+    [[nodiscard]] bool ReserveRecord();
+    [[nodiscard]] VideoCommon::CacheEnvelope::RecordMeta NextRecordMeta(
+        VideoCommon::CacheEnvelope::RecordKind kind, std::chrono::steady_clock::duration build);
 
     /// Nx2Perf shader_build_budget: whether a new graphics pipeline is left unbuilt this frame.
     [[nodiscard]] bool DeferRuntimeBuild();
@@ -230,6 +240,7 @@ private:
         GraphicsEnvironmentArray envs;
         std::promise<void> done;
         std::chrono::steady_clock::time_point queued_at;
+        u64 work{}; ///< Attribution id of the translation job
     };
     struct QueuedGraphicsTranslation {
         std::shared_future<void> done;
@@ -252,14 +263,15 @@ private:
     /// Runs on a translation worker, or on the GPU thread for a claimed translation.
     void TranslateGraphicsPipeline(const GraphicsPipelineCacheKey& key,
                                    GraphicsEnvironmentArray envs, std::promise<void> done,
-                                   std::chrono::steady_clock::time_point queued_at);
+                                   std::chrono::steady_clock::time_point queued_at, u64 work);
 
     /// Moves the pipelines the workers finished into graphics_cache (GPU thread).
     void AdoptTranslatedGraphicsPipelines();
 
-    /// Queues a new pipeline's environments for the disk cache (GPU thread).
+    /// Queues a new pipeline's environments for the cache file (GPU thread). `build` is what the
+    /// pipeline took to make.
     void StoreGraphicsPipeline(const GraphicsPipelineCacheKey& key, GraphicsEnvironmentArray envs,
-                               bool is_mesh);
+                               bool is_mesh, std::chrono::steady_clock::duration build);
 
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline(
         ShaderPools& pools, const GraphicsPipelineCacheKey& key,
@@ -286,10 +298,13 @@ private:
                                                     bool cache_only = false);
 
     void SerializeVulkanPipelineCache(const std::filesystem::path& filename,
-                                      const vk::PipelineCache& pipeline_cache, u32 cache_version);
+                                      const vk::PipelineCache& pipeline_cache);
 
     vk::PipelineCache LoadVulkanPipelineCache(const std::filesystem::path& filename,
-                                              u32 expected_cache_version);
+                                              VideoCommon::CacheEnvelope::CacheLoadResult& result);
+
+    [[nodiscard]] VideoCommon::CacheEnvelope::CacheIdentity MakeCacheIdentity(
+        VideoCommon::CacheEnvelope::PayloadKind kind) const;
 
     void QueueVulkanPipelineCacheFlush();
 
@@ -346,10 +361,7 @@ private:
     /// Task and mesh pipelines, with the mesh state they are translated with.
     std::filesystem::path mesh_pipeline_cache_filename;
 
-    /// Key hashes of the graphics pipelines in the disk cache. Only those a recent session used
-    /// (used_pipelines) are built at boot; the rest are built when first needed, and not stored
-    /// again. Each built pipeline holds driver memory (title 1: 6.5k cached, a quarter used).
-    std::unordered_set<u64> disk_pipelines;
+    /// Key hashes of the pipelines used this session, for the vulkan_used admission hint.
     std::unordered_map<u64, u8> used_pipelines; ///< Key hash -> sessions since it was last used
     std::unordered_set<const GraphicsPipeline*> used_this_session;
     std::filesystem::path used_pipelines_filename;
@@ -367,9 +379,6 @@ private:
         u64 key{};
         u64 frame{};
         const GraphicsPipeline* pipeline{};
-        /// Key hash of a disk record's replay that was running when the draw was skipped (the
-        /// pipeline does not exist yet): the geometry stops being skipped when it is done.
-        u64 replay_hash{};
     };
     /// Whether the skipped draw of an entry still has no pipeline to submit with.
     [[nodiscard]] bool GeometryEntryPending(const SkippedGeometryEntry& entry) const noexcept;
@@ -395,53 +404,34 @@ private:
     std::atomic<size_t> last_cache_size{};
     std::atomic_bool flush_in_flight{};
 
-    ::Common::unordered_map<GraphicsPipelineCacheKey, std::vector<VideoCommon::FileEnvironment>>
-        skipped_disk_envs;
-    std::unordered_set<u64> in_flight_disk_replays;
-    std::mutex ready_disk_pipelines_mutex;
-    std::vector<std::pair<GraphicsPipelineCacheKey, std::unique_ptr<GraphicsPipeline>>>
-        ready_disk_pipelines;
-    std::atomic_bool ready_disk_pipelines_pending{};
-    u64 disk_replayed_count{};
+    /// The title's cache files and the preparation over them (pipeline_prepare.h). Null until
+    /// LoadDiskResources.
+    std::unique_ptr<PipelineCacheSession> cache_session;
+    /// Whether a preparation generation runs: the one branch a draw that misses the live caches
+    /// pays while the feature is idle.
+    std::atomic_bool prepare_active{};
+    u32 record_ordinal{}; ///< GPU thread
+    u64 first_frame_ns{}; ///< NowNs() at the first TickFrame, 0 before
+    u64 demanded_hash{};  ///< GPU thread: key hash of the last demand that found its record
 
     Common::ThreadWorker workers;
     Common::ThreadWorker disk_replay_workers;
     Common::ThreadWorker serialization_thread;
     DynamicFeatures dynamic_features;
 
-    /// Cached graphics pipelines boot skipped (not in used_pipelines) are built on background
-    /// threads once the game runs, so a draw that needs one finds it built instead of translating
-    /// it on the GPU thread. EDEN_NX2_BACKGROUND_PIPELINES=0 turns it off.
-    /// With claim_if_missing, a miss marks the key as built by the GPU thread, which skips or drops
-    /// its background build; pass it only when the GPU thread really builds the pipeline.
-    std::unique_ptr<GraphicsPipeline> TakeBackgroundPipeline(const GraphicsPipelineCacheKey& key,
-                                                             bool claim_if_missing);
-    void StopBackgroundPipelines();
     /// Pipeline driver-build and translation pools: all their threads while the disk cache loads,
     /// their share of the host's cores after it (Nx2Perf worker_budget).
     void SetWorkerBudget(bool after_boot);
-    std::mutex background_mutex;
-    /// Built and not yet asked for by a draw.
-    std::unordered_map<GraphicsPipelineCacheKey, std::unique_ptr<GraphicsPipeline>> background_ready;
-    /// Keys the GPU thread built itself meanwhile: their background build is skipped or dropped.
-    std::unordered_set<GraphicsPipelineCacheKey> background_claimed;
-    std::atomic_bool background_active{};
-    std::atomic_bool background_stop{};
-    std::atomic<size_t> background_left{};
-    size_t background_taken{}; ///< Under background_mutex
-    std::chrono::steady_clock::time_point background_start{};
-    /// Last: destroyed (its threads joined) before the state above.
-    std::unique_ptr<Common::ThreadWorker> background_workers;
+    /// Ends the title's cache session: cancels the preparation and joins its workers, closes the
+    /// cache files, commits the recorded generation, then publishes the report.
+    void FinishCacheSession();
 
     /// Shader precache ("Pre-compile shaders" in the game list): the compute programs of the
     /// title's precache file, made from the game files with the reads it lacks guessed, are built
     /// on background threads once the boot is done, then thrown away. They only fill the driver's
     /// shader cache, so a dispatch that converts to the same SPIR-V finds the driver's work done.
     /// A marker skips it after it ran to the end for this driver and device.
-    void StartShaderPrecache(
-        u64 title_id,
-        std::unordered_map<ComputePipelineCacheKey, std::vector<VideoCommon::FileEnvironment>>
-            programs = {});
+    void StartShaderPrecache(u64 title_id);
     void StopShaderPrecache();
     /// Precache builds wait while the game builds pipelines (queued translations or driver
     /// compiles, or a pipeline built in the last moments): they share the CPU and the driver.
@@ -468,10 +458,8 @@ private:
     std::atomic<size_t> precache_left{};
     std::atomic<size_t> precache_built{};
     std::chrono::steady_clock::time_point precache_start{};
-    /// Key hashes of precache programs, including deferred disk records (set before game runs).
+    /// Key hashes of the precache file's programs (set before the game runs).
     std::unordered_set<u64> precache_keys;
-    /// Deferred driver-cache misses: first use waits for an in-flight build without a timeout.
-    std::unordered_set<ComputePipelineCacheKey> deferred_precache_keys;
     size_t new_compute_pipelines{}; ///< GPU thread
     size_t precached_compute_pipelines{}; ///< Of those, in the precache file (GPU thread)
     /// Last: destroyed (its threads joined) before the state above.
