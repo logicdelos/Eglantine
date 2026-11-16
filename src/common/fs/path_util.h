@@ -230,6 +230,16 @@ template <typename Path>
 void SetAppDirectory(const std::string& app_directory);
 
 /**
+ * Moves every Eden path (data, configuration, cache, shader cache, logs) below `root`, in the
+ * portable layout: data directly in it, configuration in "config", cache in "cache". Nothing is
+ * created on disk. Call it before anything reads a path: copies already taken are not updated.
+ * The paths of other emulators (legacy paths) are not changed.
+ *
+ * @param root Directory to use as the user directory.
+ */
+void UseUserDirectory(const std::filesystem::path& root);
+
+/**
  * Gets the filesystem path associated with the EdenPath enum.
  *
  * @param eden_path EdenPath enum

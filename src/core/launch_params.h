@@ -23,6 +23,9 @@ struct LaunchParams {
     std::string input_profile{};
     std::string program_args{};
     std::optional<std::string> config_path{};
+    // --user-dir <path>: the user directory of this run (applied before the full parse, see
+    // EarlyOptions).
+    std::optional<std::string> user_dir{};
     std::optional<int> selected_user{};
     bool enable_gdbstub = false;
     std::optional<u16> override_gdb_port{};
@@ -74,6 +77,10 @@ struct LaunchParams {
 struct EarlyOptions {
     // --version together with --json (written out in full).
     bool version_json = false;
+    // --user-dir <path> or --user-dir=<path>, as spelled.
+    std::optional<std::string> user_dir{};
+    // The first mistake in those options (no value, given twice); empty when there is none.
+    std::string error{};
 };
 
 EarlyOptions ScanEarlyOptions(int argc, char* argv[]) noexcept;

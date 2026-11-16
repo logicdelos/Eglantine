@@ -38,6 +38,8 @@ add_executable(yuzu-cmd
     run_report.h
     sdl_config.cpp
     sdl_config.h
+    user_dir.cpp
+    user_dir.h
     version_info.cpp
     version_info.h
     yuzu.cpp

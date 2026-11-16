@@ -66,6 +66,7 @@
 #include "video_core/renderer_base.h"
 #include "video_core/shader_warm/shader_warm_builder.h"
 #include "yuzu_cmd/run_report.h"
+#include "yuzu_cmd/user_dir.h"
 #include "yuzu_cmd/version_info.h"
 #include "yuzu_cmd/emu_window/emu_window_sdl3.h"
 #ifdef HAS_OPENGL
@@ -552,10 +553,24 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
 
     // Options that must act before the user directory, the log, the crash handler and Core::System
     // exist. They are found by a scan of their own; the full parse needs a Core::System.
-    if (Core::ScanEarlyOptions(argc, argv).version_json) {
+    const Core::EarlyOptions early = Core::ScanEarlyOptions(argc, argv);
+    if (early.version_json) {
         fmt::print("{}", VersionInfo::BuildInfoJson());
         std::fflush(stdout);
         return SDL_APP_SUCCESS;
+    }
+    // A bad --user-dir ends the run here, with the code of bad arguments: there is no log, no
+    // report and no Common::RunOutcome yet, and the default user directory is left alone.
+    std::string user_dir_error = early.error;
+    if (user_dir_error.empty() && early.user_dir) {
+        user_dir_error = UserDir::Use(*early.user_dir);
+        if (!user_dir_error.empty()) {
+            user_dir_error = "--user-dir: " + user_dir_error;
+        }
+    }
+    if (!user_dir_error.empty()) {
+        fmt::print(stderr, "{}\n", user_dir_error);
+        std::exit(Common::RunOutcome::ExitCode(Common::RunOutcome::Reason::BadArguments));
     }
 
     SdlState* state = new SdlState();
@@ -596,6 +611,10 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     // order, and says how (Common::RunOutcome, RunReport). Without them none of that is active.
     const bool unattended = lp.report_path || lp.run_seconds || lp.run_frames;
     std::string argument_error = lp.parse_error;
+    if (argument_error.empty() && lp.user_dir != early.user_dir) {
+        // Only the spelled-out option was applied, before the user directory was first read.
+        argument_error = "--user-dir must be spelled out in full, not abbreviated";
+    }
     if (argument_error.empty() && unattended && !lp.unknown_option.empty()) {
         argument_error = "unknown option, or an option without its argument: " + lp.unknown_option;
     }

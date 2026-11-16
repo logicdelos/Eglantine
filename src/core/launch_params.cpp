@@ -73,11 +73,18 @@ static std::optional<u64> ParseFrames(const char* text) {
 }
 
 /// See EarlyOptions. Mirrors only what getopt would find for the spelled-out option names; an
-/// abbreviation is left to ParseLaunchParams. The values of -p and -x are skipped: they take the
-/// next argument whatever it says.
+/// abbreviation is left to ParseLaunchParams. The values of -p, -x and --user-dir are skipped:
+/// they take the next argument whatever it says.
 EarlyOptions ScanEarlyOptions(int argc, char* argv[]) noexcept {
+    constexpr std::string_view user_dir_equals = "--user-dir=";
     bool version = false;
     bool json = false;
+    EarlyOptions early{};
+    const auto fail = [&early](std::string message) {
+        if (early.error.empty()) {
+            early.error = std::move(message);
+        }
+    };
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg{argv[i]};
         if (arg == "--") {
@@ -89,9 +96,24 @@ EarlyOptions ScanEarlyOptions(int argc, char* argv[]) noexcept {
             version = true;
         } else if (arg == "--json") {
             json = true;
+        } else if (arg == "--user-dir" || arg.starts_with(user_dir_equals)) {
+            std::string value;
+            if (arg == "--user-dir") {
+                if (i + 1 < argc) {
+                    value = argv[++i];
+                }
+            } else {
+                value = std::string{arg.substr(user_dir_equals.size())};
+            }
+            if (value.empty()) {
+                fail("--user-dir needs a directory");
+            } else if (early.user_dir) {
+                fail("--user-dir was given more than once");
+            } else {
+                early.user_dir = std::move(value);
+            }
         }
     }
-    EarlyOptions early{};
     early.version_json = version && json;
     return early;
 }
@@ -134,6 +156,7 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
         {"run-seconds", required_argument, 0, 0x109},
         {"run-frames", required_argument, 0, 0x10A},
         {"json", no_argument, 0, 0x10B},
+        {"user-dir", required_argument, 0, 0x10C},
         {0, 0, 0, 0},
         // clang-format on
     };
@@ -320,6 +343,15 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
             case 0x10B:
                 p.print_json = true;
                 break;
+            case 0x10C:
+                if (optarg[0] == '\0') {
+                    fail("--user-dir needs a directory");
+                } else if (p.user_dir.has_value()) {
+                    fail("--user-dir was given more than once");
+                } else {
+                    p.user_dir = std::string(optarg);
+                }
+                break;
             case '?':
                 // An unknown option, or one without its argument. Only an automated run
                 // (--report, --run-seconds, --run-frames) refuses it, so nothing else changes.
@@ -408,6 +440,8 @@ void ApplyLaunchParams(LaunchParams const& lp) noexcept {
             " Nickname, password, address and port for multiplayer\n"
             "-p, --program         Pass following string as arguments to executable\n"
             "-u, --user            Select a specific user profile from 0 to 7\n"
+            "--user-dir <path>     Use this directory as the user directory (configuration, saves,\n"
+            "                      shader cache, logs) for this run; created when missing. Spell it out in full\n"
             "-d, --debug           Run the GDB stub on a port from 1 to 65535\n"
             "-v, --version         Output version information and exit\n"
             "--version --json      Print the build identity (version, revision, compiler, options) as one\n"

@@ -31,6 +31,7 @@ extern char** environ;
 #include <nlohmann/json.hpp>
 
 #include "common/fs/fs_util.h"
+#include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/nx2_bottleneck.h"
 #include "common/scm_rev.h"
@@ -289,6 +290,11 @@ Json LimitsJson() {
     return json;
 }
 
+/// The user directory this run used: --user-dir, else the default one.
+std::string UserDirText() {
+    return Common::FS::PathToUTF8String(Common::FS::GetEdenPath(Common::FS::EdenPath::EdenDir));
+}
+
 /// Everything in the file, taken in one go (the recording is consumed).
 std::string Document(State& state, Common::RunOutcome::Reason reason, int code,
                      bool shutdown_complete, std::string_view detail) {
@@ -324,6 +330,7 @@ std::string Document(State& state, Common::RunOutcome::Reason reason, int code,
     Json document = Json::object();
     document["schema_version"] = kSchemaVersion;
     document["build"] = BuildJson();
+    document["user_dir"] = UserDirText();
     document["title_id"] = state.title_id ? Json(fmt::format("{:016X}", *state.title_id))
                                           : Json(nullptr);
     document["limits"] = LimitsJson();
@@ -637,6 +644,7 @@ void RebuildCrashDocument(State& state) {
     Json fixed = Json::object();
     fixed["schema_version"] = kSchemaVersion;
     fixed["build"] = BuildJson();
+    fixed["user_dir"] = UserDirText();
     fixed["title_id"] = state.title_id ? Json(fmt::format("{:016X}", *state.title_id))
                                       : Json(nullptr);
     fixed["limits"] = LimitsJson();
