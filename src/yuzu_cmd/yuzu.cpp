@@ -124,31 +124,31 @@ static void OnNetworkError(const Network::RoomMember::Error& error) {
         break;
     case Network::RoomMember::Error::CouldNotConnect:
         LOG_ERROR(Network, "Error: Could not connect");
-        exit(1);
+        RunReport::ExitWithFailure("could not connect to the room");
         break;
     case Network::RoomMember::Error::NameCollision:
         LOG_ERROR(
             Network,
             "You tried to use the same nickname as another user that is connected to the Room");
-        exit(1);
+        RunReport::ExitWithFailure("the nickname is in use in the room");
         break;
     case Network::RoomMember::Error::IpCollision:
         LOG_ERROR(Network, "You tried to use the same fake IP-Address as another user that is "
                            "connected to the Room");
-        exit(1);
+        RunReport::ExitWithFailure("the fake IP address is in use in the room");
         break;
     case Network::RoomMember::Error::WrongPassword:
         LOG_ERROR(Network, "Room replied with: Wrong password");
-        exit(1);
+        RunReport::ExitWithFailure("the room refused the password");
         break;
     case Network::RoomMember::Error::WrongVersion:
         LOG_ERROR(Network,
                   "You are using a different version than the room you are trying to connect to");
-        exit(1);
+        RunReport::ExitWithFailure("the room runs a different version");
         break;
     case Network::RoomMember::Error::RoomIsFull:
         LOG_ERROR(Network, "The room is full");
-        exit(1);
+        RunReport::ExitWithFailure("the room is full");
         break;
     case Network::RoomMember::Error::HostKicked:
         LOG_ERROR(Network, "You have been kicked by the host");

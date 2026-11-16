@@ -24,6 +24,7 @@
 #include "input_common/main.h"
 #include "video_core/renderer_base.h"
 #include "yuzu_cmd/emu_window/emu_window_sdl3_gl.h"
+#include "yuzu_cmd/run_report.h"
 
 namespace {
 void* SDLGLGetProcAddress(const char* proc_name) {
@@ -108,7 +109,7 @@ EmuWindow_SDL3_GL::EmuWindow_SDL3_GL(InputCommon::InputSubsystem* input_subsyste
 
     if (render_window == nullptr) {
         LOG_CRITICAL(Frontend, "Failed to create SDL3 window! {}", SDL_GetError());
-        exit(1);
+        RunReport::ExitWithFailure("the window was not created");
     }
 
     strict_context_required = strcmp(SDL_GetCurrentVideoDriver(), "wayland") == 0;
@@ -125,21 +126,21 @@ EmuWindow_SDL3_GL::EmuWindow_SDL3_GL(InputCommon::InputSubsystem* input_subsyste
 
     if (window_context == nullptr) {
         LOG_CRITICAL(Frontend, "Failed to create SDL3 GL context: {}", SDL_GetError());
-        exit(1);
+        RunReport::ExitWithFailure("the GL context was not created");
     }
     if (core_context == nullptr) {
         LOG_CRITICAL(Frontend, "Failed to create shared SDL3 GL context: {}", SDL_GetError());
-        exit(1);
+        RunReport::ExitWithFailure("the shared GL context was not created");
     }
 
     if (!gladLoadGLLoader(static_cast<GLADloadproc>(SDLGLGetProcAddress))) {
         LOG_CRITICAL(Frontend, "Failed to initialize GL functions! {}", SDL_GetError());
-        exit(1);
+        RunReport::ExitWithFailure("the GL functions did not load");
     }
 
     if (!SupportsRequiredGLExtensions()) {
         LOG_CRITICAL(Frontend, "GPU does not support all required OpenGL extensions! Exiting...");
-        exit(1);
+        RunReport::ExitWithFailure("the GPU does not support the required OpenGL extensions");
     }
 
     OnResize();

@@ -799,4 +799,17 @@ bool Publish(Common::RunOutcome::Reason reason, int code, bool shutdown_complete
     return state.published_ok;
 }
 
+void ExitWithFailure(std::string_view detail) {
+    int code = 1;
+    if (Common::RunOutcome::Active()) {
+        Common::RunOutcome::Request(Common::RunOutcome::Reason::StartupError, detail);
+        const Common::RunOutcome::Reason reason = Common::RunOutcome::CurrentReason();
+        code = Common::RunOutcome::ExitCode(reason);
+        if (!Publish(reason, code, false, Common::RunOutcome::Detail())) {
+            code = Common::RunOutcome::ExitCode(Common::RunOutcome::Reason::ReportIoError);
+        }
+    }
+    std::exit(code);
+}
+
 } // namespace RunReport

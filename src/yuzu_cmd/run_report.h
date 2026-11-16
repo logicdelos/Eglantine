@@ -42,4 +42,10 @@ void SetTitleId(u64 program_id);
 [[nodiscard]] bool Publish(Common::RunOutcome::Reason reason, int code, bool shutdown_complete,
                            std::string_view detail);
 
+/// Ends the process after a failure that cannot return to the frontend's own shutdown (a window
+/// constructor, a network callback). In an unattended run the failure is recorded as a startup
+/// error and the report is written first, and the exit code is the one of the reason on record;
+/// otherwise the code is 1.
+[[noreturn]] void ExitWithFailure(std::string_view detail);
+
 } // namespace RunReport

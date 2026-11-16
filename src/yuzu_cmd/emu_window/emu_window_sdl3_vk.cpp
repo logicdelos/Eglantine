@@ -18,6 +18,7 @@
 #include "common/scm_rev.h"
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
 #include "yuzu_cmd/emu_window/emu_window_sdl3_vk.h"
+#include "yuzu_cmd/run_report.h"
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_properties.h>
@@ -55,7 +56,7 @@ EmuWindow_SDL3_VK::EmuWindow_SDL3_VK(InputCommon::InputSubsystem* input_subsyste
             SDL_GetPointerProperty(window_props, SDL_PROP_WINDOW_WAYLAND_SURFACE_POINTER, nullptr);
         if (wl_surface == nullptr) {
             LOG_CRITICAL(Frontend, "Wayland surface is unavailable");
-            std::exit(EXIT_FAILURE);
+            RunReport::ExitWithFailure("the Wayland surface is unavailable");
         }
         window_info.type = Core::Frontend::WindowSystemType::Wayland;
         window_info.display_connection = wl_display;
@@ -68,7 +69,7 @@ EmuWindow_SDL3_VK::EmuWindow_SDL3_VK(InputCommon::InputSubsystem* input_subsyste
             SDL_GetNumberProperty(window_props, SDL_PROP_WINDOW_X11_WINDOW_NUMBER, 0);
         if (x11_window == 0) {
             LOG_CRITICAL(Frontend, "X11 window handle is unavailable");
-            std::exit(EXIT_FAILURE);
+            RunReport::ExitWithFailure("the X11 window handle is unavailable");
         }
         window_info.type = Core::Frontend::WindowSystemType::X11;
         window_info.display_connection = x11_display;
@@ -85,7 +86,7 @@ EmuWindow_SDL3_VK::EmuWindow_SDL3_VK(InputCommon::InputSubsystem* input_subsyste
         window_info.render_surface = android_window;
     } else {
         LOG_CRITICAL(Frontend, "Unable to determine native window backend from SDL properties");
-        std::exit(EXIT_FAILURE);
+        RunReport::ExitWithFailure("the native window backend is unknown");
     }
 
     OnResize();
