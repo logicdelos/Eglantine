@@ -53,7 +53,10 @@ enum class MemoryAttribute : u32 {
     DeviceShared = (1 << 2),
     Uncached = (1 << 3),
     PermissionLocked = (1 << 4),
-    GpuAccessible = (1 << 5), // Switch 2 (svc 0x80)
+    GpuAccessible = (1 << 5), // Switch 2 (svc 0x80); the SVC wiki names bit 5 "GpuSharable"
+    // Switch 2: SVC wiki bit 6 "GpuShared", listed without a description. Nothing in this tree
+    // sets it, so QueryMemory never reports it (SetMemoryAttribute/0x80 reject it too).
+    GpuShared = (1 << 6),
 };
 DECLARE_ENUM_FLAG_OPERATORS(MemoryAttribute);
 
@@ -166,18 +169,21 @@ enum class InfoType : u32 {
     // ASLR regions during nnosInitialize; likely the VAMM address-space region.
     Nx2RegionAddress = 29,
     Nx2RegionSize = 30,
-    // Switch 2 kernels: nn::os::GetRemoteMemoryUsage returns {id 31, id 32}; used by
-    // nn::gsv/nn::nvsrv BootWithRemoteMemory (memory set aside for the graphics stack).
-    Nx2RemoteMemorySize = 31,
-    Nx2RemoteMemoryUsed = 32,
+    // Switch 2 kernels: RemoteMemoryUsage and RemoteMemoryUsagePeak (Switchbrew SVC InfoType);
+    // nn::os::GetRemoteMemoryUsage returns {id 31, id 32}, and the last u64 of
+    // nn::gsv::BootWithRemoteMemory is the output of one of them.
+    RemoteMemoryUsage = 31,
+    RemoteMemoryUsagePeak = 32,
     // Switch 2 kernels: a page granule. The SDK aligns module ranges and VAMM's first
     // MapPhysicalMemory to it.
     Nx2VammSize = 33,
 
     TransferMemoryHint = 34,
 
-    Unknown37 = 37,
-    Unknown38 = 38,
+    // 23.0.0+ (Switchbrew SVC, Atmosphere svc_types_common.hpp).
+    AddressSpaceSize = 36,
+    ShadowStackRegionAddress = 37,
+    ShadowStackRegionSize = 38,
 
     MesosphereMeta = 65000,
     MesosphereCurrentProcess = 65001,

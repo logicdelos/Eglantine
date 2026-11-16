@@ -55,6 +55,21 @@ public:
         return m_address;
     }
 
+    /// Offset of the source address inside the largest page size the memory could be mapped with
+    /// (InfoType::TransferMemoryHint, same rule as Atmosphere's KTransferMemory::GetHint).
+    uintptr_t GetHint() const {
+        const size_t size = GetSize();
+        const uintptr_t address = GetInteger(m_address);
+        if (size >= 0x200000) {
+            return address & (0x200000 - 1);
+        } else if (size >= 0x10000) {
+            return address & (0x10000 - 1);
+        } else if (size >= 0x1000) {
+            return address & (0x1000 - 1);
+        }
+        return 0;
+    }
+
     size_t GetSize() const;
 
     Result Map(KernelCore& kernel, KProcessAddress address, size_t size, Svc::MemoryPermission map_perm);

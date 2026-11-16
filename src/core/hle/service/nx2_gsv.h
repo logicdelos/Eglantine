@@ -137,6 +137,16 @@ inline Kernel::KClientSession* CreateRawSession(Core::System& system, HLERequest
     return &session->GetClientSession();
 }
 
+// EDEN_NX2_GSV=legacy (read once): the nx2:gpu command routing from before the GSV-services
+// numbering pass, i.e. 201-203 always the GpuSession commands and 204/205/207 left unhandled.
+inline bool Nx2GsvLegacy() {
+    static const bool legacy = [] {
+        const char* value = std::getenv("EDEN_NX2_GSV");
+        return value != nullptr && std::string_view{value} == "legacy";
+    }();
+    return legacy;
+}
+
 // Replies to a TIPC request with success and raw u32 data words. ResponseBuilder::Push(Result)
 // writes the CMIF two-word result, which shifts TIPC data one word past where the client reads
 // it (and past the copied size); TIPC has a one-word result followed directly by the data.
@@ -380,9 +390,20 @@ public:
             {33, &INx2GpuSession::GetCount33, "CreateGpuAddressSpace"},
             {41, &INx2GpuSession::CreateGraphicsDevice, "CreateGraphicsDevice"},
             {42, &INx2GpuSession::DestroyGraphicsDevice, "DestroyGraphicsDevice"},
-            {201, &INx2GpuSession::GetUserPartition, "GetUserPartitionGpuAddress"},
-            {202, &INx2GpuSession::GetGsvPartition, "GetGsvPartitionGpuAddress"},
-            {203, &INx2GpuSession::GetVaRange, "GetVaRange (guessed)"},
+            // 201-207 are KUserWorker commands on SDK 19.0.0-19.1.0 (see Sdk19Request).
+            {201, &INx2GpuSession::Command201, "GetUserPartitionGpuAddress / [19.x] NormalMapGpuMemory4K"},
+            {202, &INx2GpuSession::Command202, "GetGsvPartitionGpuAddress / [19.x] NormalUnmapGpuMemory4K"},
+            {203, &INx2GpuSession::Command203, "GetVaRange (guessed) / [19.x] CreateSparseRegion"},
+            {204, &INx2GpuSession::Command204, "[19.x] DestroySparseRegion"},
+            {205, &INx2GpuSession::Command205, "[19.x] ExecuteSparseMapRequests"},
+            {207, &INx2GpuSession::Command207, "[19.x] NormalModifyMemoryKind4K"},
+            // Documented, not called by FE or XC2 (no model: the stub's success and zeroed words).
+            {171, &INx2GpuSession::StubReplyZeroed, "EnsureGpuMemoryComptags"},
+            {172, &INx2GpuSession::StubReplyZeroed, "SetGpuMemoryUserDebugLabel"},
+            {173, &INx2GpuSession::StubReplyZeroed, "SetGpuMemorySdkDebugLabel"},
+            {200, &INx2GpuSession::StubReplyZeroed, "SynchronizeGpuAddressSpace"},
+            {209, &INx2GpuSession::StubReplyZeroed, "[20.x] SetGpuSegmentUserDebugLabel"},
+            {210, &INx2GpuSession::StubReplyZeroed, "[20.x] SetGpuSegmentSdkDebugLabel"},
             // KUserWorkerSession commands (22 hands out that session; this same object answers).
             {101, &INx2GpuSession::SubRegisterMemory, "CreateGpuMemory"},
             {102, &INx2GpuSession::SubDestroyMemory, "DestroyGpuMemory"},
@@ -503,6 +524,76 @@ private:
         CountPlaceholderReply(ctx, "GpuGetGsvPartition");
         LOG_WARNING(Service, "(STUBBED) nx2:gpu TIPC 202 [2]={:#x}, empty", ctx.CommandBuffer()[2]);
         TipcReplyWords(ctx, {~0U, ~0U, 0, 0});
+    }
+
+    // KUserWorker of SDK 19.0.0-19.1.0 numbers its calls 201-207 (211-216 from 20.0.0, GSV
+    // services). 201-203 collide with GpuSession's 201/202 and the 203 above, which take one u32
+    // (an address space id); KUserWorker requests carry the job words, the slot at word 8 or
+    // later. A request of 7+ data words is therefore the SDK 19 form and runs the handler of its
+    // 211-216 twin. [INFERENCE] the SDK 19 request layouts equal the SDK 20 ones. No test title
+    // is on SDK 19 (FE and XC2 send the one-word GpuSession form); EDEN_NX2_GSV=legacy keeps
+    // 201-203 GpuSession-only and answers 204/205/207 with the zeroed auto stub reply.
+    static bool Sdk19Request(HLERequestContext& ctx) {
+        return !Nx2GsvLegacy() && (ctx.CommandBuffer()[1] & 0x3ff) >= 7;
+    }
+
+    void LogSdk19Once(HLERequestContext& ctx, std::string_view name, u32 sdk20_command) {
+        const u32 command = static_cast<u32>(ctx.GetCommand());
+        const u32 bit = 1U << (command - 200);
+        if ((m_sdk19_logged.fetch_or(bit) & bit) == 0) {
+            LOG_WARNING(Service,
+                        "nx2:gpu TIPC {} {} (SDK 19.x numbering) served by the {} handler, "
+                        "request layout assumed equal [INFERENCE]",
+                        command, name, sdk20_command);
+        }
+    }
+
+    void Command201(HLERequestContext& ctx) {
+        if (!Sdk19Request(ctx)) {
+            return GetUserPartition(ctx);
+        }
+        LogSdk19Once(ctx, "NormalMapGpuMemory4K", 211);
+        SubSubmitJob(ctx);
+    }
+
+    void Command202(HLERequestContext& ctx) {
+        if (!Sdk19Request(ctx)) {
+            return GetGsvPartition(ctx);
+        }
+        LogSdk19Once(ctx, "NormalUnmapGpuMemory4K", 213);
+        SubUnmapJob(ctx);
+    }
+
+    void Command203(HLERequestContext& ctx) {
+        if (!Sdk19Request(ctx)) {
+            return GetVaRange(ctx);
+        }
+        LogSdk19Once(ctx, "CreateSparseRegion", 214);
+        SubCreateGpuOnlyRegion(ctx);
+    }
+
+    void Command204(HLERequestContext& ctx) {
+        if (Nx2GsvLegacy()) {
+            return StubReplyZeroed(ctx);
+        }
+        LogSdk19Once(ctx, "DestroySparseRegion", 215);
+        SubDestroySparseRegion(ctx);
+    }
+
+    void Command205(HLERequestContext& ctx) {
+        if (Nx2GsvLegacy()) {
+            return StubReplyZeroed(ctx);
+        }
+        LogSdk19Once(ctx, "ExecuteSparseMapRequests", 216);
+        SubSparseMap(ctx);
+    }
+
+    void Command207(HLERequestContext& ctx) {
+        if (Nx2GsvLegacy()) {
+            return StubReplyZeroed(ctx);
+        }
+        LogSdk19Once(ctx, "NormalModifyMemoryKind4K", 212);
+        SubModifyKind(ctx);
     }
 
     // Fire Emblem: Fortune's Weave: 41(name u64, flags u64, debug label u64) returns a device id
@@ -1492,6 +1583,7 @@ private:
     std::map<u32, GpuMemory> m_memory;
     u32 m_next_memory_handle{1};
     std::array<bool, 64> m_devices{}; // gpu 41 graphics device ids (0 unused)
+    std::atomic<u32> m_sdk19_logged{}; // bit (command - 200) once its SDK 19 routing was logged
 
     // Every 30 s: the backing of sparse blocks and GPU-only regions is marked cold. The game
     // writes it once (texture uploads by 2D blits: title 1 fills 2-4 GB of texture pools) and it
@@ -1799,6 +1891,10 @@ public:
             {111, &INx2Vi2Session::StubReplyZeroed, "Unknown111"},
             {112, &INx2Vi2Session::StubReplyZeroed, "Unknown112"},
             {113, &INx2Vi2Session::StubReplyZeroed, "Unknown113"},
+            // 201(u64 client token, u32 2, u32 3): sent once per boot by both titles, right before
+            // the first 229 and with that 229's token; the layer commands 212/228/229 take the same
+            // token. Zeroed reply, as the auto stub gave; both titles carry on after it.
+            {201, &INx2Vi2Session::StubReplyZeroed, "Unknown201"},
             {202, &INx2Vi2Session::StubReplyZeroed, "Unknown202"},
             {230, &INx2Vi2Session::StubReplyZeroed, "Unknown230"},
             {231, &INx2Vi2Session::StubReplyZeroed, "Unknown231"},
@@ -3732,7 +3828,8 @@ public:
     explicit INx2GraphicsSystemSession(Core::System& system_)
         : ServiceFramework{system_, "nx2:gsv"}, m_context{system_, "nx2:gsv"} {
         RegisterHandlersTipc({
-            {4, &INx2GraphicsSystemSession::Stub, "BootWithRemoteMemory"},
+            {1, &INx2GraphicsSystemSession::StubReplyZeroed, "BootWithTransferMemory"},
+            {4, &INx2GraphicsSystemSession::BootWithRemoteMemory, "BootWithRemoteMemory"},
             {5, &INx2GraphicsSystemSession::Stub, "Unknown5"},
             {101, &INx2GraphicsSystemSession::Stub, "CreateContext"},
             {202, &INx2GraphicsSystemSession::OpenSyncptSession, "InitializeSyncptContext"},
@@ -3752,6 +3849,8 @@ public:
             {428, &INx2GraphicsSystemSession::QueryNativeImage, "QueryNativeImage"},
             {435, &INx2GraphicsSystemSession::CalculateNativeImageSize, "CalculateNativeImageSize"},
             {1402, &INx2GraphicsSystemSession::OpenNvsrvSession, "CreateNvDrv2UserSessionWithRemoteMemory"},
+            {1411, &INx2GraphicsSystemSession::GetNvDrv2UserTransferMemoryUsage,
+             "GetNvDrv2UserTransferMemoryUsage"},
             {1510, &INx2GraphicsSystemSession::CalculateRequirements, "CalculateRequirements"},
             {991, &INx2GraphicsSystemSession::CalculateDecoderImagePoolBuffer,
              "CalculateDecoderImagePoolBuffer"},
@@ -3808,7 +3907,6 @@ public:
             {403, &INx2GraphicsSystemSession::CheckPermission, "DestroyGpuContext"},
             {424, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown424"},
             {425, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown425"},
-            {427, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown427"},
             {434, &INx2GraphicsSystemSession::AttachGpuAddressSpace, "ExistsAddressSpace"},
             {436, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown436"},
             {461, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown461"},
@@ -3842,9 +3940,9 @@ public:
             {1091, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown1091"},
             {1101, &INx2GraphicsSystemSession::CheckPermission, "CreateGraphicsFrameContext"},
             {1102, &INx2GraphicsSystemSession::CheckPermission, "InitializeGraphicsFrameContext"},
-            {1111, &INx2GraphicsSystemSession::SetFeatureVersion, "SetGraphicsFrameLengthMode"},
-            {1112, &INx2GraphicsSystemSession::StubReplyZeroed, "SetGraphicsFrameRestartMode"},
-            {1113, &INx2GraphicsSystemSession::StubReplyZeroed, "SetGraphicsFrameGpuTimesliceMode"},
+            {1111, &INx2GraphicsSystemSession::SetGraphicsFrameMode<0>, "SetGraphicsFrameLengthMode"},
+            {1112, &INx2GraphicsSystemSession::SetGraphicsFrameMode<1>, "SetGraphicsFrameRestartMode"},
+            {1113, &INx2GraphicsSystemSession::SetGraphicsFrameMode<2>, "SetGraphicsFrameGpuTimesliceMode"},
             {1121, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown1121"},
             {1203, &INx2GraphicsSystemSession::StubReplyZeroed, "DestroyChatContext"},
             {1212, &INx2GraphicsSystemSession::DestroyNativeImage, "DestroyImagePool"},
@@ -3861,6 +3959,9 @@ public:
     }
 
     ~INx2GraphicsSystemSession() override {
+        LOG_INFO(Service, "nx2:gsv shutdown: 1402 CreateNvDrv2UserSessionWithRemoteMemory x{}, "
+                          "1411 GetNvDrv2UserTransferMemoryUsage x{}",
+                 m_nvsrv_sessions, m_transfer_memory_queries);
         if (m_syncpt_memory != nullptr) {
             system.Host1x().GetSyncpointManager().SetGuestMirror({});
         }
@@ -3916,11 +4017,57 @@ private:
         TipcReplyWords(ctx, {});
     }
 
-    // 1111(u32): a version or mode number the server checks and records.
-    void SetFeatureVersion(HLERequestContext& ctx) {
-        LOG_INFO(Service, "nx2:gsv TIPC 1111 value {:#x}", ctx.CommandBuffer()[2]);
-        TipcReplyWords(ctx, {});
+    // 4 BootWithRemoteMemory (GSV services): process handle, AppletResourceUserId and five u64s,
+    // no output. The first u64 is a version (0x8000000000000001 on 19.0.0, 0x8000000000000005 on
+    // 20.1.1), the last is the output of GetInfo type 31 or 32, the rest are 0. The layout is only
+    // logged, the reply is the plain success the stub gave.
+    void BootWithRemoteMemory(HLERequestContext& ctx) {
+        const auto* w = ctx.CommandBuffer();
+        const size_t data = TipcDataOffset(w);
+        const u32 words = w[1] & 0x3ff;
+        if (words >= 12) {
+            const auto u64_at = [&](size_t i) { return u64{w[data + 2 * i]} | (u64{w[data + 2 * i + 1]} << 32); };
+            LOG_WARNING(Service,
+                        "nx2:gsv TIPC 4 BootWithRemoteMemory aruid={:#x} version={:#x} "
+                        "u64s=[{:#x} {:#x} {:#x}] last={:#x}",
+                        u64_at(0), u64_at(1), u64_at(2), u64_at(3), u64_at(4), u64_at(5));
+        } else {
+            LOG_WARNING(Service, "nx2:gsv TIPC 4 BootWithRemoteMemory with {} data words (12 documented)",
+                        words);
+        }
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
     }
+
+    // 1111 SetGraphicsFrameLengthMode, 1112 SetGraphicsFrameRestartMode, 1113
+    // SetGraphicsFrameGpuTimesliceMode (GSV services; their request layout is not published).
+    // Word 2 is recorded and logged (the first call at Warning, changes at Info); nothing paces
+    // from it because the value encoding is undocumented. 1111 keeps its empty reply, 1112/1113
+    // the zeroed stub reply.
+    template <size_t Mode>
+    void SetGraphicsFrameMode(HLERequestContext& ctx) {
+        const u32 value = ctx.CommandBuffer()[2];
+        if (!m_frame_mode_seen[Mode] || value != m_frame_mode[Mode]) {
+            if (m_frame_mode_seen[Mode]) {
+                LOG_INFO(Service, "nx2:gsv TIPC {} value {:#x} (was {:#x})", ctx.GetCommand(), value,
+                         m_frame_mode[Mode]);
+            } else {
+                LOG_WARNING(Service, "(STUBBED) nx2:gsv TIPC {} value {:#x}, recorded only",
+                            ctx.GetCommand(), value);
+            }
+            m_frame_mode_seen[Mode] = true;
+            m_frame_mode[Mode] = value;
+        }
+        if constexpr (Mode == 0) {
+            CountPlaceholderReply(ctx, "FrameModeRecordOnly");
+            TipcReplyWords(ctx, {});
+        } else {
+            StubReplyZeroed(ctx);
+        }
+    }
+
+    std::array<u32, 3> m_frame_mode{};
+    std::array<bool, 3> m_frame_mode_seen{};
 
     std::set<u32> m_address_spaces;        ///< Ids attached with 434
     bool m_client_handle_registered = false; ///< Set by 11
@@ -4523,11 +4670,31 @@ private:
         // nvsrv speaks the nvdrv INvDrvServices protocol (Open/Ioctl/Close/...,
         // 13 = SetGraphicsFirmwareMemoryMarginEnabled), so serve it with Eden's nvdrv on the shared
         // module. The nx2: name keeps unknown commands auto-stubbed and logged.
+        // GSV services: CreateNvDrv2UserSessionWithRemoteMemory allows one open session at a time
+        // (a second one fails with 0x200f3). Nothing here sees the guest close its session handle
+        // (the nvdrv session is kept until teardown), so a later call cannot be told from a
+        // concurrent one: every call is granted and the count is reported at shutdown.
+        if (++m_nvsrv_sessions > 1) {
+            LOG_WARNING(Service, "nx2:gsv TIPC 1402 call #{}: the console allows one open session "
+                                 "(0x200f3 otherwise); liveness not tracked, granted",
+                        m_nvsrv_sessions);
+        }
         LOG_WARNING(Service, "(STUBBED) nx2:gsv TIPC 1402, returning an nvdrv-backed nx2:nvsrv session");
         auto module = system.ServiceManager().GetService<Nvidia::NVDRV>("nvdrv", true)->GetModule();
         auto nvsrv = std::make_shared<Nvidia::NVDRV>(system, module, "nx2:nvsrv");
         nvsrv->InitializeForProcess(ctx.GetThread().GetOwnerProcess());
         ReturnRawSession(system, ctx, std::move(nvsrv));
+    }
+
+    // 1411 GetNvDrv2UserTransferMemoryUsage (no input; TotalTransferMemorySize, UsedTransferMemorySize,
+    // MaxTransferMemorySize, three u64s). The remote-memory sessions here use no transfer memory.
+    void GetNvDrv2UserTransferMemoryUsage(HLERequestContext& ctx) {
+        CountPlaceholderReply(ctx, "GetNvDrv2UserTransferMemoryUsage");
+        if (++m_transfer_memory_queries == 1) {
+            LOG_WARNING(Service, "(STUBBED) nx2:gsv TIPC 1411 GetNvDrv2UserTransferMemoryUsage, "
+                                 "returning 0/0/0");
+        }
+        TipcReplyWords(ctx, {0, 0, 0, 0, 0, 0});
     }
 
     static constexpr std::chrono::nanoseconds SyncptPollInterval{std::chrono::microseconds{500}};
@@ -4540,6 +4707,8 @@ private:
     u64 m_syncpt_ro{};
     u32 m_syncpt_count{};
     std::shared_ptr<Core::Timing::EventType> m_syncpt_poll;
+    u32 m_nvsrv_sessions{};         ///< 1402 calls
+    u32 m_transfer_memory_queries{}; ///< 1411 calls
 };
 
 } // namespace Service

@@ -15,6 +15,7 @@
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_resource_limit.h"
 #include "core/hle/kernel/svc.h"
+#include "core/hle/kernel/k_transfer_memory.h"
 #include "core/hle/kernel/svc_results.h"
 #include "core/hle/kernel/svc_version.h"
 #include "core/hle/service/unimplemented_registry.h"
@@ -54,8 +55,9 @@ Result GetInfo(Core::System& system, u64* result, InfoType info_id_type, Handle 
     case InfoType::Nx2RegionAddress:
     case InfoType::Nx2RegionSize:
     case InfoType::Nx2VammSize:
-    case InfoType::Nx2RemoteMemorySize:
-    case InfoType::Nx2RemoteMemoryUsed:
+    case InfoType::RemoteMemoryUsage:
+    case InfoType::RemoteMemoryUsagePeak:
+    case InfoType::AddressSpaceSize:
     case InfoType::AliasRegionExtraSize: {
         R_UNLESS(info_sub_id == 0, ResultInvalidEnumValue);
 
@@ -99,14 +101,17 @@ Result GetInfo(Core::System& system, u64* result, InfoType info_id_type, Handle 
                                                    : "RemoteRegionSize");
             R_SUCCEED();
         }
-        case InfoType::Nx2RemoteMemorySize:
-            // Unknown real value; nothing backs it yet.
+        case InfoType::RemoteMemoryUsage:
+            // Bytes mapped with MapRemoteMemory (SVC 0x84, not implemented), so none.
             *result = 0;
-            LOG_WARNING(Kernel_SVC, "(STUBBED) Switch 2 InfoType 31 (remote memory size), returning 0");
+            LOG_WARNING(Kernel_SVC, "(STUBBED) Switch 2 InfoType 31 (RemoteMemoryUsage), returning 0");
+            CountPlaceholderInfo(info_id_type, "RemoteMemoryUsage");
             R_SUCCEED();
-        case InfoType::Nx2RemoteMemoryUsed:
+        case InfoType::RemoteMemoryUsagePeak:
+            // Highest value of RemoteMemoryUsage, so never below it.
             *result = 0;
-            LOG_WARNING(Kernel_SVC, "(STUBBED) Switch 2 InfoType 32 (remote memory used), returning 0");
+            LOG_WARNING(Kernel_SVC, "(STUBBED) Switch 2 InfoType 32 (RemoteMemoryUsagePeak), returning 0");
+            CountPlaceholderInfo(info_id_type, "RemoteMemoryUsagePeak");
             R_SUCCEED();
         case InfoType::Nx2VammSize:
             // A page granule: the SDK checks module addresses/sizes against (value - 1) and
@@ -170,6 +175,10 @@ Result GetInfo(Core::System& system, u64* result, InfoType info_id_type, Handle 
             *result = current_process->GetPageTable().GetAliasRegionExtraSize();
             R_SUCCEED();
         }
+        case InfoType::AddressSpaceSize:
+            // 23.0.0+
+            *result = process->GetPageTable().GetAddressSpaceSize();
+            R_SUCCEED();
         default:
             break;
         }
@@ -259,8 +268,30 @@ Result GetInfo(Core::System& system, u64* result, InfoType info_id_type, Handle 
         *result = system.Kernel().CurrentScheduler()->GetIdleThread()->GetCpuTime();
         R_SUCCEED();
     }
-    case InfoType::Unknown37:
-    case InfoType::Unknown38: {
+    case InfoType::IsSvcPermitted:
+        // 14.0.0+; Atmosphere's kernel only answers for SynchronizePreemptionState.
+        R_UNLESS(handle == InvalidHandle, ResultInvalidHandle);
+        R_UNLESS(info_sub_id == u64(SvcId::SynchronizePreemptionState), ResultInvalidCombination);
+        *result = GetCurrentProcess(system.Kernel()).IsPermittedSvc(u32(info_sub_id));
+        R_SUCCEED();
+    case InfoType::IoRegionHint:
+        // 16.0.0+; hint of an IO region handle. This kernel has no IO regions (CreateIoRegion is
+        // not implemented), so no handle can name one.
+        R_UNLESS(info_sub_id == 0, ResultInvalidCombination);
+        R_THROW(ResultInvalidHandle);
+    case InfoType::TransferMemoryHint: {
+        // 19.0.0+
+        R_UNLESS(info_sub_id == 0, ResultInvalidCombination);
+        KScopedAutoObject transfer_memory = GetCurrentProcess(system.Kernel())
+            .GetHandleTable()
+            .GetObject<KTransferMemory>(system.Kernel(), handle);
+        R_UNLESS(transfer_memory.IsNotNull(), ResultInvalidHandle);
+        *result = transfer_memory->GetHint();
+        R_SUCCEED();
+    }
+    case InfoType::ShadowStackRegionAddress:
+    case InfoType::ShadowStackRegionSize: {
+        // 23.0.0+; the page table here has no shadow stack region, so the answer is made up.
         LOG_WARNING(Kernel_SVC, "(STUBBED) called, info_id={:#x}, info_sub_id={:#x}, handle={:#08x}",
                     info_id, info_sub_id, handle);
         CountPlaceholderInfo(info_id_type, info_id_type == InfoType::ShadowStackRegionAddress
@@ -366,7 +397,7 @@ Result GetInfo64(Core::System& system, uint64_t* out, InfoType info_type, Handle
     // EDEN_NX2_MEM_TRACE: log the memory layout and size queries of a title (diagnostics).
     static const bool trace = std::getenv("EDEN_NX2_MEM_TRACE") != nullptr;
     const u32 type = static_cast<u32>(info_type);
-    if (static u32 logs{}; trace && logs < 200 && (type <= 7 || (type >= 12 && type <= 33))) {
+    if (static u32 logs{}; trace && logs < 200 && (type <= 7 || (type >= 12 && type <= 38))) {
         ++logs;
         LOG_INFO(Kernel_SVC, "mem trace: GetInfo type {} sub {:#x} -> {:#x} = {:#x}", type,
                  info_subtype, result.raw, *out);
