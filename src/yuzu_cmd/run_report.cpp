@@ -66,6 +66,7 @@ struct State {
     fs::path destination;
     fs::path temporary;
     fs::path crash_temporary;
+    bool temporary_created = false; // Prepare created `temporary` (it did not exist before)
     Json tunables = Json::object();
     Json initial_settings = Json::object();
     std::optional<u64> title_id;
@@ -362,6 +363,8 @@ bool WriteReportFile(State& state, const std::string& text) {
     {
         std::ofstream out{state.temporary, std::ios::binary | std::ios::out | std::ios::trunc};
         if (!out) {
+            out.close();
+            fs::remove(state.temporary, ec);
             return Fail("cannot open " + Common::FS::ToUTF8String(state.temporary.u8string()));
         }
         out.write(text.data(), static_cast<std::streamsize>(text.size()));
@@ -419,10 +422,14 @@ std::atomic<int> crash_phase{CrashUnarmed};
 HANDLE crash_file = INVALID_HANDLE_VALUE;
 wchar_t crash_temporary[CrashPathCapacity];
 wchar_t crash_destination[CrashPathCapacity];
+wchar_t crash_normal_temporary[CrashPathCapacity];
+using CrashChar = wchar_t;
 #else
 int crash_file = -1;
 char crash_temporary[CrashPathCapacity];
 char crash_destination[CrashPathCapacity];
+char crash_normal_temporary[CrashPathCapacity];
+using CrashChar = char;
 #endif
 
 /// Text appended to a fixed buffer, cut off where it ends.
@@ -550,6 +557,19 @@ bool CrashDestinationExists() noexcept {
 #endif
 }
 
+/// Deletes a file this process created. Takes no lock and allocates nothing; an empty path (the
+/// file is not ours to delete, or not known) does nothing.
+void RemoveCrashFile(const CrashChar* path) noexcept {
+    if (path[0] == 0) {
+        return;
+    }
+#ifdef _WIN32
+    DeleteFileW(path);
+#else
+    unlink(path);
+#endif
+}
+
 /// Writes the crash report. False when a report was meant and could not be written; true when it
 /// was written, was not armed, or the normal report is already at the destination.
 bool WriteCrashReport(std::string_view detail) noexcept {
@@ -592,7 +612,15 @@ bool WriteCrashReport(std::string_view detail) noexcept {
                          WriteCrashPart(middle, text.size) &&
                          WriteCrashPart(document.tail, document.tail_size) && FlushCrashFile();
     const bool closed = CloseCrashFile();
-    if (written && closed && PublishCrashFile()) {
+    const bool published = written && closed && PublishCrashFile();
+    // The report is out (or has failed): the files this run created for it must not stay. A crash
+    // temporary that was not moved to its destination, and the normal report's temporary that
+    // Prepare created and the normal write never got to use.
+    if (!published) {
+        RemoveCrashFile(crash_temporary);
+    }
+    RemoveCrashFile(crash_normal_temporary);
+    if (published) {
         return true;
     }
     // The normal report can have been put in place in the meantime, which is as good.
@@ -683,6 +711,17 @@ void ArmCrashReport(State& state) {
     std::memcpy(crash_temporary, temporary.c_str(), temporary.size() + 1);
     std::memcpy(crash_destination, destination.c_str(), destination.size() + 1);
 #endif
+    // The temporary file of the normal report, for the crash path to remove: only when Prepare
+    // created it (it did not exist before), so that nothing foreign is ever deleted.
+    crash_normal_temporary[0] = 0;
+    if (state.temporary_created) {
+        const auto& normal = state.temporary.native();
+        if (normal.size() < CrashPathCapacity) {
+            for (size_t i = 0; i <= normal.size(); ++i) {
+                crash_normal_temporary[i] = normal[i];
+            }
+        }
+    }
     crash_phase.store(CrashArmed, std::memory_order_release);
     RebuildCrashDocument(state);
     if (crash_document.load(std::memory_order_acquire) < 0) {
@@ -739,6 +778,8 @@ PrepareResult Prepare(const std::string& destination, std::string& message) {
     temporary += "." + std::to_string(ProcessId()) + ".tmp";
     fs::path crash_temporary_path = path;
     crash_temporary_path += "." + std::to_string(ProcessId()) + ".crash.tmp";
+    std::error_code exists_ec;
+    const bool temporary_existed = fs::exists(fs::symlink_status(temporary, exists_ec));
     {
         std::ofstream probe{temporary, std::ios::binary | std::ios::out | std::ios::trunc};
         if (!probe) {
@@ -748,6 +789,7 @@ PrepareResult Prepare(const std::string& destination, std::string& message) {
     }
     state.destination = path;
     state.temporary = std::move(temporary);
+    state.temporary_created = !temporary_existed;
     state.crash_temporary = std::move(crash_temporary_path);
     state.prepared = true;
     ArmCrashReport(state);
