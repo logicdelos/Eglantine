@@ -15,6 +15,7 @@
 #include <fmt/format.h>
 
 #include "shader_recompiler/exception.h"
+#include "core/core.h"
 #include "video_core/cache_envelope.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/shader_environment.h"
@@ -366,4 +367,59 @@ TEST_CASE("ShaderPrecache: the old cache file reader refuses a record without en
         // The file is deleted as broken: it was neither read nor allocated for.
         REQUIRE_FALSE(std::filesystem::exists(file));
     }
+}
+
+TEST_CASE("ShaderPrecache: the builder stamps the identity it is given and refuses a bad one",
+          "[video_core]") {
+    TempDir dir;
+    Core::System system;
+    const auto missing_game = dir.path / "no-such-game.nsp";
+    const auto build = [&](const CE::HostIdentity& host, u64 title_id, std::string_view folder) {
+        ShaderWarm::BuildOptions options;
+        options.output_dir = dir.path / folder;
+        return ShaderWarm::BuildWarmFilesWith(system, missing_game, title_id, host, options, {}, {});
+    };
+    const auto host = TestHost();
+    // Another title ran before and published its identity: the builder must not read it.
+    auto previous = TestHost();
+    previous.title_id += 1;
+    previous.content_stamp += 1;
+    const HostGuard guard{previous};
+
+    // Never assembled: zero build or zero content stamp, whatever the process published.
+    for (const auto& unassembled : {CE::HostIdentity{}, [&] {
+                                        auto h = host;
+                                        h.build_id = 0;
+                                        return h;
+                                    }(),
+                                    [&] {
+                                        auto h = host;
+                                        h.content_stamp = 0;
+                                        return h;
+                                    }()}) {
+        const auto result = build(unassembled, host.title_id, "unassembled");
+        REQUIRE_FALSE(result.ok);
+        REQUIRE(result.error == "No host identity was assembled for this title");
+    }
+    // The identity of another title, though it is complete (what the global holds is that one).
+    const auto wrong_title = build(previous, host.title_id, "unassembled");
+    REQUIRE_FALSE(wrong_title.ok);
+    REQUIRE(wrong_title.error == "The host identity is of another title");
+    // Refused before anything is created.
+    REQUIRE_FALSE(std::filesystem::exists(dir.path / "unassembled"));
+
+    // A complete identity of the title passes the check and goes on to open the game.
+    const auto opened = build(host, host.title_id, "assembled");
+    REQUIRE_FALSE(opened.ok);
+    REQUIRE(opened.error == "Cannot open the game file");
+    REQUIRE_FALSE(std::filesystem::exists(dir.path / "assembled" / "warm-compute.bin"));
+
+    // The explicit identity is what stamps the file: the global one is of another title and
+    // would make the file stale for the title being built.
+    const auto stamped = ShaderWarm::WarmFileIdentity(host, false);
+    REQUIRE(stamped.host.title_id == host.title_id);
+    REQUIRE(stamped.host.build_id == host.build_id);
+    REQUIRE(stamped.host.game_version == host.game_version);
+    REQUIRE_FALSE(ShaderWarm::WarmHostIdentityError(host, host.title_id).has_value());
+    REQUIRE(ShaderWarm::WarmHostIdentityError(host, host.title_id + 1).has_value());
 }
