@@ -69,6 +69,7 @@ FakeCall AxxEmitX64::FastmemCallback(u64 rip_) {
                                            [](const FastmemPatchInfo& entry, u32 value) { return entry.rip < value; })
                         : fastmem_patch_info.end();
     if (iter != fastmem_patch_info.end() && iter->rip == u32(rip_ - base)) {
+        g_jit_stats.fastmem_faults.fetch_add(1, std::memory_order_relaxed);
         FakeCall result{
             .call_rip = base + iter->callback,
             .ret_rip = base + iter->resume_rip,

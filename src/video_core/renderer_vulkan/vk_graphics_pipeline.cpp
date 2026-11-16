@@ -938,6 +938,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         if (!IsBuilt()) {
             scheduler.Record([this](vk::CommandBuffer) {
                 RunBuild();
+                Nx2Bottleneck::WaitScope wait{Nx2Bottleneck::Wait::ShaderBuild};
                 std::unique_lock lock{build_mutex};
                 build_condvar.wait(lock,
                                    [this] { return is_built.load(std::memory_order::relaxed); });

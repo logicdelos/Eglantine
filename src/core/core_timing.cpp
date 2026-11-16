@@ -150,6 +150,14 @@ bool CoreTiming::HasPendingEvents() const {
     return !(wait_set && event_queue.empty());
 }
 
+std::optional<s64> CoreTiming::GetNextEventTime() const {
+    std::scoped_lock lock{basic_lock};
+    if (event_queue.empty()) {
+        return std::nullopt;
+    }
+    return event_queue.top().time;
+}
+
 void CoreTiming::ScheduleEvent(std::chrono::nanoseconds ns_into_future,
                                const std::shared_ptr<EventType>& event_type, bool absolute_time) {
     {

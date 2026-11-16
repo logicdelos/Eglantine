@@ -8,6 +8,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
+#include <limits>
 #include <thread>
 
 #include "common/scope_exit.h"
@@ -17,6 +18,7 @@
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_scoped_resource_reservation.h"
 #include "core/hle/kernel/k_thread.h"
+#include "core/hle/kernel/physical_core.h"
 #include "core/hle/kernel/svc.h"
 
 namespace Kernel::Svc {
@@ -155,37 +157,58 @@ void ExitThread(Core::System& system) {
 /// Sleep the current thread
 void SleepThread(Core::System& system, s64 ns) {
     auto& kernel = system.Kernel();
-    const auto yield_type = static_cast<Svc::YieldType>(ns);
-
+    auto& thread = GetCurrentThread(kernel);
+    thread.NoteSleepThread(ns);
     LOG_TRACE(Kernel_SVC, "called nanoseconds={}", ns);
 
-    // When the input tick is positive, sleep.
-    if (ns > 0) {
-        // Convert the timeout from nanoseconds to ticks.
-        // NOTE: Nintendo does not use this conversion logic in WaitSynchronization...
-        s64 timeout;
-
-        const s64 offset_tick(ns);
-        if (offset_tick > 0) {
-            timeout = kernel.HardwareTimer().GetTick() + offset_tick + 2;
-            if (timeout <= 0) {
+    const auto sleep = [&] {
+        // When the input tick is positive, sleep.
+        if (ns > 0) {
+            // Convert the timeout from nanoseconds to ticks.
+            // NOTE: Nintendo does not use this conversion logic in WaitSynchronization...
+            s64 timeout;
+            const s64 offset_tick(ns);
+            if (offset_tick > 0) {
+                timeout = kernel.HardwareTimer().GetTick() + offset_tick + 2;
+                if (timeout <= 0) {
+                    timeout = (std::numeric_limits<s64>::max)();
+                }
+            } else {
                 timeout = (std::numeric_limits<s64>::max)();
             }
-        } else {
-            timeout = (std::numeric_limits<s64>::max)();
-        }
 
-        // Sleep.
-        // NOTE: Nintendo does not check the result of this sleep.
-        static_cast<void>(GetCurrentThread(kernel).Sleep(kernel, timeout));
-    } else if (yield_type == Svc::YieldType::WithoutCoreMigration) {
-        KScheduler::YieldWithoutCoreMigration(kernel);
-    } else if (yield_type == Svc::YieldType::WithCoreMigration) {
-        KScheduler::YieldWithCoreMigration(kernel);
-    } else if (yield_type == Svc::YieldType::ToAnyThread) {
-        KScheduler::YieldToAnyThread(kernel);
-    } else {
+            // Nintendo does not check the result of this sleep.
+            static_cast<void>(thread.Sleep(kernel, timeout));
+            return false;
+        }
+        const auto yield_type = static_cast<Svc::YieldType>(ns);
+        if (yield_type == Svc::YieldType::WithoutCoreMigration) {
+            return KScheduler::YieldWithoutCoreMigration(kernel);
+        }
+        if (yield_type == Svc::YieldType::WithCoreMigration) {
+            return KScheduler::YieldWithCoreMigration(kernel);
+        }
+        if (yield_type == Svc::YieldType::ToAnyThread) {
+            return KScheduler::YieldToAnyThread(kernel);
+        }
         // Nintendo does nothing at all if an otherwise invalid value is passed.
+        return false;
+    };
+
+    if (!YieldIdleEnabled) {
+        thread.CountEmptyYield(sleep());
+        return;
+    }
+    const u64 yield_epoch = thread.GetYieldEpoch();
+    const bool empty = sleep();
+    thread.CountEmptyYield(empty);
+    if (empty && thread.GetYieldEpoch() == yield_epoch) {
+        if (thread.NoteEmptyYield()) {
+            thread.ResetYieldStreak();
+            kernel.CurrentPhysicalCore().YieldIdle(kernel, YieldIdleDuration);
+        }
+    } else {
+        thread.ResetYieldStreak();
     }
 }
 

@@ -109,6 +109,7 @@ bool Scheduler::WaitSubmitted(u64 tick) {
     if (IsSubmitted(tick)) {
         return true;
     }
+    Nx2Bottleneck::WaitScope wait{Nx2Bottleneck::Wait::GpuBack};
     auto& split = VideoCommon::GpuSplit::Get();
     split.RequestIdleHook();
     // No time limit: the back can spend seconds on one entry (a large shader's translation),

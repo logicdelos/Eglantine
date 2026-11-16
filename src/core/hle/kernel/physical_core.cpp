@@ -7,21 +7,42 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <charconv>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
+#include <limits>
 #include <thread>
 #include "common/nx2_bottleneck.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/core.h"
+#include "core/core_timing.h"
 #include "core/debugger/debugger.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/k_scheduler.h"
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/physical_core.h"
 #include "core/hle/kernel/svc.h"
 
 namespace Kernel {
+
+const std::chrono::nanoseconds YieldIdleDuration = [] {
+    const char* text = std::getenv("EDEN_NX2_YIELD_IDLE");
+    u64 us{};
+    if (text == nullptr) {
+        return std::chrono::nanoseconds{0};
+    }
+    const char* end = text + std::strlen(text);
+    const auto parsed = std::from_chars(text, end, us);
+    if (parsed.ec != std::errc{} || parsed.ptr != end ||
+        us > static_cast<u64>((std::numeric_limits<s64>::max)() / 1'000)) {
+        return std::chrono::nanoseconds{0};
+    }
+    return std::chrono::nanoseconds{static_cast<s64>(us * 1'000)};
+}();
+const bool YieldIdleEnabled = YieldIdleDuration.count() > 0;
 
 PhysicalCore::PhysicalCore(KernelCore& kernel, std::size_t core_index)
     : m_core_index{core_index}
@@ -258,6 +279,55 @@ void PhysicalCore::Idle(KernelCore& kernel) {
     }
     std::unique_lock lk{m_guard};
     m_on_interrupt.wait(lk, [this] { return m_is_interrupted.load(); });
+}
+
+void PhysicalCore::YieldIdle(KernelCore& kernel, std::chrono::nanoseconds limit) {
+    // Single-core timing advances by executed instructions, not host time.
+    if (m_is_single_core || limit.count() <= 0) {
+        return;
+    }
+    auto& timing = kernel.System().CoreTiming();
+    if (const auto next = timing.GetNextEventTime()) {
+        limit = (std::min)(limit, std::chrono::nanoseconds{*next} - timing.GetGlobalTimeNs());
+    }
+    if (limit.count() <= 0) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    limit = (std::min)(limit, std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::time_point::max() - now));
+    const auto deadline = now + limit;
+    // Arm the wait under the scheduler lock so a newly runnable thread cannot be missed.
+    // Defer dispatch until m_guard is released; scheduler unlock may otherwise switch fibers.
+    KScopedDisableDispatch dd{kernel};
+    std::unique_lock lock{m_guard, std::defer_lock};
+    {
+        KScopedSchedulerLock sl{kernel};
+        if (KScheduler::HasOtherRunnableThread(kernel, static_cast<s32>(m_core_index))) {
+            return;
+        }
+        lock.lock();
+        if (m_is_interrupted.load(std::memory_order_acquire)) {
+            return;
+        }
+        m_yield_woken = false;
+        m_yield_idle.store(true, std::memory_order_release);
+    }
+    const u64 begin = Nx2Bottleneck::Now();
+    m_on_interrupt.wait_until(lock, deadline, [this] {
+        return m_yield_woken || m_is_interrupted.load(std::memory_order_acquire);
+    });
+    m_yield_idle.store(false, std::memory_order_release);
+    Nx2Bottleneck::AddYieldBackoff(m_core_index, Nx2Bottleneck::Now() - begin);
+}
+
+void PhysicalCore::WakeYieldIdle() {
+    if (!m_yield_idle.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::scoped_lock lock{m_guard};
+    m_yield_woken = true;
+    m_on_interrupt.notify_one();
 }
 
 bool PhysicalCore::IsInterrupted() const {

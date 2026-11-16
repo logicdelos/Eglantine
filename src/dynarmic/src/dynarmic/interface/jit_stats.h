@@ -16,6 +16,7 @@ struct JitStats {
     std::atomic<std::uint64_t> blocks_compiled{};
     std::atomic<std::uint64_t> compile_ns{}; ///< Translate, optimize and emit (x64 A64 only)
     std::atomic<std::uint64_t> fastmem_recompiles{}; ///< Blocks invalidated by a fastmem fault
+    std::atomic<std::uint64_t> fastmem_faults{}; ///< Host faults taken in fastmem accesses
 };
 
 inline JitStats g_jit_stats;

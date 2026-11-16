@@ -98,6 +98,9 @@ public:
     /// Checks if there are any pending time events.
     bool HasPendingEvents() const;
 
+    /// Non-dispatching snapshot of the nearest timer deadline (all cores).
+    std::optional<s64> GetNextEventTime() const;
+
     /// Schedules an event in core timing
     void ScheduleEvent(std::chrono::nanoseconds ns_into_future,
                        const std::shared_ptr<EventType>& event_type, bool absolute_time = false);

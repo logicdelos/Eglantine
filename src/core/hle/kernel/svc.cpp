@@ -13,10 +13,12 @@
 #include <cstring>
 #include <type_traits>
 
+#include "common/nx2_bottleneck.h"
 #include "core/arm/arm_interface.h"
 #include "core/core.h"
 #include "core/debugger/trace_hooks.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/physical_core.h"
 #include "core/hle/kernel/svc.h"
 #include "core/hle/kernel/k_readable_event.h"
 #include "core/hle/service/kernel_helpers.h"
@@ -2511,6 +2513,10 @@ void Call(Core::System& system, u32 imm) {
     auto& process = GetCurrentProcess(kernel);
     std::array<uint64_t, 8> args;
     kernel.CurrentPhysicalCore().SaveSvcArguments(process, args);
+    Nx2Bottleneck::NoteSvc(kernel.CurrentPhysicalCore().CoreIndex(), imm);
+    if (SvcId(imm) != SvcId::SleepThread && YieldIdleEnabled) {
+        GetCurrentThread(kernel).ResetYieldStreak();
+    }
     GetCurrentThread(kernel).SetEnteredKernel();
     // Inputs for a trace observer (the call overwrites args with its outputs); only copied when
     // one listens, so an unset hook costs one relaxed load per SVC.

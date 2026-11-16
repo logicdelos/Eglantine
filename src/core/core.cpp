@@ -522,6 +522,7 @@ struct System::Impl {
         // Waiting for GPU before initializing CPU
         cpu_manager.Initialize();
         VideoCommon::Nx2Spikes::SetGuestThreadSource({ReadGuestThreadTicks, GuestThreadName, &system});
+        Nx2Bottleneck::SetSleepThreadNameSource(GuestThreadName, &system);
 
         // Initialize cheat engine
         if (cheat_engine) {
@@ -573,6 +574,7 @@ struct System::Impl {
         Nx2Sampler::SetGuestRunning(false);
         Nx2Bottleneck::SetGuestRunning(false);
         VideoCommon::Nx2Spikes::SetGuestThreadSource({});
+        Nx2Bottleneck::SetSleepThreadNameSource(nullptr, nullptr);
         debug_service.reset();
         SetShuttingDown(true);
         Common::ADPF::Shutdown();
@@ -592,6 +594,7 @@ struct System::Impl {
         kernel.SuspendEmulation(true);
         kernel.CloseServices();
         kernel.ShutdownCores();
+        Nx2Bottleneck::ClearSleepThreadCounters();
         Service::LogUnimplementedCommandCounts();
         services.reset();
         service_manager.reset();

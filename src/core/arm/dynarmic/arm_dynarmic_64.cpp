@@ -18,6 +18,7 @@
 #include <immintrin.h>
 #endif
 #include "common/cpu_features.h"
+#include "common/nx2_bottleneck.h"
 #include "common/nx2_sampler.h"
 #include "common/settings.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
@@ -509,6 +510,7 @@ ArmDynarmic64::ArmDynarmic64(System& system, bool uses_wall_clock, Kernel::KProc
     auto& page_table_impl = page_table.GetImpl();
     MakeJit(&page_table_impl, page_table.GetAddressSpaceWidth());
     static std::once_flag polled;
+    static std::once_flag bottleneck_source;
     std::call_once(polled, [] {
         using VideoCommon::Nx2Spikes::Event;
         VideoCommon::Nx2Spikes::SetPolled(
@@ -519,6 +521,15 @@ ArmDynarmic64::ArmDynarmic64(System& system, bool uses_wall_clock, Kernel::KProc
             Event::JitFastmemRecompile,
             [] { return u64{Dynarmic::g_jit_stats.fastmem_recompiles.load(std::memory_order_relaxed)}; },
             nullptr);
+    });
+    std::call_once(bottleneck_source, [] {
+        Nx2Bottleneck::SetJitSource([] {
+            return Nx2Bottleneck::JitTotals{
+                .blocks_compiled = Dynarmic::g_jit_stats.blocks_compiled.load(std::memory_order_relaxed),
+                .compile_ns = Dynarmic::g_jit_stats.compile_ns.load(std::memory_order_relaxed),
+                .fastmem_faults = Dynarmic::g_jit_stats.fastmem_faults.load(std::memory_order_relaxed),
+            };
+        });
     });
 }
 

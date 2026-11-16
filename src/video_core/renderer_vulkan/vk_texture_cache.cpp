@@ -22,6 +22,7 @@
 #include "common/alignment.h"
 #include "common/bit_util.h"
 #include "common/div_ceil.h"
+#include "common/nx2_bottleneck.h"
 #include "common/literals.h"
 #include "common/settings.h"
 
@@ -3833,7 +3834,10 @@ bool Image::BindZeroBlock() {
                   gpu_addr, static_cast<int>(result));
         return false;
     }
-    fence.Wait();
+    {
+        Nx2Bottleneck::WaitScope wait{Nx2Bottleneck::Wait::HostGpu};
+        fence.Wait();
+    }
     // Every block now reads the shared block (and the tail its own memory): zero them all.
     ClearTiles();
     return true;
@@ -4066,6 +4070,7 @@ bool Image::BindTiles(std::span<const VideoCommon::LevelRect> rects) {
         roll_back();
         return false;
     }
+    Nx2Bottleneck::WaitScope wait{Nx2Bottleneck::Wait::HostGpu};
     fence.Wait();
     return true;
 }
@@ -4226,6 +4231,7 @@ std::vector<u32> Image::BindLayers(std::span<const u32> layers) {
         roll_back();
         return {};
     }
+    Nx2Bottleneck::WaitScope wait{Nx2Bottleneck::Wait::HostGpu};
     fence.Wait();
     return bound;
 }

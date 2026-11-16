@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iterator>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -74,9 +75,47 @@ struct WaitMeter {
 std::array<IdleMeter, NumThreads> idle_meters;
 std::array<std::array<WaitMeter, NumWaits>, NumWaitRows> wait_meters;
 std::array<std::atomic<u64>, MaxCores> guest_run_ns;
+/// Per CPU core, so cores calling SVCs at once do not share a cache line.
+alignas(64) std::array<std::array<std::atomic<u32>, NumSvcIds>, MaxCores> svc_counts;
+std::array<std::array<u32, NumSvcIds>, MaxCores> svc_previous{};
+struct alignas(64) SleepMeter {
+    std::atomic<u64> backoffs{};
+    std::atomic<u64> wait_ns{};
+    std::atomic<u64> longest_ns{};
+    u64 previous_backoffs{};
+    u64 previous_wait_ns{};
+};
+std::array<SleepMeter, MaxCores> sleep_meters;
+
+struct SleepRegistry {
+    std::mutex mutex;
+    SleepThreadCounter* first{};
+    u64 retired_id{};
+    u64 retired_calls{};
+    std::array<u64, 8> retired_bins{};
+    u64 retired_empty{};
+};
+// Threads can be destroyed during system teardown, after other static destructors.
+SleepRegistry& SleepThreads() {
+    static auto* registry = new SleepRegistry;
+    return *registry;
+}
+std::mutex sleep_name_mutex;
+std::string (*sleep_name_source)(void*, u64){};
+void* sleep_name_user{};
+std::atomic<JitTotals (*)()> jit_source{};
+/// The JIT's totals at the last report; only the reporter thread reads or writes them.
+JitTotals jit_previous;
+bool jit_previous_valid = false;
 std::atomic<u64> window_begin{};
 std::atomic<u64> last_frame{};
 std::atomic<u64> longest_frame_ns{};
+/// The last present intervals in microseconds. Only the presenting thread writes (`NoteFrame`),
+/// only the report thread reads; a slot rewritten during the read just shifts one sample.
+constexpr size_t IntervalRing = 1024;
+std::array<std::atomic<u32>, IntervalRing> interval_us{};
+std::atomic<u32> intervals_written{};
+u32 intervals_read{};
 std::atomic<u32> frames{};
 std::atomic<u32> frames_over_25ms{};
 std::atomic<u32> frames_over_50ms{};
@@ -100,6 +139,11 @@ struct WaitTotals {
     u32 count{};
 };
 
+struct SvcCount {
+    u32 id{};
+    u32 count{};
+};
+
 /// One report's worth of the counters.
 struct Window {
     double seconds{};
@@ -111,11 +155,21 @@ struct Window {
     double over_25ms_ms{};
     double over_50ms_ms{};
     double longest_frame_ms{};
+    /// Present intervals of the window (the last 1024 at most) over 1.5x their median.
+    u32 late{};
+    double median_ms{};
+    double p99_ms{};
     /// Share of the window not spent waiting for work; negative for a thread that never ran.
     std::array<double, NumThreads> busy{};
     std::array<std::array<WaitTotals, NumWaits>, NumWaitRows> waits{};
     std::array<double, MaxCores> guest_run{};
     u32 audio_underruns{};
+    u64 svc_total{};
+    /// The most called SVCs, most first; an id with no calls has count 0.
+    std::array<SvcCount, 3> svc_top{};
+    /// What the JIT did in the window; unknown until the JIT has been read twice.
+    bool jit_known = false;
+    JitTotals jit;
 
     [[nodiscard]] double Busy(Thread thread) const {
         return busy[static_cast<size_t>(thread)];
@@ -146,7 +200,39 @@ struct Window {
     [[nodiscard]] Thread Renderer() const {
         return Busy(Thread::GpuBack) >= 0.0 ? Thread::GpuBack : Thread::Gpu;
     }
+    std::array<u64, 8> sleep_bins{};
+    u64 sleep_top_id{};
+    u64 sleep_top_calls{};
+    u64 empty_yields{};
+    u64 yield_backoffs{};
+    u64 yield_wait_ns{};
+    u64 yield_longest_ns{};
 };
+
+/// Fills in the interval statistics from the ring.
+void SummarizeIntervals(Window& window) {
+    const u32 written = intervals_written.load(std::memory_order_acquire);
+    const u32 count = (std::min)(written - intervals_read, static_cast<u32>(IntervalRing));
+    intervals_read = written;
+    if (count == 0) {
+        return;
+    }
+    std::array<u32, IntervalRing> sorted;
+    for (u32 i = 0; i < count; ++i) {
+        sorted[i] =
+            interval_us[(written - count + i) % IntervalRing].load(std::memory_order_relaxed);
+    }
+    const auto end = sorted.begin() + count;
+    std::sort(sorted.begin(), end);
+    const size_t middle = count / 2;
+    const double median = count % 2 != 0
+                              ? static_cast<double>(sorted[middle])
+                              : (static_cast<double>(sorted[middle - 1]) + sorted[middle]) / 2.0;
+    window.median_ms = median / 1e3;
+    window.p99_ms = static_cast<double>(sorted[(size_t{count} * 99 + 99) / 100 - 1]) / 1e3;
+    window.late = static_cast<u32>(std::count_if(
+        sorted.begin(), end, [median](u32 us) { return static_cast<double>(us) > median * 1.5; }));
+}
 
 /// Takes the counters since `begin` and starts the next window at `now`.
 Window Collect(u64 begin, u64 now) {
@@ -165,6 +251,7 @@ Window Collect(u64 begin, u64 now) {
         static_cast<double>(over_50ms_ns.exchange(0, std::memory_order_relaxed)) / 1e6;
     window.longest_frame_ms =
         static_cast<double>(longest_frame_ns.exchange(0, std::memory_order_relaxed)) / 1e6;
+    SummarizeIntervals(window);
     window.audio_underruns = audio_underruns.exchange(0, std::memory_order_relaxed);
     for (size_t i = 0; i < NumThreads; ++i) {
         IdleMeter& meter = idle_meters[i];
@@ -192,6 +279,68 @@ Window Collect(u64 begin, u64 now) {
     for (size_t i = 0; i < MaxCores; ++i) {
         window.guest_run[i] =
             static_cast<double>(guest_run_ns[i].exchange(0, std::memory_order_relaxed)) / window_ns;
+    }
+    std::array<u32, NumSvcIds> svc{};
+    for (size_t core = 0; core < MaxCores; ++core) {
+        for (size_t id = 0; id < NumSvcIds; ++id) {
+            const u32 count = svc_counts[core][id].load(std::memory_order_relaxed);
+            svc[id] += count - svc_previous[core][id];
+            svc_previous[core][id] = count;
+        }
+    }
+    for (size_t id = 0; id < NumSvcIds; ++id) {
+        const u32 count = svc[id];
+        window.svc_total += count;
+        if (count <= window.svc_top.back().count) {
+            continue;
+        }
+        size_t slot = window.svc_top.size() - 1;
+        for (; slot > 0 && window.svc_top[slot - 1].count < count; --slot) {
+            window.svc_top[slot] = window.svc_top[slot - 1];
+        }
+        window.svc_top[slot] = {.id = static_cast<u32>(id), .count = count};
+    }
+    {
+        auto& registry = SleepThreads();
+        std::scoped_lock lock{registry.mutex};
+        for (auto& meter : sleep_meters) {
+            const u64 backoffs = meter.backoffs.load(std::memory_order_relaxed);
+            const u64 wait_ns = meter.wait_ns.load(std::memory_order_relaxed);
+            window.yield_backoffs += backoffs - meter.previous_backoffs;
+            window.yield_wait_ns += wait_ns - meter.previous_wait_ns;
+            meter.previous_backoffs = backoffs;
+            meter.previous_wait_ns = wait_ns;
+            // A per-window maximum, unlike the monotonic counters above.
+            window.yield_longest_ns = (std::max)(window.yield_longest_ns,
+                meter.longest_ns.exchange(0, std::memory_order_relaxed));
+        }
+        window.sleep_top_id = registry.retired_id;
+        window.sleep_top_calls = registry.retired_calls;
+        registry.retired_id = registry.retired_calls = 0;
+        window.sleep_bins = registry.retired_bins;
+        window.empty_yields = registry.retired_empty;
+        registry.retired_bins.fill(0);
+        registry.retired_empty = 0;
+        for (auto* counter = registry.first; counter != nullptr; counter = counter->next) {
+            const u64 calls = counter->Collect(window.sleep_bins, window.empty_yields);
+            if (calls > window.sleep_top_calls) {
+                window.sleep_top_calls = calls;
+                window.sleep_top_id = counter->id;
+            }
+        }
+    }
+    if (const auto source = jit_source.load(std::memory_order_relaxed); source != nullptr) {
+        const JitTotals totals = source();
+        if (jit_previous_valid) {
+            window.jit_known = true;
+            window.jit = {
+                .blocks_compiled = totals.blocks_compiled - jit_previous.blocks_compiled,
+                .compile_ns = totals.compile_ns - jit_previous.compile_ns,
+                .fastmem_faults = totals.fastmem_faults - jit_previous.fastmem_faults,
+            };
+        }
+        jit_previous = totals;
+        jit_previous_valid = true;
     }
     return window;
 }
@@ -755,6 +904,31 @@ void Report(const Window& window) {
     add("; file reads: {} ({:.0f} ms, longest {:.0f} ms)", reads.count, reads.ms, reads.longest_ms);
     add("; audio underruns: {}{}", window.audio_underruns, memory);
     LOG_INFO(Core, "{}", text);
+    LOG_INFO(Core,
+             "Frames: {} shown | late (> 1.5x the median interval) {} | longest {:.1f} ms | "
+             "median {:.1f} ms | 99th {:.1f} ms",
+             window.frames, window.late, window.longest_frame_ms, window.median_ms,
+             window.p99_ms);
+    LOG_INFO(Core, "CPU: {}", CpuLine(window));
+    std::string name;
+    {
+        std::scoped_lock lock{sleep_name_mutex};
+        if (sleep_name_source != nullptr && window.sleep_top_calls != 0) {
+            name = sleep_name_source(sleep_name_user, window.sleep_top_id);
+        }
+    }
+    LOG_INFO(Core,
+             "SleepThread: ns=0 {} | ns=-1 {} | ns=-2 {} | 1..999ns {} | "
+             "1..99us {} | 100..999us {} | >=1ms {} | other-negative {} | "
+             "top tid={:#x} name={:?} calls={} | empty-yields {} | "
+             "backoffs {} waited {:.3f} ms longest {:.3f} ms",
+             window.sleep_bins[0], window.sleep_bins[1], window.sleep_bins[2],
+             window.sleep_bins[3], window.sleep_bins[4], window.sleep_bins[5],
+             window.sleep_bins[6], window.sleep_bins[7], window.sleep_top_id,
+             name.empty() ? std::string{"unavailable"} : name,
+             window.sleep_top_calls, window.empty_yields, window.yield_backoffs,
+             static_cast<double>(window.yield_wait_ns) / 1e6,
+             static_cast<double>(window.yield_longest_ns) / 1e6);
 }
 
 void ReportLoop() {
@@ -842,6 +1016,11 @@ void NoteFrame() {
     }
     const u64 ns = now - previous;
     RaiseTo(longest_frame_ns, ns);
+    const u32 written = intervals_written.load(std::memory_order_relaxed);
+    interval_us[written % IntervalRing].store(
+        static_cast<u32>((std::min)(ns / 1000, u64{(std::numeric_limits<u32>::max)()})),
+        std::memory_order_relaxed);
+    intervals_written.store(written + 1, std::memory_order_release);
     if (ns > 25'000'000) {
         frames_over_25ms.fetch_add(1, std::memory_order_relaxed);
         over_25ms_ns.fetch_add(ns, std::memory_order_relaxed);
@@ -857,6 +1036,103 @@ void NoteFrame() {
 
 void NoteAudioUnderrun() {
     audio_underruns.fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteSvc(size_t core, u32 id) {
+    if (core < MaxCores && id < NumSvcIds) {
+        auto& count = svc_counts[core][id];
+        count.store(count.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    }
+}
+
+void SleepThreadCounter::Register(u64 thread_id) {
+    auto& registry = SleepThreads();
+    std::scoped_lock lock{registry.mutex};
+    id = thread_id;
+    next = registry.first;
+    registry.first = this;
+}
+
+u64 SleepThreadCounter::Collect(std::array<u64, 8>& totals, u64& empty_total) {
+    u64 calls = 0;
+    for (size_t bin = 0; bin < bins.size(); ++bin) {
+        const u64 count = bins[bin].load(std::memory_order_relaxed);
+        const u64 delta = count - previous_bins[bin];
+        previous_bins[bin] = count;
+        totals[bin] += delta;
+        calls += delta;
+    }
+    const u64 count = empty.load(std::memory_order_relaxed);
+    empty_total += count - previous_empty;
+    previous_empty = count;
+    return calls;
+}
+
+SleepThreadCounter::~SleepThreadCounter() {
+    Reset();
+}
+
+void SleepThreadCounter::Reset() {
+    auto& registry = SleepThreads();
+    std::scoped_lock lock{registry.mutex};
+    if (id == 0) {
+        return;
+    }
+    const u64 count = Collect(registry.retired_bins, registry.retired_empty);
+    if (count > registry.retired_calls) {
+        registry.retired_calls = count;
+        registry.retired_id = id;
+    }
+    auto** link = &registry.first;
+    while (*link != this) {
+        link = &(*link)->next;
+    }
+    *link = next;
+    id = 0;
+    next = nullptr;
+}
+
+void AddYieldBackoff(size_t core, u64 ns) {
+    if (core < MaxCores) {
+        auto& meter = sleep_meters[core];
+        meter.backoffs.store(meter.backoffs.load(std::memory_order_relaxed) + 1,
+                             std::memory_order_relaxed);
+        meter.wait_ns.store(meter.wait_ns.load(std::memory_order_relaxed) + ns,
+                            std::memory_order_relaxed);
+        RaiseTo(meter.longest_ns, ns);
+    }
+}
+
+void SetSleepThreadNameSource(std::string (*source)(void*, u64), void* user) {
+    std::scoped_lock lock{sleep_name_mutex};
+    sleep_name_source = source;
+    sleep_name_user = user;
+}
+
+void ClearSleepThreadCounters() {
+    auto& registry = SleepThreads();
+    std::scoped_lock lock{registry.mutex};
+    while (registry.first != nullptr) {
+        auto* counter = registry.first;
+        registry.first = counter->next;
+        counter->id = 0;
+        counter->next = nullptr;
+    }
+    registry.retired_id = 0;
+    registry.retired_calls = 0;
+    registry.retired_bins.fill(0);
+    registry.retired_empty = 0;
+    for (auto& meter : sleep_meters) {
+        meter.backoffs.store(0, std::memory_order_relaxed);
+        meter.wait_ns.store(0, std::memory_order_relaxed);
+        meter.longest_ns.store(0, std::memory_order_relaxed);
+        meter.previous_backoffs = 0;
+        meter.previous_wait_ns = 0;
+    }
+}
+
+void SetJitSource(JitTotals (*source)()) {
+    jit_source.store(source, std::memory_order_relaxed);
 }
 
 void SetGuestRunning(bool running) {

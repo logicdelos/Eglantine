@@ -10,6 +10,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <memory>
@@ -27,6 +28,9 @@ class System;
 } // namespace Core
 
 namespace Kernel {
+
+extern const std::chrono::nanoseconds YieldIdleDuration;
+extern const bool YieldIdleEnabled;
 
 class PhysicalCore {
 public:
@@ -56,6 +60,10 @@ public:
     // Wait for an interrupt.
     void Idle(KernelCore& kernel);
 
+    // Opt-in yield-loop backoff, sharing Idle's interrupt condition variable.
+    void YieldIdle(KernelCore& kernel, std::chrono::nanoseconds limit);
+    void WakeYieldIdle();
+
     // Interrupt this core.
     void Interrupt();
 
@@ -76,6 +84,8 @@ private:
     Core::ArmInterface* m_arm_interface{};
     KThread* m_current_thread{};
     std::atomic<bool> m_is_interrupted{};
+    std::atomic<bool> m_yield_idle{};
+    bool m_yield_woken{};
     bool m_is_single_core{};
 };
 

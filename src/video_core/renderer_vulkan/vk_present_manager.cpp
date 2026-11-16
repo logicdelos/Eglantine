@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <utility>
 #include <vector>
 
 #include "common/logging.h"
@@ -479,12 +480,17 @@ void PresentManager::PresentThread(std::stop_token token) {
                 const double p50 = present_intervals_ms[n * 50 / 100];
                 const double p90 = present_intervals_ms[n * 90 / 100];
                 const double dt_max = present_intervals_ms.back();
-                LOG_INFO(Render_Vulkan,
-                         "PresentCadence: n={} real={} gen={} dt_p50={:.2f} dt_p10={:.2f} "
-                         "dt_p90={:.2f} dt_max={:.2f} base_ms={:.2f}",
-                         cadence_real_count + cadence_gen_count, cadence_real_count,
-                         cadence_gen_count, p50, p10, p90, dt_max,
-                         smoothed_base_period_us / 1000.0);
+                // Once a second for the whole run: the first window at Info, the rest at Debug.
+                static bool cadence_logged{};
+                Common::Log::FmtLogMessage(
+                    Common::Log::Class::Render_Vulkan,
+                    std::exchange(cadence_logged, true) ? Common::Log::Level::Debug
+                                                        : Common::Log::Level::Info,
+                    __FILE__, __LINE__, __func__,
+                    "PresentCadence: n={} real={} gen={} dt_p50={:.2f} dt_p10={:.2f} "
+                    "dt_p90={:.2f} dt_max={:.2f} base_ms={:.2f}",
+                    cadence_real_count + cadence_gen_count, cadence_real_count, cadence_gen_count,
+                    p50, p10, p90, dt_max, smoothed_base_period_us / 1000.0);
                 present_intervals_ms.clear();
                 cadence_real_count = 0;
                 cadence_gen_count = 0;

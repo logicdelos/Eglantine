@@ -259,6 +259,7 @@ namespace Kernel {
                 RequestSuspend(kernel, SuspendType::Process);
             }
         }
+        m_sleep_calls.Register(m_thread_id);
 
         R_SUCCEED();
     }
@@ -331,6 +332,7 @@ namespace Kernel {
     }
 
     void KThread::Finalize(KernelCore& kernel) {
+        m_sleep_calls.Reset();
         // If the thread has an owner process, unregister it.
         if (m_parent != nullptr) {
             m_parent->UnregisterThread(kernel, this);

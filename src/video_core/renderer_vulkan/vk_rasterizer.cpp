@@ -35,6 +35,7 @@
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
 
 #include "common/assert.h"
+#include "common/nx2_bottleneck.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/exception.h"
 #include "common/logging.h"
@@ -1256,6 +1257,23 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
         }
     }
 }
+
+// The after-upscale trace (on by default) describes 40 draws and clears, most in the same state
+// as the one before: each distinct line is logged once.
+void LogTraceOnce(std::string line) {
+    static std::mutex mutex;
+    static std::set<std::string> seen;
+    std::scoped_lock lock{mutex};
+    if (seen.size() < 4096 && seen.insert(line).second) {
+        LOG_INFO(HW_GPU, "{}", line);
+    }
+}
+
+// The trace counter is only spent, and its lines only formatted, when they would be logged.
+bool AfterUpscaleTraceActive() {
+    return Tegra::Engines::g_nx2_trace_draws_after_upscale > 0 &&
+           Common::Log::IsLevelEnabled(Common::Log::Class::HW_GPU, Common::Log::Level::Info);
+}
 } // Anonymous namespace
 
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
@@ -1324,17 +1342,20 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
             Tegra::Engines::g_nx2_trace_draws_after_upscale = 1;
         }
     }
-    if (Tegra::Engines::g_nx2_trace_draws_after_upscale > 0) {
+    if (AfterUpscaleTraceActive()) {
         --Tegra::Engines::g_nx2_trace_draws_after_upscale;
         const auto& regs = maxwell3d->regs;
         const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
         const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1];
-        LOG_INFO(HW_GPU, "after upscale: draw rt0 {:#x} {}x{} fmt {:#x} block {}/{}/{} pitch_linear {} depth {} array_pitch {:#x} ctrl {:#x} vs {:#x} ps {:#x}",
-                 regs.rt[0].Address(), regs.rt[0].width, regs.rt[0].height,
-                 static_cast<u32>(regs.rt[0].format), regs.rt[0].tile_mode.block_width.Value(),
-                 regs.rt[0].tile_mode.block_height.Value(), regs.rt[0].tile_mode.block_depth.Value(),
-                 regs.rt[0].tile_mode.is_pitch_linear.Value(), regs.rt[0].depth.Value(),
-                 regs.rt[0].array_pitch, regs.rt_control.count.Value(), vs, ps);
+        LogTraceOnce(fmt::format("after upscale: draw rt0 {:#x} {}x{} fmt {:#x} block {}/{}/{} pitch_linear {} depth {} array_pitch {:#x} ctrl {:#x} vs {:#x} ps {:#x}",
+                                 regs.rt[0].Address(), regs.rt[0].width, regs.rt[0].height,
+                                 static_cast<u32>(regs.rt[0].format),
+                                 regs.rt[0].tile_mode.block_width.Value(),
+                                 regs.rt[0].tile_mode.block_height.Value(),
+                                 regs.rt[0].tile_mode.block_depth.Value(),
+                                 regs.rt[0].tile_mode.is_pitch_linear.Value(),
+                                 regs.rt[0].depth.Value(), regs.rt[0].array_pitch,
+                                 regs.rt_control.count.Value(), vs, ps));
         // Fragment-stage texture handles (bound buffer 2) and the images they name.
         const auto& handles = maxwell3d->state.shader_stages[4].const_buffers[2];
         if (handles.enabled) {
@@ -1344,18 +1365,20 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                 Tegra::Texture::TICEntry tic{};
                 gpu_memory->ReadBlockUnsafe(regs.tex_header.Address() + u64{handle & 0xfffff} * sizeof(tic),
                                             &tic, sizeof(tic));
-                LOG_INFO(HW_GPU, "  fs handle[{}] = {:#x}: {:#x} {}x{} format {:#x}", i, handle,
-                         tic.Address(), tic.Width(), tic.Height(), static_cast<u32>(tic.format.Value()));
+                LogTraceOnce(fmt::format("  fs handle[{}] = {:#x}: {:#x} {}x{} format {:#x}", i,
+                                         handle, tic.Address(), tic.Width(), tic.Height(),
+                                         static_cast<u32>(tic.format.Value())));
             }
         }
         const auto& bt = regs.blend_per_target[0];
-        LOG_INFO(HW_GPU, "  blend enable {} per-target {} global op {} src {:#x} dst {:#x} | rt0 op {} src {:#x} dst {:#x} alpha {:#x}/{:#x} mask {:#x}",
-                 regs.blend.enable[0], regs.blend_per_target_enabled,
-                 static_cast<u32>(regs.blend.color_op), static_cast<u32>(regs.blend.color_source),
-                 static_cast<u32>(regs.blend.color_dest), static_cast<u32>(bt.color_op),
-                 static_cast<u32>(bt.color_source), static_cast<u32>(bt.color_dest),
-                 static_cast<u32>(bt.alpha_source), static_cast<u32>(bt.alpha_dest),
-                 regs.color_mask[0].raw);
+        LogTraceOnce(fmt::format("  blend enable {} per-target {} global op {} src {:#x} dst {:#x} | rt0 op {} src {:#x} dst {:#x} alpha {:#x}/{:#x} mask {:#x}",
+                                 regs.blend.enable[0], regs.blend_per_target_enabled,
+                                 static_cast<u32>(regs.blend.color_op),
+                                 static_cast<u32>(regs.blend.color_source),
+                                 static_cast<u32>(regs.blend.color_dest),
+                                 static_cast<u32>(bt.color_op), static_cast<u32>(bt.color_source),
+                                 static_cast<u32>(bt.color_dest), static_cast<u32>(bt.alpha_source),
+                                 static_cast<u32>(bt.alpha_dest), regs.color_mask[0].raw));
     }
     // EDEN_NX2_SKIP_VS=<address>[,<address>...]: drop draws using those vertex shaders (debug aid).
     static const std::vector<u64> skip_list = [] {
@@ -1642,12 +1665,13 @@ void RasterizerVulkan::DrawTexture() {
 
 void RasterizerVulkan::Clear(u32 layer_count) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Clear};
-    if (Tegra::Engines::g_nx2_trace_draws_after_upscale > 0) {
+    if (AfterUpscaleTraceActive()) {
         const auto& regs = maxwell3d->regs;
-        LOG_INFO(HW_GPU, "after upscale: clear rt0 {:#x} {}x{} fmt {:#x} surface {:#x} colour {} {} {} {}",
-                 regs.rt[0].Address(), regs.rt[0].width, regs.rt[0].height,
-                 static_cast<u32>(regs.rt[0].format), regs.clear_surface.raw, regs.clear_color[0],
-                 regs.clear_color[1], regs.clear_color[2], regs.clear_color[3]);
+        LogTraceOnce(fmt::format("after upscale: clear rt0 {:#x} {}x{} fmt {:#x} surface {:#x} colour {} {} {} {}",
+                                 regs.rt[0].Address(), regs.rt[0].width, regs.rt[0].height,
+                                 static_cast<u32>(regs.rt[0].format), regs.clear_surface.raw,
+                                 regs.clear_color[0], regs.clear_color[1], regs.clear_color[2],
+                                 regs.clear_color[3]));
     }
     TraceWindowTarget(*maxwell3d, *gpu_memory, "clear", layer_count);
     FlushWork();
@@ -2160,8 +2184,12 @@ bool RasterizerVulkan::WaitQueryResultsFence(DAddr addr) {
     // after 2 s (the read may then see older report values).
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     std::unique_lock lock{state->mutex};
-    while (!state->cv.wait_for(lock, std::chrono::milliseconds(5),
-                               [&state] { return state->written; })) {
+    const auto wait_slice = [&] {
+        Nx2Bottleneck::WaitScope wait{Nx2Bottleneck::Wait::HostGpu};
+        return state->cv.wait_for(lock, std::chrono::milliseconds(5),
+                                  [&state] { return state->written; });
+    };
+    while (!wait_slice()) {
         if (std::chrono::steady_clock::now() >= deadline) {
             LOG_WARNING(Render_Vulkan, "FlushQueryResults: gave up waiting for query results "
                                        "at {:#x} after 2 s",

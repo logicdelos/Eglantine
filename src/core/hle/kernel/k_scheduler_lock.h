@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include "common/assert.h"
+#include "common/nx2_bottleneck.h"
 #include "core/hle/kernel/k_interrupt_manager.h"
 #include "core/hle/kernel/k_spin_lock.h"
 #include "core/hle/kernel/k_thread.h"
@@ -33,7 +34,11 @@ public:
         } else {
             // Otherwise, we want to disable scheduling and acquire the spinlock.
             SchedulerType::DisableScheduling(m_kernel);
-            m_spin_lock.Lock();
+            if (!m_spin_lock.TryLock()) {
+                // Contended: the only case that reads the clock.
+                const Nx2Bottleneck::WaitScope wait{Nx2Bottleneck::Wait::KernelLock};
+                m_spin_lock.Lock();
+            }
 
             ASSERT(m_lock_count == 0);
             ASSERT(m_owner_thread == nullptr);

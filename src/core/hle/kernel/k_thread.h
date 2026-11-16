@@ -22,6 +22,7 @@
 
 #include "common/intrusive_red_black_tree.h"
 #include "common/scratch_buffer.h"
+#include "common/nx2_bottleneck.h"
 #include "core/arm/arm_interface.h"
 #include "core/hle/kernel/k_affinity_mask.h"
 #include "core/hle/kernel/k_light_lock.h"
@@ -372,6 +373,27 @@ public:
 
     void SetYieldScheduleCount(s64 count) {
         m_schedule_count = count;
+    }
+
+    void ResetYieldStreak() {
+        m_yield_streak = 0;
+        ++m_yield_epoch;
+    }
+
+    u64 GetYieldEpoch() const {
+        return m_yield_epoch;
+    }
+
+    bool NoteEmptyYield() {
+        return ++m_yield_streak >= 64;
+    }
+
+    void NoteSleepThread(s64 ns) {
+        m_sleep_calls.Note(ns);
+    }
+
+    void CountEmptyYield(bool empty) {
+        m_sleep_calls.NoteEmptyYield(empty);
     }
 
     void WaitCancel(KernelCore& kernel);
@@ -899,6 +921,9 @@ private:
     KLightLock m_activity_pause_lock;
     SyncObjectBuffer m_sync_object_buffer{};
     s64 m_schedule_count{};
+    Nx2Bottleneck::SleepThreadCounter m_sleep_calls;
+    u32 m_yield_streak{};
+    u64 m_yield_epoch{};
     s64 m_last_scheduled_tick{};
     std::atomic<bool> m_entered_kernel{false};
     std::array<QueueEntry, Core::Hardware::NUM_CPU_CORES> m_per_core_priority_queue_entry{};
