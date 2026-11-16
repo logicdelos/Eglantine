@@ -429,9 +429,17 @@ void Filter::ParseFilterString(std::string_view filter_view) {
 static std::optional<Common::Log::Impl> logging_instance{};
 /// See SetExternalSink. Loaded once per message that passes the filter; nullptr when unset.
 static std::atomic<Common::Log::ExternalSink> external_sink{nullptr};
+/// See GetLogCounts: the messages of those levels that passed the filter.
+static std::atomic<u64> error_log_count{0};
+static std::atomic<u64> critical_log_count{0};
 
 void SetExternalSink(ExternalSink sink) {
     external_sink.store(sink, std::memory_order_release);
+}
+
+LogCounts GetLogCounts() noexcept {
+    return {.error = error_log_count.load(std::memory_order_relaxed),
+            .critical = critical_log_count.load(std::memory_order_relaxed)};
 }
 
 void Initialize() {
@@ -512,6 +520,12 @@ bool IsLevelEnabled(Class log_class, Level log_level) {
 /// Formats a message that passes the filter and writes it to every backend and the external sink.
 void FmtLogMessageImpl(Class log_class, Level log_level, const char* filename, unsigned int line_num, const char* function, fmt::string_view format, const fmt::format_args& args) {
     if (logging_instance && logging_instance->filter.CheckMessage(log_class, log_level)) {
+        // Counted once, after the filter and before any backend sees the message.
+        if (log_level == Level::Error) {
+            error_log_count.fetch_add(1, std::memory_order_relaxed);
+        } else if (log_level == Level::Critical) {
+            critical_log_count.fetch_add(1, std::memory_order_relaxed);
+        }
         auto const flush = ::Settings::values.log_flush_line.GetValue();
         char buffer[BUFSIZ];
         auto result = fmt::vformat_to_n(buffer, sizeof(buffer) - 1, format, args);

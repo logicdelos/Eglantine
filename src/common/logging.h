@@ -152,4 +152,12 @@ void SetColorConsoleBackendEnabled(bool enabled);
 using ExternalSink = void (*)(const char* class_name, Level level, std::string_view message);
 void SetExternalSink(ExternalSink sink);
 
+/// Error and Critical messages that passed the global filter since the process started, counted
+/// once each before the backends. Nothing is matched against their text.
+struct LogCounts {
+    u64 error{};
+    u64 critical{};
+};
+[[nodiscard]] LogCounts GetLogCounts() noexcept;
+
 } // namespace Common::Log

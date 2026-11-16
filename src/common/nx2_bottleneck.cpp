@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <condition_variable>
 #include <cmath>
@@ -14,6 +15,7 @@
 #include <iterator>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -25,6 +27,7 @@
 #include "common/cpu_features.h"
 #include "common/logging.h"
 #include "common/memory_accounting.h"
+#include "common/run_outcome.h"
 #include "common/thread.h"
 
 #ifdef _WIN32
@@ -127,6 +130,22 @@ std::atomic<bool> guest_running{};
 std::atomic<u32> run_count{};
 thread_local size_t wait_row = NumThreads;
 
+/// Present intervals as a histogram, kept only while a report records. Microseconds below 64 have
+/// a bucket each; above, every power of two is split into 64 equal buckets, so a bucket is at most
+/// 1/64 of its octave wide. The 58 octaves from 2^6 to 2^63 cover every u64 microsecond count.
+constexpr size_t HistogramBuckets = 64 + 64 * 58;
+std::array<std::atomic<u64>, HistogramBuckets> interval_histogram{};
+std::atomic<u64> histogram_sum_us{};
+std::atomic<u64> histogram_max_us{};
+std::atomic<bool> histogram_enabled{};
+/// The histogram of the window Collect took last (guarded by collect_mutex).
+std::array<u64, HistogramBuckets> window_histogram{};
+/// Every Collect runs under this, and `collect_begin` is where the window being filled started:
+/// Collect resets the counters, so there is one collector, and whatever wants a window of them
+/// (the log, the report) takes it from the loop below.
+std::mutex& collect_mutex = *new std::mutex;
+u64 collect_begin = 0;
+
 void RaiseTo(std::atomic<u64>& longest, u64 value) {
     u64 seen = longest.load(std::memory_order_relaxed);
     while (value > seen && !longest.compare_exchange_weak(seen, value, std::memory_order_relaxed)) {
@@ -207,6 +226,12 @@ struct Window {
     u64 yield_backoffs{};
     u64 yield_wait_ns{};
     u64 yield_longest_ns{};
+    /// Raw time not spent working, and raw guest time per core, for the report.
+    std::array<double, NumThreads> idle_ms{};
+    std::array<double, MaxCores> guest_run_ms{};
+    /// Exact sum and longest of the present intervals of the window, with the histogram.
+    u64 interval_sum_us{};
+    u64 interval_max_us{};
 };
 
 /// Fills in the interval statistics from the ring.
@@ -252,6 +277,13 @@ Window Collect(u64 begin, u64 now) {
     window.longest_frame_ms =
         static_cast<double>(longest_frame_ns.exchange(0, std::memory_order_relaxed)) / 1e6;
     SummarizeIntervals(window);
+    if (histogram_enabled.load(std::memory_order_relaxed)) {
+        for (size_t i = 0; i < HistogramBuckets; ++i) {
+            window_histogram[i] = interval_histogram[i].exchange(0, std::memory_order_acquire);
+        }
+        window.interval_sum_us = histogram_sum_us.exchange(0, std::memory_order_relaxed);
+        window.interval_max_us = histogram_max_us.exchange(0, std::memory_order_relaxed);
+    }
     window.audio_underruns = audio_underruns.exchange(0, std::memory_order_relaxed);
     for (size_t i = 0; i < NumThreads; ++i) {
         IdleMeter& meter = idle_meters[i];
@@ -263,6 +295,7 @@ Window Collect(u64 begin, u64 now) {
         window.busy[i] = meter.seen.load(std::memory_order_relaxed)
                              ? std::clamp(1.0 - static_cast<double>(idle) / window_ns, 0.0, 1.0)
                              : -1.0;
+        window.idle_ms[i] = static_cast<double>((std::min)(idle, now - begin)) / 1e6;
     }
     for (size_t row = 0; row < NumWaitRows; ++row) {
         for (size_t i = 0; i < NumWaits; ++i) {
@@ -277,8 +310,9 @@ Window Collect(u64 begin, u64 now) {
         }
     }
     for (size_t i = 0; i < MaxCores; ++i) {
-        window.guest_run[i] =
-            static_cast<double>(guest_run_ns[i].exchange(0, std::memory_order_relaxed)) / window_ns;
+        const u64 run_ns = guest_run_ns[i].exchange(0, std::memory_order_relaxed);
+        window.guest_run_ms[i] = static_cast<double>(run_ns) / 1e6;
+        window.guest_run[i] = static_cast<double>(run_ns) / window_ns;
     }
     std::array<u32, NumSvcIds> svc{};
     for (size_t core = 0; core < MaxCores; ++core) {
@@ -931,9 +965,263 @@ void Report(const Window& window) {
              static_cast<double>(window.yield_longest_ns) / 1e6);
 }
 
+// The run report: the windows of the log, kept as numbers.
+
+static_assert(NumThreads == 3);
+
+[[nodiscard]] size_t BucketOf(u64 us) {
+    if (us < 64) {
+        return static_cast<size_t>(us);
+    }
+    const unsigned octave = static_cast<unsigned>(std::bit_width(us)) - 1;
+    return 64 + 64 * (octave - 6) + static_cast<size_t>((us - (u64{1} << octave)) >> (octave - 6));
+}
+
+/// The largest microsecond count in bucket `index`.
+[[nodiscard]] u64 BucketUpper(size_t index) {
+    if (index < 64) {
+        return index;
+    }
+    const size_t step = index - 64;
+    const unsigned octave = 6 + static_cast<unsigned>(step / 64);
+    const u64 width = u64{1} << (octave - 6);
+    return (u64{1} << octave) + static_cast<u64>(step % 64) * width + (width - 1);
+}
+
+/// The sample at nearest rank ceil(percent / 100 * samples), as the upper end of its bucket
+/// (microseconds) capped at the exact longest, in milliseconds.
+[[nodiscard]] std::optional<double> Quantile(const std::array<u64, HistogramBuckets>& histogram,
+                                             u64 samples, u64 percent, u64 max_us) {
+    if (samples == 0) {
+        return std::nullopt;
+    }
+    const u64 rank = (std::max)(u64{1}, (samples * percent + 99) / 100);
+    u64 seen = 0;
+    for (size_t i = 0; i < histogram.size(); ++i) {
+        seen += histogram[i];
+        if (seen >= rank) {
+            return static_cast<double>((std::min)(BucketUpper(i), max_us)) / 1e3;
+        }
+    }
+    return static_cast<double>(max_us) / 1e3;
+}
+
+void FillIntervals(RunMetrics& metrics, const std::array<u64, HistogramBuckets>& histogram,
+                   u64 sum_us, u64 max_us) {
+    u64 samples = 0;
+    for (const u64 count : histogram) {
+        samples += count;
+    }
+    metrics.samples = samples;
+    if (samples == 0) {
+        metrics.mean_ms.reset();
+        metrics.p50_ms.reset();
+        metrics.p95_ms.reset();
+        metrics.p99_ms.reset();
+        metrics.max_ms.reset();
+        return;
+    }
+    metrics.mean_ms = static_cast<double>(sum_us) / static_cast<double>(samples) / 1e3;
+    metrics.p50_ms = Quantile(histogram, samples, 50, max_us);
+    metrics.p95_ms = Quantile(histogram, samples, 95, max_us);
+    metrics.p99_ms = Quantile(histogram, samples, 99, max_us);
+    metrics.max_ms = static_cast<double>(max_us) / 1e3;
+}
+
+/// One window as numbers. A thread's work is what its time leaves after idling and its waits.
+RunMetrics MetricsOf(const Window& window) {
+    RunMetrics metrics;
+    metrics.active_seconds = window.seconds;
+    metrics.frames = window.frames;
+    if (window.seconds > 0.0) {
+        metrics.fps = static_cast<double>(window.frames) / window.seconds;
+    }
+    FillIntervals(metrics, window_histogram, window.interval_sum_us, window.interval_max_us);
+    metrics.over_25ms = window.over_25ms;
+    metrics.over_50ms = window.over_50ms;
+    metrics.over_100ms = window.over_100ms;
+    for (size_t i = 0; i < NumThreads; ++i) {
+        if (window.busy[i] < 0.0) {
+            // Never ran: the back thread without the GPU thread split.
+            continue;
+        }
+        ThreadSplit& split = metrics.threads[i];
+        split.seen = true;
+        split.observed_seconds = window.seconds;
+        split.idle_ms = window.idle_ms[i];
+        double waited_ms = 0.0;
+        for (size_t wait = 0; wait < NumThreadWaits; ++wait) {
+            split.waits_ms[wait] = window.waits[i][wait].ms;
+            waited_ms += window.waits[i][wait].ms;
+        }
+        split.work_ms = (std::max)(window.seconds * 1000.0 - split.idle_ms - waited_ms, 0.0);
+    }
+    const WaitTotals fence = window.Waited(Wait::GuestOnGpu);
+    metrics.guest_gpu_wait = {.total_ms = fence.ms, .longest_ms = fence.longest_ms,
+                              .count = fence.count};
+    if (window.seconds > 0.0) {
+        // Summed over threads, so it can pass 1.
+        metrics.guest_gpu_fraction = fence.ms / (window.seconds * 1000.0);
+    }
+    metrics.guest_cpu_core_busy_ms = window.guest_run_ms;
+    const WaitTotals shaders = window.Waited(Wait::ShaderBuild);
+    metrics.shader_wait = {.total_ms = shaders.ms, .longest_ms = shaders.longest_ms,
+                           .count = shaders.count};
+    metrics.limiter = Limiter(window);
+    return metrics;
+}
+
+/// Adds the counters of `part` to `total`; the interval statistics and the limiter of a total
+/// come from the cumulative histogram and the aggregate window instead.
+void Accumulate(RunMetrics& total, const RunMetrics& part) {
+    total.active_seconds += part.active_seconds;
+    total.frames += part.frames;
+    total.over_25ms += part.over_25ms;
+    total.over_50ms += part.over_50ms;
+    total.over_100ms += part.over_100ms;
+    for (size_t i = 0; i < NumThreads; ++i) {
+        const ThreadSplit& from = part.threads[i];
+        if (!from.seen) {
+            continue;
+        }
+        ThreadSplit& to = total.threads[i];
+        to.seen = true;
+        to.observed_seconds += from.observed_seconds;
+        to.work_ms += from.work_ms;
+        to.idle_ms += from.idle_ms;
+        for (size_t wait = 0; wait < NumThreadWaits; ++wait) {
+            to.waits_ms[wait] += from.waits_ms[wait];
+        }
+    }
+    const auto add_wait = [](WaitSummary& to, const WaitSummary& from) {
+        to.total_ms += from.total_ms;
+        to.longest_ms = (std::max)(to.longest_ms, from.longest_ms);
+        to.count += from.count;
+    };
+    add_wait(total.guest_gpu_wait, part.guest_gpu_wait);
+    add_wait(total.shader_wait, part.shader_wait);
+    for (size_t core = 0; core < MaxCores; ++core) {
+        total.guest_cpu_core_busy_ms[core] += part.guest_cpu_core_busy_ms[core];
+    }
+}
+
+struct Recorder {
+    bool enabled = false;
+    u64 origin_ns = 0;
+    RunMetrics sum;
+    /// Raw sums of the windows, for the limiter of the whole run.
+    Window aggregate;
+    std::array<double, NumThreads> busy_weighted{};
+    std::array<double, NumThreads> seen_seconds{};
+    std::array<u64, HistogramBuckets> histogram{};
+    u64 sum_us = 0;
+    u64 max_us = 0;
+    std::vector<RunWindow> windows;
+};
+
+/// Guarded by collect_mutex. Never destroyed: the report loop can outlive static destructors.
+Recorder& GetRecorder() {
+    static auto* recorder = new Recorder;
+    return *recorder;
+}
+
+/// Seconds from the start of the recording to `ns`, on Now()'s clock.
+double RecordingSeconds(u64 ns) {
+    const u64 origin = GetRecorder().origin_ns;
+    return ns > origin ? static_cast<double>(ns - origin) / 1e9 : 0.0;
+}
+
+/// Keeps `window`, which covers `begin` to `now`, in the recording. With collect_mutex held, and
+/// right after the Collect that produced it (it reads window_histogram).
+void RecordWindowLocked(const Window& window, u64 begin, u64 now, bool partial) {
+    Recorder& recorder = GetRecorder();
+    if (!recorder.enabled || !(window.seconds > 0.0)) {
+        return;
+    }
+    RunMetrics metrics = MetricsOf(window);
+    Accumulate(recorder.sum, metrics);
+    Window& aggregate = recorder.aggregate;
+    aggregate.seconds += window.seconds;
+    aggregate.frames += window.frames;
+    aggregate.over_25ms += window.over_25ms;
+    aggregate.over_50ms += window.over_50ms;
+    aggregate.over_100ms += window.over_100ms;
+    aggregate.over_25ms_ms += window.over_25ms_ms;
+    aggregate.over_50ms_ms += window.over_50ms_ms;
+    aggregate.longest_frame_ms = (std::max)(aggregate.longest_frame_ms, window.longest_frame_ms);
+    for (size_t i = 0; i < NumThreads; ++i) {
+        if (window.busy[i] >= 0.0) {
+            recorder.busy_weighted[i] += window.busy[i] * window.seconds;
+            recorder.seen_seconds[i] += window.seconds;
+        }
+    }
+    for (size_t row = 0; row < NumWaitRows; ++row) {
+        for (size_t i = 0; i < NumWaits; ++i) {
+            WaitTotals& to = aggregate.waits[row][i];
+            const WaitTotals& from = window.waits[row][i];
+            to.ms += from.ms;
+            to.longest_ms = (std::max)(to.longest_ms, from.longest_ms);
+            to.count += from.count;
+        }
+    }
+    for (size_t i = 0; i < HistogramBuckets; ++i) {
+        recorder.histogram[i] += window_histogram[i];
+    }
+    recorder.sum_us += window.interval_sum_us;
+    recorder.max_us = (std::max)(recorder.max_us, window.interval_max_us);
+    recorder.windows.push_back({.start_seconds = RecordingSeconds(begin),
+                                .end_seconds = RecordingSeconds(now),
+                                .partial = partial,
+                                .metrics = std::move(metrics)});
+}
+
+/// The counters since the window began, as a window that ends now (guest paused or run over).
+void CloseSegmentLocked(u64 now) {
+    const u64 begin = std::exchange(collect_begin, now);
+    const Window window = Collect(begin, now);
+    RecordWindowLocked(window, begin, now, true);
+}
+
+/// Drops what the counters gathered while the guest did not run; its windows start here.
+void StartSegmentLocked(u64 now) {
+    const u64 begin = collect_begin != 0 ? collect_begin : now;
+    static_cast<void>(Collect(begin, now));
+    collect_begin = now;
+}
+
+/// The whole run: the windows added up, with the frame statistics of the cumulative histogram and
+/// the limiter judged on the raw sums.
+RunMetrics SummarizeLocked() {
+    Recorder& recorder = GetRecorder();
+    RunMetrics summary = recorder.sum;
+    const double active = summary.active_seconds;
+    if (!(active > 0.0)) {
+        return RunMetrics{};
+    }
+    FillIntervals(summary, recorder.histogram, recorder.sum_us, recorder.max_us);
+    summary.fps = static_cast<double>(summary.frames) / active;
+    summary.guest_gpu_fraction = summary.guest_gpu_wait.total_ms / (active * 1000.0);
+    Window aggregate = recorder.aggregate;
+    for (size_t i = 0; i < NumThreads; ++i) {
+        aggregate.busy[i] =
+            recorder.seen_seconds[i] > 0.0 ? recorder.busy_weighted[i] / recorder.seen_seconds[i]
+                                           : -1.0;
+    }
+    for (size_t core = 0; core < MaxCores; ++core) {
+        aggregate.guest_run[core] = summary.guest_cpu_core_busy_ms[core] / (active * 1000.0);
+    }
+    summary.limiter = Limiter(aggregate);
+    return summary;
+}
+
 void ReportLoop() {
     Common::SetCurrentThreadName("Nx2Bottleneck");
-    u64 begin = Now();
+    {
+        std::scoped_lock lock{collect_mutex};
+        if (collect_begin == 0) {
+            collect_begin = Now();
+        }
+    }
     u32 run_seen = ~u32{0};
     u32 memory_reports = 0;
     for (;;) {
@@ -953,18 +1241,30 @@ void ReportLoop() {
             continue;
         }
         const u64 now = Now();
-        const Window window = Collect(begin, now);
-        begin = now;
-        // A window the guest was paused or started in is not a whole one.
-        const u32 run = run_count.load(std::memory_order_relaxed);
-        if (guest_running.load(std::memory_order_relaxed) && run == run_seen) {
+        Window window;
+        bool whole = false;
+        {
+            std::scoped_lock lock{collect_mutex};
+            const u64 begin = std::exchange(collect_begin, now);
+            window = Collect(begin, now);
+            // A window the guest was paused or started in is not a whole one.
+            const u32 run = run_count.load(std::memory_order_relaxed);
+            const bool running = guest_running.load(std::memory_order_relaxed);
+            whole = running && run == run_seen;
+            run_seen = run;
+            if (running) {
+                // The report keeps those too, marked partial, as it keeps the end of the run.
+                RecordWindowLocked(window, begin, now,
+                                   !whole || window.seconds < static_cast<double>(Period.count()) * 0.99);
+            }
+        }
+        if (whole) {
             Report(window);
             ReportMemory();
             if (MemoryMapEnabled() && ++memory_reports % 6 == 0) {
                 ReportMemoryMap();
             }
         }
-        run_seen = run;
     }
 }
 
@@ -1011,11 +1311,18 @@ void NoteFrame() {
     const u64 now = Now();
     const u64 previous = last_frame.exchange(now, std::memory_order_relaxed);
     frames.fetch_add(1, std::memory_order_relaxed);
+    Common::RunOutcome::NoteFrame();
     if (previous == 0) {
         return;
     }
     const u64 ns = now - previous;
     RaiseTo(longest_frame_ns, ns);
+    if (histogram_enabled.load(std::memory_order_relaxed)) {
+        const u64 us = ns / 1000;
+        RaiseTo(histogram_max_us, us);
+        histogram_sum_us.fetch_add(us, std::memory_order_relaxed);
+        interval_histogram[BucketOf(us)].fetch_add(1, std::memory_order_release);
+    }
     const u32 written = intervals_written.load(std::memory_order_relaxed);
     interval_us[written % IntervalRing].store(
         static_cast<u32>((std::min)(ns / 1000, u64{(std::numeric_limits<u32>::max)()})),
@@ -1141,8 +1448,17 @@ void SetGuestRunning(bool running) {
         // The time paused is not a frame.
         last_frame.store(0, std::memory_order_relaxed);
         run_count.fetch_add(1, std::memory_order_relaxed);
+        {
+            std::scoped_lock lock{collect_mutex};
+            if (GetRecorder().enabled) {
+                StartSegmentLocked(Now());
+            }
+        }
         std::call_once(started, [] { std::thread{ReportLoop}.detach(); });
-    } else if (MemoryMapEnabled() && guest_running.load(std::memory_order_relaxed)) {
+        guest_running.store(true, std::memory_order_relaxed);
+        return;
+    }
+    if (MemoryMapEnabled() && guest_running.load(std::memory_order_relaxed)) {
         // The region census at pause or shutdown runs on the report thread, before the guest's
         // memory goes away; this waits for it.
         std::unique_lock lock{wake_mutex};
@@ -1151,7 +1467,43 @@ void SetGuestRunning(bool running) {
         wake.notify_all();
         wake.wait_for(lock, std::chrono::seconds{5}, [] { return census_done; });
     }
-    guest_running.store(running, std::memory_order_relaxed);
+    // The window the pause interrupts goes to the report as a partial one.
+    std::scoped_lock lock{collect_mutex};
+    if (GetRecorder().enabled && guest_running.load(std::memory_order_relaxed)) {
+        CloseSegmentLocked(Now());
+    }
+    guest_running.store(false, std::memory_order_relaxed);
+}
+
+void BeginRecording(u64 origin_ns) {
+    std::scoped_lock lock{collect_mutex};
+    Recorder& recorder = GetRecorder();
+    recorder = Recorder{};
+    recorder.enabled = true;
+    recorder.origin_ns = origin_ns;
+    histogram_enabled.store(true, std::memory_order_relaxed);
+    if (guest_running.load(std::memory_order_relaxed)) {
+        StartSegmentLocked(Now());
+    }
+}
+
+RunRecording EndRecording(bool forced) {
+    std::scoped_lock lock{collect_mutex};
+    Recorder& recorder = GetRecorder();
+    RunRecording result;
+    if (!recorder.enabled) {
+        return result;
+    }
+    const bool still_running = guest_running.load(std::memory_order_relaxed);
+    if (still_running) {
+        CloseSegmentLocked(Now());
+    }
+    result.summary = SummarizeLocked();
+    result.windows = std::move(recorder.windows);
+    result.complete = !forced && !still_running;
+    recorder.enabled = false;
+    histogram_enabled.store(false, std::memory_order_relaxed);
+    return result;
 }
 
 } // namespace Nx2Bottleneck

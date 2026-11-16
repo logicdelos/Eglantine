@@ -6,7 +6,9 @@
 #include <array>
 #include <atomic>
 #include <cstddef>
+#include <optional>
 #include <string>
+#include <vector>
 
 #include "common/common_types.h"
 
@@ -131,5 +133,74 @@ private:
     Wait wait;
     u64 begin;
 };
+
+// The numbers of a run for the command line's --report. The collector that writes the log every 10
+// seconds keeps them too, window by window; nothing here collects on its own.
+
+/// A thread's time: observed = work + idle + the waits, within the timer's rounding (a wait that
+/// runs past the thread's working time leaves work at 0 instead of negative).
+struct ThreadSplit {
+    bool seen{}; // false: the thread never ran (the back thread without the GPU thread split)
+    double observed_seconds{};
+    double work_ms{};
+    double idle_ms{};
+    /// Indexed by `Wait`, HostGpu to GpuBack.
+    std::array<double, static_cast<size_t>(Wait::GuestOnGpu)> waits_ms{};
+};
+
+struct WaitSummary {
+    double total_ms{};
+    double longest_ms{};
+    u64 count{};
+};
+
+/// The statistics of a window or of the whole run.
+struct RunMetrics {
+    double active_seconds{}; // time the guest ran; a paused guest does not count
+    u64 frames{};
+    std::optional<double> fps; // empty without active time
+    /// Present intervals: every frame but the first after a start or resume has one. Percentiles
+    /// are nearest rank on a log histogram of microseconds (a bucket is at most 1/64 of its
+    /// octave wide), capped at the exact longest.
+    u64 samples{};
+    std::optional<double> mean_ms;
+    std::optional<double> p50_ms;
+    std::optional<double> p95_ms;
+    std::optional<double> p99_ms;
+    std::optional<double> max_ms;
+    u64 over_25ms{};
+    u64 over_50ms{};
+    u64 over_100ms{};
+    std::array<ThreadSplit, static_cast<size_t>(Thread::Count)> threads{};
+    /// The game waiting for its frames on the GPU, summed over threads: it can exceed the time.
+    WaitSummary guest_gpu_wait{};
+    std::optional<double> guest_gpu_fraction;
+    std::array<double, MaxCores> guest_cpu_core_busy_ms{};
+    WaitSummary shader_wait{};
+    /// The verdict of the log's "Limited by", judged on the same numbers.
+    std::string limiter{"not_running"};
+};
+
+struct RunWindow {
+    double start_seconds{}; // from the start of the recording
+    double end_seconds{};
+    bool partial{}; // shorter than the reporting period: a start, a pause or the end of the run
+    RunMetrics metrics;
+};
+
+struct RunRecording {
+    RunMetrics summary;
+    std::vector<RunWindow> windows;
+    /// False when the recording was taken while the guest still ran or by a forced shutdown.
+    bool complete = true;
+};
+
+/// Starts keeping every window the guest runs, with a histogram of the present intervals.
+/// `origin_ns`, on the clock of Now(), is the zero of the window times. Call before the guest runs.
+void BeginRecording(u64 origin_ns);
+
+/// Stops recording and returns it. The window in progress is closed as a partial one. `forced`
+/// marks a recording taken while the shutdown was not finished.
+[[nodiscard]] RunRecording EndRecording(bool forced);
 
 } // namespace Nx2Bottleneck
