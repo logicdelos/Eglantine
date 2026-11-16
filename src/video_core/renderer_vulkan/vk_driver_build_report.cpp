@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <mutex>
 #include <string>
@@ -121,8 +122,51 @@ std::unordered_set<u64> built_keys;
 // Read by Tick without the mutex.
 std::atomic<bool> period_pending{};
 std::atomic<bool> drain_armed{};
-// Counted per skipped draw, so not under the mutex.
-std::atomic<u64> draws_skipped{};
+// Counted per skipped draw, so not under the mutex. `skips_period` is what no line reported yet,
+// `skips_session` the whole session.
+constexpr size_t SkipReasonCount = static_cast<size_t>(SkipReason::Count);
+using SkipCounts = std::array<u64, SkipReasonCount>;
+std::array<std::atomic<u64>, SkipReasonCount> skips_period{};
+std::array<std::atomic<u64>, SkipReasonCount> skips_session{};
+std::atomic<u64> skips_pending{};
+// Guarded by the mutex: when Tick first saw skips nothing reported.
+bool skips_window_open{};
+Clock::time_point skips_window_start;
+
+SkipCounts TakeSkips() {
+    SkipCounts taken{};
+    for (size_t i = 0; i < SkipReasonCount; ++i) {
+        taken[i] = skips_period[i].exchange(0, std::memory_order_relaxed);
+    }
+    skips_pending.store(0, std::memory_order_relaxed);
+    skips_window_open = false;
+    return taken;
+}
+
+// "14 draws skipped (disk-replay-async 10, geometry-consistency 4; last 10 s)", then, when there
+// were any, ", 2 dispatches skipped (compute-no-pipeline 2)". The reasons are in enum order.
+std::string FormatSkips(const SkipCounts& counts, const char* when) {
+    u64 draws{};
+    u64 dispatches{};
+    std::string draw_reasons;
+    std::string dispatch_reasons;
+    for (size_t i = 0; i < SkipReasonCount; ++i) {
+        if (counts[i] == 0) {
+            continue;
+        }
+        const bool compute = i >= static_cast<size_t>(SkipReason::ComputeNoShader);
+        (compute ? dispatches : draws) += counts[i];
+        auto& reasons = compute ? dispatch_reasons : draw_reasons;
+        reasons += fmt::format("{}{} {}", reasons.empty() ? "" : ", ",
+                               SkipReasonName(static_cast<SkipReason>(i)), counts[i]);
+    }
+    std::string text = fmt::format("{} draws skipped ({}{}{})", draws, draw_reasons,
+                                   draw_reasons.empty() ? "" : "; ", when);
+    if (dispatches != 0) {
+        text += fmt::format(", {} dispatches skipped ({})", dispatches, dispatch_reasons);
+    }
+    return text;
+}
 
 double Ms(Duration d) {
     return std::chrono::duration<double, std::milli>(d).count();
@@ -156,15 +200,14 @@ void EmitPeriod(Clock::time_point now, const char* when) {
              "cache), translation {:.0f} ms, SPIR-V {:.0f} ms, driver {:.0f} ms, queued {:.1f} ms "
              "avg / {:.1f} ms longest, workers busy {:.1f} of {}, longest single build {:.1f} ms, "
              "GPU thread waited {} times {:.0f} ms, duplicates {}; other {:.0f} ms, GPU thread "
-             "built {} itself in {:.0f} ms, submission thread waited {} times {:.0f} ms, {} draws "
-             "skipped ({})",
+             "built {} itself in {:.0f} ms, submission thread waited {} times {:.0f} ms, {}",
              p.pipelines, wall_ns / 1e9, p.graphics, p.compute, p.from_disk, Ms(p.translate),
              Ms(p.spirv), Ms(p.driver),
              p.queued_count != 0 ? Ms(p.queued) / static_cast<double>(p.queued_count) : 0.0,
              Ms(p.queued_max), wall_ns > 0.0 ? busy_ns / wall_ns : 0.0, builder_threads,
              Ms(p.longest), p.gpu_waits, Ms(p.gpu_wait), p.duplicates, Ms(p.other), p.gpu_builds,
              Ms(p.gpu_build), p.submission_waits, Ms(p.submission_wait),
-             draws_skipped.exchange(0, std::memory_order_relaxed), when);
+             FormatSkips(TakeSkips(), when));
     period = {};
     busy_ns = 0.0;
     last_change = now;
@@ -334,8 +377,56 @@ void NoteSubmissionWait(std::chrono::steady_clock::duration time) {
     period.submission_wait += time;
 }
 
-void NoteDrawSkipped() {
-    draws_skipped.fetch_add(1, std::memory_order_relaxed);
+const char* SkipReasonName(SkipReason reason) noexcept {
+    switch (reason) {
+    case SkipReason::StageRejected:
+        return "stage-rejected";
+    case SkipReason::DiskReplayAsync:
+        return "disk-replay-async";
+    case SkipReason::AsyncTranslation:
+        return "async-translation";
+    case SkipReason::BuildDeferred:
+        return "build-deferred";
+    case SkipReason::AsyncBuild:
+        return "async-build";
+    case SkipReason::AsyncBuildStale:
+        return "async-build-stale";
+    case SkipReason::TranslationMissing:
+        return "translation-missing";
+    case SkipReason::CreationFailed:
+        return "creation-failed";
+    case SkipReason::GeometryConsistency:
+        return "geometry-consistency";
+    case SkipReason::ConfigureFailed:
+        return "configure-failed";
+    case SkipReason::MeshDisabled:
+        return "mesh-disabled";
+    case SkipReason::ComputeNoShader:
+        return "compute-no-shader";
+    case SkipReason::ComputeNoPipeline:
+        return "compute-no-pipeline";
+    case SkipReason::ComputeConfigureFailed:
+        return "compute-configure-failed";
+    case SkipReason::Unknown:
+    case SkipReason::Count:
+        break;
+    }
+    return "no-pipeline";
+}
+
+void NoteDrawSkipped(SkipReason reason) {
+    const size_t index = static_cast<size_t>(reason);
+    skips_period[index].fetch_add(1, std::memory_order_relaxed);
+    skips_session[index].fetch_add(1, std::memory_order_relaxed);
+    skips_pending.fetch_add(1, std::memory_order_relaxed);
+}
+
+void LogSkipSummary(const char* when) {
+    SkipCounts counts{};
+    for (size_t i = 0; i < SkipReasonCount; ++i) {
+        counts[i] = skips_session[i].load(std::memory_order_relaxed);
+    }
+    LOG_INFO(Render_Vulkan, "Skipped work: {}", FormatSkips(counts, when));
 }
 
 void SetFrontEnd(std::chrono::steady_clock::time_point begin) {
@@ -358,7 +449,17 @@ void BeginSession(size_t count) {
     drain_logged = false;
     drain_armed.store(false, std::memory_order_relaxed);
     period_pending.store(false, std::memory_order_relaxed);
-    draws_skipped.store(0, std::memory_order_relaxed);
+    for (size_t i = 0; i < SkipReasonCount; ++i) {
+        skips_period[i].store(0, std::memory_order_relaxed);
+        skips_session[i].store(0, std::memory_order_relaxed);
+    }
+    skips_pending.store(0, std::memory_order_relaxed);
+    skips_window_open = false;
+}
+
+void SetBuilderThreads(size_t count) {
+    std::scoped_lock lock{mutex};
+    builder_threads = count;
 }
 
 bool DrainArmed() {
@@ -366,7 +467,8 @@ bool DrainArmed() {
 }
 
 void Tick(bool queues_idle) {
-    if (!period_pending.load(std::memory_order_relaxed) &&
+    const bool skips = skips_pending.load(std::memory_order_relaxed) != 0;
+    if (!skips && !period_pending.load(std::memory_order_relaxed) &&
         !drain_armed.load(std::memory_order_relaxed)) {
         return;
     }
@@ -379,6 +481,16 @@ void Tick(bool queues_idle) {
         }
         drain_logged = true;
         drain_armed.store(false, std::memory_order_relaxed);
+    }
+    // Skips that no "Shader builds:" line took: a build-free stretch still reports them.
+    if (skips_pending.load(std::memory_order_relaxed) == 0) {
+        return;
+    }
+    if (!skips_window_open) {
+        skips_window_open = true;
+        skips_window_start = now;
+    } else if (now - skips_window_start >= ReportInterval) {
+        LOG_INFO(Render_Vulkan, "Skipped work: {}", FormatSkips(TakeSkips(), "last 10 s"));
     }
 }
 

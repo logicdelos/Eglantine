@@ -11,10 +11,20 @@
 #include "common/common_types.h"
 #include "common/env_gate.h"
 #include "video_core/vulkan_common/vulkan.h"
+#include "video_core/nx2_perf.h"
 
 namespace Vulkan {
 
 inline bool BuildsUnoptimized(VkDriverId driver_id, u64 shader_hash) {
+    static constexpr std::array<u64, 2> nvidia_slow{
+        0x2c1c0e5f46b8be01ULL,
+        0xf973503e9c5fd270ULL,
+    };
+    if (driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY &&
+        VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::ComputeUnoptimizedSlow) &&
+        std::ranges::find(nvidia_slow, shader_hash) != nvidia_slow.end()) {
+        return true;
+    }
     // The Legend of Zelda: Ocarina of Time (0400486024DEC000), driver 2.0.353 on an RX 6600 XT
     static constexpr std::array<u64, 2> amd_proprietary{
         0xeff3ccbe1438679dULL, // compute shader built as the AV1 intro starts: 6 min (#200)

@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <vector>
+#include <unordered_set>
 
 #include <boost/container/small_vector.hpp>
 #include <fmt/format.h>
@@ -46,7 +47,8 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
                                  Common::ThreadWorker* thread_worker,
                                  PipelineStatistics* pipeline_statistics,
                                  VideoCore::ShaderNotify* shader_notify, const Shader::Info& info_,
-                                 vk::ShaderModule spv_module_, u64 shader_hash_)
+                                 vk::ShaderModule spv_module_, u64 shader_hash_,
+                                 std::span<const u32> code, bool cache_only)
     : device{device_},
       pipeline_cache(pipeline_cache_), guest_descriptor_queue{guest_descriptor_queue_},
       descriptor_buffer_ring{descriptor_buffer_ring_}, info{info_},
@@ -96,7 +98,21 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
 
     const auto queued_at = std::chrono::steady_clock::now();
     const auto front_end = DriverBuildReport::TakeFrontEnd();
-    auto func{[this, shader_notify, pipeline_statistics, queued_at, front_end] {
+    size_t loop_merges = 0;
+    size_t functions = 0;
+    // SPIR-V starts with five header words; instruction word counts include the opcode word.
+    for (size_t offset = 5; offset < code.size();) {
+        const u32 instruction = code[offset];
+        const u32 words = instruction >> 16;
+        if (words == 0 || words > code.size() - offset) {
+            break;
+        }
+        loop_merges += (instruction & 0xffffU) == 246U ? 1 : 0; // OpLoopMerge
+        functions += (instruction & 0xffffU) == 54U ? 1 : 0; // OpFunction
+        offset += words;
+    }
+    auto func{[this, shader_notify, pipeline_statistics, queued_at, front_end, cache_only,
+               word_count = code.size(), loop_merges, functions] {
         const DriverBuildReport::BuildScope busy;
         const auto started_at = std::chrono::steady_clock::now();
         DriverBuildReport::AddQueued(started_at - queued_at);
@@ -120,6 +136,9 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         }
         if (BuildsUnoptimized(device.GetDriverID(), shader_hash)) {
             flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+        }
+        if (cache_only) {
+            flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
         }
         const VkComputePipelineCreateInfo compute_ci{
             .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
@@ -147,9 +166,28 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         try {
             const auto build_begin = std::chrono::steady_clock::now();
             pipeline = device.GetLogical().CreateComputePipeline(compute_ci, *pipeline_cache);
-            DriverBuildReport::Record(DriverBuildReport::Kind::Compute,
-                                      std::chrono::steady_clock::now() - build_begin);
+            const auto elapsed = std::chrono::steady_clock::now() - build_begin;
+            DriverBuildReport::Record(DriverBuildReport::Kind::Compute, elapsed);
+            if (elapsed > std::chrono::seconds{5}) {
+                static std::mutex slow_mutex;
+                static std::unordered_set<u64> slow_hashes;
+                std::scoped_lock lock{slow_mutex};
+                if (slow_hashes.insert(shader_hash).second) {
+                    LOG_INFO(Render_Vulkan,
+                             "Slow compute build {:016x}: {:.1f} ms, SPIR-V {} words, "
+                             "{} OpLoopMerge, {} OpFunction, unoptimized={}",
+                             shader_hash, std::chrono::duration<double, std::milli>(elapsed).count(),
+                             word_count, loop_merges, functions,
+                             (flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT) != 0);
+                }
+            }
         } catch (const vk::Exception& exception) {
+            if (cache_only && exception.GetResult() == VK_PIPELINE_COMPILE_REQUIRED) {
+                if (shader_notify) {
+                    shader_notify->MarkShaderComplete();
+                }
+                throw;
+            }
             LOG_CRITICAL(Render_Vulkan, "Adreno rejected compute shader {:016X}: {}", shader_hash,
                          exception.what());
             std::scoped_lock lock{build_mutex};

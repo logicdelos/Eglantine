@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <functional>
@@ -42,8 +43,8 @@ class StatefulThreadWorker {
 public:
     explicit StatefulThreadWorker(size_t num_workers, std::string name, StateMaker func = {},
                                   ThreadPlacement placement = ThreadPlacement::Default)
-        : workers_queued{num_workers}, thread_name{std::move(name)} {
-        const auto lambda = [this, func, placement](std::stop_token stop_token) {
+        : worker_limit{num_workers}, workers_queued{num_workers}, thread_name{std::move(name)} {
+        const auto lambda = [this, func, placement](std::stop_token stop_token, size_t index) {
             Common::SetCurrentThreadName(thread_name.c_str());
             if (placement != ThreadPlacement::Default) {
                 Common::SetCurrentThreadPriority(ThreadPriority::Low);
@@ -68,8 +69,12 @@ public:
                         if (requests.empty()) {
                             wait_condition.notify_all();
                         }
-                        condition.wait(lock, stop_token,
-                                       [this] { return !requests.empty(); });
+                        // A worker above the limit stays parked: it takes no task, and counts
+                        // as idle.
+                        condition.wait(lock, stop_token, [this, index] {
+                            return !requests.empty() &&
+                                   index < worker_limit.load(std::memory_order_relaxed);
+                        });
                         if (stop_token.stop_requested()) {
                             break;
                         }
@@ -92,7 +97,7 @@ public:
         };
         threads.reserve(num_workers);
         for (size_t i = 0; i < num_workers; ++i) {
-            threads.emplace_back(lambda);
+            threads.emplace_back(lambda, i);
         }
     }
 
@@ -108,7 +113,23 @@ public:
             requests.emplace(std::move(work));
             ++work_scheduled;
         }
-        condition.notify_one();
+        // With parked workers a single wakeup could land on one that may not take the task.
+        if (worker_limit.load(std::memory_order_relaxed) < threads.size()) {
+            condition.notify_all();
+        } else {
+            condition.notify_one();
+        }
+    }
+
+    /// Lets only the first `count` workers (clamped to 1..all) take tasks. The others stay parked
+    /// until the limit rises again; a running task always finishes, queued tasks are kept.
+    void SetWorkerLimit(size_t count) {
+        {
+            std::scoped_lock lock{queue_mutex};
+            worker_limit.store((std::min)((std::max)(count, size_t{1}), threads.size()),
+                               std::memory_order_relaxed);
+        }
+        condition.notify_all();
     }
 
     void WaitForRequests(std::stop_token stop_token = {}) {
@@ -144,6 +165,7 @@ private:
     std::atomic<size_t> work_scheduled{};
     std::atomic<size_t> work_done{};
     std::atomic<size_t> workers_stopped{};
+    std::atomic<size_t> worker_limit{};
     std::atomic<size_t> workers_queued{};
     std::string thread_name;
     std::vector<std::jthread> threads;

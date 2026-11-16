@@ -91,8 +91,36 @@ void NoteGpuBuild(std::chrono::steady_clock::duration time);
 /// The submission thread waited for a pipeline's driver build before the draw or dispatch.
 void NoteSubmissionWait(std::chrono::steady_clock::duration time);
 
-/// A draw was dropped because its pipeline was not ready.
-void NoteDrawSkipped();
+/// Why a draw or dispatch was dropped instead of submitted. The names are the `miss=` values of
+/// the rasterizer's "Draw skipped" warning. The first group is draws, the second dispatches.
+enum class SkipReason : u8 {
+    Unknown,             ///< "no-pipeline": a null return that set no reason
+    StageRejected,       ///< "stage-rejected": a shader stage could not be resolved
+    DiskReplayAsync,     ///< "disk-replay-async": the disk record's build is still running
+    AsyncTranslation,    ///< "async-translation": queued translation not done in time
+    BuildDeferred,       ///< "build-deferred": over the per-frame build budget
+    AsyncBuild,          ///< "async-build": pipeline built asynchronously, not ready yet
+    AsyncBuildStale,     ///< "async-build-stale": the same, a small draw onto a drawn target
+    TranslationMissing,  ///< "translation-missing": adopted translations lack this key
+    CreationFailed,      ///< "creation-failed": the pipeline could not be created
+    GeometryConsistency, ///< "geometry-consistency": ready depth-only pass of skipped geometry
+    ConfigureFailed,     ///< "configure-failed": the pipeline's resources could not be set up
+    MeshDisabled,        ///< "mesh-disabled": task/mesh draw without mesh support
+    ComputeNoShader,     ///< "compute-no-shader": no compute program resolved
+    ComputeNoPipeline,   ///< "compute-no-pipeline": the compute pipeline could not be created
+    ComputeConfigureFailed, ///< "compute-configure-failed"
+    Count,
+};
+
+[[nodiscard]] const char* SkipReasonName(SkipReason reason) noexcept;
+
+/// A draw or dispatch was dropped. Counted per reason: the "Shader builds:" line carries the
+/// counts since its last line, "Skipped work:" lines the ones nothing else reported (every 10 s),
+/// and LogSkipSummary the session's.
+void NoteDrawSkipped(SkipReason reason);
+
+/// Logs the skips of the whole session (at shutdown), by reason.
+void LogSkipSummary(const char* when);
 
 /// Start of a pipeline's front end (environments to pipeline object), for the thread's next
 /// pipeline constructor to pick up. TakeFrontEnd returns the time since then, right before the
@@ -103,6 +131,9 @@ std::chrono::steady_clock::duration TakeFrontEnd();
 /// A new pipeline cache starts a session: forgets the keys built, the pending period and the
 /// boot state. `count` is the number of threads that can build pipelines at once.
 void BeginSession(size_t count);
+
+/// The number of threads that can build pipelines at once changed (a pool was shrunk).
+void SetBuilderThreads(size_t count);
 
 /// True from the first build after boot until the builders first go idle.
 [[nodiscard]] bool DrainArmed();

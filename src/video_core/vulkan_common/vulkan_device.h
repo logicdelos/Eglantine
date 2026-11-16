@@ -54,6 +54,8 @@ VK_DEFINE_HANDLE(VmaPool)
     FEATURE(EXT, ShaderDemoteToHelperInvocation, SHADER_DEMOTE_TO_HELPER_INVOCATION,               \
             shader_demote_to_helper_invocation)                                                    \
     FEATURE(EXT, SubgroupSizeControl, SUBGROUP_SIZE_CONTROL, subgroup_size_control)                \
+    FEATURE(EXT, PipelineCreationCacheControl, PIPELINE_CREATION_CACHE_CONTROL,                   \
+            pipeline_creation_cache_control)                                                     \
     FEATURE(KHR, Maintenance4, MAINTENANCE_4, maintenance4)                                        \
     FEATURE(KHR, Synchronization2, SYNCHRONIZATION_2, synchronization2)
 
@@ -798,6 +800,10 @@ FN_MAX_LIMIT_LIST
     /// Returns true if the device supports VK_EXT_subgroup_size_control.
     bool IsExtSubgroupSizeControlSupported() const {
         return extensions.subgroup_size_control;
+    }
+
+    bool IsPipelineCreationCacheControlSupported() const {
+        return features.pipeline_creation_cache_control.pipelineCreationCacheControl != VK_FALSE;
     }
 
     /// Returns true if vkResetQueryPool (host-side query reset) is supported.

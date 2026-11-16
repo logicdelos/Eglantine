@@ -8,6 +8,7 @@
 // SPDX-FileCopyrightText: 2014 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -1021,6 +1022,40 @@ void SetCurrentThreadToAllCores() {
 #elif defined(__linux__)
     SetCurrentThreadLinuxGroup(LinuxCoreGroup::Unrestricted);
 #endif
+}
+
+size_t PhysicalCoreCount() {
+    static const size_t count = [] {
+        const size_t threads = (std::max)(size_t{std::thread::hardware_concurrency()}, size_t{1});
+#ifdef _WIN32
+        // The Ex form covers every processor group.
+        DWORD length = 0;
+        GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &length);
+        if (length != 0) {
+            std::vector<u8> buffer(length);
+            if (GetLogicalProcessorInformationEx(
+                    RelationProcessorCore,
+                    reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data()),
+                    &length)) {
+                size_t cores = 0;
+                for (size_t offset = 0; offset < length;) {
+                    const auto* const entry =
+                        reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(
+                            buffer.data() + offset);
+                    if (entry->Relationship == RelationProcessorCore) {
+                        ++cores;
+                    }
+                    offset += entry->Size;
+                }
+                if (cores != 0) {
+                    return cores;
+                }
+            }
+        }
+#endif
+        return threads;
+    }();
+    return count;
 }
 
 void RefreshThreadPolicies() {

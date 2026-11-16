@@ -41,6 +41,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
+#include "video_core/renderer_vulkan/vk_driver_build_report.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
@@ -161,9 +162,17 @@ public:
         return nx2_code_ranges;
     }
 
-    /// Why the last CurrentGraphicsPipeline() returned null (diagnostics).
+    /// Why the last CurrentGraphicsPipeline() returned null (diagnostics), and the same as the
+    /// reason to count the dropped draw under. "no-pipeline"/Unknown: a null return set none.
     [[nodiscard]] const char* GraphicsMissReason() const noexcept {
-        return graphics_miss;
+        return DriverBuildReport::SkipReasonName(graphics_skip);
+    }
+    [[nodiscard]] DriverBuildReport::SkipReason GraphicsSkipReason() const noexcept {
+        return graphics_skip;
+    }
+    /// Why the last CurrentComputePipeline() returned null.
+    [[nodiscard]] DriverBuildReport::SkipReason ComputeSkipReason() const noexcept {
+        return compute_skip;
     }
 
     void TickFrame();
@@ -179,7 +188,8 @@ private:
     [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline,
                                                   bool is_indexed) noexcept;
 
-    void RecordSkippedGeometry(bool is_indexed, const GraphicsPipeline* pipeline) noexcept;
+    void RecordSkippedGeometry(bool is_indexed, const GraphicsPipeline* pipeline,
+                               u64 replay_hash = 0) noexcept;
     [[nodiscard]] bool ShouldSkipDepthOnlyGeometry(bool is_indexed) noexcept;
     void ClearSkippedGeometryIfDrawn(bool is_indexed) noexcept;
 
@@ -272,7 +282,8 @@ private:
                                                     const ComputePipelineCacheKey& key,
                                                     Shader::Environment& env,
                                                     PipelineStatistics* statistics,
-                                                    bool build_in_parallel);
+                                                    bool build_in_parallel,
+                                                    bool cache_only = false);
 
     void SerializeVulkanPipelineCache(const std::filesystem::path& filename,
                                       const vk::PipelineCache& pipeline_cache, u32 cache_version);
@@ -296,7 +307,8 @@ private:
 
     GraphicsPipelineCacheKey graphics_key{};
     GraphicsPipeline* current_pipeline{};
-    mutable const char* graphics_miss{"no-pipeline"};
+    DriverBuildReport::SkipReason graphics_skip{DriverBuildReport::SkipReason::Unknown};
+    DriverBuildReport::SkipReason compute_skip{DriverBuildReport::SkipReason::Unknown};
 
     /// Destroys graphics pipelines unused for a while, once the GPU is done with them.
     void EvictUnusedPipelines();
@@ -355,7 +367,12 @@ private:
         u64 key{};
         u64 frame{};
         const GraphicsPipeline* pipeline{};
+        /// Key hash of a disk record's replay that was running when the draw was skipped (the
+        /// pipeline does not exist yet): the geometry stops being skipped when it is done.
+        u64 replay_hash{};
     };
+    /// Whether the skipped draw of an entry still has no pipeline to submit with.
+    [[nodiscard]] bool GeometryEntryPending(const SkippedGeometryEntry& entry) const noexcept;
     std::array<SkippedGeometryEntry, SkippedGeometryTableSize> skipped_geometry{};
     u64 last_skipped_geometry_frame{~u64{}};
 
@@ -400,6 +417,9 @@ private:
     std::unique_ptr<GraphicsPipeline> TakeBackgroundPipeline(const GraphicsPipelineCacheKey& key,
                                                              bool claim_if_missing);
     void StopBackgroundPipelines();
+    /// Pipeline driver-build and translation pools: all their threads while the disk cache loads,
+    /// their share of the host's cores after it (Nx2Perf worker_budget).
+    void SetWorkerBudget(bool after_boot);
     std::mutex background_mutex;
     /// Built and not yet asked for by a draw.
     std::unordered_map<GraphicsPipelineCacheKey, std::unique_ptr<GraphicsPipeline>> background_ready;
@@ -418,7 +438,10 @@ private:
     /// on background threads once the boot is done, then thrown away. They only fill the driver's
     /// shader cache, so a dispatch that converts to the same SPIR-V finds the driver's work done.
     /// A marker skips it after it ran to the end for this driver and device.
-    void StartShaderPrecache(u64 title_id);
+    void StartShaderPrecache(
+        u64 title_id,
+        std::unordered_map<ComputePipelineCacheKey, std::vector<VideoCommon::FileEnvironment>>
+            programs = {});
     void StopShaderPrecache();
     /// Precache builds wait while the game builds pipelines (queued translations or driver
     /// compiles, or a pipeline built in the last moments): they share the CPU and the driver.
@@ -427,8 +450,8 @@ private:
     /// build report counts the builders as idle.
     bool ShaderBuildsBusy() const;
     void WaitForIdleRuntimeBuilds();
-    /// A dispatch needs `key` (GPU thread): a precache build not started yet is dropped, one in
-    /// progress is waited for, briefly, so the dispatch's build finds it in the driver's cache.
+    /// A dispatch claims a queued precache build. It waits for a running deferred disk build;
+    /// ordinary warm-file builds have a bounded wait before normal first-use creation.
     void ClaimPrecacheProgram(const ComputePipelineCacheKey& key);
     enum class PrecacheState : u8 { Queued, Building, Done, Claimed };
     /// Programs the precache queued, by key. Filled before the workers start, then only the
@@ -445,8 +468,10 @@ private:
     std::atomic<size_t> precache_left{};
     std::atomic<size_t> precache_built{};
     std::chrono::steady_clock::time_point precache_start{};
-    /// Key hashes of the precache file's programs (written before the game runs).
+    /// Key hashes of precache programs, including deferred disk records (set before game runs).
     std::unordered_set<u64> precache_keys;
+    /// Deferred driver-cache misses: first use waits for an in-flight build without a timeout.
+    std::unordered_set<ComputePipelineCacheKey> deferred_precache_keys;
     size_t new_compute_pipelines{}; ///< GPU thread
     size_t precached_compute_pipelines{}; ///< Of those, in the precache file (GPU thread)
     /// Last: destroyed (its threads joined) before the state above.
@@ -456,7 +481,8 @@ private:
     std::chrono::microseconds translation_frame_budget{}; ///< Per frame
     std::chrono::microseconds translation_frame_left{};
     u64 translation_frame{}; ///< frame_count when translation_frame_left was last reset
-    size_t num_translation_threads{};
+    std::atomic<size_t> num_translation_threads{}; ///< Translation threads allowed now
+    size_t translation_threads_boot{}; ///< Translation pool size at construction
     /// Keys being translated on a worker (GPU thread only).
     ::Common::unordered_map<GraphicsPipelineCacheKey, QueuedGraphicsTranslation> translating_graphics;
     std::mutex translated_mutex;

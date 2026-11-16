@@ -382,6 +382,24 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
 size_t GetTotalPipelineWorkers() {
     const size_t max_core_threads =
         std::max<size_t>(static_cast<size_t>(std::thread::hardware_concurrency()), 2ULL) - 1ULL;
+    static const size_t requested = [] {
+        const char* const value = std::getenv("EDEN_NX2_PIPELINE_THREADS");
+        if (!value || value[0] < '0' || value[0] > '9') {
+            return size_t{0};
+        }
+        char* end{};
+        const auto threads = std::strtoull(value, &end, 10);
+        return *end == '\0' && threads <= 1024 ? static_cast<size_t>(threads) : size_t{0};
+    }();
+    if (requested != 0) {
+        const size_t count = (std::min)(max_core_threads, requested);
+        static const bool logged = [count] {
+            LOG_INFO(Render_Vulkan, "Shader memory budget: pipeline worker cap {} threads", count);
+            return true;
+        }();
+        (void)logged;
+        return count;
+    }
 #ifdef __ANDROID__
     const int configured = AndroidSettings::values.pipeline_worker_count.GetValue();
     const int clamped = std::clamp(configured, 2, 8);
@@ -393,6 +411,15 @@ size_t GetTotalPipelineWorkers() {
 #else
     return max_core_threads;
 #endif
+}
+
+// Threads each of the two pipeline pools (driver compile, translation) keeps once the disk cache
+// is loaded. The pools share the physical cores less six (guest cores, GPU thread, audio and
+// present threads), at least two per pool.
+size_t PostBootPoolThreads() {
+    const size_t cores = Common::PhysicalCoreCount();
+    const size_t budget = cores > 6 ? cores - 6 : 0;
+    return std::max<size_t>((budget + 1) / 2, 2);
 }
 
 // With asynchronous shaders, new native graphics pipelines are translated on worker threads
@@ -499,18 +526,20 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         translation_wait = MillisecondsFromEnv("EDEN_NX2_ASYNC_TRANSLATION_WAIT_MS", 2.0);
         translation_frame_budget = MillisecondsFromEnv("EDEN_NX2_ASYNC_TRANSLATION_FRAME_MS", 4.0);
         translation_frame_left = translation_frame_budget;
+        translation_threads_boot = num_translation_threads.load(std::memory_order_relaxed);
         translation_workers.reset(new Common::ThreadWorker(num_translation_threads,
                                                            "VkPipelineTranslator", {},
                                                            Common::ThreadPlacement::Background));
         LOG_INFO(Render_Vulkan,
                  "Native graphics pipelines translate on {} threads (wait {:.1f} ms per pipeline, "
                  "{:.1f} ms per frame)",
-                 num_translation_threads, translation_wait.count() / 1000.0,
+                 num_translation_threads.load(std::memory_order_relaxed),
+                 translation_wait.count() / 1000.0,
                  translation_frame_budget.count() / 1000.0);
     }
     DriverBuildReport::BeginSession(
         (device.HasBrokenParallelShaderCompiling() ? 1ULL : GetTotalPipelineWorkers()) +
-        num_translation_threads);
+        num_translation_threads.load(std::memory_order_relaxed));
     const auto& float_control{device.FloatControlProperties()};
     const VkDriverId driver_id{device.GetDriverID()};
     const VkShaderStageFlags subgroup_stages{device.GetSubgroupSupportedStages()};
@@ -814,6 +843,7 @@ bool PreloadAllPipelines() {
 } // Anonymous namespace
 
 PipelineCache::~PipelineCache() {
+    DriverBuildReport::LogSkipSummary("session");
     StopShaderPrecache();
     if (!precache_keys.empty()) {
         LOG_INFO(Render_Vulkan,
@@ -907,10 +937,10 @@ size_t GraphicsFastCacheSlot(const GraphicsPipelineCacheKey& key, size_t size) {
 } // Anonymous namespace
 
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline(bool is_indexed) {
-
+    graphics_skip = DriverBuildReport::SkipReason::Unknown;
     if (!RefreshStages(graphics_key.unique_hashes)) {
         current_pipeline = nullptr;
-        graphics_miss = "stage-rejected";
+        graphics_skip = DriverBuildReport::SkipReason::StageRejected;
         return nullptr;
     }
     graphics_key.state.Refresh(*maxwell3d, dynamic_features);
@@ -1033,9 +1063,10 @@ bool PipelineCache::StaleNullPointerSlot(const ComputePipelineCacheEntry& entry)
 }
 
 ComputePipeline* PipelineCache::CurrentComputePipeline(u64& native_key) {
-
+    compute_skip = DriverBuildReport::SkipReason::Unknown;
     const ShaderInfo* const shader{ComputeShader()};
     if (!shader) {
+        compute_skip = DriverBuildReport::SkipReason::ComputeNoShader;
         return nullptr;
     }
     native_key = shader->lowered_native ? shader->lowered_native->native_program_key : 0;
@@ -1130,11 +1161,20 @@ ComputePipeline* PipelineCache::CurrentComputePipeline(u64& native_key) {
         fast_entry.key = key;
         fast_entry.pipeline = entry.pipeline.get();
     }
+    if (!entry.pipeline) {
+        compute_skip = DriverBuildReport::SkipReason::ComputeNoPipeline;
+    }
     return entry.pipeline.get();
 }
 
 void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                                       const VideoCore::DiskResourceLoadCallback& callback) {
+    // A load is a boot: it runs on the full pools, and the budget applies when it ends, whatever
+    // the way out (the cache loads again for each application).
+    SetWorkerBudget(false);
+    SCOPE_EXIT {
+        SetWorkerBudget(true);
+    };
     if (title_id == 0) {
         return;
     }
@@ -1188,9 +1228,23 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     std::unordered_set<u64> boot_graphics; ///< Graphics keys built at boot (loading thread)
     std::vector<std::pair<GraphicsPipelineCacheKey, std::vector<FileEnvironment>>>
         deferred_graphics;
+    std::unordered_map<ComputePipelineCacheKey, std::vector<FileEnvironment>> deferred_compute;
+    const auto boot_compute_begin = std::chrono::steady_clock::now();
+    const bool defer_compute =
+        VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::ComputeBootDeferred) &&
+        device.IsPipelineCreationCacheControlSupported();
+    if (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::ComputeBootDeferred) && !defer_compute) {
+        LOG_INFO(Render_Vulkan,
+                 "Compute boot deferred: pipelineCreationCacheControl unavailable; using blocking replay");
+    }
 
     if (use_vulkan_pipeline_cache) {
-        vulkan_pipeline_cache_filename = cache_path("vulkan_pipelines");
+        // Guest translation records are unchanged; driver binaries with different optimization
+        // policy live separately. Vulkan also keys the implicit driver cache by creation flags.
+        vulkan_pipeline_cache_filename =
+            cache_path(VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::ComputeUnoptimizedSlow)
+                           ? "vulkan_pipelines.unoptimized"
+                           : "vulkan_pipelines");
         vulkan_pipeline_cache =
             LoadVulkanPipelineCache(vulkan_pipeline_cache_filename, CACHE_VERSION);
     }
@@ -1221,7 +1275,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         [&](const ComputePipelineCacheKey& key, std::vector<FileEnvironment> candidates) {
             const auto queued_at = std::chrono::steady_clock::now();
             workers.QueueWork([this, key, envs_ = std::move(candidates), preload_variants, &state,
-                               &callback, queued_at]() mutable {
+                               &callback, queued_at, defer_compute, &deferred_compute]() mutable {
                 DriverBuildReport::AddQueuedSince(queued_at);
                 const DriverBuildReport::DiskScope from_disk;
                 ShaderPools pools;
@@ -1236,8 +1290,22 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                         }
                     }
                     pools.ReleaseContents();
-                    auto candidate =
-                        CreateComputePipeline(pools, key, env, state.statistics.get(), false);
+                    ComputePipelineCacheEntry candidate;
+                    try {
+                        candidate = CreateComputePipeline(pools, key, env, state.statistics.get(),
+                                                          false, defer_compute);
+                    } catch (const vk::Exception& exception) {
+                        if (!defer_compute || exception.GetResult() != VK_PIPELINE_COMPILE_REQUIRED) {
+                            throw;
+                        }
+                        std::scoped_lock lock{state.mutex};
+                        deferred_compute.emplace(key, std::move(envs_));
+                        ++state.built;
+                        if (state.has_loaded) {
+                            callback(VideoCore::LoadCallbackStage::Build, state.built, state.total);
+                        }
+                        return;
+                    }
                     if (!candidate.pipeline) {
                         continue;
                     }
@@ -1411,6 +1479,14 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
 
     workers.WaitForRequests(stop_loading);
     DriverBuildReport::LogSummary("at boot");
+    if (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::ComputeBootDeferred)) {
+        LOG_INFO(Render_Vulkan,
+                 "Compute boot deferred: {} pipelines deferred; boot replay waited {:.1f} ms "
+                 "(including translation and graphics)",
+                 deferred_compute.size(),
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                          boot_compute_begin).count());
+    }
 
     // A cache from an older compatible version: its records were translated again above. Write
     // it back under the current version without the ones that failed (deferred ones are kept).
@@ -1431,7 +1507,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                 }
                 std::memcpy(&key, record.data() + record.size() - sizeof(key), sizeof(key));
                 const auto it = compute_cache.find(key);
-                if (it == compute_cache.end() || !it->second.pipeline) {
+                if ((it == compute_cache.end() || !it->second.pipeline) &&
+                    !deferred_compute.contains(key)) {
                     ++dropped;
                     continue;
                 }
@@ -1533,7 +1610,39 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         state.statistics->Report();
     }
     if (!stop_loading.stop_requested()) {
-        StartShaderPrecache(title_id);
+        StartShaderPrecache(title_id, std::move(deferred_compute));
+    }
+}
+
+void PipelineCache::SetWorkerBudget(bool after_boot) {
+    const size_t builders_boot =
+        device.HasBrokenParallelShaderCompiling() ? 1ULL : GetTotalPipelineWorkers();
+    const size_t translators_boot = translation_threads_boot;
+    size_t builders = builders_boot;
+    size_t translators = translators_boot;
+    const bool budget =
+        after_boot && VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::WorkerBudget);
+    if (budget) {
+        const size_t pool = PostBootPoolThreads();
+        builders = std::min(builders, pool);
+        // An explicit EDEN_NX2_TRANSLATION_THREADS stays as asked.
+        if (std::getenv("EDEN_NX2_TRANSLATION_THREADS") == nullptr) {
+            translators = std::min(translators, pool);
+        }
+    }
+    workers.SetWorkerLimit(builders);
+    if (translation_workers) {
+        translation_workers->SetWorkerLimit(translators);
+    }
+    num_translation_threads.store(translators, std::memory_order_relaxed);
+    DriverBuildReport::SetBuilderThreads(builders + translators);
+    if (after_boot) {
+        LOG_INFO(Render_Vulkan,
+                 "Pipeline workers after the disk cache load: {} driver builders (boot {}), {} "
+                 "translators (boot {}); {} physical cores, {} hardware threads, worker_budget {}",
+                 builders, builders_boot, translators, translators_boot,
+                 Common::PhysicalCoreCount(), std::thread::hardware_concurrency(),
+                 budget ? "on" : "off");
     }
 }
 
@@ -1651,6 +1760,20 @@ bool IsGBufferDraw(const Maxwell& regs) noexcept {
     return regs.zeta_enable != 0 && ActiveColorTargetCount(regs) > 1;
 }
 
+// EDEN_NX2_GEOMETRY_GUARD=legacy restores the guard as it was: a key without the base instance,
+// and a draw skipped behind a disk replay suppresses depth-only draws of its geometry for the
+// frame and the one after it, whether or not the replay finished in between.
+bool LegacyGeometryGuard() {
+    static const bool legacy = [] {
+        const char* const value = std::getenv("EDEN_NX2_GEOMETRY_GUARD");
+        const bool is_legacy = value != nullptr && std::strcmp(value, "legacy") == 0;
+        LOG_INFO(Render_Vulkan, "Geometry consistency guard: {}",
+                 is_legacy ? "legacy" : "base instance in the key, disk replay ends the skip");
+        return is_legacy;
+    }();
+    return legacy;
+}
+
 u64 DrawGeometryKey(const Tegra::Engines::Maxwell3D& maxwell3d, bool is_indexed) noexcept {
     const auto& draw_state = maxwell3d.draw_manager.draw_state;
     if (draw_state.draw_element_count == 0) {
@@ -1668,6 +1791,9 @@ u64 DrawGeometryKey(const Tegra::Engines::Maxwell3D& maxwell3d, bool is_indexed)
     } else {
         mix(maxwell3d.regs.vertex_streams[0].Address());
         mix((u64{draw_state.vertex_buffer.first} << 32) | draw_state.vertex_buffer.count);
+    }
+    if (!LegacyGeometryGuard()) {
+        mix(draw_state.base_instance);
     }
     return hash == 0 ? 1ULL : hash;
 }
@@ -1741,8 +1867,19 @@ void ReportUnsupportedMeshPipeline(const GraphicsPipelineCacheKey& key, const Pr
 }
 } // Anonymous namespace
 
-void PipelineCache::RecordSkippedGeometry(bool is_indexed,
-                                          const GraphicsPipeline* pipeline) noexcept {
+bool PipelineCache::GeometryEntryPending(const SkippedGeometryEntry& entry) const noexcept {
+    if (entry.pipeline != nullptr) {
+        return !entry.pipeline->IsBuilt();
+    }
+    // No pipeline yet. A disk replay is the one build whose end is known here: its key leaves
+    // the in-flight set when it is done (a failed one is built by the next draw of it). The
+    // frame that lost the colour draw stays suppressed: finishing the build doesn't redraw it.
+    return LegacyGeometryGuard() || frame_count == entry.frame || entry.replay_hash == 0 ||
+           in_flight_disk_replays.contains(entry.replay_hash);
+}
+
+void PipelineCache::RecordSkippedGeometry(bool is_indexed, const GraphicsPipeline* pipeline,
+                                          u64 replay_hash) noexcept {
     if (!maxwell3d || !VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::GeometryConsistency) ||
         !IsDepthTestedColorDraw(maxwell3d->regs)) {
         return;
@@ -1758,7 +1895,7 @@ void PipelineCache::RecordSkippedGeometry(bool is_indexed,
         const size_t slot = (base + probe) & (SkippedGeometryTableSize - 1);
         const auto& entry = skipped_geometry[slot];
         if (entry.key == geom_key || entry.key == 0 || frame_count > entry.frame + 1 ||
-            (entry.pipeline != nullptr && entry.pipeline->IsBuilt())) {
+            !GeometryEntryPending(entry)) {
             target_slot = slot;
             break;
         }
@@ -1767,6 +1904,7 @@ void PipelineCache::RecordSkippedGeometry(bool is_indexed,
         .key = geom_key,
         .frame = frame_count,
         .pipeline = pipeline,
+        .replay_hash = replay_hash,
     };
     last_skipped_geometry_frame = frame_count;
 }
@@ -1789,8 +1927,7 @@ bool PipelineCache::ShouldSkipDepthOnlyGeometry(bool is_indexed) noexcept {
         if (entry.key != geom_key) {
             continue;
         }
-        if (frame_count <= entry.frame + 1 &&
-            (entry.pipeline == nullptr || !entry.pipeline->IsBuilt())) {
+        if (frame_count <= entry.frame + 1 && GeometryEntryPending(entry)) {
             return true;
         }
         entry = {};
@@ -1956,9 +2093,8 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath(bool is_indexed
     DrainReadyDiskPipelines();
     const u64 key_hash = graphics_key.Hash();
     if (in_flight_disk_replays.contains(key_hash)) {
-        RecordSkippedGeometry(is_indexed, nullptr);
-        DriverBuildReport::NoteDrawSkipped();
-        graphics_miss = "disk-replay-async";
+        RecordSkippedGeometry(is_indexed, nullptr, key_hash);
+        graphics_skip = DriverBuildReport::SkipReason::DiskReplayAsync;
         return nullptr;
     }
     auto it{graphics_cache.find(graphics_key)};
@@ -1989,9 +2125,8 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath(bool is_indexed
                         ready_disk_pipelines.emplace_back(key, std::move(built));
                         ready_disk_pipelines_pending.store(true, std::memory_order_release);
                     });
-                RecordSkippedGeometry(is_indexed, nullptr);
-                DriverBuildReport::NoteDrawSkipped();
-                graphics_miss = "disk-replay-async";
+                RecordSkippedGeometry(is_indexed, nullptr, key_hash);
+                graphics_skip = DriverBuildReport::SkipReason::DiskReplayAsync;
                 return nullptr;
             }
         }
@@ -2002,7 +2137,7 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath(bool is_indexed
     }
     auto& pipeline{it->second};
     if (!pipeline) {
-        graphics_miss = "creation-failed";
+        graphics_skip = DriverBuildReport::SkipReason::CreationFailed;
         return nullptr;
     }
     const auto save_interval =
@@ -2151,84 +2286,92 @@ void PipelineCache::StopBackgroundPipelines() {
     background_workers.reset();
 }
 
-void PipelineCache::StartShaderPrecache(u64 title_id) {
+void PipelineCache::StartShaderPrecache(
+    u64 title_id,
+    std::unordered_map<ComputePipelineCacheKey, std::vector<FileEnvironment>> programs) {
     namespace ShaderWarm = VideoCommon::ShaderWarm;
-    const std::filesystem::path warm_file = ShaderWarm::ComputeWarmPath(title_id);
-    std::error_code ec;
-    if (!std::filesystem::exists(warm_file, ec)) {
-        return;
-    }
-    const std::string path = Common::FS::PathToUTF8String(warm_file);
-    const u32 driver = device.GetDriverVersion();
-    const u32 device_id = device.GetDeviceID();
-    const auto marker = ShaderWarm::ReadWarmMarker(warm_file);
-    const auto current = ShaderWarm::CurrentWarmStamp(warm_file, 0, driver, device_id, CACHE_VERSION);
-    const bool done = current && marker && marker->Matches(*current);
-
-    std::vector<std::pair<ComputePipelineCacheKey, FileEnvironment>> programs;
-    size_t entries = 0;
+    std::function<void()> write_marker = [] {};
+    size_t entries = programs.size();
     size_t in_disk_cache = 0;
-    try {
-        // Its own reader: the disk cache loader deletes files it rejects.
-        std::ifstream file(warm_file, std::ios::binary | std::ios::ate);
-        file.exceptions(std::ifstream::failbit);
-        const auto end{file.tellg()};
-        file.seekg(0, std::ios::beg);
-        std::array<char, 8> magic;
-        u32 version{};
-        file.read(magic.data(), magic.size())
-            .read(reinterpret_cast<char*>(&version), sizeof(version));
-        constexpr std::array<char, 8> expected_magic{'y', 'u', 'z', 'u', 'c', 'a', 'c', 'h'};
-        // The file holds environments only, which read the same in every compatible version: one
-        // from an older version is built again under this one (the marker carries the version).
-        if (magic != expected_magic || version < MIN_COMPATIBLE_CACHE_VERSION ||
-            version > CACHE_VERSION) {
-            LOG_WARNING(Render_Vulkan,
-                        "Shader precache: {} is a version {} file, not {} to {}; pre-compile the "
-                        "game's shaders again",
-                        path, version, MIN_COMPATIBLE_CACHE_VERSION, CACHE_VERSION);
+    for (const auto& [key, envs] : programs) {
+        deferred_precache_keys.insert(key);
+    }
+    // Loading the optional warm file must not prevent deferred disk records from being queued.
+    const auto load_warm_file = [&] {
+        const std::filesystem::path warm_file = ShaderWarm::ComputeWarmPath(title_id);
+        std::error_code ec;
+        if (!std::filesystem::exists(warm_file, ec)) {
             return;
         }
-        while (file.tellg() != end) {
-            u32 num_envs{};
-            file.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
-            FileEnvironment env;
-            env.Deserialize(file);
-            if (num_envs != 1 || env.ShaderStage() != Shader::Stage::Compute) {
-                throw std::runtime_error("unexpected entry");
+        const std::string path = Common::FS::PathToUTF8String(warm_file);
+        const u32 driver = device.GetDriverVersion();
+        const u32 device_id = device.GetDeviceID();
+        const auto marker = ShaderWarm::ReadWarmMarker(warm_file);
+        const auto current =
+            ShaderWarm::CurrentWarmStamp(warm_file, 0, driver, device_id, CACHE_VERSION);
+        const bool done = current && marker && marker->Matches(*current);
+        size_t warm_entries = 0;
+        try {
+            // Its own reader: the disk cache loader deletes files it rejects.
+            std::ifstream file(warm_file, std::ios::binary | std::ios::ate);
+            file.exceptions(std::ifstream::failbit);
+            const auto end{file.tellg()};
+            file.seekg(0, std::ios::beg);
+            std::array<char, 8> magic;
+            u32 version{};
+            file.read(magic.data(), magic.size())
+                .read(reinterpret_cast<char*>(&version), sizeof(version));
+            constexpr std::array<char, 8> expected_magic{'y', 'u', 'z', 'u', 'c', 'a', 'c', 'h'};
+            if (magic != expected_magic || version < MIN_COMPATIBLE_CACHE_VERSION ||
+                version > CACHE_VERSION) {
+                LOG_WARNING(Render_Vulkan,
+                            "Shader precache: {} is a version {} file, not {} to {}; pre-compile "
+                            "the game's shaders again",
+                            path, version, MIN_COMPATIBLE_CACHE_VERSION, CACHE_VERSION);
+                return;
             }
-            ComputePipelineCacheKey key;
-            file.read(reinterpret_cast<char*>(&key), sizeof(key));
-            ++entries;
-            precache_keys.insert(key.Hash());
-            // Programs already in the disk cache were built at boot.
-            if (compute_cache.contains(key)) {
-                ++in_disk_cache;
-            } else if (!done) {
-                programs.emplace_back(key, std::move(env));
+            while (file.tellg() != end) {
+                u32 num_envs{};
+                file.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
+                FileEnvironment env;
+                env.Deserialize(file);
+                if (num_envs != 1 || env.ShaderStage() != Shader::Stage::Compute) {
+                    throw std::runtime_error("unexpected entry");
+                }
+                ComputePipelineCacheKey key;
+                file.read(reinterpret_cast<char*>(&key), sizeof(key));
+                ++warm_entries;
+                precache_keys.insert(key.Hash());
+                if (compute_cache.contains(key)) {
+                    ++in_disk_cache;
+                } else if (!done && !programs.contains(key)) {
+                    static const VideoCommon::GuessMissing guess{};
+                    env.SetGuessMissing(&guess);
+                    programs[key].push_back(std::move(env));
+                }
             }
+        } catch (const std::exception& e) {
+            LOG_WARNING(Render_Vulkan, "Shader precache: reading {} failed: {}", path, e.what());
+            precache_keys.clear();
+            return;
         }
-    } catch (const std::exception& e) {
-        LOG_WARNING(Render_Vulkan, "Shader precache: reading {} failed: {}", path, e.what());
-        precache_keys.clear();
-        return;
-    }
-    // How well the precache matches what the game ran: the disk cache holds the compute
-    // pipelines of earlier sessions.
-    LOG_INFO(Render_Vulkan,
-             "Shader precache: {} compute programs; {} of the {} compute pipelines in the disk "
-             "cache are among them",
-             entries, in_disk_cache, compute_cache.size());
-    if (done) {
-        LOG_INFO(Render_Vulkan, "Shader precache: already built for this driver");
-        return;
-    }
-    const auto write_marker = [warm_file, driver, device_id, entries] {
-        if (const auto stamp = VideoCommon::ShaderWarm::CurrentWarmStamp(
-                warm_file, entries, driver, device_id, CACHE_VERSION)) {
-            VideoCommon::ShaderWarm::WriteWarmMarker(warm_file, *stamp);
+        LOG_INFO(Render_Vulkan,
+                 "Shader precache: {} compute programs; {} of the {} compute pipelines in the "
+                 "disk cache are among them",
+                 warm_entries, in_disk_cache, compute_cache.size());
+        entries += warm_entries;
+        if (done) {
+            LOG_INFO(Render_Vulkan, "Shader precache: already built for this driver");
+            return;
         }
+        write_marker = [warm_file, driver, device_id, warm_entries] {
+            if (const auto stamp = VideoCommon::ShaderWarm::CurrentWarmStamp(
+                    warm_file, warm_entries, driver, device_id, CACHE_VERSION)) {
+                VideoCommon::ShaderWarm::WriteWarmMarker(warm_file, *stamp);
+            }
+        };
     };
+    load_warm_file();
     if (programs.empty()) {
         write_marker();
         return;
@@ -2241,11 +2384,13 @@ void PipelineCache::StartShaderPrecache(u64 title_id) {
     precache_start = std::chrono::steady_clock::now();
     for (const auto& [key, env] : programs) {
         precache_states.try_emplace(key, PrecacheState::Queued);
+        precache_keys.insert(key.Hash());
     }
     precache_workers.reset(new Common::ThreadWorker(threads, "VkShaderPrecache", {},
                                                     Common::ThreadPlacement::Background));
-    for (auto& [key, env] : programs) {
-        precache_workers->QueueWork([this, key, env = std::move(env), write_marker]() mutable {
+    for (auto& [key, environments] : programs) {
+        precache_workers->QueueWork(
+            [this, key, envs = std::move(environments), write_marker]() mutable {
             WaitForIdleRuntimeBuilds();
             if (precache_stop.load(std::memory_order_relaxed)) {
                 return;
@@ -2254,13 +2399,17 @@ void PipelineCache::StartShaderPrecache(u64 title_id) {
             PrecacheState expected{PrecacheState::Queued};
             if (state.compare_exchange_strong(expected, PrecacheState::Building)) {
                 try {
-                    static const VideoCommon::GuessMissing guess{};
-                    env.SetGuessMissing(&guess);
                     ShaderPools pools;
-                    // Built and destroyed here, never bound: only the driver's cache keeps it.
                     const DriverBuildReport::PrecacheScope precache_scope;
-                    if (CreateComputePipeline(pools, key, env, nullptr, false).pipeline) {
-                        precache_built.fetch_add(1, std::memory_order_relaxed);
+                    for (auto& env : envs) {
+                        pools.ReleaseContents();
+                        if (CreateComputePipeline(pools, key, env, nullptr, false).pipeline) {
+                            precache_built.fetch_add(1, std::memory_order_relaxed);
+                            if (!VideoCommon::Nx2Perf::On(
+                                    VideoCommon::Nx2Perf::Opt::ComputePreloadVariants)) {
+                                break;
+                            }
+                        }
                     }
                 } catch (const std::exception& e) {
                     LOG_DEBUG(Render_Vulkan, "Shader precache: {}", e.what());
@@ -2333,13 +2482,17 @@ void PipelineCache::ClaimPrecacheProgram(const ComputePipelineCacheKey& key) {
     if (expected != PrecacheState::Building) {
         return;
     }
-    // When its SPIR-V matches the dispatch's, the dispatch's build then takes about 1 ms from
-    // the driver's cache instead of compiling a second time. Bounded: a cold compile takes
-    // tens of ms, and a precache thread runs below normal priority.
+    // Deferred disk records are known driver-cache misses: let the in-flight build finish
+    // instead of starting a second long compile. Ordinary warm-file entries keep their budget.
     precache_waited.fetch_add(1, std::memory_order_relaxed);
     std::unique_lock lock{precache_mutex};
-    precache_condvar.wait_for(lock, std::chrono::milliseconds{250},
-                              [&] { return state.load() != PrecacheState::Building; });
+    Nx2Bottleneck::WaitScope build_wait{Nx2Bottleneck::Wait::ShaderBuild};
+    if (deferred_precache_keys.contains(key)) {
+        precache_condvar.wait(lock, [&] { return state.load() != PrecacheState::Building; });
+    } else {
+        precache_condvar.wait_for(lock, std::chrono::milliseconds{250},
+                                 [&] { return state.load() != PrecacheState::Building; });
+    }
 }
 
 void PipelineCache::StopShaderPrecache() {
@@ -2352,7 +2505,7 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline,
                                                bool is_indexed) noexcept {
     if (pipeline->IsBuilt()) {
         if (ShouldSkipDepthOnlyGeometry(is_indexed)) {
-            graphics_miss = "geometry-consistency";
+            graphics_skip = DriverBuildReport::SkipReason::GeometryConsistency;
             return nullptr;
         }
         ClearSkippedGeometryIfDrawn(is_indexed);
@@ -2386,8 +2539,7 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline,
     // will be used one time.
     if (maxwell3d->regs.zeta_enable) {
         RecordSkippedGeometry(is_indexed, pipeline);
-        DriverBuildReport::NoteDrawSkipped();
-        graphics_miss = "async-build";
+        graphics_skip = DriverBuildReport::SkipReason::AsyncBuild;
         return nullptr;
     }
     // If games are using a small index count, we can assume these are full screen quads.
@@ -2400,8 +2552,7 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline,
                    : (draw_state.draw_element_count <= 6);
     if (is_small_draw) {
         if (stale_skip && texture_cache.ColorTargetHasPriorFrameOutput()) {
-            DriverBuildReport::NoteDrawSkipped();
-            graphics_miss = "async-build-stale";
+            graphics_skip = DriverBuildReport::SkipReason::AsyncBuildStale;
             return nullptr;
         }
         return pipeline;
@@ -2413,8 +2564,7 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline,
     if (Settings::CurrentProgramIsSwitch2()) {
         return pipeline;
     }
-    DriverBuildReport::NoteDrawSkipped();
-    graphics_miss = "async-build";
+    graphics_skip = DriverBuildReport::SkipReason::AsyncBuild;
     return nullptr;
 }
 
@@ -2446,14 +2596,18 @@ bool PipelineCache::BuildNewGraphicsPipeline(bool is_indexed) {
         if (CanSkipDraw()) {
             if (!WaitForGraphicsTranslation(queued.done)) {
                 RecordSkippedGeometry(is_indexed, nullptr);
-                graphics_miss = "async-translation";
+                graphics_skip = DriverBuildReport::SkipReason::AsyncTranslation;
                 return false;
             }
         } else {
             FinishGraphicsTranslation(queued);
         }
         AdoptTranslatedGraphicsPipelines();
-        return graphics_cache.contains(graphics_key);
+        if (graphics_cache.contains(graphics_key)) {
+            return true;
+        }
+        graphics_skip = DriverBuildReport::SkipReason::TranslationMissing;
+        return false;
     }
     // Claim the key only once the GPU thread is going to build it. A draw that defers leaves the
     // background build alone, so a later draw can still take the finished pipeline.
@@ -2461,8 +2615,7 @@ bool PipelineCache::BuildNewGraphicsPipeline(bool is_indexed) {
     if (!pipeline) {
         if (DeferRuntimeBuild()) {
             RecordSkippedGeometry(is_indexed, nullptr);
-            DriverBuildReport::NoteDrawSkipped();
-            graphics_miss = "build-deferred";
+            graphics_skip = DriverBuildReport::SkipReason::BuildDeferred;
             return false;
         }
         pipeline = TakeBackgroundPipeline(graphics_key, true);
@@ -2472,11 +2625,15 @@ bool PipelineCache::BuildNewGraphicsPipeline(bool is_indexed) {
         if (const auto done{QueueGraphicsTranslation()}) {
             if (!WaitForGraphicsTranslation(*done)) {
                 RecordSkippedGeometry(is_indexed, nullptr);
-                graphics_miss = "async-translation";
+                graphics_skip = DriverBuildReport::SkipReason::AsyncTranslation;
                 return false;
             }
             AdoptTranslatedGraphicsPipelines();
-            return graphics_cache.contains(graphics_key);
+            if (graphics_cache.contains(graphics_key)) {
+                return true;
+            }
+            graphics_skip = DriverBuildReport::SkipReason::TranslationMissing;
+            return false;
         }
     }
     if (!pipeline) {
@@ -3396,9 +3553,13 @@ bool PipelineCache::WaitForGraphicsTranslation(const std::shared_future<void>& d
     // Behind a backlog, waiting would spend the budget without getting the pipeline.
     const auto wait{std::min(translation_wait, translation_frame_left)};
     bool ready{done.wait_for(std::chrono::seconds{0}) == std::future_status::ready};
-    if (!ready && wait.count() > 0 && translating_graphics.size() <= num_translation_threads) {
+    if (!ready && wait.count() > 0 &&
+        translating_graphics.size() <= num_translation_threads.load(std::memory_order_relaxed)) {
         const auto begin = std::chrono::steady_clock::now();
-        ready = done.wait_for(wait) == std::future_status::ready;
+        {
+            Nx2Bottleneck::WaitScope build_wait{Nx2Bottleneck::Wait::ShaderBuild};
+            ready = done.wait_for(wait) == std::future_status::ready;
+        }
         const auto spent{std::chrono::steady_clock::now() - begin};
         DriverBuildReport::NoteGpuWait(spent);
         translation_frame_left -=
@@ -3410,7 +3571,6 @@ bool PipelineCache::WaitForGraphicsTranslation(const std::shared_future<void>& d
     report.skipped += ready ? 0 : 1;
     if (!ready) {
         VideoCommon::Nx2Spikes::Note(VideoCommon::Nx2Spikes::Event::DrawSkipped);
-        DriverBuildReport::NoteDrawSkipped();
     }
     report.Log();
     return ready;
@@ -3429,7 +3589,10 @@ void PipelineCache::FinishGraphicsTranslation(const QueuedGraphicsTranslation& q
     }
     // A worker that started it first finishes one translation.
     const auto wait_begin = std::chrono::steady_clock::now();
-    queued.done.wait();
+    {
+        Nx2Bottleneck::WaitScope build_wait{Nx2Bottleneck::Wait::ShaderBuild};
+        queued.done.wait();
+    }
     const auto end = std::chrono::steady_clock::now();
     report.unskippable += end - begin;
     if (!claimed_here) {
@@ -3555,7 +3718,8 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(ShaderPools& pool
                                                                const ComputePipelineCacheKey& key,
                                                                Shader::Environment& env,
                                                                PipelineStatistics* statistics,
-                                                               bool build_in_parallel) try {
+                                                               bool build_in_parallel,
+                                                               bool cache_only) try {
     const DriverBuildReport::BuildScope busy;
     const auto build_begin = std::chrono::steady_clock::now();
     auto hash = key.Hash();
@@ -3627,7 +3791,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(ShaderPools& pool
     return {.pipeline = std::make_unique<ComputePipeline>(
                 device, scheduler, vulkan_pipeline_cache, descriptor_pool, guest_descriptor_queue,
                 descriptor_buffer_ring, thread_worker, statistics, &shader_notify, program.info,
-                std::move(spv_module), key.unique_hash),
+                std::move(spv_module), key.unique_hash, code, cache_only),
             .null_pointer_slots = env.IsNativeProgram() ? env.NullStoragePointerSlots()
                                                         : std::vector<std::pair<u32, u32>>{},
             .mapped_pointers = std::move(mapped_pointers)};

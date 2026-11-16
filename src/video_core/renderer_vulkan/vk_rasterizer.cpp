@@ -862,6 +862,12 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     const auto report_failure = [&](std::string_view reason) {
         diag_outcome = reason == "no pipeline" ? pipeline_cache.GraphicsMissReason()
                        : reason == "configure failed" ? "configure-failed" : "mesh-disabled";
+        // The one place a dropped draw is counted, whatever dropped it: PipelineCache only
+        // names the reason (its nested lookups for dynamic state must not count).
+        DriverBuildReport::NoteDrawSkipped(
+            reason == "no pipeline"          ? pipeline_cache.GraphicsSkipReason()
+            : reason == "configure failed" ? DriverBuildReport::SkipReason::ConfigureFailed
+                                           : DriverBuildReport::SkipReason::MeshDisabled);
         static std::set<std::tuple<u64, u64, std::string_view>> seen;
         static size_t async_logged{};
         const auto& regs = maxwell3d->regs;
@@ -1888,6 +1894,7 @@ void RasterizerVulkan::DispatchCompute() {
     u64 native_key{};
     ComputePipeline* const pipeline{pipeline_cache.CurrentComputePipeline(native_key)};
     if (!pipeline) {
+        DriverBuildReport::NoteDrawSkipped(pipeline_cache.ComputeSkipReason());
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute pipeline unavailable");
         return;
     }
@@ -1914,6 +1921,7 @@ void RasterizerVulkan::DispatchCompute() {
     }
     if (!pipeline->Configure(*kepler_compute, *gpu_memory, scheduler, buffer_cache,
                              texture_cache)) {
+        DriverBuildReport::NoteDrawSkipped(DriverBuildReport::SkipReason::ComputeConfigureFailed);
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute resources unavailable");
         return;
     }

@@ -112,6 +112,9 @@ void SetCurrentThreadToEfficiencyCores();
 void SetCurrentThreadToBackgroundWork();
 void SetCurrentThreadToAllCores();
 
+/// Physical cores of the host: the hardware thread count where the platform cannot tell.
+[[nodiscard]] size_t PhysicalCoreCount();
+
 void RefreshThreadPolicies();
 void PollThreadPolicies();
 
