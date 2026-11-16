@@ -368,7 +368,8 @@ std::optional<WarmStamp> CurrentWarmStamp(const fs::path& warm_file, u64 entries
     }
     return WarmStamp{size,      static_cast<s64>(time.time_since_epoch().count()),
                      entries,   driver,
-                     device_id, cache_version};
+                     device_id, cache_version,
+                     u64{}};
 }
 
 std::optional<WarmStamp> ReadWarmMarker(const fs::path& warm_file) {

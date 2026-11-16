@@ -25,6 +25,7 @@
 #include "common/polyfill_thread.h"
 #include "common/unique_function.h"
 #include "shader_recompiler/environment.h"
+#include "video_core/cache_envelope.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 
@@ -127,7 +128,7 @@ public:
 
     /// with_mesh_state: also the mesh registers and pass-through header of task and mesh
     /// programs (only the mesh pipeline file carries them).
-    void Serialize(std::ofstream& file, bool with_mesh_state = false) const;
+    void Serialize(std::ostream& file, bool with_mesh_state = false) const;
 
     bool HasHLEMacroState() const override {
         return has_hle_engine_state;
@@ -323,7 +324,7 @@ public:
     FileEnvironment& operator=(const FileEnvironment&) = delete;
     FileEnvironment(const FileEnvironment&) = delete;
 
-    void Deserialize(std::ifstream& file, bool with_mesh_state = false);
+    void Deserialize(std::istream& file, bool with_mesh_state = false);
 
     [[nodiscard]] u64 ReadInstruction(u32 address) override;
 
@@ -419,5 +420,33 @@ void LoadPipelines(
 /// (the old one is kept as <name>.v<old>.bak until the new one is in place).
 void RewritePipelines(const std::filesystem::path& filename, u32 cache_version, u32 old_version,
                       std::span<const std::string* const> records);
+
+/// The envelope record codec (slice C implements it in shader_environment.cpp, slice D calls it;
+/// the envelope itself is in video_core/cache_envelope.h and its grammar defines the payload).
+/// Replaces SerializePipeline, LoadPipelines and RewritePipelines, which stay declared only until
+/// the pipeline cache and the tests have moved to it and are then deleted by slice A.
+
+/// A decoded record: the environments (1 to CacheEnvelope::MaxEnvsPerRecord, every nested count
+/// and length validated against the bytes that remain before anything is allocated) and the key
+/// bytes exactly as the cache encoded them.
+struct PipelineRecord {
+    std::vector<FileEnvironment> envs;
+    std::vector<u8> key;
+    bool is_compute{};
+};
+
+/// Encodes one record payload. False, `out` untouched, when an environment cannot be serialized
+/// (CanBeSerialized) or the payload would pass CacheEnvelope::MaxRecordBytes: the pipeline is
+/// compiled normally and not persisted. `key` is the cache's explicit encoding of the pipeline
+/// key (no struct padding or pointers).
+[[nodiscard]] bool EncodePipelineRecord(std::span<const u8> key,
+                                        std::span<const GenericEnvironment* const> envs,
+                                        bool with_mesh_state, std::vector<u8>& out);
+
+/// Decodes a payload read back by CacheEnvelope::EnvelopeReader::ReadRecord. Returns None or
+/// bad_record; `out` is only valid on None.
+[[nodiscard]] CacheEnvelope::RejectReason DecodePipelineRecord(std::span<const u8> payload,
+                                                               bool with_mesh_state,
+                                                               PipelineRecord& out);
 
 } // namespace VideoCommon

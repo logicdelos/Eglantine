@@ -40,7 +40,9 @@ std::filesystem::path WarmCountPath(const std::filesystem::path& warm_file);
 u64 ReadWarmCount(const std::filesystem::path& warm_file);
 
 /// What a marker records: the precache file's size and last-write time, its entry count, the GPU
-/// driver version and device ID and the pipeline cache version.
+/// driver version and device ID, the pipeline cache version and the content stamp of the title
+/// (CacheEnvelope::HostIdentity::content_stamp: the executable and content set, add-ons included;
+/// 0 until the marker writer stores it).
 struct WarmStamp {
     u64 size{};
     s64 write_time{};
@@ -48,12 +50,14 @@ struct WarmStamp {
     u32 driver{};
     u32 device_id{};
     u32 cache_version{};
+    u64 content_stamp{};
 
-    /// True when `other` was written for the same file, driver, device and cache version (the
-    /// entry count is informative).
+    /// True when `other` was written for the same file, driver, device, cache version and content
+    /// (the entry count is informative).
     [[nodiscard]] bool Matches(const WarmStamp& other) const noexcept {
         return size == other.size && write_time == other.write_time && driver == other.driver &&
-               device_id == other.device_id && cache_version == other.cache_version;
+               device_id == other.device_id && cache_version == other.cache_version &&
+               content_stamp == other.content_stamp;
     }
 };
 
