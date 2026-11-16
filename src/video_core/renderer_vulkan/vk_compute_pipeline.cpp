@@ -168,11 +168,13 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         try {
             const auto build_begin = std::chrono::steady_clock::now();
             {
-                // The driver compiles the pipeline here. Work id: the one the dispatch waits on.
+                // The driver compiles the pipeline here. Work id: this instance, the one the
+                // dispatch waits on (the same shader hash can have several variants).
                 VideoCommon::Nx2Spikes::SpanScope build_span{
                     VideoCommon::Nx2Spikes::Cause::Pipeline,
                     VideoCommon::Nx2Spikes::DerivedWorkId(
-                        VideoCommon::Nx2Spikes::WorkKind::ComputePipelineBuild, shader_hash)};
+                        VideoCommon::Nx2Spikes::WorkKind::ComputePipelineBuild,
+                        reinterpret_cast<std::uintptr_t>(this))};
                 try {
                     pipeline =
                         device.GetLogical().CreateComputePipeline(compute_ci, *pipeline_cache);
@@ -455,10 +457,12 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                 const VideoCommon::Nx2Spikes::SpanScope build_wait{
                     VideoCommon::Nx2Spikes::Cause::Waiting};
                 if (build_wait.Token().Valid()) {
+                    // The instance identifies the build: the same shader has other variants.
                     VideoCommon::Nx2Spikes::LinkWait(
                         build_wait.Token(),
                         VideoCommon::Nx2Spikes::DerivedWorkId(
-                            VideoCommon::Nx2Spikes::WorkKind::ComputePipelineBuild, shader_hash),
+                            VideoCommon::Nx2Spikes::WorkKind::ComputePipelineBuild,
+                            reinterpret_cast<std::uintptr_t>(this)),
                         VideoCommon::Nx2Spikes::DependencyKind::Job);
                 }
                 build_condvar.wait(lock,
