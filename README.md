@@ -21,8 +21,10 @@ This is an independent fork. It is not an official Eglantine release, and it is 
 
 | Game | Fork build | Date | Result |
 |---|---|---|---|
-| Fire Emblem: Fortune's Weave | to be filled from the 0.1 test run | | |
-| Xenoblade Chronicles 2 | to be filled from the 0.1 test run | | |
+| Fire Emblem: Fortune's Weave | [fork-v0.1.0](https://github.com/logicdelos/Eglantine/releases/tag/fork-v0.1.0) | 2026-11-16 | Boots from a save into the reference scene at 1x and 2x resolution scale. 30.0 fps with the speed limit on, longest frame 76 ms at 1x and 69 ms at 2x, no error lines in the log, clean exit. |
+| Xenoblade Chronicles 2 | [fork-v0.1.0](https://github.com/logicdelos/Eglantine/releases/tag/fork-v0.1.0) | 2026-11-16 | Boots to the title screen at 1x resolution scale. 60.0 fps with the speed limit on, longest frame 59 ms, no error lines in the log, clean exit. Play past the title screen was not part of this test. |
+
+Each run lasted about 3 minutes with Vulkan, GPU accuracy High, SMAA, the BUF scaling filter and docked mode. The release notes of each build carry the full table.
 
 Test machine: Windows 11, AMD Ryzen 9 8940HX, NVIDIA GeForce RTX 5070 Ti Laptop GPU, 16 GB RAM.
 

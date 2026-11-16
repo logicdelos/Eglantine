@@ -23,10 +23,10 @@ Milestones 0.1 to 0.6 improve the emulator as it exists today. Milestones 0.7 on
 
 ## Milestones
 
-Status values: **planned**, **in progress**, **released**. Nothing below is released yet.
+Status values: **planned**, **in progress**, **released**.
 
 ### 0.1: Fork baseline
-Status: in progress.
+Status: released as [fork-v0.1.0](https://github.com/logicdelos/Eglantine/releases/tag/fork-v0.1.0) on 2026-11-16. The test table is in the release notes.
 
 **Significant change:** the fork's own fixes on top of upstream build `daily-20261116`.
 
@@ -40,7 +40,7 @@ Status: in progress.
 Done when: both tested games boot to their reference scenes on a clean build.
 
 ### 0.2: Fixes from sibling forks
-Status: planned.
+Status: in progress.
 
 **Significant change:** correctness fixes ported from other Eglantine forks, each credited to its author.
 
@@ -80,13 +80,13 @@ Status: planned.
 
 Done when: frames over 100 ms in the first two minutes are at least halved on the second launch in both games.
 
-### 0.6: Replay and regression gate
+### 0.6: Replay and regression check
 Status: planned.
 
 **Significant change:** a frame's graphics calls can be recorded and replayed without the game, and pictures compared automatically.
 
 - A census of the graphics library calls each game makes per frame, built into the emulator.
-- A gate that fails a change when median or low-end frame rate drops beyond measured noise.
+- A check that fails a change when median or low-end frame rate drops beyond measured noise.
 
 Done when: an injected 5 % slowdown is caught, and the call census is complete for both games with no per-game code.
 
