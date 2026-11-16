@@ -40,6 +40,7 @@ Result IStorage::Read(
 
     R_UNLESS(length >= 0, FileSys::ResultInvalidSize);
     R_UNLESS(offset >= 0, FileSys::ResultInvalidOffset);
+    R_UNLESS(static_cast<u64>(length) <= out_bytes.size(), FileSys::ResultInvalidSize);
 
     // Custom (EDEN_NX2_FS_READ_MBPS=<n>): the emulated storage speed in MB/s for this read
     // throttle. 0 turns it off. Default: 40 MB/s (a Switch 1 card), 100 MB/s for Switch 2 titles.
