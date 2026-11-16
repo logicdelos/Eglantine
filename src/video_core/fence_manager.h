@@ -85,7 +85,7 @@ public:
 
     void SignalFence(std::function<void()>&& func, bool force_completion = false) {
         Nx2Profile::Scope profile_scope{Nx2Profile::Zone::Fence};
-        const bool delay_fence = force_completion || (Settings::IsGPUFenceBehaviorDefault() ? Settings::IsGPULevelHigh() : Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate());
+        const bool delay_fence = force_completion || Settings::IsGPUFenceDelayed();
         if constexpr (!can_async_check) {
             TryReleasePendingFences<false>();
         }

@@ -528,14 +528,49 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         if (acquire.Matches(drained)) {
             return;
         }
+        const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address);
+        // acquire_issued: a release already issued (its write delayed until the host GPU is
+        // done) meets the value. Host work is recorded in issue order, so the channel goes on.
+        // Verify runs the waiting path too and logs when it would have suspended.
+        // Not with the GPU thread split: its acquires wait through the back thread.
+        auto& issued = Nx2IssuedReleases::Get();
+        const bool met_issued =
+            device && VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::AcquireIssued) &&
+            !VideoCommon::GpuSplit::Get().Active() &&
+            issued.Meets(*device, acquire.value, acquire.operation, [&] {
+                return dma_pusher.memory_manager.Read<u32>(acquire.address);
+            });
+        if (met_issued) {
+            VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireMetIssued, 1);
+            if (!VideoCommon::Nx2Perf::Verify()) {
+                // Releasing the fences also sent off the operations queued outside one.
+                if (issued.TakeUncommitted()) {
+                    dma_pusher.rasterizer->SignalReference();
+                }
+                return;
+            }
+        }
         // Registered before the fences run, so a release among them that meets the value counts
         // even if a later one overwrites it.
         auto& waiters = Nx2SemaphoreWaiters::Get();
-        if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address)) {
+        if (device) {
             waiters.Add(this, *device, acquire.value, acquire.operation);
         }
         ReleaseFences(dma_pusher);
-        if (!waiters.Latched(this) && !acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
+        u32 current{};
+        if (!waiters.Latched(this) &&
+            !acquire.Matches(current = ReadSemaphoreWord(dma_pusher, acquire.address))) {
+            if (met_issued) {
+                static std::atomic<u64> differences{};
+                const u64 count = differences.fetch_add(1) + 1;
+                if (count <= 64) {
+                    LOG_ERROR(HW_GPU,
+                              "Nx2Perf acquire_issued: channel {} semaphore {:#x} (op {}, {:#x}) "
+                              "met by an issued release but unmet now (word {:#x}) ({} differences)",
+                              dma_pusher.channel_state.bind_id, acquire.address, acquire.operation,
+                              acquire.value, current, count);
+                }
+            }
             pending_acquire = acquire;
             dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
             VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);

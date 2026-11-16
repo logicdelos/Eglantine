@@ -19,6 +19,7 @@
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
 #include "memory_manager.h"
+#include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_perf.h"
@@ -249,6 +250,25 @@ void MemoryManager::PreserveMapping(GPUVAddr gpu_addr, std::size_t size) {
     GetSubmappedRangeImpl<false>(gpu_addr, size, ranges);
     for (const auto& [address, bytes] : ranges) {
         rasterizer->FlushRegion(address, bytes, VideoCommon::CacheType::All);
+    }
+}
+
+// acquire_issued: the acquire a pending reduction met no longer waits for its write, which
+// resolves the GPU address when it runs. It has to land before the mapping under it changes.
+// For the map changes ordered with the command lists, on the GPU thread, as the acquire was.
+void MemoryManager::SettleIssuedReleases(GPUVAddr gpu_addr, std::size_t size) {
+    auto& issued = Nx2IssuedReleases::Get();
+    if (rasterizer == nullptr || size == 0 || !issued.Any() ||
+        VideoCommon::GpuSplit::Get().Active()) {
+        return;
+    }
+    boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> ranges;
+    GetSubmappedRangeImpl<false>(gpu_addr, size, ranges);
+    for (const auto& [address, bytes] : ranges) {
+        if (issued.HasReductionIn(address, bytes)) {
+            rasterizer->ReleaseFences();
+            return;
+        }
     }
 }
 

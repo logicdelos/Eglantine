@@ -181,6 +181,7 @@ void nvhost_as_gpu::Nx2Map(u64 gpu_address, u64 cpu_address, u64 size) {
     // nx2:gpu locks that the GPU thread takes under that lock (sparse blocks backed on write).
     system.GPU().MapInOrder(
         gpu_address, size, [gmmu = gmmu.get(), gpu_address, device_address, size] {
+            gmmu->SettleIssuedReleases(gpu_address, size);
             gmmu->Map(gpu_address, device_address, size, Tegra::PTEKind::PITCH, false);
         });
     LOG_DEBUG(Service_NVDRV, "Switch 2 GPU mapping {:#x}+{:#x} -> CPU {:#x}", gpu_address, size,
@@ -193,7 +194,10 @@ void nvhost_as_gpu::Nx2Unmap(u64 gpu_address, u64 size) {
         return;
     }
     // The GPU thread may still be running command lists that use the range.
-    system.GPU().RunInOrder([gmmu = gmmu.get(), gpu_address, size] { gmmu->Unmap(gpu_address, size); });
+    system.GPU().RunInOrder([gmmu = gmmu.get(), gpu_address, size] {
+        gmmu->SettleIssuedReleases(gpu_address, size);
+        gmmu->Unmap(gpu_address, size);
+    });
     LOG_DEBUG(Service_NVDRV, "Switch 2 GPU unmapping {:#x}+{:#x}", gpu_address, size);
 }
 
@@ -243,6 +247,7 @@ void nvhost_as_gpu::Nx2Sparse(u64 gpu_address, u64 size, bool create) {
         // After the command lists that may still use it.
         system.GPU().RunInOrder([gmmu = gmmu.get(), &smmu, gpu_address, size, device_address,
                                  device_size] {
+            gmmu->SettleIssuedReleases(gpu_address, size);
             gmmu->Unmap(gpu_address, size);
             smmu.Unmap(device_address, size);
             smmu.Free(device_address, device_size);
@@ -259,6 +264,7 @@ void nvhost_as_gpu::Nx2Sparse(u64 gpu_address, u64 size, bool create) {
     // On the GPU thread, as in Nx2Map.
     system.GPU().MapInOrder(
         gpu_address, size, [gmmu = gmmu.get(), gpu_address, device_address, size] {
+            gmmu->SettleIssuedReleases(gpu_address, size);
             gmmu->Map(gpu_address, device_address, size, Tegra::PTEKind::PITCH, false);
         });
     LOG_DEBUG(Service_NVDRV, "Switch 2 sparse region {:#x}+{:#x} -> device {:#x}", gpu_address,
@@ -305,6 +311,7 @@ void nvhost_as_gpu::Nx2SparseTile(u64 gpu_address, u64 cpu_address, u64 size) {
     system.GPU().MapInOrder(
         gpu_address, size, [&smmu, memory = gmmu.get(), device, cpu_address, size, gpu_address,
                            canonical, asid = session->asid] {
+            memory->SettleIssuedReleases(gpu_address, size);
             if (canonical) {
                 memory->Map(gpu_address, *canonical, size, Tegra::PTEKind::PITCH, false);
                 smmu.Unmap(device, size);

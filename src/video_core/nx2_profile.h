@@ -338,6 +338,7 @@ enum class Counter : u32 {
     IndirectRecords,
     /// Of those, drawn after storage writes no barrier ordered yet (RasterizerVulkan::DrawIndirect)
     IndirectRecordsUnordered,
+    AcquireMetIssued, ///< Of AcquireChecks: met by an issued release (Nx2Perf acquire_issued)
     Count,
 };
 
@@ -494,9 +495,10 @@ inline void Report(const char* thread_name = "GPU thread") {
     line += fmt::format(" | 3D register writes {:.0f} ({:.0f} same value)",
                         static_cast<double>(data.counters[4]) * 1e9 / window,
                         static_cast<double>(data.counters[5]) * 1e9 / window);
-    line += fmt::format(" | acquires {:.0f} ({:.0f} waited)",
+    line += fmt::format(" | acquires {:.0f} ({:.0f} waited, {:.0f} met by an issued release)",
                         static_cast<double>(data.counters[6]) * 1e9 / window,
-                        static_cast<double>(data.counters[7]) * 1e9 / window);
+                        static_cast<double>(data.counters[7]) * 1e9 / window,
+                        static_cast<double>(data.counters[static_cast<size_t>(Counter::AcquireMetIssued)]) * 1e9 / window);
     const auto per_second = [&](Counter counter) {
         return static_cast<double>(data.counters[static_cast<size_t>(counter)]) * 1e9 / window;
     };

@@ -13,12 +13,14 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <utility>
 #include <vector>
 
 #include "common/common_types.h"
 #include "common/container/unordered_map.h"
 #include "common/thread.h"
+#include "video_core/native_qmd.h"
 #include "video_core/nx2_perf.h"
 
 namespace Tegra {
@@ -662,6 +664,20 @@ public:
     static constexpr u32 AcquireGequal = 0x4;
     static constexpr u32 AcquireMask = 0x8;
 
+    /// Whether a word holding `current` meets an acquire of `operation` and `value`.
+    static bool Satisfies(u32 operation, u32 value, u32 current) {
+        switch (operation) {
+        case AcquireEqual:
+            return current == value;
+        case AcquireGequal:
+            return current >= value;
+        case AcquireMask:
+            return (current & value) != 0;
+        default:
+            return false;
+        }
+    }
+
     static Nx2SemaphoreWaiters& Get() {
         static Nx2SemaphoreWaiters waiters;
         return waiters;
@@ -723,21 +739,178 @@ private:
     };
 
     static bool Matches(const Waiter& w, u32 current) {
-        switch (w.operation) {
-        case AcquireEqual:
-            return current == w.value;
-        case AcquireGequal:
-            return current >= w.value;
-        case AcquireMask:
-            return (current & w.value) != 0;
-        default:
-            return false;
-        }
+        return Satisfies(w.operation, w.value, current);
     }
 
     std::mutex mutex;
     std::vector<Waiter> waiters;
     std::atomic<size_t> count{};
+};
+
+/// Semaphore releases a channel has issued whose guest memory write is still delayed (delayed
+/// fences run their operations, in issue order, once the host GPU is done). A later acquire one
+/// of them meets may continue at once: the host command stream is already in issue order.
+/// Every record is forgotten by the operation that was issued with it.
+class Nx2IssuedReleases {
+public:
+    static Nx2IssuedReleases& Get() {
+        static Nx2IssuedReleases issued;
+        return issued;
+    }
+
+    [[nodiscard]] bool Any() const {
+        return count.load(std::memory_order_acquire) != 0;
+    }
+
+    /// A release that stores `value`. `wide`: a four-word report (value and time stamp).
+    void Issue(u64 device_address, u32 value, bool wide) {
+        Push({device_address, value, PlainWrite, false, true, wide});
+    }
+
+    /// A release that reduces the word with `payload` (ReduceSemaphore's `op`). Its operation
+    /// must write through the Settle that takes the write.
+    void IssueReduction(u64 device_address, u32 op, bool is_signed, u32 payload) {
+        Push({device_address, payload, static_cast<s8>(op), is_signed, true, false});
+    }
+
+    /// A queued write no acquire may count on: it and the releases issued after it are not
+    /// predicted. `uncommitted`: no fence has taken its operation yet (TakeUncommitted).
+    void IssueUnpredicted(u64 device_address, bool wide, bool uncommitted) {
+        Push({device_address, 0, PlainWrite, false, false, wide});
+        if (uncommitted) {
+            has_uncommitted.store(true, std::memory_order_release);
+        }
+    }
+
+    /// Whether an operation was queued outside a fence since the last call. An acquire that
+    /// does not release the fences then has to send those off with a fence of its own.
+    [[nodiscard]] bool TakeUncommitted() {
+        return has_uncommitted.load(std::memory_order_acquire) &&
+               has_uncommitted.exchange(false, std::memory_order_acq_rel);
+    }
+
+    /// Whether a reduction is pending in the range. Its operation resolves the GPU address when
+    /// it runs, so it has to run before that mapping changes.
+    [[nodiscard]] bool HasReductionIn(u64 device_address, u64 size) {
+        if (count.load(std::memory_order_acquire) == 0) {
+            return false;
+        }
+        std::scoped_lock lk{mutex};
+        return std::ranges::any_of(releases, [&](const Release& r) {
+            return r.reduction != PlainWrite && r.address - device_address < size;
+        });
+    }
+
+    /// The releases pending at `device_address` may be dropped or overwritten.
+    void Unpredict(u64 device_address) {
+        if (count.load(std::memory_order_acquire) == 0) {
+            return;
+        }
+        std::scoped_lock lk{mutex};
+        for (Release& r : releases) {
+            if (r.address == device_address) {
+                r.predicted = false;
+            }
+        }
+    }
+
+    /// A new emulation session starts: operations the previous one abandoned never settle.
+    void Clear() {
+        std::scoped_lock lk{mutex};
+        releases.clear();
+        count.store(0, std::memory_order_release);
+    }
+
+    /// The operation of the oldest release at `device_address` starts. No acquire is predicted
+    /// at the address until Settle: its write may or may not have reached the word.
+    void Land(u64 device_address) {
+        std::scoped_lock lk{mutex};
+        if (const auto it = Oldest(device_address); it != releases.end()) {
+            it->landing = true;
+        }
+    }
+
+    /// The release at `device_address` was written (or dropped): forgets the oldest one.
+    void Settle(u64 device_address) {
+        if (count.load(std::memory_order_acquire) == 0) {
+            return;
+        }
+        std::scoped_lock lk{mutex};
+        Pop(device_address);
+    }
+
+    /// Runs `write`, the memory write of the oldest release at `device_address`, then forgets
+    /// the release. The write runs outside the lock: it can back sparse memory.
+    template <typename Write>
+    void Settle(u64 device_address, Write&& write) {
+        Land(device_address);
+        write();
+        Settle(device_address);
+    }
+
+    /// Whether the releases pending at `device_address`, applied in order to the word `read()`
+    /// returns, meet the acquire at any step.
+    template <typename Read>
+    [[nodiscard]] bool Meets(u64 device_address, u32 value, u32 operation, Read&& read) {
+        if (count.load(std::memory_order_acquire) == 0) {
+            return false;
+        }
+        std::scoped_lock lk{mutex};
+        std::optional<u32> word;
+        for (const Release& r : releases) {
+            if (device_address - r.address >= (r.wide ? 16u : 4u)) {
+                continue;
+            }
+            // The other words of a four-word report are not tracked.
+            if (r.address != device_address || !r.predicted || r.landing) {
+                return false;
+            }
+            word = r.reduction == PlainWrite
+                       ? r.value
+                       : ReduceSemaphore(static_cast<u32>(r.reduction), r.is_signed,
+                                         word ? *word : read(), r.value);
+            if (Nx2SemaphoreWaiters::Satisfies(operation, value, *word)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+private:
+    static constexpr s8 PlainWrite = -1;
+
+    struct Release {
+        u64 address;
+        u32 value;
+        s8 reduction;
+        bool is_signed;
+        bool predicted;
+        bool wide;
+        bool landing = false;
+    };
+
+    void Push(const Release& release) {
+        std::scoped_lock lk{mutex};
+        releases.push_back(release);
+        count.store(releases.size(), std::memory_order_release);
+    }
+
+    [[nodiscard]] std::vector<Release>::iterator Oldest(u64 device_address) {
+        return std::ranges::find_if(
+            releases, [device_address](const Release& r) { return r.address == device_address; });
+    }
+
+    void Pop(u64 device_address) {
+        if (const auto it = Oldest(device_address); it != releases.end()) {
+            releases.erase(it);
+            count.store(releases.size(), std::memory_order_release);
+        }
+    }
+
+    std::mutex mutex;
+    std::vector<Release> releases;
+    std::atomic<size_t> count{};
+    std::atomic<bool> has_uncommitted{};
 };
 
 } // namespace Tegra

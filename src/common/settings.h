@@ -1051,6 +1051,8 @@ bool IsDMALevelSafe();
 bool IsGPUFenceBehaviorDefault();
 bool IsGPUFenceBehaviorBalanced();
 bool IsGPUFenceBehaviorAccurate();
+/// Fence operations run once the host GPU is done, rather than when the fence is signalled.
+bool IsGPUFenceDelayed();
 
 bool IsFastmemEnabled();
 void SetNceEnabled(bool is_64bit);

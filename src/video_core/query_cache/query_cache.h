@@ -293,11 +293,8 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         return std::make_pair<u64, u32>(cur_addr >> Core::DEVICE_PAGEBITS,
                                         static_cast<u32>(cur_addr & Core::DEVICE_PAGEMASK));
     };
-    const bool is_synced =
-        (Settings::IsGPUFenceBehaviorDefault()
-             ? !Settings::IsGPULevelHigh()
-             : !Settings::IsGPUFenceBehaviorBalanced() && !Settings::IsGPUFenceBehaviorAccurate()) &&
-        is_fence;
+    const bool is_delayed = Settings::IsGPUFenceDelayed();
+    const bool is_synced = !is_delayed && is_fence;
     // Fits beside query_location and is_synced: the capture stays within the SBO limit below.
     const u16 settle_slot = static_cast<u16>(Tegra::Nx2AsyncReportSlot(cpu_addr));
     auto operation_fn = [this, query_base = query, pointer, query_location, is_synced,
@@ -305,11 +302,20 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         // Whatever path this takes, the slot's result write is done when it returns.
         struct Settle {
             u16 slot;
+            DAddr address;
+            bool issued;
             ~Settle() {
                 Tegra::g_nx2_async_reports_completed[slot].fetch_add(1,
                                                                      std::memory_order_release);
+                if (issued) {
+                    Tegra::Nx2IssuedReleases::Get().Settle(address);
+                }
             }
-        } const settle{settle_slot};
+        } const settle{settle_slot, query_base->guest_address,
+                       True(query_base->flags & QueryFlagBits::IsIssuedRelease)};
+        if (settle.issued) {
+            Tegra::Nx2IssuedReleases::Get().Land(settle.address);
+        }
         if (True(query_base->flags & QueryFlagBits::IsInvalidated)) {
             if (!is_synced) [[likely]] {
                 impl->pending_unregister.push_back(query_location);
@@ -348,6 +354,18 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
                   "CounterReport operation lambda should fit in std::function SBO");
     std::function<void()> operation(std::move(operation_fn));
     Tegra::g_nx2_async_reports_issued[settle_slot].fetch_add(1, std::memory_order_release);
+    if (is_delayed && Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
+        Nx2Perf::On(Nx2Perf::Opt::AcquireIssued)) {
+        // acquire_issued: the operation below stays queued. A payload release in a delayed fence
+        // is predicted. Any other report writes a result not known yet, and one outside a fence
+        // waits for some later fence to take it.
+        if (counter_type == QueryType::Payload && is_fence) {
+            Tegra::Nx2IssuedReleases::Get().Issue(cpu_addr, payload, has_timestamp);
+        } else {
+            Tegra::Nx2IssuedReleases::Get().IssueUnpredicted(cpu_addr, has_timestamp, !is_fence);
+        }
+        query->flags |= QueryFlagBits::IsIssuedRelease;
+    }
     if (is_fence) {
         impl->rasterizer.SignalFence(std::move(operation));
     } else {
@@ -608,6 +626,10 @@ void QueryCacheBase<Traits>::InvalidateQuery(QueryCacheBase<Traits>::QueryLocati
         return;
     }
     query_base->flags |= QueryFlagBits::IsInvalidated;
+    if (True(query_base->flags & QueryFlagBits::IsIssuedRelease)) {
+        // Its operation will skip the write.
+        Tegra::Nx2IssuedReleases::Get().Unpredict(query_base->guest_address);
+    }
 }
 
 template <typename Traits>

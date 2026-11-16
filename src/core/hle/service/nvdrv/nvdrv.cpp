@@ -139,6 +139,7 @@ Module::Module(Core::System& system)
     Tegra::Nx2ClearSparseRegions();
     Tegra::Nx2ClearGpuWrittenPages();
     Tegra::Nx2ClearAsyncReports();
+    Tegra::Nx2IssuedReleases::Get().Clear();
     Devices::g_nx2_driver = false;
     Tegra::g_nx2_ampere = false;
     Core::g_nx2_present_count = 0;

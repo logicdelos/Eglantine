@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include "common/nx2_bottleneck.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/core.h"
@@ -138,11 +139,14 @@ bool DmaPusher::Step() {
     const CommandListHeader& header = current_command;
     dma_state.dma_get = header.addr;
 
-    if (signal_sync && !synced) {
-        std::unique_lock lk(sync_mutex);
-        sync_cv.wait(lk, [this]() { return synced; });
+    if (signal_sync) {
+        if (!synced) {
+            // The fence callback runs once the host GPU is done (delayed fences).
+            Nx2Bottleneck::WaitScope wait{Nx2Bottleneck::Wait::HostGpu};
+            std::unique_lock lk(sync_mutex);
+            sync_cv.wait(lk, [this]() { return synced.load(); });
+        }
         signal_sync = false;
-        synced = false;
     }
 
     if (header.size > 0) {
@@ -385,10 +389,20 @@ bool DmaPusher::Step() {
         dma_pushbuffer.pop_front();
         dma_pushbuffer_subindex = 0;
     } else {
-        signal_sync = command_list.command_lists[dma_pushbuffer_subindex].sync && Settings::values.sync_memory_operations.GetValue();
+        // On hardware the sync bit only orders the fetch after Host has processed the preceding
+        // entry, engines not included (NV_PPBDMA_GP_ENTRY1_SYNC_WAIT in dev_pbdma.ref.txt);
+        // entries are processed in order here. The wait for the host GPU is a workaround, and
+        // on a Switch 2 title GPU-written lists have their own handling.
+        const bool host_only = g_nx2_ampere.load(std::memory_order_relaxed) &&
+                               VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::GpSyncHost);
+        signal_sync = command_list.command_lists[dma_pushbuffer_subindex].sync && !host_only &&
+                      Settings::values.sync_memory_operations.GetValue();
     }
 
     if (signal_sync) {
+        // Reset per fence: a callback that ran before the next Step left this set, and every
+        // later sync entry then skipped its wait.
+        synced = false;
         // SignalFence invalidates the GPU caches, which can record copies into the scheduler: the
         // back's state, which a drained back still submits from in its idle hook.
         VideoCommon::GpuSplit::Get().Run([this] {

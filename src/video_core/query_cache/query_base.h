@@ -18,6 +18,7 @@ enum class QueryFlagBits : u32 {
     IsInvalidated = 1 << 6,      ///< Indicates the value of th query has been nullified.
     IsOrphan = 1 << 7,           ///< Indicates the query has not been set by a guest query.
     IsFence = 1 << 8,            ///< Indicates the query is a fence.
+    IsIssuedRelease = 1 << 9,    ///< Its operation settles a Tegra::Nx2IssuedReleases record.
 };
 DECLARE_ENUM_FLAG_OPERATORS(QueryFlagBits)
 

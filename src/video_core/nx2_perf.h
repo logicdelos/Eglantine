@@ -101,6 +101,17 @@ enum class Opt : unsigned {
     /// Async shaders: keep FileEnvironments of graphics pipelines skipped at boot and replay their
     /// translation and compilation on background workers on first skippable use
     ReplayDiskRecordings,
+    /// A Switch 2 semaphore acquire that an already issued release (its guest write still
+    /// delayed by the fence behavior) will meet continues at once instead of waiting for the
+    /// host GPU (Tegra::Nx2IssuedReleases in nx2.h)
+    AcquireIssued,
+    /// Texture cache: final host image extents clamped to >= 1, image construction failure
+    /// non-fatal (emergency eviction and one retry, then native resolution), budget refreshed on
+    /// failure
+    ImageAdmission,
+    /// Switch 2 titles: a GPFIFO entry's sync bit keeps its hardware meaning (fetch ordered after
+    /// Host processing) and no longer waits for the host GPU when "sync memory operations" is on
+    GpSyncHost,
     Count,
 };
 
@@ -114,7 +125,8 @@ inline constexpr std::array<std::string_view, static_cast<size_t>(Opt::Count)> o
     "submit_while_waited", "pipeline_keep_preloaded", "bank_once_per_frame", "dirty_gather_fast",
     "handle_page_cache", "dma_forward", "draw_begin_coalesce", "pending_wake", "diag_draw_lite",
     "shader_build_budget", "compute_rebuild_async", "compute_preload_variants", "stale_target_skip",
-    "geometry_consistency", "build_order_priority", "replay_disk_recordings",
+    "geometry_consistency", "build_order_priority", "replay_disk_recordings", "acquire_issued",
+    "image_admission", "gp_sync_host",
 };
 
 static_assert(static_cast<size_t>(Opt::Count) <= 64, "the off-mask is 64 bits");
