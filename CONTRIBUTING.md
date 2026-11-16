@@ -1,5 +1,7 @@
 # Contributing
 
+> This repository is a fork of Eglantine. Report problems and send pull requests to [logicdelos/Eglantine](https://github.com/logicdelos/Eglantine), and use `fork-main` as the base branch. The text below is upstream's and is kept unchanged. Its Discord invite, issue links and base branch `nx2` refer to upstream, not to this fork.
+
 Eglantine has lots of different ways that you can contribute to its efforts, even without knowing how to write code:
 
 - Join our [Discord](https://discord.gg/XkS5NVPTUY) community
