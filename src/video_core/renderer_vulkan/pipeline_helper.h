@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -21,6 +22,7 @@
 #include "common/nx2_bottleneck.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/shader_info.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/renderer_vulkan/vk_driver_build_report.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
@@ -455,6 +457,14 @@ class RescalingPushConstant {
 public:
     explicit RescalingPushConstant() noexcept {}
 
+    explicit RescalingPushConstant(
+        const std::array<u32, NUM_TEXTURE_AND_IMAGE_SCALING_WORDS>* cached) noexcept {
+        if (cached) {
+            std::copy_n(cached->begin(), Shader::Backend::SPIRV::NUM_TEXTURE_SCALING_WORDS,
+                        words.begin());
+        }
+    }
+
     void PushTexture(bool is_rescaled) noexcept {
         *texture_ptr |= is_rescaled ? texture_bit : 0u;
         texture_bit <<= 1u;
@@ -495,31 +505,47 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
                                  GuestDescriptorQueue& guest_descriptor_queue,
                                  const Shader::Info& info, RescalingPushConstant& rescaling,
                                  const VideoCommon::SamplerId*& samplers,
-                                 const VideoCommon::ImageViewInOut*& views) {
+                                 const VideoCommon::ImageViewInOut*& views,
+                                 bool skip_sampled = false, bool force_slow = false) {
     const u32 num_texture_buffers = Shader::NumDescriptors(info.texture_buffer_descriptors);
     const u32 num_image_buffers = Shader::NumDescriptors(info.image_buffer_descriptors);
     views += num_texture_buffers;
     views += num_image_buffers;
     const bool rescaling_active{Settings::values.resolution_info.active};
-    for (const auto& desc : info.texture_descriptors) {
-        bool is_rescaled{};
-        for (u32 index = 0; index < desc.count; ++index) {
-            const VideoCommon::ImageViewId image_view_id{(views++)->id};
-            const VideoCommon::SamplerId sampler_id{*(samplers++)};
-            ImageView& image_view{texture_cache.GetImageView(image_view_id)};
-            VkImageView vk_image_view{image_view.Handle(desc.type)};
-            if (vk_image_view == VK_NULL_HANDLE) {
-                const VkImageView null_image_view{texture_cache.GetImageView(VideoCommon::NULL_IMAGE_VIEW_ID).Handle(desc.type)};
-                if (null_image_view != VK_NULL_HANDLE) vk_image_view = null_image_view;
+    if (skip_sampled) {
+        const u32 count = Shader::NumDescriptors(info.texture_descriptors);
+        views += count;
+        samplers += count;
+    } else {
+        for (const auto& desc : info.texture_descriptors) {
+            bool is_rescaled{};
+            for (u32 index = 0; index < desc.count; ++index) {
+                const VideoCommon::ImageViewId image_view_id{(views++)->id};
+                const VideoCommon::SamplerId sampler_id{*(samplers++)};
+                ImageView& image_view{texture_cache.GetImageView(image_view_id)};
+                Sampler& sampler{texture_cache.GetSampler(sampler_id)};
+                if (!force_slow &&
+                    VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::DescriptorHandleMemo)) {
+                    const auto descriptor = sampler.DescriptorFor(
+                        image_view, sampler_id, desc.type, desc.is_depth,
+                        texture_cache.GetImageView(VideoCommon::NULL_IMAGE_VIEW_ID));
+                    guest_descriptor_queue.AddSampledImage(descriptor.imageView, descriptor.sampler);
+                } else {
+                    VkImageView vk_image_view{image_view.Handle(desc.type)};
+                    if (vk_image_view == VK_NULL_HANDLE) {
+                        const VkImageView null_image_view{
+                            texture_cache.GetImageView(VideoCommon::NULL_IMAGE_VIEW_ID).Handle(desc.type)};
+                        if (null_image_view != VK_NULL_HANDLE) vk_image_view = null_image_view;
+                    }
+                    guest_descriptor_queue.AddSampledImage(
+                        vk_image_view, sampler.HandleFor(image_view, desc.is_depth));
+                }
+                if (rescaling_active) {
+                    is_rescaled |= texture_cache.IsRescaling(image_view);
+                }
             }
-            Sampler& sampler{texture_cache.GetSampler(sampler_id)};
-            guest_descriptor_queue.AddSampledImage(vk_image_view,
-                                                   sampler.HandleFor(image_view, desc.is_depth));
-            if (rescaling_active) {
-                is_rescaled |= texture_cache.IsRescaling(image_view);
-            }
+            rescaling.PushTexture(is_rescaled);
         }
-        rescaling.PushTexture(is_rescaled);
     }
     for (const auto& desc : info.image_descriptors) {
         bool is_rescaled{};

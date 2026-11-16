@@ -32,6 +32,7 @@ UpdateDescriptorQueue::UpdateDescriptorQueue(const Device& device_, size_t frame
 UpdateDescriptorQueue::~UpdateDescriptorQueue() = default;
 
 void UpdateDescriptorQueue::TickFrame() {
+    ++sequence;
     if (++frame_index >= FRAMES_IN_FLIGHT) {
         frame_index = 0;
     }
@@ -48,8 +49,10 @@ void UpdateDescriptorQueue::AcquireOverflow(Scheduler& scheduler, size_t reserve
                     used, reserve, frame_payload_size);
         scheduler.WaitWorker();
         payload_cursor = payload_start;
+        ++sequence;
     }
     upload_start = payload_cursor;
+    ++sequence;
 }
 
 } // namespace Vulkan

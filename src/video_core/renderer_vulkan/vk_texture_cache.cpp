@@ -4286,6 +4286,7 @@ bool Image::ScaleUp(bool ignore) {
         }
         ignore = false;
     }
+    runtime->InvalidateDescriptorRuns();
     flags |= ImageFlagBits::Rescaled;
     has_scaled = true;
     current_image = &Image::scaled_image;
@@ -4315,6 +4316,7 @@ bool Image::ScaleDown(bool ignore) {
         return false;
     }
     ASSERT(info.type != ImageType::Linear);
+    runtime->InvalidateDescriptorRuns();
     flags &= ~ImageFlagBits::Rescaled;
     current_image = &Image::original_image;
     if (ignore) {
@@ -4424,8 +4426,9 @@ bool Image::NeedsScaleHelper() const {
 ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewInfo& info,
                      ImageId image_id_, Image& image)
     : VideoCommon::ImageViewBase{info, image.info, image_id_, image.gpu_addr},
-      device{&runtime.device}, image_handle{image.Handle()},
+      device{&runtime.device}, runtime_ptr{&runtime}, image_handle{image.Handle()},
       samples(ConvertSampleCount(image.info.num_samples)) {
+    runtime.InvalidateDescriptorRuns();
     using Shader::TextureType;
 
     const VkImageAspectFlags aspect_mask = ImageViewAspectMask(info);
@@ -4555,10 +4558,14 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
 ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageInfo& info,
                      const VideoCommon::ImageViewInfo& view_info, GPUVAddr gpu_addr_)
     : VideoCommon::ImageViewBase{info, view_info, gpu_addr_},
-      buffer_size{static_cast<u32>(VideoCommon::CalculateGuestSizeInBytes(info))} {}
+      runtime_ptr{&runtime},
+      buffer_size{static_cast<u32>(VideoCommon::CalculateGuestSizeInBytes(info))} {
+    runtime.InvalidateDescriptorRuns();
+}
 
 ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::NullImageViewParams& params)
-    : VideoCommon::ImageViewBase{params}, device{&runtime.device} {
+    : VideoCommon::ImageViewBase{params}, device{&runtime.device}, runtime_ptr{&runtime} {
+    runtime.InvalidateDescriptorRuns();
     if (device->HasNullDescriptor()) {
         return;
     }
@@ -4574,7 +4581,11 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::NullImageV
     }
 }
 
-ImageView::~ImageView() = default;
+ImageView::~ImageView() {
+    if (runtime_ptr) {
+        runtime_ptr->InvalidateDescriptorRuns();
+    }
+}
 
 VkImageView ImageView::DepthView() {
     if (!image_handle) {
@@ -4640,6 +4651,7 @@ bool ImageView::IsRescaled() const noexcept {
 
 vk::ImageView ImageView::MakeView(VkFormat vk_format, VkImageAspectFlags aspect_mask,
                                   std::optional<Shader::TextureType> texture_type) {
+    runtime_ptr->InvalidateDescriptorRuns();
     VkImageViewType view_type = ImageViewType(type);
     VkImageSubresourceRange subresource_range = MakeSubresourceRange(aspect_mask, range);
     const auto is_3d = [](VkImageViewType t) { return t == VK_IMAGE_VIEW_TYPE_3D; };
@@ -4716,7 +4728,7 @@ void CustomBorderColorBudget::Release() noexcept {
 }
 
 Sampler::Sampler(TextureCacheRuntime& runtime, const Tegra::Texture::TSCEntry& tsc)
-    : descriptor{tsc} {
+    : runtime_ptr{&runtime}, descriptor{tsc} {
     const auto& device = runtime.device;
     device_ptr = &device;
     border_color = tsc.BorderColor();
@@ -4821,6 +4833,8 @@ VkSampler Sampler::Find(const VariantKey& key) const noexcept {
 }
 
 VkSampler Sampler::Emplace(VariantKey key) {
+    // A budget fallback must be retried, not captured as a reusable descriptor run.
+    runtime_ptr->InvalidateDescriptorRuns();
     bool custom_border = has_custom_border_colors && !key.drop_custom_border;
     if (custom_border && !custom_border_color_budget.TryAcquire(*device_ptr, 1)) {
         static bool warned_budget = false;
@@ -4899,6 +4913,56 @@ VkSampler Sampler::HandleFor(const ImageView& image_view, bool is_depth) {
         return existing;
     }
     return Emplace(key);
+}
+
+VkDescriptorImageInfo Sampler::DescriptorFor(
+    ImageView& image_view, VideoCommon::SamplerId sampler_id, Shader::TextureType texture_type,
+    bool is_depth, const ImageView& null_image_view) {
+    const auto resolve = [&] {
+        VkImageView handle = image_view.Handle(texture_type);
+        if (handle == VK_NULL_HANDLE) {
+            handle = null_image_view.Handle(texture_type);
+        }
+        return VkDescriptorImageInfo{
+            .sampler = HandleFor(image_view, is_depth),
+            .imageView = handle,
+            .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+        };
+    };
+    auto& memo = image_view.sampled_descriptor_memo;
+    const size_t variant_count = variants.size();
+    if (memo.variant_count == variant_count && memo.sampler_id == sampler_id &&
+        memo.texture_type == texture_type && memo.is_depth == is_depth) {
+        if (VideoCommon::Nx2Perf::Verify()) [[unlikely]] {
+            const VkDescriptorImageInfo expected = resolve();
+            if (memo.descriptor.sampler != expected.sampler ||
+                memo.descriptor.imageView != expected.imageView ||
+                memo.descriptor.imageLayout != expected.imageLayout) {
+                LOG_ERROR(Render_Vulkan,
+                          "Nx2Perf descriptor_handle_memo: sampler={} type={} depth={} mismatch",
+                          sampler_id.Value(), static_cast<u32>(texture_type), is_depth);
+                memo.variant_count = 0;
+                return expected;
+            }
+        }
+        return memo.descriptor;
+    }
+    const VkDescriptorImageInfo descriptor_info = resolve();
+    VariantKey key = MakeKey(image_view, is_depth);
+    if (variant_count >= MAX_VARIANTS) {
+        key.srgb_border = false;
+        key.swizzle = {};
+    }
+    // Count changes invalidate the MAX_VARIANTS policy. A budget fallback has no requested-key
+    // variant, so keep retrying it just as HandleFor does when custom-border capacity returns.
+    memo = {
+        .descriptor = descriptor_info,
+        .variant_count = Find(key) != VK_NULL_HANDLE ? variant_count : 0,
+        .sampler_id = sampler_id,
+        .texture_type = texture_type,
+        .is_depth = is_depth,
+    };
+    return descriptor_info;
 }
 
 Framebuffer::Framebuffer(TextureCacheRuntime& runtime, std::span<ImageView*, NUM_RT> color_buffers,

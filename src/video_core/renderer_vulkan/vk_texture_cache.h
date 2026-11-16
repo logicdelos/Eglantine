@@ -65,6 +65,14 @@ public:
                                  DescriptorPool& descriptor_pool,
                                  ComputePassDescriptorQueue& compute_pass_descriptor_queue);
 
+    u64 DescriptorGeneration() const noexcept {
+        return descriptor_generation;
+    }
+
+    void InvalidateDescriptorRuns() noexcept {
+        ++descriptor_generation;
+    }
+
     void Finish();
 
     StagingBufferRef UploadStagingBuffer(size_t size, bool deferred = false);
@@ -246,6 +254,7 @@ public:
     RenderPassCache& render_pass_cache;
     DescriptorPool& descriptor_pool;
     ComputePassDescriptorQueue& compute_pass_descriptor_queue;
+    u64 descriptor_generation{};
 
     /// FSR 3.1 in place of a DLSS evaluation (TemporalUpscale), created on first use.
     bool UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageView& input_color,
@@ -798,6 +807,18 @@ public:
     }
 
 private:
+    friend class Sampler;
+
+    // Owned by the view: deletion, rescaling and slot reuse discard the memo with its handles.
+    struct SampledDescriptorMemo {
+        VkDescriptorImageInfo descriptor{};
+        size_t variant_count{};
+        VideoCommon::SamplerId sampler_id{};
+        Shader::TextureType texture_type{};
+        bool is_depth{};
+    };
+    SampledDescriptorMemo sampled_descriptor_memo;
+
     struct StorageViews {
         std::array<vk::ImageView, Shader::NUM_TEXTURE_TYPES> signeds;
         std::array<vk::ImageView, Shader::NUM_TEXTURE_TYPES> unsigneds;
@@ -807,6 +828,7 @@ private:
                                          std::optional<Shader::TextureType> texture_type = std::nullopt);
 
     const Device* device = nullptr;
+    TextureCacheRuntime* runtime_ptr{};
     const SlotVector<Image>* slot_images = nullptr;
 
     std::array<vk::ImageView, Shader::NUM_TEXTURE_TYPES> image_views;
@@ -861,6 +883,10 @@ public:
 
     [[nodiscard]] VkSampler HandleFor(const ImageView& image_view, bool is_depth);
 
+    [[nodiscard]] VkDescriptorImageInfo DescriptorFor(
+        ImageView& image_view, VideoCommon::SamplerId sampler_id, Shader::TextureType texture_type,
+        bool is_depth, const ImageView& null_image_view);
+
     /// The guest descriptor and the host state built from it, for the frame dump.
     [[nodiscard]] const Tegra::Texture::TSCEntry& Descriptor() const noexcept {
         return descriptor;
@@ -901,6 +927,7 @@ private:
     std::vector<Variant> variants;
 
     const Device* device_ptr{nullptr};
+    TextureCacheRuntime* runtime_ptr{};
     Tegra::Texture::TSCEntry descriptor{};
     VkSamplerCreateInfo base_ci{};
     VkSamplerReductionModeEXT reduction_mode{VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE_EXT};

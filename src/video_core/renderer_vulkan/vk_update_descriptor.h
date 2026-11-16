@@ -10,7 +10,9 @@
 #pragma once
 
 #include <array>
+#include <cstring>
 #include <memory>
+#include <span>
 #include <variant>
 #include <vector>
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -76,10 +78,26 @@ public:
             return;
         }
         upload_start = payload_cursor;
+        ++sequence;
     }
 
     const DescriptorUpdateEntry* UpdateData() const noexcept {
         return upload_start;
+    }
+
+    u64 Sequence() const noexcept {
+        return sequence;
+    }
+
+    const DescriptorUpdateEntry* Cursor() const noexcept {
+        return payload_cursor;
+    }
+
+    void AddImageRun(std::span<const DescriptorUpdateEntry> entries) {
+        if (!entries.empty()) {
+            std::memcpy(payload_cursor, entries.data(), entries.size_bytes());
+            payload_cursor += entries.size();
+        }
     }
 
     void AddSampledImage(VkImageView image_view, VkSampler sampler) {
@@ -144,6 +162,7 @@ private:
     const bool supports_descriptor_buffer;
     bool use_descriptor_buffer{false};
     size_t frame_index{0};
+    u64 sequence{};
     DescriptorUpdateEntry* payload_cursor = nullptr;
     DescriptorUpdateEntry* payload_start = nullptr;
     const DescriptorUpdateEntry* upload_start = nullptr;

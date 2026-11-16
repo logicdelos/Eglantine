@@ -799,7 +799,28 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);
     }
 
-    RescalingPushConstant rescaling;
+    const bool cache_descriptor_run =
+        num_textures != 0 &&
+        VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::DescriptorRunReuse);
+    const u64 descriptor_generation =
+        cache_descriptor_run ? texture_cache.DescriptorGeneration() : 0;
+    const bool rescaling_active = Settings::values.resolution_info.active;
+    const bool reuse_descriptor_run =
+        // The queue sequence also excludes intervening pipelines, wraps and frame changes.
+        cache_descriptor_run && descriptor_run_valid &&
+        descriptor_run_sequence + 1 == guest_descriptor_queue.Sequence() &&
+        descriptor_run_generation == descriptor_generation &&
+        descriptor_run_rescaling_active == rescaling_active &&
+        descriptor_run_views.size() == views.size() &&
+        descriptor_run_samplers.size() == samplers.size() &&
+        std::equal(views.begin(), views.end(), descriptor_run_views.begin(),
+                   [](const auto& lhs, const auto& rhs) { return lhs.id == rhs.id; }) &&
+        std::memcmp(samplers.data(), descriptor_run_samplers.data(),
+                    samplers.size() * sizeof(VideoCommon::SamplerId)) == 0;
+    const bool verify_descriptor_run = reuse_descriptor_run && VideoCommon::Nx2Perf::Verify();
+    bool descriptor_run_mismatch{};
+    RescalingPushConstant rescaling{
+        reuse_descriptor_run && !verify_descriptor_run ? &descriptor_run_scaling : nullptr};
     RenderAreaPushConstant render_area;
     const VideoCommon::SamplerId* samplers_it{samplers.data()};
     const VideoCommon::ImageViewInOut* views_it{views.data()};
@@ -812,8 +833,28 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         if (!info.texture_descriptors.empty() || !info.image_descriptors.empty() ||
             !info.texture_buffer_descriptors.empty() || !info.image_buffer_descriptors.empty()) {
             Profile::Scope scope{Profile::Zone::PushDescriptors};
+            const u32 sampled_count = Shader::NumDescriptors(info.texture_descriptors);
+            const auto previous_run = descriptor_runs[stage];
+            const auto* run_start = guest_descriptor_queue.Cursor();
+            if (reuse_descriptor_run && !verify_descriptor_run) {
+                guest_descriptor_queue.AddImageRun(previous_run);
+            }
             PushImageDescriptors(texture_cache, guest_descriptor_queue, info, rescaling,
-                                 samplers_it, views_it);
+                                 samplers_it, views_it,
+                                 reuse_descriptor_run && !verify_descriptor_run,
+                                 verify_descriptor_run);
+            if (verify_descriptor_run && sampled_count != 0 &&
+                !std::equal(run_start, run_start + sampled_count, previous_run.begin(),
+                            [](const auto& lhs, const auto& rhs) {
+                                return lhs.image.sampler == rhs.image.sampler &&
+                                       lhs.image.imageView == rhs.image.imageView &&
+                                       lhs.image.imageLayout == rhs.image.imageLayout;
+                            })) {
+                descriptor_run_mismatch = true;
+            }
+            if (cache_descriptor_run) {
+                descriptor_runs[stage] = {run_start, sampled_count};
+            }
         }
     }};
     if constexpr (Spec::enabled_stages[0]) {
@@ -830,6 +871,24 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     }
     if constexpr (Spec::enabled_stages[4]) {
         prepare_stage(4);
+    }
+    if (verify_descriptor_run && rescaling.Data() != descriptor_run_scaling) {
+        descriptor_run_mismatch = true;
+    }
+    if (descriptor_run_mismatch) {
+        LOG_ERROR(Render_Vulkan, "Nx2Perf descriptor_run_reuse: descriptor or rescaling mismatch");
+    }
+    descriptor_run_valid = cache_descriptor_run && !descriptor_run_mismatch &&
+                           texture_cache.DescriptorGeneration() == descriptor_generation;
+    if (descriptor_run_valid) {
+        if (!reuse_descriptor_run) {
+            descriptor_run_views.assign(views.begin(), views.end());
+            descriptor_run_samplers.assign(samplers.begin(), samplers.end());
+        }
+        descriptor_run_generation = descriptor_generation;
+        descriptor_run_sequence = guest_descriptor_queue.Sequence();
+        descriptor_run_rescaling_active = rescaling_active;
+        descriptor_run_scaling = rescaling.Data();
     }
     if (has_render_area_push_constants) [[unlikely]] {
         render_area.uses_render_area = true;

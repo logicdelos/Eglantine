@@ -248,6 +248,12 @@ public:
     /// Notify the cache that a new frame has been queued
     void TickFrame();
 
+    u64 DescriptorGeneration() const noexcept
+        requires requires(const Runtime& value) { value.DescriptorGeneration(); }
+    {
+        return runtime.DescriptorGeneration();
+    }
+
     /// Return a constant reference to the given image view id
     [[nodiscard]] const ImageView& GetImageView(ImageViewId id) const noexcept;
 

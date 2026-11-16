@@ -311,6 +311,14 @@ private:
     size_t num_image_elements{};
     std::vector<SampledImage> sampled_images;
     u32 num_textures{};
+    std::vector<VideoCommon::ImageViewInOut> descriptor_run_views;
+    std::vector<VideoCommon::SamplerId> descriptor_run_samplers;
+    std::array<std::span<const DescriptorUpdateEntry>, NUM_STAGES> descriptor_runs{};
+    std::array<u32, NUM_TEXTURE_AND_IMAGE_SCALING_WORDS> descriptor_run_scaling{};
+    u64 descriptor_run_generation{};
+    u64 descriptor_run_sequence{};
+    bool descriptor_run_valid{};
+    bool descriptor_run_rescaling_active{};
     bool fragment_has_color0_output{};
     u32 color_output_mask{};
     bool writes_storage{};
