@@ -459,7 +459,13 @@ inline std::atomic<bool> attribution_enabled{false}; ///< Set by BeginSession, c
 
 struct SessionConfig {
     u64 threshold_ns{100'000'000};
-    /// Detailed span storage, shared by all threads; spans past it are counted as lost.
+    /// What the recorder may hold in total, shared by all threads; spans past it are counted as
+    /// lost. Half goes to the per-thread rings. The other half goes to the retained spans and the
+    /// storage used to resolve them: a retained span slot is charged its record and the most
+    /// working storage resolving it can need, about 584 bytes on a 64-bit host (an estimate, not an
+    /// allocator measurement), after a fixed 16 KiB for what does not grow with the spans. The
+    /// history never has fewer than 64 slots and a ring never fewer than four events, so budgets
+    /// below about 100 KiB are exceeded.
     size_t buffer_bytes{size_t{16} << 20};
 };
 

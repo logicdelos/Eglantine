@@ -57,7 +57,9 @@ void ReadEventCounts(std::array<u64, static_cast<size_t>(Event::Count)>& counts)
 void SetAttributionCounting(bool on);
 size_t PeakRetainedHistoryBytes();
 size_t PeakResolverScratchBytes();
+size_t ResolverScratchAllowance();
 u64 DrainedRingEvents();
+u64 UndrainedRingEvents();
 } // namespace Detail
 
 namespace {
@@ -206,16 +208,73 @@ struct SweepEvent {
 
 /// What one node of an ordered or hashed map costs here, an estimate: key, value, links, allocator.
 constexpr size_t MapNodeBytes = 64;
+/// What one bucket of the hashed work totals costs, an estimate (some libraries keep two pointers).
+constexpr size_t BucketBytes = 2 * sizeof(void*);
 
-/// The scratch of a decomposition per span of the window, in the worst case. The leaves (at most
-/// two per span) and the work spans are held throughout; on top of them comes either the sweep that
-/// builds the leaves of a thread (span pointer, two events, two active-map nodes) or the wait
-/// expansions (candidate pieces, at most one per leaf, and their two sweep points each).
-constexpr size_t SweepBytesPerSpan =
-    sizeof(const SpanRec*) + 2 * sizeof(SweepEvent) + 2 * MapNodeBytes;
-constexpr size_t WaitBytesPerLeaf = sizeof(Leaf) + 2 * sizeof(u64);
-constexpr size_t ScratchBytesPerSpan = 2 * sizeof(Leaf) + sizeof(WorkSpan) +
-                                       std::max(SweepBytesPerSpan, 2 * WaitBytesPerLeaf);
+/// How much of each kind of storage a decomposition holds at one moment. The peak the tests read
+/// and the allowance per retained span are both worked out from counts like these by
+/// ScratchBytes, so they cannot drift apart. The byte figures are estimates (MapNodeBytes,
+/// BucketBytes), not allocator measurements.
+struct ScratchCounts {
+    size_t leaves{};       ///< Leaf slots of all threads
+    size_t work_spans{};   ///< WorkSpan slots
+    size_t sweep_spans{};  ///< Span pointers of the sweep that builds the leaves of a thread
+    size_t sweep_events{}; ///< Its events
+    size_t sweep_nodes{};  ///< Its active-map nodes
+    size_t root_points{};  ///< Points of the root sweep
+    size_t pieces{};       ///< Candidate pieces of the wait expansions that are running
+    size_t wait_points{};  ///< Their sweep points
+    size_t work_nodes{};   ///< Entries of the work totals
+    size_t work_buckets{}; ///< Buckets of the work totals
+};
+
+constexpr size_t ScratchBytes(const ScratchCounts& c) {
+    return c.leaves * sizeof(Leaf) + c.work_spans * sizeof(WorkSpan) +
+           c.sweep_spans * sizeof(const SpanRec*) + c.sweep_events * sizeof(SweepEvent) +
+           c.sweep_nodes * MapNodeBytes + c.root_points * sizeof(u64) + c.pieces * sizeof(Leaf) +
+           c.wait_points * sizeof(u64) + c.work_nodes * MapNodeBytes +
+           c.work_buckets * BucketBytes;
+}
+
+/// Storage that does not grow with the number of spans, as an upper estimate: the per-thread and
+/// per-level vectors (at most 32 threads, 6 levels of a chain), the two extra sweep points of each
+/// level, and the bucket array of the work totals while it is small (up to 512 buckets).
+constexpr size_t ScratchFixedBytes = 16 * 1024;
+
+/// The counts of one retained span in the worst case, in the two phases of a decomposition. A span
+/// gives at most two leaves, one work span and two active-map nodes. While the leaves of a thread
+/// are built they are joined by the sweep's pointer, two events and the two map nodes. While the
+/// waits are resolved they are joined by the root sweep's points (two per leaf of a root, two
+/// ends each), the candidate pieces (at most one per leaf) with their points (two per piece, two
+/// ends each), and the work totals: at most two ids per span (its own and the one it waits for),
+/// with two buckets per entry.
+constexpr ScratchCounts SweepPhasePerSpan() {
+    ScratchCounts c;
+    c.leaves = 2;
+    c.work_spans = 1;
+    c.sweep_spans = 1;
+    c.sweep_events = 2;
+    c.sweep_nodes = 2;
+    return c;
+}
+constexpr ScratchCounts WaitPhasePerSpan() {
+    ScratchCounts c;
+    c.leaves = 2;
+    c.work_spans = 1;
+    c.root_points = 4;
+    c.pieces = 2;
+    c.wait_points = 4;
+    c.work_nodes = 2;
+    c.work_buckets = 4;
+    return c;
+}
+constexpr size_t ScratchBytesPerSpan =
+    std::max(ScratchBytes(SweepPhasePerSpan()), ScratchBytes(WaitPhasePerSpan()));
+
+/// The scratch a decomposition may hold when `spans` slots of span storage are retained.
+constexpr size_t ScratchAllowance(size_t spans) {
+    return spans * ScratchBytesPerSpan + ScratchFixedBytes;
+}
 
 /// What one slot of retained span storage costs against SessionConfig::buffer_bytes: the record and
 /// the worst-case scratch of decomposing it, so rings plus history stay inside the one budget.
@@ -286,7 +345,7 @@ public:
             out.reasons |= UnknownReason::LostSpans;
             out.complete = false;
         }
-        NoteScratch(out.work_ns.size() * MapNodeBytes + out.work_ns.bucket_count() * sizeof(void*));
+        NoteScratch({});
         return std::move(out);
     }
 
@@ -298,6 +357,7 @@ public:
 private:
     void BuildLeaves(u32 thread, const ThreadState& state, std::vector<Leaf>& result) {
         std::vector<const SpanRec*> spans;
+        spans.reserve(state.open.size() + state.closed.size());
         const auto consider = [&](const SpanRec& rec) {
             const u64 finish = rec.open ? OpenEnd : rec.end_ns;
             if (rec.begin_ns >= e || finish <= s) {
@@ -381,8 +441,11 @@ private:
             most_active = std::max(most_active, active.size() + active_work.size());
             cur = t;
         }
-        NoteScratch(spans.capacity() * sizeof(const SpanRec*) + events.capacity() * sizeof(Ev) +
-                    most_active * MapNodeBytes);
+        ScratchCounts sweep;
+        sweep.sweep_spans = spans.capacity();
+        sweep.sweep_events = events.capacity();
+        sweep.sweep_nodes = most_active;
+        NoteScratch(sweep);
     }
 
     void Charge(Cause cause, u64 from, u64 to, WorkId work) {
@@ -413,6 +476,7 @@ private:
             reserved += 2 * list->size();
         }
         points.reserve(reserved);
+        root_points = points.capacity();
         points.push_back(s);
         points.push_back(e);
         for (const auto* list : lists) {
@@ -451,6 +515,8 @@ private:
                 Charge(best->cause, x, y, best->work);
             }
         }
+        NoteScratch({}); // the work totals have grown while the points were held
+        root_points = 0;
     }
 
     /// Charges [x, y) of a wait: the part covered by the spans of the work it was linked to goes to
@@ -503,10 +569,10 @@ private:
         }
         std::sort(points.begin(), points.end());
         points.erase(std::unique(points.begin(), points.end()), points.end());
-        const size_t held = cands.capacity() * sizeof(Leaf) + points.capacity() * sizeof(u64);
         live_pieces += count;
-        wait_bytes += held;
-        NoteScratch(wait_bytes);
+        wait_pieces += cands.capacity();
+        wait_points += points.capacity();
+        NoteScratch({});
         // The pieces of one thread are sorted and do not overlap, so one cursor per thread finds
         // the piece covering a segment.
         std::vector<size_t> cursor = group_first;
@@ -541,8 +607,10 @@ private:
             }
         }
         visited.pop_back();
+        NoteScratch({}); // the work totals have grown while this level held its candidates
         live_pieces -= count;
-        wait_bytes -= held;
+        wait_pieces -= cands.capacity();
+        wait_points -= points.capacity();
     }
 
     /// Calls `emit` with every piece of a leaf of another thread than `skip_thread` that lies inside
@@ -593,13 +661,21 @@ private:
         flush();
     }
 
-    /// Notes the storage the resolver holds now: the leaves, the work spans and `transient`.
-    void NoteScratch(size_t transient) {
-        size_t bytes = work_spans.capacity() * sizeof(WorkSpan) + transient;
+    /// Notes the storage the resolver holds now: everything that is alive at the same time (the
+    /// leaves, the work spans, the root sweep's points, the candidates and points of every wait
+    /// level that is running, the work totals so far), and `c`, the sweep of one thread when that
+    /// is what is running.
+    void NoteScratch(ScratchCounts c) {
+        c.work_spans = work_spans.capacity();
         for (const std::vector<Leaf>& list : leaves) {
-            bytes += list.capacity() * sizeof(Leaf);
+            c.leaves += list.capacity();
         }
-        peak_scratch = std::max(peak_scratch, bytes);
+        c.root_points = root_points;
+        c.pieces = wait_pieces;
+        c.wait_points = wait_points;
+        c.work_nodes = out.work_ns.size();
+        c.work_buckets = out.work_ns.bucket_count();
+        peak_scratch = std::max(peak_scratch, ScratchBytes(c) + ScratchFixedBytes);
     }
 
     std::span<const ThreadState> states;
@@ -613,7 +689,9 @@ private:
     std::vector<WorkSpan> work_spans;
     size_t leaf_total{};  ///< The number of leaves of all threads: the cap on live wait candidates
     size_t live_pieces{}; ///< Candidate pieces held by the wait expansions that are running
-    size_t wait_bytes{};  ///< Their storage and that of their sweep points
+    size_t wait_pieces{}; ///< Capacity of the candidate vectors of the waits that are running
+    size_t wait_points{}; ///< and of their point vectors
+    size_t root_points{}; ///< Capacity of the root sweep's point vector while it is held
     size_t peak_scratch{};
     std::vector<WorkId> visited;
     Decomp out;
@@ -1491,6 +1569,18 @@ size_t PeakResolverScratchBytes() {
     return g_owned != nullptr ? g_owned->peak_scratch_bytes.load(std::memory_order_relaxed) : 0;
 }
 
+/// What a decomposition may hold of resolver scratch, worked out by the same function as the
+/// allowance behind the history size, for the most span slots the current (or last) session
+/// retained at once, for the tests.
+size_t ResolverScratchAllowance() {
+    std::scoped_lock lock{g_lifecycle_mutex};
+    if (g_owned == nullptr) {
+        return 0;
+    }
+    return ScratchAllowance(g_owned->peak_retained_bytes.load(std::memory_order_relaxed) /
+                            sizeof(SpanRec));
+}
+
 /// The number of events of the calling thread's ring the consumer has taken so far (0 without a
 /// session), for the tests that must not outrun the consumer. It reads one existing counter and is
 /// on no recording path.
@@ -1501,6 +1591,19 @@ u64 DrainedRingEvents() {
     }
     const ThreadBuf* t = ThisThread(*s);
     return t != nullptr ? t->head.load(std::memory_order_acquire) : 0;
+}
+
+/// The number of events in the calling thread's ring that the consumer has not taken yet (0
+/// without a session), for the tests. It reads two existing counters and is on no recording path.
+u64 UndrainedRingEvents() {
+    Session* s = ActiveSession();
+    if (s == nullptr) {
+        return 0;
+    }
+    const ThreadBuf* t = ThisThread(*s);
+    return t != nullptr ? t->tail.load(std::memory_order_acquire) -
+                              t->head.load(std::memory_order_acquire)
+                        : 0;
 }
 } // namespace Detail
 
@@ -1514,12 +1617,19 @@ bool BeginSession(const SessionConfig& config) {
     s->config = config;
     s->start_ns = NowNs();
     // One budget: half for the rings (allocated by the threads that register), half for the
-    // retained history and the resolver's copies of it, counted in slots of span storage by the
-    // capacity the session owns. A ring never holds less than four events.
+    // retained history and the resolver's working storage for it. A slot of span storage is
+    // charged the record and the worst-case scratch of resolving it (HistoryBytesPerSpan), slots
+    // are counted by the capacity the session owns, and the scratch that does not depend on the
+    // number of spans (ScratchFixedBytes) is taken off first. A ring never holds less than four
+    // events, and the history never fewer than 64 slots, whatever the budget.
     const size_t ring_budget = config.buffer_bytes / 2;
+    const size_t history_budget = config.buffer_bytes - ring_budget;
     const size_t per_thread = ring_budget / MaxThreads / sizeof(RingEvent);
     s->ring_capacity = std::bit_floor(std::max<size_t>(per_thread, 4));
-    s->history_cap = std::max<size_t>((config.buffer_bytes - ring_budget) / HistoryBytesPerSpan, 64);
+    s->history_cap = std::max<size_t>(
+        (history_budget > ScratchFixedBytes ? history_budget - ScratchFixedBytes : 0) /
+            HistoryBytesPerSpan,
+        64);
     s->process_created_ns.store(g_pending_created.exchange(0), std::memory_order_relaxed);
     s->process_created_uncertainty_ns.store(g_pending_uncertainty.exchange(0),
                                             std::memory_order_relaxed);

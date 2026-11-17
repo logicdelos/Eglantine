@@ -15,6 +15,8 @@
 namespace VideoCommon::Nx2Spikes::Detail {
 size_t PeakRetainedHistoryBytes();
 size_t PeakResolverScratchBytes();
+size_t ResolverScratchAllowance();
+u64 UndrainedRingEvents();
 u64 DrainedRingEvents();
 } // namespace VideoCommon::Nx2Spikes::Detail
 
@@ -125,6 +127,15 @@ bool AwaitDrained(u64 recorded) {
         std::this_thread::yield();
     }
     return Detail::DrainedRingEvents() >= recorded;
+}
+
+/// Returns true once the consumer has taken everything this thread has recorded so far.
+bool AwaitIdle() {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
+    while (Detail::UndrainedRingEvents() != 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    return Detail::UndrainedRingEvents() == 0;
 }
 
 } // Anonymous namespace
@@ -854,7 +865,7 @@ TEST_CASE("Span storage held by many producers over pruning windows stays inside
     SessionConfig config = Config(100 * Ms);
     config.buffer_bytes = 1024 * 1024;
     constexpr u64 Producers = 16;
-    constexpr u64 SpansPerBurst = 800;
+    constexpr u64 SpansPerBurst = 600;
     constexpr u64 RingChunk = 64; // a quarter of a ring (256 events), recorded between two drains
     // Pruning only ever removes spans more than two seconds old on the recorder clock.
     WaitUntil(5'000 * Ms);
@@ -901,18 +912,25 @@ struct CloseOutcome {
     u64 lost_events{};
 };
 
-/// A span begun on a fresh thread and ended from the test thread inside one long frame. With
-/// `fill_allowance` another thread first records spans, in the next frame's time, until the
+enum class CloseCase {
+    Room,         ///< The span ends while the history has room
+    FullEnded,    ///< It ends after the history was filled
+    FullNotEnded, ///< The history is filled the same way and it does not end
+};
+
+/// A span begun on a fresh thread and ended from the test thread inside one long frame. Unless the
+/// case is `Room`, another thread first records spans, in the next frame's time, until the
 /// history has no room left, so the end of the first span finds none for its closed record.
-CloseOutcome RunCloseScenario(bool fill_allowance) {
+CloseOutcome RunCloseScenario(CloseCase which) {
     SessionConfig config = Config(100 * Ms);
-    config.buffer_bytes = 256 * 1024; // rings of 64 events, a history of a few hundred records
+    config.buffer_bytes = 256 * 1024; // rings of 64 events, a history of about 200 records
     Run run{config};
     // The first two presents are resolved, and the history pruned for the first time, before
     // anything below is recorded: nothing frees capacity between the fill and the end.
     Present(run.T(0));
     Present(run.T(1 * Ms));
     AwaitFrames(1);
+    WaitUntil(run.T(2 * Ms)); // the span begins after the end of the first frame
     std::atomic<bool> drained{true};
     SpanToken open{};
     OnThread([&] {
@@ -922,7 +940,7 @@ CloseOutcome RunCloseScenario(bool fill_allowance) {
     });
     REQUIRE(drained.load());
     REQUIRE(open.Valid());
-    if (fill_allowance) {
+    if (which != CloseCase::Room) {
         constexpr u64 Fill = 640; // more records than the history can hold
         constexpr u64 Chunk = 32; // half a ring
         OnThread([&] {
@@ -941,7 +959,9 @@ CloseOutcome RunCloseScenario(bool fill_allowance) {
         });
         REQUIRE(drained.load());
     }
-    EndSpan(open); // the owner's closed vector has to be allocated now
+    if (which != CloseCase::FullNotEnded) {
+        EndSpan(open); // the owner's closed vector has to be allocated now
+    }
     Present(run.T(10'000 * Ms)); // the long frame holds the span, not the filler's time
     const AttributionSnapshot snap = run.Finish();
     REQUIRE(g_frames.size() == 1);
@@ -952,7 +972,7 @@ CloseOutcome RunCloseScenario(bool fill_allowance) {
 
 TEST_CASE("A span that ends while the history has room is kept and its frame is complete",
           "[nx2][attribution]") {
-    const CloseOutcome outcome = RunCloseScenario(false);
+    const CloseOutcome outcome = RunCloseScenario(CloseCase::Room);
     CHECK(outcome.lost_events == 0);
     CHECK(outcome.frame.instrumentation_complete);
     CHECK((outcome.frame.unknown_reasons & UnknownReason::LostSpans) == 0);
@@ -960,11 +980,15 @@ TEST_CASE("A span that ends while the history has room is kept and its frame is 
 
 TEST_CASE("A span whose end finds no room in the history is counted as lost and marks its frame",
           "[nx2][attribution]") {
-    const CloseOutcome outcome = RunCloseScenario(true);
+    // The same fill twice, once with the end and once without it: the records the filler loses
+    // are the same, so the difference is the end alone, and exactly one.
+    const CloseOutcome not_ended = RunCloseScenario(CloseCase::FullNotEnded);
+    const CloseOutcome ended = RunCloseScenario(CloseCase::FullEnded);
+    REQUIRE(not_ended.lost_events > 0); // the history really was full
+    CHECK(ended.lost_events == not_ended.lost_events + 1);
     // The filler's refused records lie after the frame, so only the refused close can touch it.
-    CHECK(outcome.lost_events > 0);
-    CHECK_FALSE(outcome.frame.instrumentation_complete);
-    CHECK((outcome.frame.unknown_reasons & UnknownReason::LostSpans) != 0);
+    CHECK_FALSE(ended.frame.instrumentation_complete);
+    CHECK((ended.frame.unknown_reasons & UnknownReason::LostSpans) != 0);
 }
 
 TEST_CASE("Deeply nested spans with distinct work ids keep the resolver scratch linear",
@@ -1005,12 +1029,136 @@ TEST_CASE("Deeply nested spans with distinct work ids keep the resolver scratch 
     CHECK(At(frame.cause_ns, Cause::Unknown) == 10 * Ms);
     CHECK(Total(frame.cause_ns) == 20 * Ms);
     CHECK(At(frame.activity_ns, Cause::Shader) == covered);
-    // The scratch is a few hundred bytes per span, not one entry per span and ancestor pair
-    // (which would be 4096 * 4096 entries here), and far inside the budget.
+    // The peak of everything the resolver held at once is inside the allowance that the same
+    // accounting works out for the retained spans, and that allowance inside the budget. It is a
+    // few hundred bytes per span, not one entry per span and ancestor pair (which would be
+    // 4096 * 4096 entries here).
     const size_t scratch = Detail::PeakResolverScratchBytes();
-    CHECK(scratch >= Spans * 64);
-    CHECK(scratch <= Spans * 512);
-    CHECK(scratch <= config.buffer_bytes / 2);
+    const size_t allowance = Detail::ResolverScratchAllowance();
+    CHECK(scratch >= Spans * 128);
+    CHECK(scratch <= allowance);
+    CHECK(allowance <= config.buffer_bytes / 2);
+    CHECK(Detail::PeakRetainedHistoryBytes() + scratch <= config.buffer_bytes / 2);
+}
+
+TEST_CASE("A full history with every ring in use and a large wait stays inside the scratch bound",
+          "[nx2][attribution]") {
+    SessionConfig config = Config(10 * Ms);
+    config.buffer_bytes = size_t{2} << 20; // rings of 1024 events, a history of about 1700 slots
+    Run run{config};
+    constexpr u64 Idle = 24;    // registrations that each take a ring and a first vector
+    constexpr u64 Nested = 500; // distinct work ids charged by the one wait
+    constexpr u64 Fill = 2000;  // more records than the history has room left for
+    constexpr u64 Chunk = 256;  // a quarter of a ring
+    constexpr u64 Unit = 1000;  // ns
+    std::vector<WorkId> works;
+    for (u64 i = 0; i < Nested; ++i) {
+        works.push_back(NewWorkId());
+    }
+    Present(run.T(0));
+    // The wait of the present thread comes first, and is in the history before anything is
+    // recorded that could use up the room.
+    const SpanToken wait = run.NextRootToken();
+    RecordSpan(Cause::Waiting, run.T(0), run.T(10 * Ms));
+    LinkWait(wait, works[0], DependencyKind::Job);
+    REQUIRE(AwaitIdle());
+    std::atomic<bool> drained{true};
+    for (u64 i = 0; i < Idle; ++i) {
+        OnThread([&] {
+            RegisterThread("idle producer");
+            RecordSpan(Cause::Shader, run.T(20'000 * Ms), run.T(20'001 * Ms));
+            drained = drained.load() && AwaitDrained(1);
+        });
+    }
+    // Span i runs from (i + 1) to (2 * Nested - i) units: each contains the next, the outermost
+    // owns all of them, and every one has a work id of its own.
+    OnThread([&] {
+        RegisterThread("nested producer");
+        for (u64 i = 0; i < Nested; ++i) {
+            RecordSpan(Cause::Shader, run.T((i + 1) * Unit), run.T((2 * Nested - i) * Unit),
+                       works[i]);
+        }
+        drained = drained.load() && AwaitDrained(Nested);
+    });
+    // Then spans after the frame, more than the history can take: it is full, and what does not
+    // fit is counted as lost, outside the frame.
+    OnThread([&] {
+        RegisterThread("filler");
+        u64 recorded = 0;
+        for (u64 done = 0; done < Fill; done += Chunk) {
+            for (u64 i = 0; i < Chunk; ++i) {
+                RecordSpan(Cause::Shader, run.T(20'000 * Ms), run.T(20'005 * Ms));
+            }
+            recorded += Chunk;
+            if (!AwaitDrained(recorded)) {
+                drained = false;
+                return;
+            }
+        }
+    });
+    REQUIRE(drained.load());
+    Present(run.T(20 * Ms));
+    const AttributionSnapshot snap = run.Finish();
+    REQUIRE(g_frames.size() == 1);
+    const LongFrame& frame = g_frames[0];
+    const u64 covered = (2 * Nested - 1) * Unit;
+    CHECK(snap.lost_events > 0); // the history was full
+    CHECK(frame.instrumentation_complete);
+    CHECK((frame.unknown_reasons & UnknownReason::LostSpans) == 0);
+    CHECK(At(frame.cause_ns, Cause::Shader) == covered);
+    CHECK(At(frame.cause_ns, Cause::Waiting) == 10 * Ms - covered);
+    CHECK(At(frame.cause_ns, Cause::Unknown) == 10 * Ms);
+    CHECK(Total(frame.cause_ns) == 20 * Ms);
+    // Everything alive at once: the leaves and work spans, the candidates and points of the wait,
+    // and the totals of 500 distinct work ids.
+    const size_t scratch = Detail::PeakResolverScratchBytes();
+    const size_t allowance = Detail::ResolverScratchAllowance();
+    CHECK(scratch >= Nested * 128);
+    CHECK(scratch <= allowance);
+    CHECK(allowance <= config.buffer_bytes / 2);
+    CHECK(Detail::PeakRetainedHistoryBytes() + scratch <= config.buffer_bytes / 2);
+}
+
+TEST_CASE("An ordinary wait through a worker to a pipeline build is resolved in full",
+          "[nx2][attribution]") {
+    Run run;
+    const WorkId worker = NewWorkId();
+    const WorkId build = NewWorkId();
+    Present(run.T(0));
+    // The present thread waits 0-100 ms for a worker. The worker runs 0-10 ms and 90-100 ms and
+    // waits 10-90 ms for a pipeline build on a third thread, which runs a Pipeline span 20-50 ms
+    // and a Shader span 50-80 ms. Two levels of waiting, three threads, six leaves in all.
+    OnThread([&] {
+        const u32 id = RegisterThread("worker");
+        RecordSpan(Cause::Waiting, run.T(10 * Ms), run.T(90 * Ms), worker);
+        RecordSpan(Cause::Texture, run.T(0), run.T(10 * Ms), worker);
+        RecordSpan(Cause::Texture, run.T(90 * Ms), run.T(100 * Ms), worker);
+        LinkWait(run.FirstSpanOf(id), build, DependencyKind::Job);
+    });
+    OnThread([&] {
+        RegisterThread("pipeline build");
+        RecordSpan(Cause::Pipeline, run.T(20 * Ms), run.T(50 * Ms), build);
+        RecordSpan(Cause::Shader, run.T(50 * Ms), run.T(80 * Ms), build);
+    });
+    const SpanToken wait = run.NextRootToken();
+    RecordSpan(Cause::Waiting, run.T(0), run.T(100 * Ms));
+    LinkWait(wait, worker, DependencyKind::Join);
+    Present(run.T(150 * Ms));
+    run.Finish();
+    REQUIRE(g_frames.size() == 1);
+    const LongFrame& frame = g_frames[0];
+    CHECK(At(frame.cause_ns, Cause::Texture) == 20 * Ms);
+    CHECK(At(frame.cause_ns, Cause::Pipeline) == 30 * Ms);
+    CHECK(At(frame.cause_ns, Cause::Shader) == 30 * Ms);
+    CHECK(At(frame.cause_ns, Cause::Waiting) == 20 * Ms); // the build was not running 10-20, 80-90
+    CHECK(At(frame.cause_ns, Cause::Unknown) == 50 * Ms);
+    CHECK(Total(frame.cause_ns) == 150 * Ms);
+    CHECK((frame.unknown_reasons & UnknownReason::AmbiguousDependency) == 0);
+    CHECK(frame.instrumentation_complete);
+    // The build is charged 80 ms (its spans and the gaps in its wait), the worker 20 ms.
+    REQUIRE(frame.critical_work_count == 2);
+    CHECK(frame.critical_work_ids[0] == build);
+    CHECK(frame.critical_work_ids[1] == worker);
 }
 
 TEST_CASE("Nested spans that overflow a small ring are counted as lost and the frame says so",
