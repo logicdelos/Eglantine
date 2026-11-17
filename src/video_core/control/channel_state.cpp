@@ -8,6 +8,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "common/assert.h"
+#include "common/logging.h"
+#include "common/nx2_sampler.h"
 #include "core/core.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/dma_pusher.h"
@@ -112,6 +114,10 @@ void ChannelState::Nx2IncrementSyncpoint() {
     auto& dma_pusher = payload->dma_pusher;
     const u32 value =
         dma_pusher.system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(nx2_syncpoint);
+    if (Nx2Sampler::DependencyTraceEnabled()) {
+        LOG_INFO(HW_GPU, "dep fence-request source=channel ch={} id={} current={} max={}",
+                 bind_id, nx2_syncpoint, value, nx2_syncpoint_max.load(std::memory_order_relaxed));
+    }
     // Never past what the kernel handed out: waits on later submissions would pass early.
     if (static_cast<s32>(nx2_syncpoint_max.load(std::memory_order_relaxed) - value) <= 0) {
         return;
@@ -123,6 +129,10 @@ void ChannelState::Nx2IncrementSyncpoint() {
 void ChannelState::Nx2RaiseSyncpoint(u32 value) {
     auto& dma_pusher = payload->dma_pusher;
     const auto& syncpoints = dma_pusher.system.Host1x().GetSyncpointManager();
+    if (Nx2Sampler::DependencyTraceEnabled()) {
+        LOG_INFO(HW_GPU, "dep fence-raise source=channel ch={} id={} target={}",
+                 bind_id, nx2_syncpoint, value);
+    }
     bool raised = false;
     while (static_cast<s32>(value - syncpoints.GetGuestSyncpointValue(nx2_syncpoint)) > 0) {
         dma_pusher.rasterizer->SignalSyncPoint(nx2_syncpoint);

@@ -20,6 +20,8 @@
 
 #include "common/common_types.h"
 #include "common/container/unordered_map.h"
+#include "common/logging.h"
+#include "common/nx2_sampler.h"
 #include "common/thread.h"
 #include "video_core/native_qmd.h"
 #include "video_core/nx2_perf.h"
@@ -754,6 +756,10 @@ public:
 
     /// A GPU write of `value` to the u32 at `device_address`.
     void OnWrite(u64 device_address, u32 value) {
+        const bool trace = Nx2Sampler::DependencyTraceEnabled();
+        if (trace) {
+            LOG_INFO(HW_GPU, "dep sem-write device={:#x} value={:#x}", device_address, value);
+        }
         if (count.load(std::memory_order_acquire) == 0) {
             return;
         }
@@ -764,6 +770,10 @@ public:
                 if (w.address == device_address && !w.latched && Matches(w, value)) {
                     w.latched = true;
                     latched = true;
+                    if (trace) {
+                        LOG_INFO(HW_GPU, "dep sem-latched waiter={} device={:#x} value={:#x}",
+                                 fmt::ptr(w.owner), device_address, value);
+                    }
                 }
             }
         }

@@ -124,6 +124,7 @@ struct CommandList final {
 
     boost::container::small_vector<CommandListHeader, 512> command_lists;
     boost::container::small_vector<CommandHeader, 512> prefetch_command_list;
+    u64 dependency_queue_position{};
     /// EDEN_NX2_PB_CHECK: hash of each entry's words when it was submitted.
     std::vector<u64> submit_hashes;
     /// The entries' words when they were submitted (NX2), each entry's at submitted_offsets[i]:
@@ -200,6 +201,8 @@ public:
     }
 
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
+    void TraceBlockedQueue() const;
+    void TraceSemaphore(const char* action, GPUVAddr address, u32 payload, u32 operation) const;
 
 private:
     static bool IsMemoryWriter(const Engines::EngineInterface& engine,

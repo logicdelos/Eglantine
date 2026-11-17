@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "common/nx2_bottleneck.h"
+#include "common/nx2_sampler.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/core.h"
@@ -115,6 +116,11 @@ bool DmaPusher::Step() {
 
     CommandList& command_list = dma_pushbuffer.front();
 
+    if (Nx2Sampler::DependencyTraceEnabled()) {
+        LOG_INFO(HW_GPU, "dep fifo-execute ch={} q={} i={} offset={}", channel_state.bind_id,
+                 command_list.dependency_queue_position, dma_pushbuffer_subindex,
+                 command_resume_offset);
+    }
     const size_t prefetch_size = command_list.prefetch_command_list.size();
     const size_t command_list_size = command_list.command_lists.size();
 
@@ -1069,6 +1075,59 @@ void DmaPusher::DumpCurrentEntry(const char* reason) {
             }
             LOG_WARNING(HW_GPU, "    +{:03x}:{}", word * 4, gpu_line);
             LOG_WARNING(HW_GPU, "    cpu :{}", cpu_line);
+        }
+    }
+}
+
+void DmaPusher::TraceSemaphore(const char* action, GPUVAddr address, u32 payload, u32 operation) const {
+    LOG_INFO(HW_GPU,
+             "dep sem-{} ch={} q={} i={} waiter={} as={} gpu={:#x} device={:#x} value={:#x} op={:#x}",
+             action, channel_state.bind_id,
+             dma_pushbuffer.empty() ? 0 : dma_pushbuffer.front().dependency_queue_position,
+             dma_pushbuffer_subindex, fmt::ptr(&puller), memory_manager.GetID(), address,
+             memory_manager.GpuToCpuAddress(address).value_or(0), payload, operation);
+}
+
+void DmaPusher::TraceBlockedQueue() const {
+    // Existing GPFIFO copies only, never another guest read or GPU flush. A stale or missing
+    // copy is not evidence that a command was absent from the stream.
+    size_t remaining_words = 65536;
+    const u64 generation = suspensions.load(std::memory_order_relaxed);
+    bool head = true;
+    for (const auto& list : dma_pushbuffer) {
+        const size_t first = head ? dma_pushbuffer_subindex : 0;
+        const size_t resume = head ? command_resume_offset : 0;
+        LOG_INFO(HW_GPU,
+                 "dep fifo-blocked ch={} q={} i={} offset={} entries={} snapshots={} generation={}/{}",
+                 channel_state.bind_id, list.dependency_queue_position, first, resume,
+                 list.command_lists.size(), list.submitted_offsets.size(),
+                 list.snapshot_suspensions, generation);
+        head = false;
+        for (size_t i = first; i < list.submitted_offsets.size(); ++i) {
+            if (std::ranges::binary_search(list.deferred_entries, static_cast<u32>(i))) {
+                LOG_INFO(HW_GPU, "dep fifo-snapshot-unavailable ch={} q={} i={} reason=deferred",
+                         channel_state.bind_id, list.dependency_queue_position, i);
+                continue;
+            }
+            const auto words = std::span{list.submitted_words}.subspan(
+                list.submitted_offsets[i], list.command_lists[i].size.Value());
+            for (size_t offset = i == first ? resume : 0; offset < words.size();) {
+                if (remaining_words == 0) {
+                    LOG_INFO(HW_GPU, "dep fifo-snapshot-truncated ch={} q={} i={} offset={}",
+                             channel_state.bind_id, list.dependency_queue_position, i, offset);
+                    return;
+                }
+                std::array<u32, 32> raw{};
+                const size_t count = std::min({raw.size(), words.size() - offset, remaining_words});
+                for (size_t j = 0; j < count; ++j) {
+                    raw[j] = words[offset + j].argument;
+                }
+                LOG_INFO(HW_GPU, "dep fifo-snapshot ch={} q={} i={} offset={} {:08x}",
+                         channel_state.bind_id, list.dependency_queue_position, i, offset,
+                         fmt::join(std::span{raw}.first(count), " "));
+                offset += count;
+                remaining_words -= count;
+            }
         }
     }
 }

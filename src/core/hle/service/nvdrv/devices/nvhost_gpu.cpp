@@ -14,6 +14,7 @@
 #include <vector>
 #include "common/assert.h"
 #include "common/logging.h"
+#include "common/nx2_sampler.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/service/nvdrv/core/container.h"
@@ -509,6 +510,11 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
                   (flags.increment_value.Value() != 0 ? params.fence.value : 0)};
     params.fence.value = syncpoint_manager.IncrementSyncpointMaxExt(channel_syncpoint, increment);
     channel_state->nx2_syncpoint_max.store(params.fence.value, std::memory_order_relaxed);
+    if (Nx2Sampler::DependencyTraceEnabled()) {
+        LOG_INFO(Service_NVDRV, "dep fence-submit ch={} tid={} id={} target={} increment={} flags={:#x}",
+                 bind_id, Nx2Sampler::dependency_ipc_thread, channel_syncpoint,
+                 static_cast<u32>(params.fence.value), increment, flags.raw);
+    }
     gpu.PushGPUEntries(bind_id, std::move(entries));
 
     if (g_nx2_driver && !flags.fence_increment.Value() && increment > 0) {

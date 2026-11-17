@@ -7,6 +7,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstdlib>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -14,6 +15,15 @@
 #include <vector>
 
 namespace Nx2Sampler {
+
+/// Trace the submit, completion, and guest wait boundaries without altering their policy.
+[[nodiscard]] inline bool DependencyTraceEnabled() {
+    static const bool enabled = std::getenv("EDEN_NX2_DEPENDENCY_TRACE") != nullptr;
+    return enabled;
+}
+
+/// Guest thread whose synchronous HLE request is currently dispatched on this host thread.
+inline thread_local std::uint64_t dependency_ipc_thread{};
 
 // EDEN_NX2_SAMPLE=<thread names>: a sampling profiler for named host threads (Windows only).
 // Names are comma separated; a name ending in '*' matches by prefix (CPUCore_*). From

@@ -16,6 +16,7 @@
 
 #include "common/assert.h"
 #include "common/logging.h"
+#include "common/nx2_sampler.h"
 #include "common/settings.h"
 #include "core/core.h"
 #include "video_core/nx2_perf.h"
@@ -308,6 +309,13 @@ bool Puller::PollAcquire(DmaPusher& dma_pusher) {
         // The fence completion is an event, not a guest-memory poll. It owns all earlier
         // report writes and cache downloads, including reports overwritten before we resume.
         if (!acquire_fence_ready->load(std::memory_order_acquire)) {
+            if (Nx2Sampler::DependencyTraceEnabled() && !pending.reported &&
+                std::chrono::steady_clock::now() - pending.since > std::chrono::seconds{2}) {
+                pending.reported = true;
+                dma_pusher.TraceSemaphore("fence-blocked", pending.address, pending.value,
+                                          pending.operation);
+                dma_pusher.TraceBlockedQueue();
+            }
             return false;
         }
         const u32 current = dma_pusher.memory_manager.Read<u32>(pending.address);
@@ -371,6 +379,10 @@ bool Puller::PollAcquire(DmaPusher& dma_pusher) {
                     dma_pusher.memory_manager.Read<u32>((pending_acquire->address & ~GPUVAddr{0xf}) + 4),
                     dma_pusher.memory_manager.Read<u32>((pending_acquire->address & ~GPUVAddr{0xf}) + 8),
                     dma_pusher.memory_manager.Read<u32>((pending_acquire->address & ~GPUVAddr{0xf}) + 12));
+        if (Nx2Sampler::DependencyTraceEnabled()) {
+            dma_pusher.TraceSemaphore("blocked", pending.address, pending.value, pending.operation);
+            dma_pusher.TraceBlockedQueue();
+        }
     }
     return false;
 }
@@ -383,6 +395,10 @@ bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
     // counting those made the count odd ("suspended") at random, so submit-time snapshots were
     // thrown away for about half of all entries (CommandList::snapshot_suspensions).
     if (pending_acquire) {
+        if (Nx2Sampler::DependencyTraceEnabled()) {
+            dma_pusher.TraceSemaphore("resume", pending_acquire->address, pending_acquire->value,
+                                      pending_acquire->operation);
+        }
         if (pending_acquire->fence_lean) {
             if (VideoCommon::Nx2Perf::Verify()) {
                 const u32 current =
@@ -462,6 +478,12 @@ void Puller::ProcessBindMethod(DmaPusher& dma_pusher, const MethodCall& method_c
 }
 
 void Puller::ProcessFenceActionMethod(DmaPusher& dma_pusher) {
+    if (Nx2Sampler::DependencyTraceEnabled()) {
+        LOG_INFO(HW_GPU, "dep fence-method ch={} id={} value={} op={} raise={}",
+                 dma_pusher.channel_state.bind_id, regs.fence_action.syncpoint_id.Value(),
+                 regs.fence_value, static_cast<u32>(regs.fence_action.op.Value()),
+                 regs.fence_action.nx2_raise.Value());
+    }
     switch (regs.fence_action.op) {
     case Puller::FenceOperation::Acquire:
         // UNIMPLEMENTED_MSG("Channel Scheduling pending.");
@@ -495,6 +517,10 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
     // OPERATION is 4:0 on the host class (clc76f.h); bit 4 is REDUCTION (EDEN_NX2_CLASS_FIXES, h3).
     const auto semaphoreOperationMask = Census::FixOn(Census::Fix::H3) ? 0x1F : 0xF;
     const auto op = GpuSemaphoreOperation(regs.semaphore_trigger & semaphoreOperationMask);
+    if (Nx2Sampler::DependencyTraceEnabled()) {
+        dma_pusher.TraceSemaphore("trigger", regs.semaphore_address.SemaphoreAddress(),
+                                  regs.semaphore_sequence, regs.semaphore_trigger);
+    }
     // EDEN_NX2_SEM_WATCH=<gpu address>: log every release/acquire on the 16 bytes there.
     static const GPUVAddr watch = [] {
         const char* value = std::getenv("EDEN_NX2_SEM_WATCH");
@@ -662,6 +688,10 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             acquire.fence_lean = true;
             acquire.since = std::chrono::steady_clock::now();
             pending_acquire = acquire;
+            if (Nx2Sampler::DependencyTraceEnabled()) {
+                dma_pusher.TraceSemaphore("fence-park", acquire.address, acquire.value,
+                                          acquire.operation);
+            }
             dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
             Nx2SemaphoreFenceLean::pending.fetch_add(1, std::memory_order_release);
             ++Nx2SemaphoreFenceLean::stats.suspended;
@@ -698,6 +728,9 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                 }
             }
             pending_acquire = acquire;
+            if (Nx2Sampler::DependencyTraceEnabled()) {
+                dma_pusher.TraceSemaphore("park", acquire.address, acquire.value, acquire.operation);
+            }
             dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
             VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);
         } else {
@@ -738,6 +771,9 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
 void Puller::ProcessSemaphoreRelease(DmaPusher& dma_pusher) {
     const GPUVAddr sequence_address{regs.semaphore_address.SemaphoreAddress()};
     const u32 payload = regs.semaphore_release;
+    if (Nx2Sampler::DependencyTraceEnabled()) {
+        dma_pusher.TraceSemaphore("release", sequence_address, payload, 0);
+    }
     OnBackRelease(dma_pusher, sequence_address,
                   [rasterizer = dma_pusher.rasterizer, sequence_address, payload] {
                       rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload,
@@ -798,6 +834,9 @@ void Puller::ProcessSemaphoreAcquire(DmaPusher& dma_pusher) {
     DrainBack();
     u32 word = dma_pusher.memory_manager.Read<u32>(regs.semaphore_address.SemaphoreAddress());
     const auto value = regs.semaphore_acquire;
+    if (Nx2Sampler::DependencyTraceEnabled()) {
+        dma_pusher.TraceSemaphore("acquire", regs.semaphore_address.SemaphoreAddress(), value, 0);
+    }
     while (word != value) {
         regs.acquire_active = true;
         regs.acquire_value = value;
@@ -821,6 +860,9 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
                              (regs.reg_array[0x17] & ~3U);
     const u32 payload = regs.reg_array[0x19];
     const u32 operation = argument & 7;
+    if (Nx2Sampler::DependencyTraceEnabled()) {
+        dma_pusher.TraceSemaphore("execute", address, payload, argument);
+    }
     if (operation == 1) { // RELEASE
         auto properties = VideoCommon::QueryPropertiesFlags::IsAFence;
         if ((argument & ((1U << 24) | (1U << 25))) == (1U << 25) &&

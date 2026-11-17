@@ -21,6 +21,7 @@
 #include <unordered_set>
 #include "common/assert.h"
 #include "common/logging.h"
+#include "common/nx2_sampler.h"
 #include "common/settings.h"
 #include "shader_recompiler/exception.h"
 #include "core/core.h"
@@ -154,6 +155,12 @@ void KeplerCompute::ProcessNativeReportSemaphore(u32 argument) {
     const u32 payload = native_registers[0x6c2];
     const u32 operation = argument & 3;
     const bool one_word = (argument >> 28) & 1;
+    if (Nx2Sampler::DependencyTraceEnabled()) {
+        LOG_INFO(HW_GPU,
+                 "dep sem-compute ch={} as={} gpu={:#x} device={:#x} value={:#x} op={:#x}",
+                 nx2_channel ? nx2_channel->bind_id : -1, memory_manager.GetID(), address,
+                 memory_manager.GpuToCpuAddress(address).value_or(0), payload, argument);
+    }
     static u32 logged{};
     if (logged++ < 32) {
         LOG_INFO(HW_GPU, "Native compute report semaphore {:#x} = {:#x}, control {:#x}", address,
@@ -447,6 +454,13 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
             },
             [&](u64 address, u32 payload, u32 flags) {
                 const bool four_words = (flags >> 30) == 0;
+                if (Nx2Sampler::DependencyTraceEnabled()) {
+                    LOG_INFO(HW_GPU,
+                             "dep sem-qmd ch={} as={} gpu={:#x} device={:#x} value={:#x} flags={:#x}",
+                             nx2_channel ? nx2_channel->bind_id : -1, memory_manager.GetID(),
+                             address, memory_manager.GpuToCpuAddress(address).value_or(0),
+                             payload, flags);
+                }
                 if (!memory_manager.IsFullyMappedRange(address, four_words ? 16 : sizeof(payload))) return false;
                 if (flags & (1U << 26)) {
                     rasterizer->SignalFence([this, address, payload, flags,

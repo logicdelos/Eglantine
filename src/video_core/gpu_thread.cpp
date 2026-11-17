@@ -19,6 +19,7 @@
 #include "common/assert.h"
 #include "common/logging.h"
 #include "common/nx2_bottleneck.h"
+#include "common/nx2_sampler.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/thread.h"
@@ -408,6 +409,23 @@ u64 ThreadManager::PushCommand(CommandData&& command_data, bool block, bool is_a
 
     std::unique_lock lk(state.write_lock);
     const u64 fence{++state.last_fence};
+    if (Nx2Sampler::DependencyTraceEnabled()) {
+        if (auto* submit = std::get_if<SubmitListCommand>(&command_data)) {
+            auto& list = submit->entries;
+            list.dependency_queue_position = fence;
+            LOG_INFO(HW_GPU, "dep fifo-submit ch={} q={} tid={} entries={} inline={}",
+                     submit->channel, fence, Nx2Sampler::dependency_ipc_thread,
+                     list.command_lists.size(), list.prefetch_command_list.size());
+            for (size_t i = 0; i < list.command_lists.size(); ++i) {
+                LOG_INFO(HW_GPU, "dep fifo-entry ch={} q={} i={} raw={:#018x}",
+                         submit->channel, fence, i, list.command_lists[i].raw);
+            }
+            for (size_t i = 0; i < list.prefetch_command_list.size(); ++i) {
+                LOG_INFO(HW_GPU, "dep fifo-inline ch={} q={} i={} raw={:#010x}",
+                         submit->channel, fence, i, list.prefetch_command_list[i].argument);
+            }
+        }
+    }
     state.queue.EmplaceWait(std::move(command_data), fence, block);
     if (Tegra::Nx2PendingWake::Needed()) [[unlikely]] {
         Tegra::Nx2PendingWake::Wake(Tegra::Nx2PendingWake::push_seq, Tegra::Nx2PendingWake::ByPush);

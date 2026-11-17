@@ -17,6 +17,7 @@
 #include <string>
 #include "common/assert.h"
 #include "common/bit_util.h"
+#include "common/nx2_sampler.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/core.h"
@@ -895,6 +896,14 @@ void Maxwell3D::ProcessQueryGet() {
         static_cast<VideoCommon::QueryType>(regs.report_semaphore.query.report.Value());
     const u32 payload = regs.report_semaphore.payload;
     const u32 subreport = regs.report_semaphore.query.sub_report;
+    if (Nx2Sampler::DependencyTraceEnabled()) {
+        LOG_INFO(HW_GPU,
+                 "dep sem-graphics ch={} as={} gpu={:#x} device={:#x} value={:#x} op={:#x} type={}",
+                 nx2_channel ? nx2_channel->bind_id : -1, memory_manager.GetID(), sequence_address,
+                 memory_manager.GpuToCpuAddress(sequence_address).value_or(0), payload,
+                 static_cast<u32>(regs.report_semaphore.query.operation.Value()),
+                 static_cast<u32>(query_type));
+    }
     if (g_nx2_ampere && sequence_address == 0 &&
         regs.report_semaphore.query.operation == Regs::ReportSemaphore::Operation::Release) {
         // NVN2's syncpoint increment (video_core/nx2.h, queue syncpoints).

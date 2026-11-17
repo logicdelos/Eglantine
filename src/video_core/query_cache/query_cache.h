@@ -249,7 +249,8 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         return value ? GPUVAddr{std::strtoull(value, nullptr, 16)} : GPUVAddr{};
     }();
     if (static const bool trace = std::getenv("EDEN_NX2_QUERY_TRACE") != nullptr;
-        trace || (watch != 0 && (addr & ~GPUVAddr{0xf}) == watch)) {
+        trace || Nx2Sampler::DependencyTraceEnabled() ||
+        (watch != 0 && (addr & ~GPUVAddr{0xf}) == watch)) {
         LOG_INFO(HW_GPU, "nx2 report addr={:#x} type={} flags={:#x} payload={:#x} as={} device={:#x}", addr,
                  static_cast<u32>(counter_type), static_cast<u32>(flags), payload, gpu_memory->GetID(),
                  gpu_memory->GpuToCpuAddress(addr).value_or(0));
@@ -264,6 +265,10 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     }
     auto cpu_addr_opt = gpu_memory->GpuToCpuAddress(addr);
     if (!cpu_addr_opt) [[unlikely]] {
+        if (Nx2Sampler::DependencyTraceEnabled()) {
+            LOG_INFO(HW_GPU, "dep query-unmapped as={} gpu={:#x} value={:#x}",
+                     gpu_memory->GetID(), addr, payload);
+        }
         return;
     }
     DAddr cpu_addr = *cpu_addr_opt;
@@ -283,6 +288,10 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     }
     const size_t new_query_id = streamer->WriteCounter(cpu_addr, has_timestamp, payload, subreport);
     auto* query = streamer->GetQuery(new_query_id);
+    if (Nx2Sampler::DependencyTraceEnabled()) {
+        LOG_INFO(HW_GPU, "dep query-queued query={} device={:#x} value={:#x}",
+                 fmt::ptr(query), cpu_addr, payload);
+    }
     if (is_fence) {
         query->flags |= QueryFlagBits::IsFence;
     }
@@ -317,12 +326,20 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             Tegra::Nx2IssuedReleases::Get().Land(settle.address);
         }
         if (True(query_base->flags & QueryFlagBits::IsInvalidated)) {
+            if (Nx2Sampler::DependencyTraceEnabled()) {
+                LOG_INFO(HW_GPU, "dep query-invalidated query={} device={:#x}",
+                         fmt::ptr(query_base), settle.address);
+            }
             if (!is_synced) [[likely]] {
                 impl->pending_unregister.push_back(query_location);
             }
             return;
         }
         if (False(query_base->flags & QueryFlagBits::IsFinalValueSynced)) [[unlikely]] {
+            if (Nx2Sampler::DependencyTraceEnabled()) {
+                LOG_INFO(HW_GPU, "dep query-unsynced query={} device={:#x}",
+                         fmt::ptr(query_base), settle.address);
+            }
             LOG_ERROR(HW_GPU,
                       "Query report value not synchronized. Consider increasing GPU accuracy.");
             if (!is_synced) [[likely]] {
@@ -343,6 +360,10 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         } else {
             const u32 value = static_cast<u32>(query_base->value);
             std::memcpy(pointer, &value, sizeof(value));
+        }
+        if (Nx2Sampler::DependencyTraceEnabled()) {
+            LOG_INFO(HW_GPU, "dep query-ready query={} device={:#x} value={:#x}",
+                     fmt::ptr(query_base), query_cpu_addr, query_base->value);
         }
         Tegra::Nx2SemaphoreWaiters::Get().OnWrite(query_cpu_addr,
                                                   static_cast<u32>(query_base->value));

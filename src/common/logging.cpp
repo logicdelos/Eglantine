@@ -35,6 +35,7 @@
 #include "common/fs/path_util.h"
 #include "common/literals.h"
 #include "common/log_ring.h"
+#include "common/nx2_sampler.h"
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
 
@@ -310,7 +311,9 @@ struct FileBackend final : public Backend {
 
         using namespace Common::Literals;
         // Prevent logs from exceeding a set maximum size in the event that log entries are spammed.
-        const auto write_limit = Settings::values.extended_logging.GetValue() ? 1_GiB : 100_MiB;
+        static const bool dependency_trace = Nx2Sampler::DependencyTraceEnabled();
+        const auto write_limit =
+            (Settings::values.extended_logging.GetValue() || dependency_trace) ? 1_GiB : 100_MiB;
         const bool write_limit_exceeded = bytes_written > write_limit;
         if (entry.log_level >= Level::Error || write_limit_exceeded) {
             // Stop writing after the write limit is exceeded.

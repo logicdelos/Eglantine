@@ -93,7 +93,7 @@ public:
 private:
     void Increment(std::atomic<u32>& syncpoint, std::condition_variable& wait_cv,
                    std::list<RegisteredAction>& action_storage,
-                   std::optional<u32> mirrored_id = std::nullopt);
+                   u32 syncpoint_id, bool guest);
 
     ActionHandle RegisterAction(std::atomic<u32>& syncpoint,
                                 std::list<RegisteredAction>& action_storage, u32 expected_value,
