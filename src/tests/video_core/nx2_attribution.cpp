@@ -19,6 +19,7 @@ size_t ResolverScratchAllowance();
 u64 UndrainedRingEvents();
 u64 DrainedRingEvents();
 bool HoldConsumer(bool hold);
+void ForceHistoryRelief(bool on);
 } // namespace VideoCommon::Nx2Spikes::Detail
 
 namespace {
@@ -1618,6 +1619,70 @@ TEST_CASE("Rings that deliver more at once than the history holds lose nothing",
     CHECK(Total(frame.cause_ns) == end - start);
     CHECK(At(frame.activity_ns, Cause::Shader) == sum);
     CHECK(Detail::PeakRetainedHistoryBytes() <= Config(Ms).buffer_bytes / 2);
+}
+
+TEST_CASE("A link whose owner is still in its ring does not age between the rounds of a pass",
+          "[nx2][attribution]") {
+    Run run{Config(Ms)};
+    constexpr u64 Spans = 4000; // 500 rounds of 8 before the owner's record, far past 8 attempts
+    const WorkId work = NewWorkId();
+    Present(run.T(0));
+    REQUIRE(Detail::HoldConsumer(true));
+    Detail::ForceHistoryRelief(true);
+    for (u64 i = 0; i < Spans; ++i) {
+        (void)run.NextRootToken();
+        RecordSpan(Cause::Texture, run.T(i * 1000), run.T(i * 1000 + 1000));
+    }
+    const SpanToken wait = run.NextRootToken();
+    RecordSpan(Cause::Waiting, run.T(10 * Ms), run.T(100 * Ms));
+    OnThread([&] {
+        RegisterThread("producer");
+        RecordSpan(Cause::Shader, run.T(20 * Ms), run.T(60 * Ms), work);
+    });
+    OnThread([&] {
+        RegisterThread("linker");
+        LinkWait(wait, work, DependencyKind::Job);
+    });
+    Present(run.T(150 * Ms));
+    REQUIRE(Detail::HoldConsumer(false));
+    AwaitFrames(1);
+    const AttributionSnapshot snap = run.Finish();
+    CHECK(snap.lost_events == 0);
+    CHECK(snap.complete);
+    REQUIRE(g_frames.size() == 1);
+    const LongFrame& frame = g_frames[0];
+    CHECK(At(frame.cause_ns, Cause::Shader) == 40 * Ms); // the link reached its wait
+    CHECK(At(frame.cause_ns, Cause::Waiting) == 50 * Ms);
+    CHECK(At(frame.cause_ns, Cause::Texture) == Spans * 1000);
+    CHECK(Total(frame.cause_ns) == 150 * Ms);
+}
+
+TEST_CASE("Ending a session resolves nothing in part before the open spans are marked",
+          "[nx2][attribution]") {
+    Run run{Config(Ms)};
+    Present(run.T(0));
+    Present(run.T(5 * Ms));
+    AwaitFrames(1); // the first present is behind the consumer: only the last interval is left
+    REQUIRE(Detail::HoldConsumer(true));
+    (void)BeginSpan(Cause::Shader); // never ended
+    Present(run.T(60 * Ms));
+    WaitUntil(run.T(62 * Ms)); // the pass runs past the interval's end plus the margin
+    OnThread([&] {
+        RegisterThread("later work");
+        for (u64 i = 0; i < 300; ++i) {
+            const u64 begin = NowNs();
+            u64 end = NowNs();
+            while (end - begin < 1000) {
+                end = NowNs();
+            }
+            RecordSpan(Cause::Disk, begin, end);
+        }
+    });
+    Detail::ForceHistoryRelief(true); // the rounds of the final pass relieve the history
+    run.Finish();
+    REQUIRE(g_frames.size() == 2);
+    CHECK(g_frames[1].end_ns == run.T(60 * Ms));
+    CHECK_FALSE(g_frames[1].instrumentation_complete); // the open span was marked first
 }
 
 TEST_CASE("Losses mark only the frames they fall in, however many there are",
