@@ -1005,6 +1005,82 @@ TEST_CASE("A span closing at capacity reuses its open history slot",
     CHECK((ended.frame.unknown_reasons & UnknownReason::LostSpans) == 0);
 }
 
+TEST_CASE("A full history can transfer a span and reports only actual overflow",
+          "[nx2][attribution][history]") {
+    SessionConfig config = Config(100 * Ms);
+    config.buffer_bytes = 16 * 1024; // 64 history slots and four events per producer ring
+    Run run{config};
+    const u64 future = run.T(3'600'000 * Ms);
+    // Fill all 64 charged slots: 16 closed (including the probe) and 16 open on the
+    // presenter, then 32 closed on the other producer. No presents can prune these yet.
+    REQUIRE(AwaitIdle());
+    for (u64 i = 0; i < 15; ++i) {
+        RecordSpan(Cause::Texture, future, future + Ms);
+        REQUIRE(AwaitIdle());
+    }
+    const SpanToken open = BeginSpan(Cause::Shader);
+    REQUIRE(open.Valid());
+    REQUIRE(AwaitIdle());
+    std::atomic<bool> drained{true};
+    OnThread([&] {
+        for (u64 i = 0; i < 32; ++i) {
+            RecordSpan(Cause::Texture, future, future + Ms);
+            if (!AwaitIdle()) {
+                drained = false;
+                break;
+            }
+        }
+    });
+    REQUIRE(drained.load());
+    CHECK(ReadAttributionSnapshot().lost_events == 0);
+
+    bool overflow = false;
+    u64 before_drop{};
+    u64 after_drop{};
+    SECTION("Transfer without a free slot") {}
+    SECTION("One new span beyond capacity") {
+        overflow = true;
+        before_drop = NowNs();
+        // The lost span intersects both the short and the long frame, but not the next one.
+        RecordSpan(Cause::Disk, run.T(0) + 1, std::max(before_drop, run.T(2 * Ms)));
+        REQUIRE(AwaitIdle());
+        after_drop = NowNs();
+    }
+    EndSpan(open);
+    REQUIRE(AwaitIdle());
+    Present(run.T(0));
+    if (overflow) {
+        Present(run.T(Ms));
+    }
+    const u64 end = std::max(NowNs(), run.T(Ms)) + 150 * Ms;
+    Present(end);
+    Present(end + 150 * Ms);
+    const AttributionSnapshot snap = run.Finish();
+
+    CHECK(snap.lost_events == (overflow ? 1 : 0));
+    CHECK(snap.complete == !overflow);
+    const auto& closed_loss =
+        snap.history_loss[static_cast<size_t>(HistoryLossCause::ClosedCapacity)];
+    CHECK(closed_loss.count == (overflow ? 1 : 0));
+    CHECK(snap.history_loss[static_cast<size_t>(HistoryLossCause::BeginCapacity)].count == 0);
+    CHECK(snap.history_loss[static_cast<size_t>(HistoryLossCause::TransferCapacity)].count == 0);
+    if (overflow) {
+        CHECK(closed_loss.first_drop_ns >= before_drop);
+        CHECK(closed_loss.last_drop_ns <= after_drop);
+        CHECK(closed_loss.first_drop_ns == closed_loss.last_drop_ns);
+    }
+    CHECK(snap.first_120s.frames_with_history_loss == (overflow ? 2 : 0));
+    REQUIRE(g_frames.size() == 2);
+    CHECK(g_frames[0].history_loss == overflow);
+    CHECK(g_frames[0].instrumentation_complete == !overflow);
+    CHECK(Total(g_frames[0].cause_ns) == g_frames[0].duration_ns);
+    if (!overflow) {
+        CHECK(At(g_frames[0].cause_ns, Cause::Shader) > 0);
+    }
+    CHECK_FALSE(g_frames[1].history_loss);
+    CHECK(g_frames[1].instrumentation_complete);
+}
+
 TEST_CASE("Deeply nested spans with distinct work ids keep the resolver scratch linear",
           "[nx2][attribution]") {
     SessionConfig config = Config(10 * Ms);
@@ -1623,6 +1699,58 @@ TEST_CASE("Rings that deliver more at once than the history holds lose nothing",
     CHECK(Total(frame.cause_ns) == end - start);
     CHECK(At(frame.activity_ns, Cause::Shader) == sum);
     CHECK(Detail::PeakRetainedHistoryBytes() <= Config(Ms).buffer_bytes / 2);
+}
+
+TEST_CASE("Default history survives simultaneous 4x peak delivery before a delayed present",
+          "[nx2][attribution][history]") {
+    SessionConfig config;
+    config.charge_presenter_gaps = false;
+    Run run{config};
+    constexpr size_t Producers = 16;
+    constexpr u64 SpansEach = 4000; // below the default ring limit, but 64,000 retained in all
+    constexpr u64 Delay = 1500 * Ms; // 42,666 records/s, > 4x the saved peak (10,343.42/s)
+    constexpr u64 WorkNs = 1000;
+    // Model a delayed present without a real-time wait. No cut at NowNs() can free these spans.
+    const u64 start = run.T(3'600'000 * Ms);
+    Present(start);
+    REQUIRE(Detail::HoldConsumer(true));
+    std::vector<std::thread> producers;
+    for (size_t i = 0; i < Producers; ++i) {
+        producers.emplace_back([start, i] {
+            RegisterThread("pressure producer");
+            for (u64 j = 0; j < SpansEach; ++j) {
+                const u64 offset = (j * Producers + i) * Delay / (Producers * SpansEach);
+                const u64 t = start + offset;
+                RecordSpan(Cause::Shader, t, t + WorkNs);
+            }
+        });
+    }
+    for (std::thread& producer : producers) {
+        producer.join();
+    }
+    RecordSpan(Cause::Texture, start, start + Delay / 2);
+    RecordSpan(Cause::Waiting, start + Delay / 2, start + Delay);
+    Present(start + Delay);
+    REQUIRE(Detail::HoldConsumer(false));
+    AwaitFrames(1);
+    Present(start + FirstWindowNs);
+    const AttributionSnapshot snap = run.Finish();
+
+    CHECK(snap.lost_events == 0);
+    CHECK(snap.complete);
+    CHECK(snap.first_120s.complete);
+    CHECK(snap.first_120s.elapsed_ns == FirstWindowNs);
+    CHECK(snap.first_120s.frames_with_history_loss == 0);
+    REQUIRE(g_frames.size() == 2);
+    const LongFrame& frame = g_frames.front();
+    CHECK(frame.instrumentation_complete);
+    CHECK_FALSE(frame.history_loss);
+    CHECK(frame.duration_ns == Delay);
+    CHECK(At(frame.cause_ns, Cause::Texture) == Delay / 2);
+    CHECK(At(frame.cause_ns, Cause::Waiting) == Delay / 2);
+    CHECK(frame.waiting_ns[static_cast<size_t>(WaitClass::HostOther)] == Delay / 2);
+    CHECK(Total(frame.cause_ns) == Delay);
+    CHECK(At(frame.activity_ns, Cause::Shader) == Producers * SpansEach * WorkNs);
 }
 
 TEST_CASE("A link whose owner is still in its ring does not age between the rounds of a pass",

@@ -340,6 +340,32 @@ TEST_CASE("waiting breakdown json: clamps the handler count and names unknown se
     CHECK_FALSE(Json::parse(Schema2::LongFrameJson(frame)).contains("waiting_breakdown_ns"));
 }
 
+TEST_CASE("schema 2 reports shared history loss without changing coverage",
+          "[report][schema2][history]") {
+    Spikes::AttributionSnapshot snapshot = MakeSnapshot(1);
+    auto& loss =
+        snapshot.history_loss[static_cast<size_t>(Spikes::HistoryLossCause::ClosedCapacity)];
+    loss = {2, 100, 101};
+    snapshot.complete = false;
+    snapshot.lost_events = 2;
+    snapshot.first_120s.frames_with_history_loss = 2;
+    const Json attr = Json::parse(Schema2::AttributionJsonHead(snapshot));
+    CHECK(attr["lost_events"] == 2);
+    CHECK(attr["complete"] == false);
+    CHECK(attr["history_loss"] ==
+          Json::parse(R"({"closed_capacity":{"count":2,"first_drop_ns":100,"last_drop_ns":101}})"));
+    const Json window = Json::parse(Schema2::First120sJson(snapshot));
+    CHECK(window["complete"] == true);
+    CHECK(window["frames_with_history_loss"] == 2);
+    auto frame = MakeFrame(7, 150'000'000);
+    CHECK(Json::parse(Schema2::LongFrameJson(frame))["history_loss"] == false);
+    frame.history_loss = true;
+    CHECK(Json::parse(Schema2::LongFrameJson(frame))["history_loss"] == true);
+    const Json disabled = Json::parse(Schema2::AttributionJsonHead({}));
+    CHECK(disabled["history_loss"].is_null());
+    CHECK(Json::parse(Schema2::First120sJson({}))["frames_with_history_loss"].is_null());
+}
+
 TEST_CASE("schema 2 keeps every schema 1 member", "[report][schema2]") {
     static_assert(Schema2::SchemaVersion == 2);
     const Json schema1 = Json::parse(Schema1Document);
