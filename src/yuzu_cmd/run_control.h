@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
@@ -508,7 +510,9 @@ private:
 struct HostIdentitySource {
     u64 title_id{};
     u32 game_version{};
-    /// The game file, or a loose dump directory (every file of it is in the manifest).
+    /// The game file, or a loose dump directory (every file of it is in the manifest). A launch
+    /// path that is the `main` of a loose ExeFS (or such an ExeFS directory) also stands for the
+    /// files the deconstructed loader uses with it: see ResolveLooseContent.
     std::filesystem::path game_path;
     /// The enabled add-ons, one line each: type, program, version number, name, version text.
     std::vector<std::string> labels;
@@ -582,14 +586,153 @@ inline constexpr std::array<std::string_view, 15> ShaderGenerationSwitches{
     return settings.Value();
 }
 
+namespace Detail {
+
+[[nodiscard]] inline bool IsRomFSDirectoryName(std::string_view name) {
+    return std::ranges::equal(name, std::string_view{"romfs"}, [](char a, char b) {
+        return std::tolower(static_cast<unsigned char>(a)) == b;
+    });
+}
+
+/// The subdirectories of `parent`, in name order (the order the walk of a manifest uses).
+[[nodiscard]] inline std::vector<std::filesystem::path> SubdirectoriesByName(
+    const std::filesystem::path& parent) {
+    std::vector<std::filesystem::path> directories;
+    std::error_code ec;
+    for (std::filesystem::directory_iterator it{parent, ec}, end; !ec && it != end;
+         it.increment(ec)) {
+        std::error_code status_ec;
+        if (it->is_directory(status_ec)) {
+            directories.push_back(it->path());
+        }
+    }
+    std::ranges::sort(directories, {}, [](const std::filesystem::path& directory) {
+        return PathText(directory.filename());
+    });
+    return directories;
+}
+
+/// The loader's loose RomFS directory of `parent`: `romfs`, else a directory whose name is
+/// `romfs` in any letter case. Empty when there is none.
+[[nodiscard]] inline std::filesystem::path FindLooseRomFSDirectory(
+    const std::filesystem::path& parent) {
+    std::error_code ec;
+    if (std::filesystem::path exact = parent / "romfs"; std::filesystem::is_directory(exact, ec)) {
+        return exact;
+    }
+    for (std::filesystem::path& directory : SubdirectoriesByName(parent)) {
+        if (IsRomFSDirectoryName(PathText(directory.filename()))) {
+            return std::move(directory);
+        }
+    }
+    return {};
+}
+
+/// The size of the `main` in an ExeFS directory; 0 when there is none.
+[[nodiscard]] inline u64 MainSize(const std::filesystem::path& exefs_directory) {
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(exefs_directory / "main", ec);
+    return ec ? 0 : static_cast<u64>(size);
+}
+
+/// The directory of `updates` whose whole name is the greatest number (the later one in name
+/// order when two spell the same number); empty when there is none.
+[[nodiscard]] inline std::filesystem::path NewestUpdateDirectory(
+    const std::filesystem::path& updates) {
+    std::filesystem::path newest;
+    u64 newest_version = 0;
+    for (std::filesystem::path& candidate : SubdirectoriesByName(updates)) {
+        const std::string name = PathText(candidate.filename());
+        u64 version = 0;
+        const auto parsed = std::from_chars(name.data(), name.data() + name.size(), version);
+        if (parsed.ec != std::errc{} || parsed.ptr != name.data() + name.size()) {
+            continue;
+        }
+        if (version >= newest_version) {
+            newest_version = version;
+            newest = std::move(candidate);
+        }
+    }
+    return newest;
+}
+
+} // namespace Detail
+
+/// What the deconstructed ExeFS loader reads besides the launch path, found the way the loader
+/// finds it (src/core/loader/deconstructed_rom_directory.cpp, FindLooseRomFS).
+struct LooseContent {
+    /// The ExeFS directory of the launch path (its main, main.npdm, rtld, modules and any
+    /// `.romfs` file). Empty when the launch path is a directory: the manifest walks all of it.
+    std::filesystem::path exefs_tree;
+    /// The loose RomFS directory in use. Empty when the RomFS is a `.romfs` file of the ExeFS
+    /// directory, or when the loader finds none or refuses the update's.
+    std::filesystem::path romfs_tree;
+    /// The `main` of the update directory whose RomFS stands in for an absent base RomFS: the
+    /// loader compares its size with the base's, so the size belongs to the identity.
+    std::filesystem::path update_main;
+};
+
+/// The loose content of a launch path that is the `main` of an ExeFS directory (one that also
+/// holds main.npdm), or such a directory. The loader takes the first `.romfs` file of the ExeFS
+/// directory; else the `romfs` directory beside it; else, for a base without one, the `romfs`
+/// of the newest numbered directory of the `updates` directory beside that, unless that
+/// update's main has another size than the base's. Any other launch path has none.
+[[nodiscard]] inline LooseContent ResolveLooseContent(const std::filesystem::path& game_path) {
+    std::error_code ec;
+    const bool directory = std::filesystem::is_directory(game_path, ec);
+    if (!directory && game_path.filename() != "main") {
+        return {};
+    }
+    const std::filesystem::path exefs = directory ? game_path : game_path.parent_path();
+    if (!std::filesystem::is_regular_file(exefs / "main", ec) ||
+        !std::filesystem::is_regular_file(exefs / "main.npdm", ec)) {
+        return {};
+    }
+    LooseContent loose;
+    if (!directory) {
+        loose.exefs_tree = exefs;
+    }
+    for (std::filesystem::directory_iterator it{exefs, ec}, end; !ec && it != end;
+         it.increment(ec)) {
+        std::error_code status_ec;
+        if (it->is_regular_file(status_ec) && it->path().extension() == ".romfs") {
+            return loose;
+        }
+    }
+
+    const std::filesystem::path title = exefs.parent_path();
+    loose.romfs_tree = Detail::FindLooseRomFSDirectory(title);
+    if (!loose.romfs_tree.empty()) {
+        return loose;
+    }
+    const std::filesystem::path update =
+        Detail::NewestUpdateDirectory(title.parent_path() / "updates");
+    if (update.empty()) {
+        return loose;
+    }
+    const std::filesystem::path update_romfs = Detail::FindLooseRomFSDirectory(update);
+    if (update_romfs.empty()) {
+        return loose;
+    }
+    loose.update_main = update / "exefs" / "main";
+    const u64 base_size = Detail::MainSize(exefs);
+    const u64 update_size = Detail::MainSize(update / "exefs");
+    if (base_size == 0 || update_size == 0 || base_size == update_size) {
+        loose.romfs_tree = update_romfs;
+    }
+    return loose;
+}
+
 /// What the caches are tied to, from the emulator and the title, before any cache is loaded:
 ///   build_id       the emulator build
 ///   title_id       the program
 ///   game_version   the numeric version of the base game or its update
 ///   content_stamp  the hash of the content manifest: the game file (size and last write time; a
-///                  loose dump: every file's relative path, size and time), the enabled add-ons
-///                  by name and version, the update and add-on files (size and time), every file
-///                  of every enabled mod and loose RomFS directory (relative path, size, time),
+///                  loose dump: every file's relative path, size and time; a loose ExeFS main:
+///                  also its ExeFS directory and the loose RomFS the loader uses with it, see
+///                  ResolveLooseContent), the enabled add-ons by name and version, the update
+///                  and add-on files (size and time), every file of every enabled mod and loose
+///                  RomFS directory (relative path, size, time),
 ///                  the EDEN_NX2_WARM_ADDON option and whether the walk hit its cap. The
 ///                  contents of files are not read; the executable's build id is not in it
 ///                  because only a running guest knows it, and an offline build must stamp the
@@ -623,6 +766,16 @@ inline constexpr std::array<std::string_view, 15> ShaderGenerationSwitches{
         manifest.Tree("game_directory", source.game_path);
     } else {
         manifest.File("game", source.game_path);
+    }
+    const LooseContent loose = ResolveLooseContent(source.game_path);
+    if (!loose.exefs_tree.empty()) {
+        manifest.Tree("loose_exefs", loose.exefs_tree);
+    }
+    if (!loose.romfs_tree.empty()) {
+        manifest.Tree("loose_romfs", loose.romfs_tree);
+    }
+    if (!loose.update_main.empty()) {
+        manifest.File("loose_update_main", loose.update_main);
     }
 
     std::vector<std::string> labels = source.labels;

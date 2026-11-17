@@ -1003,6 +1003,132 @@ TEST_CASE("content manifest cap is deterministic and part of the stamp", "[repor
     CHECK(StampOf(source) != stamp_capped);
 }
 
+TEST_CASE("content stamp of an ExeFS main launch path covers the loose content the loader uses",
+          "[report][identity]") {
+    TempTree tree;
+    tree.Write("dump/exefs/main", "MAIN");
+    tree.Write("dump/exefs/main.npdm", "NPDM");
+    tree.Write("dump/exefs/rtld", "RTLD");
+    tree.Write("dump/romfs/data/x.bin", "xxxx");
+    tree.Write("dump/notes.txt", "notes");
+
+    RunControl::HostIdentitySource source;
+    source.title_id = 0x0100000000001234ull;
+    source.game_path = tree.root / "dump" / "exefs" / "main";
+    const u64 base = StampOf(source);
+    CHECK(StampOf(source) == base);
+
+    SECTION("a RomFS file changes while main is untouched") {
+        tree.Write("dump/romfs/data/x.bin", "xxxxxx");
+        CHECK(StampOf(source) != base);
+    }
+    SECTION("a RomFS file is added") {
+        tree.Write("dump/romfs/data/y.bin", "y");
+        CHECK(StampOf(source) != base);
+    }
+    SECTION("a RomFS file changes only its write time") {
+        TempTree::Stamp(tree.root / "dump" / "romfs" / "data" / "x.bin", 90);
+        CHECK(StampOf(source) != base);
+    }
+    SECTION("a sibling of main in the ExeFS directory changes") {
+        tree.Write("dump/exefs/rtld", "RTLD2");
+        CHECK(StampOf(source) != base);
+    }
+    SECTION("main.npdm changes") {
+        tree.Write("dump/exefs/main.npdm", "NPDM2");
+        CHECK(StampOf(source) != base);
+    }
+    SECTION("a file the loader does not read is not in the stamp") {
+        tree.Write("dump/notes.txt", "much longer notes");
+        CHECK(StampOf(source) == base);
+    }
+    SECTION("an ExeFS directory as the launch path covers the RomFS as well") {
+        source.game_path = tree.root / "dump" / "exefs";
+        const u64 directory_base = StampOf(source);
+        tree.Write("dump/romfs/data/x.bin", "xxxxxx");
+        CHECK(StampOf(source) != directory_base);
+        tree.Write("dump/notes.txt", "much longer notes");
+        const u64 after_romfs = StampOf(source);
+        tree.Write("dump/notes.txt", "notes");
+        CHECK(StampOf(source) == after_romfs);
+    }
+}
+
+TEST_CASE("content stamp of an ExeFS main launch path follows the loader's RomFS rules",
+          "[report][identity]") {
+    TempTree tree;
+    RunControl::HostIdentitySource source;
+    source.title_id = 0x0100000000001234ull;
+
+    SECTION("a .romfs file in the ExeFS directory is the RomFS, a romfs directory is not read") {
+        tree.Write("dump/exefs/main", "MAIN");
+        tree.Write("dump/exefs/main.npdm", "NPDM");
+        tree.Write("dump/exefs/game.romfs", "image");
+        tree.Write("dump/romfs/x.bin", "xxxx");
+        source.game_path = tree.root / "dump" / "exefs" / "main";
+        const u64 base = StampOf(source);
+        tree.Write("dump/romfs/x.bin", "xxxxxx");
+        CHECK(StampOf(source) == base);
+        tree.Write("dump/exefs/game.romfs", "image!");
+        CHECK(StampOf(source) != base);
+    }
+    SECTION("the romfs directory is found whatever its letter case") {
+        tree.Write("dump/exefs/main", "MAIN");
+        tree.Write("dump/exefs/main.npdm", "NPDM");
+        tree.Write("dump/RomFS/x.bin", "xxxx");
+        source.game_path = tree.root / "dump" / "exefs" / "main";
+        const u64 base = StampOf(source);
+        tree.Write("dump/RomFS/x.bin", "xxxxxx");
+        CHECK(StampOf(source) != base);
+    }
+    SECTION("a main without main.npdm is not a loose ExeFS") {
+        tree.Write("dump/exefs/main", "MAIN");
+        tree.Write("dump/romfs/x.bin", "xxxx");
+        source.game_path = tree.root / "dump" / "exefs" / "main";
+        const u64 base = StampOf(source);
+        tree.Write("dump/romfs/x.bin", "xxxxxx");
+        CHECK(StampOf(source) == base);
+    }
+    SECTION("a base without a RomFS uses the newest update's") {
+        tree.Write("game/base/exefs/main", "MAIN");
+        tree.Write("game/base/exefs/main.npdm", "NPDM");
+        tree.Write("game/updates/100/romfs/old.bin", "old");
+        tree.Write("game/updates/655360/romfs/new.bin", "new");
+        tree.Write("game/updates/655360/exefs/main", "MAIN");
+        tree.Write("game/updates/655360_old/romfs/skipped.bin", "skipped");
+        source.game_path = tree.root / "game" / "base" / "exefs" / "main";
+        const u64 base = StampOf(source);
+
+        tree.Write("game/updates/655360/romfs/new.bin", "newer");
+        const u64 newest_changed = StampOf(source);
+        CHECK(newest_changed != base);
+        tree.Write("game/updates/100/romfs/old.bin", "older");
+        CHECK(StampOf(source) == newest_changed);
+        tree.Write("game/updates/655360_old/romfs/skipped.bin", "skipped!");
+        CHECK(StampOf(source) == newest_changed);
+
+        // An update of another build is refused by the loader: its RomFS is not in use, its
+        // main is what decides that.
+        tree.Write("game/updates/655360/exefs/main", "MAIN2");
+        const u64 refused = StampOf(source);
+        CHECK(refused != newest_changed);
+        tree.Write("game/updates/655360/romfs/new.bin", "newer still");
+        CHECK(StampOf(source) == refused);
+    }
+    SECTION("the base's own RomFS wins over an update's") {
+        tree.Write("game/base/exefs/main", "MAIN");
+        tree.Write("game/base/exefs/main.npdm", "NPDM");
+        tree.Write("game/base/romfs/x.bin", "xxxx");
+        tree.Write("game/updates/655360/romfs/new.bin", "new");
+        source.game_path = tree.root / "game" / "base" / "exefs" / "main";
+        const u64 base = StampOf(source);
+        tree.Write("game/updates/655360/romfs/new.bin", "newer");
+        CHECK(StampOf(source) == base);
+        tree.Write("game/base/romfs/x.bin", "xxxxxx");
+        CHECK(StampOf(source) != base);
+    }
+}
+
 TEST_CASE("settings hash covers every switch that changes generated shaders",
           "[report][identity]") {
     const u64 base = RunControl::HostSettingsHash();
