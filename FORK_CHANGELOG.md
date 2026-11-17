@@ -22,7 +22,7 @@ Milestone 0.4, "Measured speed work": every speed change ships off by default be
 
 ### Speed experiments: measured, not kept
 
-Left out, code removed:
+Left out, code removed. No switch from this list is in the release:
 
 - `EDEN_NX2_PIN_GPU_THREADS` (front and back GPU threads on performance cores of their own): no measurable change on either game.
 - `EDEN_NX2_SKIP_EMPTY_FLUSH` (a fence flush skips an empty Vulkan submit): no measurable change on either game.
@@ -32,10 +32,7 @@ Left out, code removed:
 - `EDEN_NX2_PROTECT_NO_LOCK` (protection changes without the map/unmap lock): no measurable change on either game.
 - `EDEN_NX2_ASTC_CHEAP_UPLOAD` (cheaper per-block set-up in the ASTC decoder): no measurable change on either game.
 - `EDEN_NX2_WARM_ADDON` (the shader precache build also reads a `.nup`'s add-on packages): no measurable change on Fire Emblem: Fortune's Weave; its Xenoblade Chronicles 2 runs were incomplete.
-
-Still in, off by default, while its incomplete Xenoblade Chronicles 2 runs are repeated:
-
-- `EDEN_NX2_HIRES_TIMER`: the host timer thread waits on a high resolution waitable timer (Windows 10 1803 or later only). No measurable change on Fire Emblem: Fortune's Weave.
+- `EDEN_NX2_HIRES_TIMER` (the host timer thread on a high resolution waitable timer): no measurable change on Fire Emblem: Fortune's Weave; its Xenoblade Chronicles 2 runs were incomplete.
 
 ### Command line
 

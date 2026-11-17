@@ -27,15 +27,6 @@
 # Enable only if frame pacing stability is preferred over responsive controls.
 #EDEN_NX2_FRAMES_AHEAD=2
 
-# --- Speed experiments (0.4) ---
-# Off by default. Its 0.4 measurement is being repeated. Read once when it is first needed. Values: 1
-# turns it on; unset or any other value leaves it off.
-
-# Windows only, multicore CPU emulation. The host timer thread (it delivers the guest's timed events,
-# vsync among them) waits on a high resolution waitable timer instead of a wait that follows the
-# Windows timer resolution. Windows 10 1803 or later.
-#EDEN_NX2_HIRES_TIMER=1
-
 # --- Workarounds / Debug ---
 # Terrain/indirect drawing fix for Donkey Kong Bananza: enabled by default. Set to 0 only to leave to GPU.
 #EDEN_NX2_RESETFIX=0
