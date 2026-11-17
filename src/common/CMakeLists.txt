@@ -61,6 +61,8 @@ add_library(
     assert.cpp
     assert.h
     atomic_ops.h
+    baseline_settings.cpp
+    baseline_settings.h
     bit_field.h
     bit_util.h
     bounded_threadsafe_queue.h

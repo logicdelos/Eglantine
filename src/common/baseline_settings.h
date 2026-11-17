@@ -1,0 +1,107 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#pragma once
+
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include <nlohmann/json_fwd.hpp>
+
+#include "common/common_types.h"
+
+namespace Settings {
+
+struct Values;
+
+/// The baseline settings are the settings every game is tested on: the default of every emulation
+/// setting, with every EDEN_NX2_* switch unset. There is no second table of values; the baseline
+/// is read from the settings themselves. docs/baseline.md lists it and keeps its history.
+///
+/// Raise this number, and add a line to the baseline history in docs/baseline.md, whenever a
+/// default of a baseline setting changes or a baseline setting is added or removed.
+/// src/tests/common/baseline_settings.cpp pins the list for the current version.
+namespace Baseline {
+
+inline constexpr u32 kBaselineVersion = 1;
+
+/// Settings that sit in a baseline category but belong to the user or to the running session, not
+/// to the emulation: the selected profile, the console's device name and the volume controls.
+[[nodiscard]] bool IsExcludedKey(std::string_view key);
+
+struct Entry {
+    std::string key;
+    std::string value; ///< The default of the setting as text (enums as their number).
+};
+
+struct Deviation {
+    std::string key;
+    std::string baseline;
+    std::string effective;
+    /// "global config", "per-game config", "command line", "environment switch",
+    /// "hardware fallback" or "program requirement".
+    std::string source;
+};
+
+/// An EDEN_NX2_* environment switch that is set. Every one is a deviation from the baseline.
+struct EnvironmentSwitch {
+    std::string name;
+    std::string value;
+};
+
+/// Prefix of the environment variables that are switches.
+inline constexpr std::string_view kSwitchPrefix = "EDEN_NX2_";
+
+/// The baseline, sorted by key: the default of every persisted setting in the emulation
+/// categories (core, CPU, renderer, system, audio, GPU driver), without the excluded keys.
+[[nodiscard]] std::vector<Entry> Entries(const Values& source);
+[[nodiscard]] std::vector<Entry> Entries();
+
+/// "key=value\n" for every entry, in order. This is the text that is hashed.
+[[nodiscard]] std::string CanonicalText(const std::vector<Entry>& entries);
+
+/// SHA-256 of a text as lower-case hex.
+[[nodiscard]] std::string Sha256Hex(std::string_view text);
+
+/// SHA-256 of the canonical text of the baseline, as lower-case hex.
+[[nodiscard]] std::string Hash(const std::vector<Entry>& entries);
+[[nodiscard]] std::string Hash();
+
+/// Records where the current value of a setting came from when it is not the configuration file:
+/// "command line", "hardware fallback" or "program requirement". Used by Deviations.
+void NoteSource(std::string_view key, std::string_view source);
+void ClearNotedSources();
+
+/// The EDEN_NX2_* variables that are set in the process environment.
+[[nodiscard]] std::vector<EnvironmentSwitch> SetEnvironmentSwitches();
+
+/// Every baseline setting whose effective value is not its default, plus every set environment
+/// switch, sorted by key. A setting uses the source noted for it; otherwise "per-game config"
+/// when it uses a per-game value and "global config" when not.
+[[nodiscard]] std::vector<Deviation> Deviations(const Values& source,
+                                                const std::vector<EnvironmentSwitch>& switches);
+[[nodiscard]] std::vector<Deviation> Deviations();
+
+/// True when every deviation is one of the declared keys (or there is none).
+[[nodiscard]] bool OnBaseline(const std::vector<Deviation>& deviations,
+                              const std::vector<std::string>& declared);
+
+/// Puts every baseline setting on its default and switchable ones on their global value.
+/// Controls, paths, profiles and everything else are left alone.
+void ResetToBaseline(Values& target);
+void ResetToBaseline();
+
+/// The "baseline" object of a run report:
+/// {"version","hash","requested","on_baseline","deviations":[{"key","baseline","effective",
+/// "source"}],"declared":[key...]}.
+[[nodiscard]] nlohmann::json ReportJson(bool requested, const std::vector<std::string>& declared,
+                                        const std::vector<Deviation>& deviations);
+[[nodiscard]] nlohmann::json ReportJson(bool requested, const std::vector<std::string>& declared);
+
+/// The text `--print-baseline` writes: version, hash and one "key=value" line per entry.
+[[nodiscard]] std::string PrintableText();
+
+} // namespace Baseline
+} // namespace Settings
