@@ -124,14 +124,6 @@ public:
     /// Switch 2: the front flushed this command list page with the split drained.
     virtual void NoteGpuWrittenCommandListSynced([[maybe_unused]] DAddr page) {}
 
-    /// Any thread: whether the texture or query cache may hold GPU data for the range that guest
-    /// memory lacks (an image was registered there, or a report can still land). Without caches
-    /// that can tell, assume so. (Lichii #1808)
-    [[nodiscard]] virtual bool MayHoldImagesOrReports([[maybe_unused]] DAddr addr,
-                                                      [[maybe_unused]] u64 size) {
-        return true;
-    }
-
     /// Check if the the specified memory area requires flushing to CPU Memory.
     virtual bool MustFlushRegion(DAddr addr, u64 size,
                                  VideoCommon::CacheType which = VideoCommon::CacheType::All) = 0;

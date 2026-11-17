@@ -24,50 +24,13 @@ EDEN_NX2_FENCE_BATCH=1
 # Enable only if frame pacing stability is preferred over responsive controls.
 #EDEN_NX2_FRAMES_AHEAD=2
 
-# --- Speed experiments (0.4) ---
-# These switches are off by default and unmeasured until the 0.4 release table. Each is read once
-# when it is first needed. Values: 1 turns it on; unset or any other value leaves it off.
-
-# Windows only. The front and back GPU threads of the split each get a physical performance core of
-# their own and the emulated CPU cores keep off those two. Skipped, with one log line, on CPUs with
-# too few physical performance cores and with EDEN_HYBRID_CORES=0.
-#EDEN_NX2_PIN_GPU_THREADS=1
-
-# Vulkan. A fence flush skips its queue submit when nothing was recorded since the last submit
-# (compare "submits by origin: fence" in the EDEN_NX2_GPU_PROFILE log line).
-#EDEN_NX2_SKIP_EMPTY_FLUSH=1
-
-# Windows only, multicore CPU emulation. The host timer thread (it delivers the guest's timed events,
-# vsync among them) waits on a high resolution waitable timer instead of a wait that follows the
-# Windows timer resolution. Windows 10 1803 or later.
-#EDEN_NX2_HIRES_TIMER=1
-
-# Vulkan. The GPU ASTC to BC transcode records the decode and the encode in one queue submit instead
-# of submitting after the decode. Only has an effect where ASTC is transcoded on the GPU.
-#EDEN_NX2_ASTC_ONE_SUBMIT=1
-
-# The GPU front/back thread split also runs at GPU accuracy High and with safe DMA (otherwise it only
-# runs below High); the back writes out what the caches hold of a command list before the front
-# reads it. Weaker than a plain High: watch buffer-fed effects such as the sky.
-#EDEN_NX2_SPLIT_AT_HIGH=1
-
-# Windows only. A background thread takes guest memory pages that hold only zeros out of the process
-# working set (the contents stay; a write brings the page back), so a PC low on RAM pages less. The
-# log line "Trimmed ... MiB of all-zero guest pages" shows what it did.
-#EDEN_NX2_ZERO_PAGE_TRIM=1
-
-# Windows only. Changing the protection of guest memory (the GPU caches' write traps) first tries the
-# range without the lock that map and unmap hold, and takes the lock only when the range is not inside
-# one mapped view (EDEN_NX2_PROTECT_STATS=1 logs the protection calls).
-#EDEN_NX2_PROTECT_NO_LOCK=1
+# --- Speed experiment (0.5, not released) ---
+# Off by default and unmeasured. Read once when it is first needed. Values: 1 turns it on; unset or
+# any other value leaves it off.
 
 # The shader precache build also reads the add-on packages of a .nup (Xenoblade Chronicles 2 Switch 2
 # Edition keeps its game data there). Rebuild the precache after changing it.
 #EDEN_NX2_WARM_ADDON=1
-
-# The Vulkan GPU ASTC decoder does its per-block set-up once per block instead of once per texel (same
-# results), and the opaque-ASTC scan reads the guest data in place when it is in one piece.
-#EDEN_NX2_ASTC_CHEAP_UPLOAD=1
 
 # Attribution of long frames (over 100 ms) and of the first minutes to causes (disk, shader
 # compilation, translation, decompression, waits), written into the run report. On by default;

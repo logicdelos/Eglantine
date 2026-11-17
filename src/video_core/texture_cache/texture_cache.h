@@ -3608,23 +3608,9 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         if (IsPixelFormatASTC(new_info.format) && runtime.UseOpaqueAstcFormat()) {
             const size_t scan_bytes = CalculateGuestSizeInBytes(new_info);
             if (scan_bytes <= MaxScanBytes) {
-                // Opt-in (default off): EDEN_NX2_ASTC_CHEAP_UPLOAD=1 scans the data where it is
-                // when it is in one piece, and copies it (into the scratch buffer) only when the
-                // range is split. Off: the data is always copied into the vector. Read once.
-                static const bool scan_in_place = [] {
-                    const char* value = std::getenv("EDEN_NX2_ASTC_CHEAP_UPLOAD");
-                    return value != nullptr && value[0] == '1';
-                }();
-                if (scan_in_place) {
-                    Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead>
-                        scan_data(*gpu_memory, gpu_addr, scan_bytes, &astc_scan_scratch);
-                    new_info.astc_opaque = AstcDataLooksOpaque(
-                        std::span<const u8>{scan_data.data(), scan_data.size()});
-                } else {
-                    astc_scan_buffer.resize(scan_bytes);
-                    gpu_memory->ReadBlockUnsafe(gpu_addr, astc_scan_buffer.data(), scan_bytes);
-                    new_info.astc_opaque = AstcDataLooksOpaque(astc_scan_buffer);
-                }
+                astc_scan_buffer.resize(scan_bytes);
+                gpu_memory->ReadBlockUnsafe(gpu_addr, astc_scan_buffer.data(), scan_bytes);
+                new_info.astc_opaque = AstcDataLooksOpaque(astc_scan_buffer);
                 ++(new_info.astc_opaque ? astc_opaque_images : astc_alpha_images);
             }
         }

@@ -2245,10 +2245,6 @@ bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheT
     return false;
 }
 
-bool RasterizerVulkan::MayHoldImagesOrReports(DAddr addr, u64 size) {
-    return texture_cache.page_filter.Any(addr, size) || query_cache.page_filter.Any(addr, size);
-}
-
 VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64 size) {
     // Guest cores ask this on reads of cached pages, and the GPU thread holds both caches' locks
     // through each draw. Pages no image was ever registered on, and Switch 2 pages the GPU never
@@ -2590,12 +2586,6 @@ void RasterizerVulkan::FlushCommands() {
         return;
     }
     draw_counter = 0;
-    // A fence with a download is submitted by InnerFence::Queue, and SignalFence then comes here
-    // with nothing recorded since: an empty submit followed by a full rebind (Lichii #1329, from
-    // Fritchii c338269b92). EDEN_NX2_SKIP_EMPTY_FLUSH=1 skips it (off by default, for A/B runs).
-    if (scheduler.SkipEmptyFlush() && !scheduler.RecordedSinceSubmit()) {
-        return;
-    }
     // Fences with downloads or queries come here right after queueing: ~9,400 a second in
     // Hyrule Warriors: Age of Imprisonment fights. Batched like the fences themselves.
     if (!scheduler.DeferFlush()) {

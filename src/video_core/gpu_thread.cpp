@@ -185,7 +185,6 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
         Nx2Bottleneck::MarkThread(Nx2Bottleneck::Thread::Gpu);
         Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
         Common::SetCurrentThreadToPerformanceCores();
-        Common::PinCurrentThread(Common::PinnedRole::GpuFront);
         system.RegisterHostThread();
 
         auto current_context = context.Acquire();

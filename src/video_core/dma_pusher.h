@@ -251,12 +251,6 @@ public:
     bool ReadGpuWrittenCommands(GPUVAddr address, u32 count);
     /// Brings command list words the GPU wrote (still only in host buffers) to guest memory.
     void FlushGpuWrittenCommands(GPUVAddr address, size_t size);
-    /// A safe read of a command list on the split's front: what the texture and query caches hold
-    /// of the list (images, reports) is written out on the back after the work sent before it, as
-    /// a safe read flushes it. Only a list read from memory (`live`) or one an image wrote is
-    /// flushed. After an image write every cache is flushed, the buffer cache too, and it
-    /// returns true: the list is read from guest memory, not from its submit-time copy.
-    bool FlushCachedCommands(GPUVAddr address, size_t size, bool live);
 
 private:
 

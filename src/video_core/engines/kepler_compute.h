@@ -302,13 +302,6 @@ public:
     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                               const u32* base_start, u32 amount, u32 methods_pending,
                               const GPUVAddr* segment);
-    /// The split stopped: hands the macros back to the engine when the front owns them
-    /// (ReleaseFront), so a restart that keeps them on the back starts clean.
-    void ReleaseFrontIfOwned() {
-        if (front) {
-            ReleaseFront();
-        }
-    }
 
 private:
     struct FrontState;

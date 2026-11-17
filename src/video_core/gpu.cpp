@@ -130,15 +130,6 @@ struct GPU::Impl {
         }
     }
 
-    void ReleaseFrontMacros() {
-        for (auto& [id, channel] : channels) {
-            if (channel->payload) {
-                channel->payload->maxwell_3d.ReleaseFrontIfOwned();
-                channel->payload->kepler_compute.ReleaseFrontIfOwned();
-            }
-        }
-    }
-
     /// Signal the ending of command list.
     void OnCommandListEnd() {
         renderer->ReadRasterizer()->ReleaseFences(false);
@@ -520,10 +511,6 @@ void GPU::InvalidateGPUCache() {
 
 void GPU::ForEachPendingCpuWrite(const std::function<void(DAddr, size_t)>& callback) {
     impl->ForEachPendingCpuWrite(callback);
-}
-
-void GPU::ReleaseFrontMacros() {
-    impl->ReleaseFrontMacros();
 }
 
 void GPU::OnCommandListEnd() {

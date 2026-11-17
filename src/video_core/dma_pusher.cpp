@@ -228,12 +228,10 @@ bool DmaPusher::Step() {
             }
         }
         // A resumed entry is read again: the words after the acquire may be new by now.
-        // A safe read flushes the caches, which belong to the split's back thread while it runs:
-        // there the GPU-written list tracking below and FlushCachedCommands take its place
-        // (Lichii #1808; the settings can change mid-game).
-        const bool safe_reads =
-            Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh() : Settings::IsDMALevelSafe();
-        const bool use_safe = !VideoCommon::GpuSplit::Get().Active() && safe_reads;
+        // A safe read flushes the caches, which belong to the split's back thread while it runs
+        // (the split only starts with unsafe reads; the settings can change mid-game).
+        const bool use_safe = !VideoCommon::GpuSplit::Get().Active() &&
+                              (Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh() : Settings::IsDMALevelSafe());
         // The split's back marks the pages GPU work writes as it runs that work: a page first
         // written by a dispatch or copy still queued for it reads as unwritten, and its words as
         // stale (Fast Fusion's culling fills in instanced draws' arguments; stale ones asked for
@@ -261,22 +259,11 @@ bool DmaPusher::Step() {
                 }
             }
         }
-        // EDEN_NX2_SPLIT_AT_HIGH=1 (off by default): safe reads on the split. They wait for all of
-        // the work before the last host-level wait, draws included: a queued draw may write the
-        // list's page for the first time.
-        const bool split_safe = !skip_record_read && safe_reads &&
-                                VideoCommon::GpuSplit::AtHighAccuracy() &&
-                                VideoCommon::GpuSplit::Get().Active();
-        if (split_safe) {
-            VideoCommon::GpuSplit::Get().WaitForSync();
-            gpu_written =
-                IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
-        }
         // The words as submitted, unless this is a resumed entry or the GPU has newer ones the
         // safe read below would flush (with the split, the front can't tell: it reads memory
         // unflushed anyway). Entries on pages the GPU writes (culling) always take the flushing
         // read: their words at submit time are an older frame's.
-        bool submitted = command_resume_offset < header.size &&
+        const bool submitted = command_resume_offset < header.size &&
                                dma_pushbuffer_subindex < command_list.submitted_offsets.size() &&
                                (command_list.snapshot_suspensions & 1) == 0 &&
                                command_list.snapshot_suspensions ==
@@ -287,14 +274,6 @@ bool DmaPusher::Step() {
                                !gpu_written &&
                                !(use_safe && memory_manager.IsMemoryDirty(dma_state.dma_get,
                                                                           header.size * sizeof(u32)));
-        // Texture and query caches may hold what the list's pages should: write it out on the back.
-        // After an image write every cache is flushed and the list is read from guest memory.
-        const bool caches_flushed =
-            split_safe &&
-            FlushCachedCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32), !submitted);
-        if (caches_flushed) {
-            submitted = false;
-        }
         // Off by default: the check below reads memory and allocates for each entry it checks.
         // EDEN_NX2_PERF_VERIFY=1 turns it on.
         static const bool check_parsed_entries = VideoCommon::Nx2Perf::Verify();
@@ -366,7 +345,7 @@ bool DmaPusher::Step() {
             RecordParsedEntry(header, commands);
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
-        } else if (skip_record_read || caches_flushed) {
+        } else if (skip_record_read) {
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::UnsafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
             RecordParsedEntry(header, commands);
@@ -953,39 +932,6 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
         chunk = chunk_end;
     }
     return true;
-}
-
-bool DmaPusher::FlushCachedCommands(GPUVAddr address, size_t size, bool live) {
-    if (rasterizer == nullptr) {
-        return false;
-    }
-    // The back registers images and reports as it runs: look once the work the GPU fetches this
-    // list after (everything before the last host-level wait) has run.
-    auto& split = VideoCommon::GpuSplit::Get();
-    split.WaitForSync();
-    bool cached = false;
-    for (GPUVAddr chunk = address; chunk < address + size && !cached;) {
-        const GPUVAddr chunk_end = (std::min)(address + size, (chunk & ~GPUVAddr{0xfff}) + 0x1000);
-        const auto device = memory_manager.GpuToCpuAddress(chunk);
-        cached = device && rasterizer->MayHoldImagesOrReports(*device, chunk_end - chunk);
-        chunk = chunk_end;
-    }
-    if (!cached) {
-        return false;
-    }
-    bool image_written = false;
-    split.Run(
-        [memory = &memory_manager, address, size, live, image_written = &image_written] {
-            using VideoCommon::CacheType;
-            *image_written = memory->IsMemoryDirty(address, size, CacheType::TextureCache);
-            if (*image_written) {
-                memory->FlushRegion(address, size, CacheType::All);
-            } else if (live) {
-                memory->FlushRegion(address, size, CacheType::TextureCache | CacheType::QueryCache);
-            }
-        },
-        VideoCommon::DrainSite::SafeRead);
-    return image_written;
 }
 
 void DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
