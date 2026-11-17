@@ -9,13 +9,10 @@
 
 #ifdef _WIN32
 
-#include <algorithm>
 #include <iterator>
 #include "common/container/unordered_map.h"
 #include <boost/icl/separate_interval_set.hpp>
 #include <windows.h>
-#include <psapi.h>
-#include <vector>
 #include "common/dynamic_library.h"
 
 #else // ^^^ Windows ^^^ vvv POSIX vvv
@@ -278,25 +275,9 @@ public:
     void Unmap(size_t virtual_offset, size_t length) {
         std::scoped_lock lock{placeholder_mutex};
 
-        // Odd while views are being taken apart and put back, see Protect.
-        if (ProtectWithoutLockEnabled()) {
-            unmap_generation.fetch_add(1, std::memory_order_seq_cst);
-        }
         // Unmap until there are no more placeholders
         while (UnmapOnePlaceholder(virtual_offset, length)) {
         }
-        if (ProtectWithoutLockEnabled()) {
-            unmap_generation.fetch_add(1, std::memory_order_seq_cst);
-        }
-    }
-
-    /// EDEN_NX2_PROTECT_NO_LOCK=1, read once.
-    static bool ProtectWithoutLockEnabled() {
-        static const bool enabled = [] {
-            const char* const value = std::getenv("EDEN_NX2_PROTECT_NO_LOCK");
-            return value != nullptr && value[0] == '1';
-        }();
-        return enabled;
     }
 
     void Protect(size_t virtual_offset, size_t length, bool read, bool write, bool execute) {
@@ -312,32 +293,6 @@ public:
         }
         const size_t virtual_end = virtual_offset + length;
 
-        // EDEN_NX2_PROTECT_NO_LOCK=1: try the whole range without the lock first. Nearly every
-        // call protects a range inside one mapped view, which VirtualProtect does whole. It
-        // refuses a range that reaches a placeholder or a second view (one Map or Unmap is making
-        // or taking apart, or a range across views): those take the lock below, which gives the
-        // whole range the same flags. Map and Unmap hold the lock across their kernel calls,
-        // which slow down when a game maps memory in bulk (zone changes): write-trap protections,
-        // thousands a second, then queued behind them.
-        //
-        // A partial Unmap takes the whole view away and maps the parts that stay again as
-        // read-write, so a protection applied meanwhile to one of those parts would be lost
-        // although VirtualProtect succeeded. Unmap makes unmap_generation odd for as long as it
-        // works: an attempt only counts when the generation was even before it and the same after
-        // it, otherwise the protection is applied again under the lock, after the Unmap, as it
-        // would have been without the switch. Nothing outside this class orders Protect against
-        // Map or Unmap (Memory::UnmapRegion and Memory::RasterizerMarkRegionCached share no lock).
-        if (ProtectWithoutLockEnabled()) {
-            const u32 before = unmap_generation.load(std::memory_order_seq_cst);
-            if ((before & 1) == 0) {
-                DWORD old_flags{};
-                if (VirtualProtect(virtual_base + virtual_offset, length, new_flags, &old_flags) &&
-                    unmap_generation.load(std::memory_order_seq_cst) == before) {
-                    return;
-                }
-            }
-        }
-
         std::scoped_lock lock{placeholder_mutex};
         auto [it, end] = placeholders.equal_range({virtual_offset, virtual_end});
         while (it != end) {
@@ -349,22 +304,6 @@ public:
             }
             ++it;
         }
-    }
-
-    std::atomic<u32> unmap_generation{}; ///< Even: no Unmap is working (EDEN_NX2_PROTECT_NO_LOCK)
-
-    /// Backing offset the view page at virtual_offset maps, or nullopt when it is not mapped.
-    std::optional<size_t> BackingOffset(size_t virtual_offset) {
-        std::scoped_lock lock{placeholder_mutex};
-        const auto it = placeholders.find(virtual_offset);
-        if (it == placeholders.end()) {
-            return std::nullopt;
-        }
-        const auto host_pointer_it = placeholder_host_pointers.find(it->lower());
-        if (host_pointer_it == placeholder_host_pointers.end()) {
-            return std::nullopt;
-        }
-        return host_pointer_it->second + virtual_offset - it->lower();
     }
 
     void EnableDirectMappedAddress() {
@@ -966,30 +905,6 @@ HostMemory::HostMemory(HostMemory&&) noexcept = default;
 
 HostMemory& HostMemory::operator=(HostMemory&&) noexcept = default;
 
-bool HostMemory::ZeroPageTrimEnabled() noexcept {
-#ifdef _WIN32
-    static const bool enabled = [] {
-        const char* const value = std::getenv("EDEN_NX2_ZERO_PAGE_TRIM");
-        return value != nullptr && value[0] == '1';
-    }();
-    return enabled;
-#else
-    return false;
-#endif
-}
-
-namespace {
-std::atomic<u64> g_mapped_bytes{};
-
-/// Counts the bytes Map, Unmap and Protect cover, for the zero-page trim to wait out bulk
-/// mapping. With the trim off this is one test of a constant.
-[[maybe_unused]] void NoteMappedBytes(size_t length) noexcept {
-    if (HostMemory::ZeroPageTrimEnabled()) {
-        g_mapped_bytes.fetch_add(length, std::memory_order_relaxed);
-    }
-}
-} // namespace
-
 void HostMemory::Map(size_t virtual_offset, size_t host_offset, size_t length, MemoryPermission perms, bool separate_heap) {
 #if !(defined(__OPENORBIS__) || defined(__managarm__))
     ASSERT(virtual_offset % PageAlignment == 0);
@@ -1000,7 +915,6 @@ void HostMemory::Map(size_t virtual_offset, size_t host_offset, size_t length, M
     if (length == 0 || !virtual_base || !impl) {
         return;
     }
-    NoteMappedBytes(length);
     impl->Map(virtual_offset + virtual_base_offset, host_offset, length, perms);
 #endif
 }
@@ -1013,7 +927,6 @@ void HostMemory::Unmap(size_t virtual_offset, size_t length, bool separate_heap)
     if (length == 0 || !virtual_base || !impl) {
         return;
     }
-    NoteMappedBytes(length);
     impl->Unmap(virtual_offset + virtual_base_offset, length);
 #endif
 }
@@ -1029,7 +942,6 @@ void HostMemory::Protect(size_t virtual_offset, size_t length, MemoryPermission 
     const bool read = True(perm & MemoryPermission::Read);
     const bool write = True(perm & MemoryPermission::Write);
     const bool execute = True(perm & MemoryPermission::Execute);
-    NoteMappedBytes(length);
     impl->Protect(virtual_offset + virtual_base_offset, length, read, write, execute);
 #endif
 }
@@ -1197,118 +1109,6 @@ ColdHintAction HostMemory::HintCold(size_t physical_offset, size_t length,
     return page_out ? ColdHintAction::PagedOut : ColdHintAction::MarkedCold;
 }
 
-namespace {
-std::atomic<u64> g_zero_filled_bytes{};
-
-[[maybe_unused]] bool IsZeroPage(const u8* page) {
-    // Stops at the first non-zero line. Read whole, the ~6 GB of resident guest pages took
-    // 1.35-1.47 s a pass, and most pages hold data in their first bytes.
-    const auto* words = reinterpret_cast<const u64*>(page);
-    constexpr size_t LineWords = 8; // 64 bytes
-    for (size_t i = 0; i < PageAlignment / sizeof(u64); i += LineWords) {
-        u64 bits = 0;
-        for (size_t j = 0; j < LineWords; ++j) {
-            bits |= words[i + j];
-        }
-        if (bits != 0) {
-            return false;
-        }
-    }
-    return true;
-}
-} // namespace
-
-u64 HostMemory::ZeroFilledBytes() noexcept {
-    return g_zero_filled_bytes.load(std::memory_order_relaxed);
-}
-
-u64 HostMemory::MappedBytes() noexcept {
-    return g_mapped_bytes.load(std::memory_order_relaxed);
-}
-
-std::pair<size_t, size_t> HostMemory::TrimZeroPages() const {
-#ifdef _WIN32
-    if (backing_base == nullptr) {
-        return {0, 0};
-    }
-    std::vector<ULONG_PTR> entries(size_t{1} << 22);
-    for (int attempt = 0;; ++attempt) {
-        if (K32QueryWorkingSet(GetCurrentProcess(), entries.data(),
-                               static_cast<DWORD>(entries.size() * sizeof(ULONG_PTR)))) {
-            break;
-        }
-        if (GetLastError() != ERROR_BAD_LENGTH || attempt == 3) {
-            return {0, 0};
-        }
-        entries.assign((std::max)(entries.size() * 2, size_t{entries[0]} + (size_t{1} << 18)), 0);
-    }
-    const size_t count = (std::min)(size_t{entries[0]}, entries.size() - 1);
-    const auto backing_begin = reinterpret_cast<uintptr_t>(backing_base);
-    const auto view_begin = reinterpret_cast<uintptr_t>(impl ? impl->virtual_base : nullptr);
-    const size_t view_size = impl ? impl->virtual_size : 0;
-    std::vector<uintptr_t> backing_pages;
-    std::vector<uintptr_t> view_pages;
-    for (size_t i = 1; i <= count; ++i) {
-        const uintptr_t page = entries[i] & ~uintptr_t{PageAlignment - 1};
-        if (page - backing_begin < backing_size) {
-            backing_pages.push_back(page);
-        } else if (view_begin != 0 && page - view_begin < view_size) {
-            view_pages.push_back(page);
-        }
-    }
-    std::sort(backing_pages.begin(), backing_pages.end());
-    // Pages are only ever read through the backing, which stays mapped and writable: a view page
-    // can be unmapped or protected by a guest thread meanwhile. Trimming keeps the contents, so a
-    // write that lands after the check costs a soft fault and nothing else.
-    std::vector<uintptr_t> trim;
-    size_t zero_bytes = 0;
-    for (const uintptr_t page : backing_pages) {
-        if (IsZeroPage(reinterpret_cast<const u8*>(page))) {
-            trim.push_back(page);
-            zero_bytes += PageAlignment;
-        }
-    }
-    for (const uintptr_t page : view_pages) {
-        const auto offset = impl->BackingOffset(page - view_begin);
-        if (!offset || *offset >= backing_size) {
-            continue;
-        }
-        const uintptr_t backing_page = backing_begin + *offset;
-        if (IsZeroPage(reinterpret_cast<const u8*>(backing_page))) {
-            trim.push_back(page);
-            zero_bytes += PageAlignment;
-        }
-        // Reading it put the backing page in the working set: take it out again.
-        if (!std::binary_search(backing_pages.begin(), backing_pages.end(), backing_page)) {
-            trim.push_back(backing_page);
-        }
-    }
-    std::sort(trim.begin(), trim.end());
-    trim.erase(std::unique(trim.begin(), trim.end()), trim.end());
-    // A run can span two views, which VirtualUnlock refuses as a whole: then page by page.
-    const auto unlock = [](uintptr_t begin, uintptr_t end) {
-        if (VirtualUnlock(reinterpret_cast<void*>(begin), end - begin) ||
-            GetLastError() == ERROR_NOT_LOCKED) {
-            return;
-        }
-        for (uintptr_t page = begin; page < end; page += PageAlignment) {
-            VirtualUnlock(reinterpret_cast<void*>(page), PageAlignment);
-        }
-    };
-    for (size_t i = 0; i < trim.size();) {
-        size_t j = i + 1;
-        while (j < trim.size() && trim[j] == trim[j - 1] + PageAlignment) {
-            ++j;
-        }
-        unlock(trim[i], trim[j - 1] + PageAlignment);
-        i = j;
-    }
-    return {(backing_pages.size() + view_pages.size()) * PageAlignment, zero_bytes};
-#else
-    return {0, 0};
-#endif
-}
-
 void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 fill_value) {
     if (length == 0) {
         return;
@@ -1343,9 +1143,6 @@ void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 f
 #endif
             if (!cleared) {
                 std::memset(backing_base + offset, 0, clear_end - offset);
-                if (ZeroPageTrimEnabled()) {
-                    g_zero_filled_bytes.fetch_add(clear_end - offset, std::memory_order_relaxed);
-                }
             }
             if (whole) {
                 granules[index].fetch_and(static_cast<u8>(~GranuleDirty), std::memory_order_release);

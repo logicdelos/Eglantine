@@ -14,23 +14,28 @@ All runs were made on one Windows 11 laptop: AMD Ryzen 9 8940HX, NVIDIA GeForce 
 
 ## 0.4.0 (unreleased)
 
-Milestone 0.4, "Measured speed work": every speed change ships off by default behind an `EDEN_NX2_*` switch and is measured on and off before it is recommended. None of the switches below has been measured yet; the results are to be filled from the measurement table. Each is described in `dist/nx2_switches.txt`; `=1` turns it on.
+Milestone 0.4, "Measured speed work": every speed change ships off by default behind an `EDEN_NX2_*` switch and is measured on and off before it is recommended. Nine candidates were measured on Fire Emblem: Fortune's Weave and Xenoblade Chronicles 2; a candidate is kept only with a gain beyond the measured spread on one game, no loss beyond the spread on the other and the picture within the limit. The figures, with scene, settings, hardware and method, are in the 0.4.0 release notes.
 
 ### Accuracy policy
 
 - `tools/check_accuracy_policy.py` freezes the existing per-game exceptions in `tools/accuracy_policy_allowlist.json` and fails any change that adds one (title or program id literals and comparisons, game names, shader or build hashes, workaround switches, layout and patch constants, override paths, per-game data files). The rule is in `fork-notes/accuracy-policy.md`; its tests are in `tools/integration/test_accuracy_policy.py`. No emulator behaviour changes.
 
-### Speed experiments (measurement build; the release keeps only those with a measured gain)
+### Speed experiments: measured, not kept
 
-- `EDEN_NX2_PIN_GPU_THREADS`: pins the front and back GPU threads to physical performance cores of their own and keeps the emulated CPU cores off them (Windows only). Results: to be filled from the measurement table.
-- `EDEN_NX2_SKIP_EMPTY_FLUSH`: a fence flush skips its Vulkan queue submit when nothing was recorded since the last submit. Results: to be filled from the measurement table.
-- `EDEN_NX2_HIRES_TIMER`: the host timer thread waits on a high resolution waitable timer (Windows 10 1803 or later only). Results: to be filled from the measurement table.
-- `EDEN_NX2_ASTC_ONE_SUBMIT`: the GPU ASTC to BC transcode records the decode and the encode in one submit. Results: to be filled from the measurement table.
-- `EDEN_NX2_SPLIT_AT_HIGH`: the GPU front/back thread split also runs at GPU accuracy High and with safe DMA. Results: to be filled from the measurement table.
-- `EDEN_NX2_ZERO_PAGE_TRIM`: a background thread takes all-zero guest memory pages out of the process working set (Windows only). Results: to be filled from the measurement table.
-- `EDEN_NX2_PROTECT_NO_LOCK`: guest memory protection changes first try the range without the map/unmap lock (Windows only). Results: to be filled from the measurement table.
-- `EDEN_NX2_WARM_ADDON`: the shader precache build also reads the add-on packages of a `.nup`. Results: to be filled from the measurement table.
-- `EDEN_NX2_ASTC_CHEAP_UPLOAD`: cheaper per-block set-up in the Vulkan GPU ASTC decoder, and the opaque-ASTC scan reads guest data in place. Results: to be filled from the measurement table.
+Left out, code removed:
+
+- `EDEN_NX2_PIN_GPU_THREADS` (front and back GPU threads on performance cores of their own): no measurable change on either game.
+- `EDEN_NX2_SKIP_EMPTY_FLUSH` (a fence flush skips an empty Vulkan submit): no measurable change on either game.
+- `EDEN_NX2_ASTC_ONE_SUBMIT` (ASTC to BC transcode in one submit): picture broken on Xenoblade Chronicles 2, above the 0.06 limit.
+- `EDEN_NX2_SPLIT_AT_HIGH` (GPU thread split at accuracy High): slower beyond the spread on Fire Emblem: Fortune's Weave, with a host crash in one pass.
+- `EDEN_NX2_ZERO_PAGE_TRIM` (all-zero guest pages out of the working set): no measurable change on either game.
+- `EDEN_NX2_PROTECT_NO_LOCK` (protection changes without the map/unmap lock): no measurable change on either game.
+- `EDEN_NX2_ASTC_CHEAP_UPLOAD` (cheaper per-block set-up in the ASTC decoder): no measurable change on either game.
+
+Still in, off by default, while their incomplete Xenoblade Chronicles 2 runs are repeated:
+
+- `EDEN_NX2_HIRES_TIMER`: the host timer thread waits on a high resolution waitable timer (Windows 10 1803 or later only). No measurable change on Fire Emblem: Fortune's Weave.
+- `EDEN_NX2_WARM_ADDON`: the shader precache build also reads the add-on packages of a `.nup`. No measurable change on Fire Emblem: Fortune's Weave.
 
 ### Command line
 

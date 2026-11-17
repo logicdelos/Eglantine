@@ -11,7 +11,6 @@
 
 #include <chrono>
 #include <condition_variable>
-#include <cstdlib>
 #include <cstddef>
 #include <functional>
 #include <memory>
@@ -243,25 +242,6 @@ public:
             });
     }
 
-    /// Whether EDEN_NX2_SKIP_EMPTY_FLUSH=1 (off by default).
-    [[nodiscard]] bool SkipEmptyFlush() const noexcept {
-        return skip_empty_flush;
-    }
-
-    /// Whether anything was recorded since the last Flush or Finish, or waits to be: commands in
-    /// the current chunk or in chunks already dispatched without a submit, batched uploads and a
-    /// deferred clear (the last two reach the command buffer only at the next record or submit).
-    /// Only valid while SkipEmptyFlush().
-    [[nodiscard]] bool RecordedSinceSubmit() const noexcept {
-        return dispatched_since_submit || !chunk->Empty() || uploads_pending ||
-               deferred_clear.framebuffer != nullptr;
-    }
-
-    static bool ReadSkipEmptyFlush() {
-        const char* const value = std::getenv("EDEN_NX2_SKIP_EMPTY_FLUSH");
-        return value != nullptr && value[0] == '1';
-    }
-
     /// Whether the recording thread submitted `tick` within 20 ms.
     [[nodiscard]] bool WaitForSubmission(u64 tick) const {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{20};
@@ -479,11 +459,6 @@ private:
     std::unique_ptr<CommandPool> command_pool;
     std::unique_ptr<UploadBatch> upload_batch;
     bool uploads_pending{};
-    /// EDEN_NX2_SKIP_EMPTY_FLUSH, read once. Only then DispatchWork tracks dispatched_since_submit.
-    bool skip_empty_flush{ReadSkipEmptyFlush()};
-    /// A chunk without a submit was handed to the worker since the last submit chunk (only
-    /// maintained while skip_empty_flush is on).
-    bool dispatched_since_submit{};
     void FlushUploads();
 
     VideoCommon::QueryCacheBase<QueryCacheParams>* query_cache = nullptr;

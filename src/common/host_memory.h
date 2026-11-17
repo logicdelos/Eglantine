@@ -9,7 +9,6 @@
 
 #pragma once
 
-#include <utility>
 #include <atomic>
 #include <memory>
 #include <optional>
@@ -88,22 +87,6 @@ public:
     /// background thread.
     ColdHintAction HintCold(size_t physical_offset, size_t length,
                             std::optional<size_t> virtual_offset) const;
-    /// Windows: resident pages of guest memory (backing and its views) that hold only zeros leave
-    /// the working set, like HintCold. Returns {resident bytes looked at, bytes trimmed}.
-    std::pair<size_t, size_t> TrimZeroPages() const;
-
-    /// EDEN_NX2_ZERO_PAGE_TRIM=1 (read once; Windows only, false elsewhere): Core::DeviceMemory
-    /// then runs TrimZeroPages in the background and the counters below are kept.
-    static bool ZeroPageTrimEnabled() noexcept;
-
-    /// Bytes ClearBackingRegion has filled with zeros (memset) since start (only counted while
-    /// ZeroPageTrimEnabled).
-    static u64 ZeroFilledBytes() noexcept;
-
-    /// Bytes Map, Unmap and Protect have covered since start (only counted while
-    /// ZeroPageTrimEnabled).
-    static u64 MappedBytes() noexcept;
-
     /// Pages the kernel hands out (cleared or not).
     void MarkUsed(size_t physical_offset, size_t length);
 

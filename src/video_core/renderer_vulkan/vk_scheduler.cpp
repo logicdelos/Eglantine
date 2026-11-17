@@ -170,11 +170,6 @@ void Scheduler::DispatchWork() {
         FlushUploads();
     }
     if (chunk && !chunk->Empty()) {
-        if (skip_empty_flush) {
-            // A submit chunk ends everything recorded so far; any other chunk leaves work that
-            // the next submit still has to carry.
-            dispatched_since_submit = !chunk->HasSubmit();
-        }
         // Waking the worker is a system call (~2% of the GPU thread at one dispatch per 8
         // draws): skip it while the worker is still busy, it pops the queue before waiting.
         bool wake;

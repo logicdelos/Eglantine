@@ -154,9 +154,6 @@ public:
     /// Calls `callback` for each CPU write into GPU-written memory that InvalidateGPUCache has not
     /// applied yet.
     void ForEachPendingCpuWrite(const std::function<void(DAddr, size_t)>& callback);
-    /// The GPU thread split stopped: every channel's 3D and compute engine takes its macros back
-    /// from the split's front (they run on the back from here, or on a fresh front mirror).
-    void ReleaseFrontMacros();
     /// Signal the ending of command list.
     void OnCommandListEnd();
 
