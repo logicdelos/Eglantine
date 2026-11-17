@@ -146,8 +146,10 @@ TEST_CASE("The early scan records the mistakes with the fork options", "[launch_
 
     // An argument that an option takes is not a missing one, and an option is not misused when
     // it is spelled right.
-    CHECK(Scan({"--version", "--json", "--baseline-allow", "key=1"}).error.empty());
-    CHECK(Scan({"--version", "--json", "--baseline-allow=key=1"}).error.empty());
+    CHECK(Scan({"--version", "--json", "--baseline", "--baseline-allow", "use_docked_mode=0"})
+              .error.empty());
+    CHECK(Scan({"--version", "--json", "--baseline", "--baseline-allow=use_docked_mode=0"})
+              .error.empty());
     CHECK(Scan({"--version", "--json", "--report", "out.json"}).error.empty());
     CHECK(Scan({"--version", "--json", "--baseline"}).error.empty());
     CHECK(Scan({"--version", "--json", "--print-baseline"}).error.empty());
@@ -226,9 +228,9 @@ TEST_CASE("--baseline refuses a --set of a baseline setting that is not declared
     // The order on the command line does not matter.
     CHECK(Scan({"--set", "resolution_setup=3", "--baseline"}).error == refused);
     CHECK(Scan({"--set=resolution_setup=3", "-g", "game.nsp", "--baseline"}).error == refused);
-    // Given twice, it is named once.
+    // Given twice, it is the mistake the full parse names first.
     CHECK(Scan({"--baseline", "--set", "resolution_setup=3", "--set", "resolution_setup=2"})
-              .error == refused);
+              .error == "--set resolution_setup was given more than once");
     // --version --json is refused too, so the build identity is not printed.
     const auto version = Scan({"--version", "--json", "--baseline", "--set", "resolution_setup=3"});
     CHECK(version.version_json);
@@ -237,15 +239,45 @@ TEST_CASE("--baseline refuses a --set of a baseline setting that is not declared
     // Declared, in either form the baseline accepts, before or after the --set.
     CHECK(Scan({"--baseline", "--baseline-allow", "resolution_setup", "--set", "resolution_setup=3"})
               .error.empty());
-    CHECK(Scan({"--set", "resolution_setup=3", "--baseline-allow=use_docked_mode,resolution_setup=2",
+    CHECK(Scan({"--set", "resolution_setup=3", "--baseline-allow=use_docked_mode=0,resolution_setup",
                 "--baseline"})
               .error.empty());
     // A setting outside the baseline, and --set without --baseline, are not refused.
     CHECK(Scan({"--baseline", "--set", "log_filter=*:Debug"}).error.empty());
     CHECK(Scan({"--set", "resolution_setup=3"}).error.empty());
     CHECK(Scan({"--version", "--json", "--set", "resolution_setup=3"}).error.empty());
-    // The value is never read as an option, and the name of a malformed request is not guessed.
-    CHECK(Scan({"--baseline", "--set", "=3"}).error.empty());
+    // The value is never read as an option.
+    CHECK(Scan({"--baseline", "--set", "log_filter=--baseline=1"}).error.empty());
+}
+
+TEST_CASE("The early scan refuses what --baseline-allow and --set get wrong", "[launch_params]") {
+    // Each ends in exit code 64 before the user directory is created.
+    CHECK(Scan({"--user-dir", "fresh", "--baseline", "--baseline-allow", "not_a_key"}).error ==
+          "--baseline-allow: 'not_a_key' is neither a baseline setting nor an EDEN_NX2_ switch "
+          "name");
+    CHECK(Scan({"--baseline", "--baseline-allow", "no_such_setting=1"}).error ==
+          "--baseline-allow: 'no_such_setting' is not a baseline setting");
+    CHECK_FALSE(Scan({"--baseline", "--baseline-allow", "anti_aliasing=nonsense"}).error.empty());
+    CHECK(Scan({"--baseline", "--baseline-allow", "use_docked_mode,,quest_flag"}).error ==
+          "invalid --baseline-allow 'use_docked_mode,,quest_flag': expected KEY[,KEY...], each "
+          "KEY or KEY=VALUE");
+    CHECK(Scan({"--user-dir", "fresh", "--baseline-allow", "use_docked_mode"}).error ==
+          "--baseline-allow needs --baseline");
+    // A --set given twice, declared or not, with or without --baseline.
+    const std::string twice = "--set resolution_setup was given more than once";
+    CHECK(Scan({"--set", "resolution_setup=3", "--set=resolution_setup=2"}).error == twice);
+    CHECK(Scan({"--baseline", "--baseline-allow", "resolution_setup", "--set",
+                "resolution_setup=3", "--set", "resolution_setup=2"})
+              .error == twice);
+    // A malformed --set, without repeating its text (the value may be a credential).
+    CHECK(Scan({"--user-dir", "fresh", "--set", "=3"}).error ==
+          "--set expects name=value, with a name and an equals sign");
+    CHECK(Scan({"--version", "--json", "--set", "no_equals"}).error ==
+          "--set expects name=value, with a name and an equals sign");
+    // An EDEN_NX2_ switch name is a valid bare item.
+    CHECK(Scan({"--baseline", "--baseline-allow", "EDEN_NX2_SPLIT"}).error.empty());
+    // A declared bare item is accepted with --print-baseline too, wherever --baseline stands.
+    CHECK(Scan({"--print-baseline", "--baseline-allow", "quest_flag", "--baseline"}).error.empty());
 }
 
 TEST_CASE("A trailing --set or --control says what the full parse says", "[launch_params]") {

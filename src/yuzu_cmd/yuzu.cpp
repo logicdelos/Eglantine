@@ -640,22 +640,15 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         argument_error = CliSettings::Resolve(lp.setting_overrides, setting_overrides);
     }
     if (argument_error.empty() && lp.baseline) {
-        // Checked before the run starts, on a scratch copy of the settings: a declared value that
-        // does not exist or is not accepted, and an EDEN_NX2_* switch that is set but not named.
-        const auto scratch = std::make_unique<Settings::Values>();
-        argument_error = Settings::Baseline::ApplyAllowedValues(*scratch, lp.baseline_allow);
-        Settings::Baseline::ClearNotedSources();
-        if (!argument_error.empty()) {
-            argument_error = "--baseline-allow: " + argument_error;
-        } else {
-            const auto undeclared = Settings::Baseline::UndeclaredSwitches(
-                Settings::Baseline::SetEnvironmentSwitches(), lp.baseline_allow);
-            if (!undeclared.empty()) {
-                argument_error = "--baseline refused: " + undeclared.front() +
-                                 " is set, which takes the run off the baseline. Unset it, or "
-                                 "declare it with --baseline-allow " +
-                                 undeclared.front();
-            }
+        // Checked before the run starts: an EDEN_NX2_* switch that is set but not named. The
+        // --baseline-allow items themselves were checked by the early scan and the full parse.
+        const auto undeclared = Settings::Baseline::UndeclaredSwitches(
+            Settings::Baseline::SetEnvironmentSwitches(), lp.baseline_allow);
+        if (!undeclared.empty()) {
+            argument_error = "--baseline refused: " + undeclared.front() +
+                             " is set, which takes the run off the baseline. Unset it, or "
+                             "declare it with --baseline-allow " +
+                             undeclared.front();
         }
     }
     if (lp.report_path && !lp.report_conflict) {

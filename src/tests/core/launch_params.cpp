@@ -150,4 +150,12 @@ TEST_CASE("--baseline refuses a --set of a baseline setting unless it is declare
                                "--set", "resolution_setup=2"})
                     .parse_error == "--set resolution_setup was given more than once");
     }
+    SECTION("a --baseline-allow item that names nothing is refused, as by the early scan") {
+        REQUIRE(Parse(system, {"-g", "game.nsp", "--baseline", "--baseline-allow", "not_a_key"})
+                    .parse_error ==
+                "--baseline-allow: 'not_a_key' is neither a baseline setting nor an EDEN_NX2_ "
+                "switch name");
+        REQUIRE(Parse(system, {"-g", "game.nsp", "--baseline-allow", "use_docked_mode"})
+                    .parse_error == "--baseline-allow needs --baseline");
+    }
 }

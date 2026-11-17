@@ -10,6 +10,7 @@
 #include <cerrno>
 #include <cstring>
 #include <cmath>
+#include <memory>
 #include <utility>
 #include <string_view>
 
@@ -142,6 +143,38 @@ static std::string BaselineOverrideRefusal(const std::vector<std::string>& set_n
     return "--baseline refused: --set " + undeclared.front() +
            " changes a baseline setting, which takes the run off the baseline. Drop --baseline, "
            "or declare it with --baseline-allow " + undeclared.front();
+}
+
+/// What --baseline-allow says when an item of its operand is empty or starts with '='.
+static std::string InvalidAllowListMessage(std::string_view operand) {
+    return "invalid --baseline-allow '" + std::string{operand} +
+           "': expected KEY[,KEY...], each KEY or KEY=VALUE";
+}
+
+/// Under --baseline, the first --baseline-allow item that names neither a baseline setting nor an
+/// EDEN_NX2_ switch, or declares a value its setting does not accept; empty when there is none.
+/// Tried on a scratch copy of the settings, so nothing changes.
+static std::string AllowListProblem(const std::vector<std::string>& allow_items) {
+    if (allow_items.empty()) {
+        return {};
+    }
+    const auto scratch = std::make_unique<Settings::Values>();
+    std::string problem = Settings::Baseline::ApplyAllowedValues(*scratch, allow_items);
+    Settings::Baseline::ClearNotedSources();
+    return problem.empty() ? problem : "--baseline-allow: " + problem;
+}
+
+/// The refusals of --baseline-allow and --baseline that need the whole command line, in the order
+/// both ScanEarlyOptions and ParseLaunchParams report them; empty when there is none.
+static std::string BaselineRefusal(bool baseline, const std::vector<std::string>& set_names,
+                                   const std::vector<std::string>& allow_items) {
+    if (!baseline) {
+        return allow_items.empty() ? std::string{} : "--baseline-allow needs --baseline";
+    }
+    if (std::string problem = AllowListProblem(allow_items); !problem.empty()) {
+        return problem;
+    }
+    return BaselineOverrideRefusal(set_names, allow_items);
 }
 
 /// The long option getopt_long picks for `name`: spelled out in full, or an abbreviation that
@@ -277,12 +310,17 @@ EarlyOptions ScanEarlyOptions(int argc, char* argv[]) noexcept {
                 user_dir(value);
                 break;
             case 0x10E:
-                // Only the name: the value may be a credential. A malformed request is left to
-                // ParseLaunchParams, which says what is wrong with it.
+                // Only the name is kept: the value may be a credential, and is not repeated.
                 if (value) {
-                    if (const size_t name_end = value->find('=');
-                        name_end != std::string::npos && name_end != 0) {
-                        set_names.push_back(value->substr(0, name_end));
+                    const size_t name_end = value->find('=');
+                    if (name_end == std::string::npos || name_end == 0) {
+                        fail(std::string{kSetOperandMessage});
+                    } else if (std::string name = value->substr(0, name_end);
+                               std::find(set_names.begin(), set_names.end(), name) !=
+                               set_names.end()) {
+                        fail("--set " + name + " was given more than once");
+                    } else {
+                        set_names.push_back(std::move(name));
                     }
                 }
                 break;
@@ -292,7 +330,11 @@ EarlyOptions ScanEarlyOptions(int argc, char* argv[]) noexcept {
             case 0x111:
                 if (value) {
                     for (auto& item : Settings::Baseline::SplitAllowList(*value)) {
-                        allow_items.push_back(std::move(item));
+                        if (item.empty() || item.front() == '=') {
+                            fail(InvalidAllowListMessage(*value));
+                        } else {
+                            allow_items.push_back(std::move(item));
+                        }
                     }
                 }
                 break;
@@ -331,10 +373,9 @@ EarlyOptions ScanEarlyOptions(int argc, char* argv[]) noexcept {
         }
     }
     // Refused here, before the user directory is touched and before --version --json prints.
-    if (baseline_requested) {
-        if (std::string refusal = BaselineOverrideRefusal(set_names, allow_items); !refusal.empty()) {
-            fail(std::move(refusal));
-        }
+    if (std::string refusal = BaselineRefusal(baseline_requested, set_names, allow_items);
+        !refusal.empty()) {
+        fail(std::move(refusal));
     }
     early.version_json = version && json;
     return early;
@@ -585,8 +626,7 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
             case 0x111:
                 for (const auto& token : Settings::Baseline::SplitAllowList(optarg)) {
                     if (token.empty() || token.front() == '=') {
-                        fail(std::string("invalid --baseline-allow '") + optarg +
-                             "': expected KEY[,KEY...], each KEY or KEY=VALUE");
+                        fail(InvalidAllowListMessage(optarg));
                     } else {
                         p.baseline_allow.push_back(token);
                     }
@@ -644,19 +684,14 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
     if (p.print_json && !p.print_version) {
         fail("--json is only valid together with --version");
     }
-    if (!p.baseline && !p.baseline_allow.empty()) {
-        fail("--baseline-allow needs --baseline");
+    // The same refusals as ScanEarlyOptions, wherever the options stand.
+    std::vector<std::string> set_names;
+    for (const auto& request : p.setting_overrides) {
+        set_names.push_back(request.first);
     }
-    if (p.baseline) {
-        // The same refusal as ScanEarlyOptions, wherever --set and --baseline stand.
-        std::vector<std::string> set_names;
-        for (const auto& request : p.setting_overrides) {
-            set_names.push_back(request.first);
-        }
-        if (std::string refusal = BaselineOverrideRefusal(set_names, p.baseline_allow);
-            !refusal.empty()) {
-            fail(std::move(refusal));
-        }
+    if (std::string refusal = BaselineRefusal(p.baseline, set_names, p.baseline_allow);
+        !refusal.empty()) {
+        fail(std::move(refusal));
     }
     if ((p.report_path || p.run_seconds || p.run_frames) &&
         (p.print_help || p.print_version || p.list_settings || p.print_baseline ||
@@ -749,7 +784,10 @@ void ApplyLaunchParams(LaunchParams const& lp) noexcept {
             "                      The configuration file is read and never written; a missing one is\n"
             "                      not created and the defaults are used\n"
             "--baseline-allow KEY[,KEY...]  Declare a variation from the baseline; KEY=VALUE also sets\n"
-            "                      the setting (for example resolution_setup=6)\n"
+            "                      the setting (for example resolution_setup=6). A bad item, a --set\n"
+            "                      given twice or without name=value, and a refused --set end the run\n"
+            "                      (exit 64) before --user-dir is created; an EDEN_NX2_* switch that is\n"
+            "                      not named, and an unknown --set name or value, are refused after it\n"
             "--print-baseline      Print the baseline version, hash and settings, and exit\n"
             "Exit codes: 0 normal or frame limit, 1 startup failure, 64 bad arguments, 70 guest crash,\n"
             "71 device lost, 72 shader or pipeline failure, 73 emulator crash, 74 report not written,\n"
