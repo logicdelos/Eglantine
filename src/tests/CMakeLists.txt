@@ -35,6 +35,7 @@ add_executable(tests
     video_core/mesh_fallback.cpp
     video_core/spirv_software_matrix.cpp
     common/baseline_settings.cpp
+    common/baseline_config.cpp
     common/bit_field.cpp
     common/cityhash.cpp
     common/container_hash.cpp
@@ -135,7 +136,7 @@ if (ENABLE_UPDATE_CHECKER)
         ../frontend_common/update_installer.cpp)
 endif()
 
-target_link_libraries(tests PRIVATE common core input_common video_core)
+target_link_libraries(tests PRIVATE common core input_common video_core frontend_common)
 if (MSVC)
     # tests/core/launch_params.cpp includes <getopt.h>: the bundled getopt that core links.
     target_link_libraries(tests PRIVATE getopt)
