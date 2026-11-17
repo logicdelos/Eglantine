@@ -12,9 +12,9 @@ Where a fix is described as a "likely fix", it was written to remove a cause fou
 
 All runs were made on one Windows 11 laptop: AMD Ryzen 9 8940HX, NVIDIA GeForce RTX 5070 Ti Laptop GPU, 16 GB RAM. Only Fire Emblem: Fortune's Weave and Xenoblade Chronicles 2 were run. Fixes marked "Orchid" or "Lichii" were ported from those forks, with the original author named in the commit message.
 
-## 0.4.0 (unreleased)
+## 0.4.0 (2026-11-17)
 
-Milestone 0.4, "Measured speed work": every speed change ships off by default behind an `EDEN_NX2_*` switch and is measured on and off before it is recommended. Nine candidates were measured on Fire Emblem: Fortune's Weave and Xenoblade Chronicles 2; a candidate is kept only with a gain beyond the measured spread on one game, no loss beyond the spread on the other and the picture within the limit. The figures, with scene, settings, hardware and method, are in the 0.4.0 release notes.
+Milestone 0.4, "Measured speed work": every speed change ships off by default behind an `EDEN_NX2_*` switch and is measured on and off before it is recommended. Nine candidates were measured on Fire Emblem: Fortune's Weave and Xenoblade Chronicles 2; a candidate is kept only with a gain beyond the measured spread on one game, no loss beyond the spread on the other and the picture within the limit. None met that rule, so none is in the release. The figures, with scene, settings, hardware and method, are in the 0.4.0 release notes. Verified on the as-shipped folder: the release gate passed against the `fork-v0.3.0` baseline on settings baseline 1 (three runs, no new error lines, pictures within the limit), the fresh-install test passed on both games in both stages, the unattended exit test passed 10 of 10 cases, and all 563 unit test cases passed. The speed matrix itself was measured on an earlier development build that still carried the nine switches.
 
 ### Accuracy policy
 
