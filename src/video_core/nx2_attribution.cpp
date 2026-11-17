@@ -22,7 +22,14 @@
 //    it dequeued a present, then drains the rings, so every event stamped before the present is
 //    visible when the frame is resolved.
 //  * Rings and the history are bounded by SessionConfig::buffer_bytes. What does not fit is counted
-//    (lost_events) and its time range marks every frame it touches incomplete.
+//    (lost_events) and its time range marks every frame it touches incomplete, and only those
+//    frames: loss episodes are kept sorted and merged, never widened to cover the session.
+//  * Memory is bounded per interval, not by loss. Spans that ended before the last resolved time
+//    are pruned as soon as the history is half full, and an interval that is still open when the
+//    history is three quarters full is resolved in part (ResolveChunk): its decomposition so far
+//    is kept as a carry, its finished spans are freed, and the present that ends the interval
+//    adds the rest. Time is additive over disjoint windows, so the sum is the one a whole-interval
+//    decomposition would give, except for a wait expansion that straddles the cut.
 //
 // The crash path (ReadCrashStatus) reads mirrored relaxed atomics only.
 
@@ -82,6 +89,13 @@ constexpr u64 RetainNs = 2'000'000'000;
 constexpr u64 OpenEnd = std::numeric_limits<u64>::max();
 constexpr auto ConsumerPeriod = std::chrono::milliseconds{2};
 constexpr auto QuiesceLimit = std::chrono::milliseconds{5};
+/// Below this many history slots the session never resolves in part (tiny budgets of tests and
+/// diagnostics): the decomposition costs more than the memory it would free.
+constexpr size_t MinChunkHistory = 4096;
+/// Loss episodes closer than this are one episode.
+constexpr u64 LossMergeNs = 1'000'000;
+/// A partial resolution stops this far before now, so that spans stamped before it are published.
+constexpr u64 ChunkMarginNs = 1'000'000;
 
 constexpr size_t CauseIdx(Cause cause) noexcept {
     return static_cast<size_t>(cause);
@@ -124,6 +138,8 @@ struct ThreadBuf {
     alignas(64) std::atomic<u32> busy{};
     std::atomic<u32> open_count{};
     std::atomic<u64> lost{};
+    /// Events published per EventType (producer only; the consumer reads them for diagnostics).
+    std::array<std::atomic<u64>, 4> kinds{};
     // Overflow range [min, max] of the events this thread could not record. Only the owning thread
     // writes it (compare-exchange, no lock); the consumer takes it with exchange.
     std::atomic<u64> loss_min{OpenEnd};
@@ -290,6 +306,20 @@ struct Decomp {
     bool complete{true};
     u64 producer_unknown_wait_ns{};
     std::unordered_map<WorkId, u64> work_ns;
+
+    /// Adds the decomposition of the neighbouring part of the same interval.
+    void Add(const Decomp& part) {
+        for (size_t i = 0; i < CauseCount; ++i) {
+            cause[i] += part.cause[i];
+            activity[i] += part.activity[i];
+        }
+        reasons |= part.reasons;
+        complete = complete && part.complete;
+        producer_unknown_wait_ns += part.producer_unknown_wait_ns;
+        for (const auto& [work, ns] : part.work_ns) {
+            work_ns[work] += ns;
+        }
+    }
 };
 
 struct CumulativeEntry {
@@ -697,6 +727,13 @@ private:
     Decomp out;
 };
 
+/// The part of an interval that was resolved before its end, and where the rest begins.
+struct Joined {
+    Decomp part;
+    u64 from{};
+    bool broken{}; ///< The resolved part did not fit the interval: it is Unknown and incomplete
+};
+
 struct Session {
     Session() = default;
     ~Session();
@@ -776,6 +813,13 @@ struct Session {
     CauseTimes cum_causes{};
     bool cum_complete{true};
     std::vector<CumulativeEntry> cum;
+    size_t chunk_slots{};  ///< History use that makes the open interval resolve in part (0: never)
+    size_t retain_slots{}; ///< History use from which spans are pruned at once (0: after RetainNs)
+    Decomp carry;          ///< The decomposition of (carry_from, carry_through]
+    u64 carry_from{};
+    u64 carry_through{}; ///< 0: nothing of the open interval is resolved yet
+    u64 lost_history{};  ///< Of lost_consumer: records the history had no room for
+    u64 lost_late{};     ///< Of lost_consumer: spans that ended before a resolved time
 
     void StartConsumer();
     void StopConsumer();
@@ -791,7 +835,7 @@ struct Session {
     void AddLoss(u64 begin, u64 end);
     void Quiesce();
     void MarkOpenIncomplete();
-    void Prune();
+    void Prune(bool force = false);
     bool Reserve(std::vector<SpanRec>& spans);
     void Trim(std::vector<SpanRec>& spans);
     void NoteRetained();
@@ -804,6 +848,10 @@ struct Session {
     u64 TotalLost() const;
     AttributionSnapshot Snapshot();
     void Mirror();
+    void MaybeChunk();
+    bool LostBetween(u64 s, u64 e) const;
+    Joined TakeCarry(u64 s, u64 e);
+    void LogDiagnostics() const;
 };
 
 std::atomic<Session*> g_session{nullptr};
@@ -869,6 +917,8 @@ bool Push(ThreadBuf& t, const RingEvent& event, u64 reserve) {
         }
     }
     t.events[tail & t.mask] = event;
+    std::atomic<u64>& kind = t.kinds[static_cast<size_t>(event.type)];
+    kind.store(kind.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
     t.tail.store(tail + 1, std::memory_order_release);
     return true;
 }
@@ -946,6 +996,9 @@ void Session::ConsumerMain() {
             DrainAll();
             Process(item);
         }
+        if (!stopping) {
+            MaybeChunk();
+        }
         if (stopping && batch.empty()) {
             return;
         }
@@ -968,11 +1021,39 @@ void Session::Quiesce() {
 }
 
 void Session::AddLoss(u64 begin, u64 end) {
-    if (losses.size() < MaxLossEpisodes) {
-        losses.emplace_back(begin, end);
+    end = std::max(begin, end);
+    // The episodes are sorted and apart: one within LossMergeNs of another is merged with it, so
+    // an episode covers only the time its losses fell in and a frame is marked incomplete only
+    // when an episode touches it.
+    using Episode = std::pair<u64, u64>;
+    const auto first = std::lower_bound(
+        losses.begin(), losses.end(), begin,
+        [](const Episode& episode, u64 value) { return episode.second + LossMergeNs < value; });
+    auto last = first;
+    while (last != losses.end() && last->first <= end + LossMergeNs) {
+        ++last;
+    }
+    if (first == last) {
+        losses.insert(first, Episode{begin, end});
     } else {
-        losses.back().first = std::min(losses.back().first, begin);
-        losses.back().second = std::max(losses.back().second, end);
+        const u64 low = std::min(begin, first->first);
+        const u64 high = std::max(end, (last - 1)->second);
+        const auto merged = losses.erase(first + 1, last) - 1;
+        *merged = Episode{low, high};
+    }
+    if (losses.size() > MaxLossEpisodes) {
+        // Merge the two closest, which widens the episodes by the least.
+        size_t best = 0;
+        u64 narrowest = ~u64{};
+        for (size_t i = 0; i + 1 < losses.size(); ++i) {
+            const u64 gap = losses[i + 1].first - losses[i].second;
+            if (gap < narrowest) {
+                narrowest = gap;
+                best = i;
+            }
+        }
+        losses[best].second = losses[best + 1].second;
+        losses.erase(losses.begin() + static_cast<std::ptrdiff_t>(best) + 1);
     }
 }
 
@@ -1037,11 +1118,13 @@ bool Session::CloseSpan(const PendingEnd& end) {
     if (!Reserve(owner.closed)) {
         // The finished record does not fit: lost like a span refused at its Begin.
         lost_consumer.fetch_add(1, std::memory_order_relaxed);
+        ++lost_history;
         AddLoss(rec.begin_ns, rec.end_ns);
         return true;
     }
     if (last_resolved_ts != 0 && rec.end_ns <= last_resolved_ts) {
         lost_consumer.fetch_add(1, std::memory_order_relaxed); // charged to its frame as open
+        ++lost_late;
     }
     owner.closed.push_back(rec);
     return true;
@@ -1067,6 +1150,7 @@ void Session::DrainThread(u32 id, ThreadBuf& buf) {
         case EventType::Begin: {
             if (!Reserve(state.open)) {
                 lost_consumer.fetch_add(1, std::memory_order_relaxed);
+                ++lost_history;
                 AddLoss(event.begin_ns, event.begin_ns);
                 break;
             }
@@ -1100,12 +1184,14 @@ void Session::DrainThread(u32 id, ThreadBuf& buf) {
         case EventType::Closed: {
             if (!Reserve(state.closed)) {
                 lost_consumer.fetch_add(1, std::memory_order_relaxed);
+                ++lost_history;
                 AddLoss(event.begin_ns, event.end_ns);
                 break;
             }
             if (last_resolved_ts != 0 && event.end_ns <= last_resolved_ts) {
                 // It ended before a frame that is already resolved: that frame missed it.
                 lost_consumer.fetch_add(1, std::memory_order_relaxed);
+                ++lost_late;
                 AddLoss(event.begin_ns, event.end_ns);
                 break;
             }
@@ -1214,9 +1300,12 @@ void Session::NoteRetained() {
     }
 }
 
-void Session::Prune() {
+void Session::Prune(bool force) {
     const u64 now = NowNs();
-    const u64 floor = std::min(last_resolved_ts, Sub(now, RetainNs));
+    // Spans stay RetainNs for the marker, until the history is half full: then everything before
+    // the last resolved time goes, so that a busy period cannot fill the history with history.
+    const bool tight = force || (retain_slots != 0 && history >= retain_slots);
+    const u64 floor = tight ? last_resolved_ts : std::min(last_resolved_ts, Sub(now, RetainNs));
     if (floor <= pruned_through) {
         return;
     }
@@ -1228,7 +1317,128 @@ void Session::Prune() {
         Trim(state.closed);
         Trim(state.open);
     }
-    std::erase_if(losses, [floor](const std::pair<u64, u64>& l) { return l.second <= floor; });
+    // The losses of an interval resolved in part stay until its present has joined the parts.
+    const u64 loss_floor = carry_through != 0 ? std::min(floor, carry_from) : floor;
+    std::erase_if(losses, [loss_floor](const std::pair<u64, u64>& l) {
+        return l.second <= loss_floor;
+    });
+}
+
+/// Resolves the open interval up to a little before now, when the history is three quarters full,
+/// and frees what that part used. Nothing is lost by it: the part is kept as a carry and the
+/// present that ends the interval adds the rest.
+void Session::MaybeChunk() {
+    if (chunk_slots == 0 || history < chunk_slots) {
+        return;
+    }
+    const u64 stamp = NowNs();
+    Quiesce();
+    DrainAll();
+    const u64 through = Sub(stamp, ChunkMarginNs);
+    const u64 from = last_resolved_ts != 0 ? last_resolved_ts : start_ns;
+    if (through <= from) {
+        return;
+    }
+    {
+        std::scoped_lock lock{queue_mutex};
+        if (!queue.empty()) {
+            return; // a present is waiting: it resolves the interval whole and prunes
+        }
+    }
+    std::vector<u32> roots;
+    if (have_prev) {
+        if (last_root != 0) {
+            roots.push_back(last_root);
+        }
+    } else {
+        std::scoped_lock lock{stats_mutex};
+        roots = boot_roots;
+    }
+    Decomp part = Decompose(from, through, roots);
+    if (carry_through == 0) {
+        carry_from = from;
+        carry = std::move(part);
+    } else {
+        carry.Add(part);
+    }
+    carry_through = through;
+    last_resolved_ts = through;
+    if (have_prev && !interactive_done && cum.size() < MaxCumulative) {
+        CauseTimes sum = cum_causes;
+        for (size_t i = 0; i < CauseCount; ++i) {
+            sum[i] += carry.cause[i];
+        }
+        cum.push_back({through, sum, cum_complete && carry.complete});
+    }
+    Prune(true);
+}
+
+/// Takes the part of the interval (s, e] that MaybeChunk resolved, and says where the rest begins.
+Joined Session::TakeCarry(u64 s, u64 e) {
+    Joined joined;
+    joined.from = s;
+    if (carry_through == 0) {
+        return joined;
+    }
+    const u64 begin = carry_from;
+    const u64 through = carry_through;
+    joined.part = std::move(carry);
+    carry = Decomp{};
+    carry_from = 0;
+    carry_through = 0;
+    if (begin == s && through <= e) {
+        joined.from = through;
+        return joined;
+    }
+    // The resolved part belongs to another interval, or runs past this one's end (a present
+    // arrived late): this interval cannot be built from it.
+    const u64 end = std::max(s, std::min(through, e));
+    joined.part = Decomp{};
+    joined.part.cause[CauseIdx(Cause::Unknown)] = end - s;
+    joined.part.reasons |= UnknownReason::LostSpans;
+    joined.part.complete = false;
+    joined.from = end;
+    joined.broken = true;
+    lost_consumer.fetch_add(1, std::memory_order_relaxed);
+    return joined;
+}
+
+/// Whether a loss episode touches (s, e].
+bool Session::LostBetween(u64 s, u64 e) const {
+    return std::any_of(losses.begin(), losses.end(),
+                       [s, e](const std::pair<u64, u64>& l) { return l.second > s && l.first <= e; });
+}
+
+/// Names what was recorded and what was lost, by kind and by thread, when the session ends.
+void Session::LogDiagnostics() const {
+    std::array<u64, 4> total{};
+    u64 ring_lost = 0;
+    const u32 count = thread_count.load(std::memory_order_acquire);
+    for (u32 i = 0; i < count; ++i) {
+        const ThreadBuf& buf = *threads[i];
+        std::array<u64, 4> own{};
+        u64 sum = 0;
+        for (size_t k = 0; k < own.size(); ++k) {
+            own[k] = buf.kinds[k].load(std::memory_order_relaxed);
+            total[k] += own[k];
+            sum += own[k];
+        }
+        const u64 dropped = buf.lost.load(std::memory_order_relaxed);
+        ring_lost += dropped;
+        if (dropped != 0 || sum >= 10000) {
+            LOG_INFO(HW_GPU,
+                     "Nx2Attribution thread {}: {} begin, {} end, {} closed, {} link events, {} "
+                     "lost in the ring",
+                     buf.name.data(), own[0], own[1], own[2], own[3], dropped);
+        }
+    }
+    const u64 all = TotalLost();
+    const u64 known = ring_lost + lost_history + lost_late;
+    LOG_INFO(HW_GPU,
+             "Nx2Attribution events: {} begin, {} end, {} closed, {} link; lost: {} ring, {} "
+             "history, {} late, {} other",
+             total[0], total[1], total[2], total[3], ring_lost, lost_history, lost_late,
+             all > known ? all - known : u64{0});
 }
 
 Decomp Session::Decompose(u64 s, u64 e, std::span<const u32> roots) const {
@@ -1278,6 +1488,8 @@ void Session::ResolveStartup(u64 first_present) {
         snap.first_host_present_ns = first_present;
         snap.first_120s.anchor_ns = first_present;
     }
+    // What MaybeChunk resolved before the first present is part of this interval.
+    Joined joined = TakeCarry(start_ns, first_present);
     if (created == 0 || created >= first_present) {
         return;
     }
@@ -1285,13 +1497,31 @@ void Session::ResolveStartup(u64 first_present) {
     ia.duration_ns = first_present - created;
     const u64 pre_end = std::min(start_ns, first_present);
     const u64 pre = created < pre_end ? pre_end - created : 0;
-    const u64 from = std::max(created, start_ns);
-    bool complete = !quiesce_timeout;
+    u64 from = std::max(created, start_ns);
+    bool complete = !quiesce_timeout && !joined.broken;
     Decomp d;
-    if (from < first_present) {
-        d = Decompose(from, first_present, roots);
-        complete = complete && d.complete;
+    if (joined.from > start_ns) {
+        if (created <= start_ns) {
+            d = std::move(joined.part);
+            from = joined.from;
+        } else {
+            // The process was created after the recorder began: the part resolved from the
+            // start cannot be cut back to its creation.
+            const u64 covered = std::max(from, joined.from);
+            d.cause[CauseIdx(Cause::Unknown)] = covered - from;
+            d.reasons |= UnknownReason::LostSpans;
+            d.complete = false;
+            from = covered;
+        }
+        if (LostBetween(start_ns, joined.from)) {
+            d.reasons |= UnknownReason::LostSpans;
+            d.complete = false;
+        }
     }
+    if (from < first_present) {
+        d.Add(Decompose(from, first_present, roots));
+    }
+    complete = complete && d.complete;
     ia.cause_ns = d.cause;
     ia.cause_ns[CauseIdx(Cause::Unknown)] += pre;
     ia.status = complete ? IntervalStatus::Complete : IntervalStatus::Incomplete;
@@ -1339,10 +1569,20 @@ void Session::ResolveBoundary(const Item& item) {
     }
     const bool degraded = timeout || unregistered_new || gap;
 
+    // What MaybeChunk resolved while the interval was open is joined with the rest here.
+    Joined joined = TakeCarry(s, e);
     Decomp d;
     if (dur > 0 && (is_long || !interactive_done)) {
         const u32 root = item.root;
-        d = Decompose(s, e, root != 0 ? std::span<const u32>{&root, 1} : std::span<const u32>{});
+        if (joined.from < e) {
+            d = Decompose(joined.from, e,
+                          root != 0 ? std::span<const u32>{&root, 1} : std::span<const u32>{});
+        }
+        d.Add(joined.part);
+        if (joined.from > s && LostBetween(s, joined.from)) {
+            d.reasons |= UnknownReason::LostSpans;
+            d.complete = false;
+        }
     }
     d.reasons |= item.reasons;
     if (degraded) {
@@ -1630,6 +1870,10 @@ bool BeginSession(const SessionConfig& config) {
         (history_budget > ScratchFixedBytes ? history_budget - ScratchFixedBytes : 0) /
             HistoryBytesPerSpan,
         64);
+    if (s->history_cap >= MinChunkHistory) {
+        s->chunk_slots = s->history_cap / 4 * 3;
+        s->retain_slots = s->history_cap / 2;
+    }
     s->process_created_ns.store(g_pending_created.exchange(0), std::memory_order_relaxed);
     s->process_created_uncertainty_ns.store(g_pending_uncertainty.exchange(0),
                                             std::memory_order_relaxed);
@@ -1661,6 +1905,7 @@ void EndSession() {
     s->Mirror();
     LOG_INFO(HW_GPU, "Nx2Attribution session ended: {} frames, {} long, {} lost events",
              s->snap.frames, s->snap.long_frames, s->TotalLost());
+    s->LogDiagnostics();
 }
 
 u32 RegisterThread(std::string_view name) {
@@ -1752,6 +1997,9 @@ void RecordSpan(Cause cause, u64 begin_ns, u64 end_ns, WorkId work, u64 amount, 
         NoteUnregisteredLoss(*s);
         return;
     }
+    // The consumer waits for a publication in progress (see Quiesce); the stamps are the
+    // caller's, so what this covers is the push, not the time before it.
+    t->busy.exchange(1, std::memory_order_seq_cst);
     RingEvent event;
     event.type = EventType::Closed;
     event.cause = cause;
@@ -1766,6 +2014,7 @@ void RecordSpan(Cause cause, u64 begin_ns, u64 end_ns, WorkId work, u64 amount, 
     } else {
         NoteLoss(*t, event.begin_ns, event.end_ns);
     }
+    t->busy.store(0, std::memory_order_release);
 }
 
 void LinkWait(SpanToken wait, WorkId producer, DependencyKind kind) {
