@@ -32,9 +32,9 @@
 //
 // Records are prepared in the order the first run reached them (Begin). Ready objects are kept
 // for their draws: once ready plus building reach the ready cap, builds are held back until a
-// draw adopts one, so the objects needed first are never the ones released. Only a game that has
-// stopped following the recorded order (draws matching no record for PrepareOptions::
-// diverged_after_ns while the cap holds) has its oldest unused ready objects released.
+// draw adopts one, so the objects needed first are never the ones released. Only when draws have
+// gone on for PrepareOptions::stalled_after_ns without adopting any (they match no record, or
+// take a record still queued) while the cap holds are the oldest unused ready objects released.
 // A draw is never denied anything: the budget, the ready cap and the RAM pause only hold back
 // preparation.
 //
@@ -257,8 +257,9 @@ private:
     bool ram_paused_{};
     bool paused_{};
     bool cap_held_{};            ///< Builds are being held at the ready cap (one count per run)
-    /// Clock value of the first draw that matched no record since one last did; 0 when none.
-    u64 miss_since_ns_{};
+    /// Clock value of the first draw that adopted nothing while ready objects held the cap, since
+    /// the last adoption; 0 when none.
+    u64 stall_since_ns_{};
     std::vector<LateRecord> late_;
     Counters counters_;
 };

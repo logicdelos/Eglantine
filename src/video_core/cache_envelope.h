@@ -280,10 +280,13 @@ struct PrepareOptions {
     u64 memory_budget_bytes{u64{256} << 20}; ///< Index, queued buffers, staging, bookkeeping
     u32 ready_cap{128};                   ///< Prepared but unused live pipelines
     u64 min_available_ram_bytes{u64{2} << 30}; ///< Optional admission pauses below this
-    /// Draws that match no record for this long while builds are held at the ready cap show that
-    /// the game is not following the recorded order: unused ready objects are then released,
-    /// oldest first, so the rest of the index is still prepared. A bound, not a measurement.
-    u64 diverged_after_ns{u64{10} * 1'000'000'000};
+    /// Draws that adopt no ready object for this long while ready objects hold the ready cap and
+    /// records wait to be built (the draws match no record, or take records still queued) show
+    /// that the objects at the cap are not the ones this run needs: unused ready objects are then
+    /// released, oldest first, so the rest of the index is still prepared. Draws that find
+    /// nothing to adopt are the only clock; a quiet period does not count. A bound, not a
+    /// measurement.
+    u64 stalled_after_ns{u64{10} * 1'000'000'000};
 };
 
 /// One record to append: the index fields the writer does not compute itself.

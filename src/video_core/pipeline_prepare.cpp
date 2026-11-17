@@ -90,7 +90,7 @@ u64 Scheduler::Begin(std::span<const Candidate> candidates) {
     ready_order_.clear();
     ram_paused_ = paused_ = false;
     cap_held_ = false;
-    miss_since_ns_ = 0;
+    stall_since_ns_ = 0;
     late_.clear();
     counters_ = {};
     counters_.records = candidates.size();
@@ -207,6 +207,7 @@ Scheduler::Task Scheduler::Next(u64 generation, u64 available_ram_bytes, bool ho
     bool cap_reached = u64{ready_} + building_ >= options.ready_cap;
     if (!cap_reached) {
         cap_held_ = false;
+        stall_since_ns_ = 0;
     }
     bool blocked = ram_low;
     // Decode ahead first, up to the window: a decoded record is known by its key, so a draw that
@@ -244,11 +245,12 @@ Scheduler::Task Scheduler::Next(u64 generation, u64 available_ram_bytes, bool ho
     if (!ram_low && !hold_builds && cap_reached && ready_ != 0 && !queued_.empty()) {
         // The ready objects are the ones the game reaches first (records are prepared in the
         // order it reached them), so they are kept and the builds behind them wait until a draw
-        // adopts one. Only when draws have stopped matching any record is the game off the
-        // recorded order: the objects nobody asked for would then hold the rest back for ever,
-        // so the one that became ready first is released (built again if its draw ever comes).
+        // adopts one. Draws that go on without adopting any (they match no record, or take a
+        // record still queued) for stalled_after_ns show the objects at the cap are not the
+        // ones this run needs: they would hold the rest back for ever, so the one that became
+        // ready first is released (built again if its draw ever comes).
         const u64 now = Now();
-        if (miss_since_ns_ != 0 && now - miss_since_ns_ >= options.diverged_after_ns) {
+        if (stall_since_ns_ != 0 && now - stall_since_ns_ >= options.stalled_after_ns) {
             const auto oldest = ready_order_.begin();
             Entry& victim = entries_[oldest->second];
             ready_order_.erase(oldest);
@@ -443,11 +445,14 @@ Scheduler::Demand Scheduler::Request(u64 hash, std::span<const u8> key) {
             break;
         }
     }
-    // A draw that finds its record, in any state, shows the game is still on the recorded order.
-    if (known) {
-        miss_since_ns_ = 0;
-    } else if (miss_since_ns_ == 0) {
-        miss_since_ns_ = now;
+    // The stall clock runs from the first draw that does not adopt while ready objects hold the
+    // cap, and stops at the next adoption: what a draw finds queued or unknown frees no ready
+    // slot, so it is no sign the objects at the cap are still wanted.
+    if (!demand.results.empty()) {
+        stall_since_ns_ = 0;
+    } else if (stall_since_ns_ == 0 && ready_ != 0 &&
+               u64{ready_} + building_ >= options.ready_cap) {
+        stall_since_ns_ = now;
     }
     demand.generation = generation_;
     if (!demand.results.empty()) {
