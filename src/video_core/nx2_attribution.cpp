@@ -306,6 +306,7 @@ constexpr size_t MinSpanCapacity = 16;
 struct Decomp {
     CauseTimes cause{};
     CauseTimes activity{};
+    CauseTimes inferred{}; ///< The part of `cause` that is an inference (UnknownReason::PresenterGap)
     u32 reasons{};
     bool complete{true};
     u64 producer_unknown_wait_ns{};
@@ -316,6 +317,7 @@ struct Decomp {
         for (size_t i = 0; i < CauseCount; ++i) {
             cause[i] += part.cause[i];
             activity[i] += part.activity[i];
+            inferred[i] += part.inferred[i];
         }
         reasons |= part.reasons;
         complete = complete && part.complete;
@@ -485,6 +487,9 @@ private:
 
     void Charge(Cause cause, u64 from, u64 to, WorkId work) {
         out.cause[CauseIdx(cause)] += to - from;
+        if (inferring) {
+            out.inferred[CauseIdx(cause)] += to - from;
+        }
         if (work != 0) {
             out.work_ns[work] += to - from;
         }
@@ -683,6 +688,7 @@ private:
             return;
         }
         out.reasons |= UnknownReason::PresenterGap;
+        inferring = true;
         ExpandByActivity(
             x, y,
             [this](size_t t) {
@@ -690,6 +696,7 @@ private:
                        root_ids.end();
             },
             [this](u64 from, u64 to) { Charge(Cause::Waiting, from, to, 0); });
+        inferring = false;
     }
 
     /// Charges [x, y) by the leaves of the threads `include` accepts that are not waiting or
@@ -849,6 +856,7 @@ private:
     u64 e;
     std::vector<u32> root_ids; ///< The roots of the sweep that is running (ResolveRoots)
     bool charge_gaps; ///< SessionConfig::charge_presenter_gaps
+    bool inferring{}; ///< Charges are inferences (ExpandRootGap is running)
     std::vector<std::vector<Leaf>> leaves;
     /// The spans of the window that carry a work id, clipped to it, sorted by (work, thread, begin).
     /// A leaf belongs to a work when it lies inside one of that work's spans on its thread, which is
@@ -1774,6 +1782,9 @@ void Session::ResolveStartup(u64 first_present) {
     sum_duration_ns += ia.duration_ns;
     sum_unknown_ns += ia.cause_ns[CauseIdx(Cause::Unknown)];
     snap.producer_unknown_wait_ns += d.producer_unknown_wait_ns;
+    for (size_t i = 0; i < CauseCount; ++i) {
+        snap.inferred_ns[i] += d.inferred[i];
+    }
 }
 
 void Session::ResolveBoundary(const Item& item) {
@@ -1852,6 +1863,7 @@ void Session::ResolveBoundary(const Item& item) {
         frame.duration_ns = dur;
         frame.cause_ns = d.cause;
         frame.activity_ns = d.activity;
+        frame.inferred_ns = d.inferred;
         u64 top = 0;
         u32 at_top = 0;
         Cause primary = Cause::Unknown;
@@ -1908,6 +1920,9 @@ void Session::ResolveBoundary(const Item& item) {
             sum_duration_ns += dur;
             sum_unknown_ns += d.cause[CauseIdx(Cause::Unknown)];
             snap.producer_unknown_wait_ns += d.producer_unknown_wait_ns;
+            for (size_t i = 0; i < CauseCount; ++i) {
+                snap.inferred_ns[i] += d.inferred[i];
+            }
             if (frame.primary_cause == Cause::Unknown) {
                 ++primary_unknown;
             }

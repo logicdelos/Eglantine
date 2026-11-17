@@ -1836,7 +1836,7 @@ TEST_CASE("Time the presenting thread has no span for is charged by what the oth
             RecordSpan(Cause::CodeTranslation, run.T(60 * Ms), run.T(100 * Ms), 0, 1);
         });
         Present(run.T(150 * Ms));
-        run.Finish();
+        const AttributionSnapshot snap = run.Finish();
         REQUIRE(g_frames.size() == 1);
         const LongFrame& frame = g_frames[0];
         // [30, 40) nobody works; [40, 60) the disk; [60, 100) the translation, which ends last of
@@ -1850,6 +1850,16 @@ TEST_CASE("Time the presenting thread has no span for is charged by what the oth
         CHECK(frame.primary_cause == Cause::Waiting);
         CHECK(frame.unknown_reasons == UnknownReason::PresenterGap);
         CHECK(At(frame.activity_ns, Cause::Disk) == 30 * Ms);
+        // What the spans cover is observed; only the gaps are inferred, per cause.
+        CHECK(At(frame.inferred_ns, Cause::Shader) == 0);
+        CHECK(At(frame.inferred_ns, Cause::Disk) == 20 * Ms);
+        CHECK(At(frame.inferred_ns, Cause::CodeTranslation) == 40 * Ms);
+        CHECK(At(frame.inferred_ns, Cause::Waiting) == 60 * Ms);
+        CHECK(At(frame.inferred_ns, Cause::Unknown) == 0);
+        CHECK(Total(frame.inferred_ns) == 120 * Ms);
+        CHECK(At(snap.inferred_ns, Cause::Disk) == 20 * Ms);
+        CHECK(At(snap.inferred_ns, Cause::Waiting) == 60 * Ms);
+        CHECK(Total(snap.inferred_ns) == 120 * Ms);
     }
     SECTION("with nobody else working the gap is the presenter's own Waiting") {
         Run run{SessionConfig{}};
@@ -1862,6 +1872,8 @@ TEST_CASE("Time the presenting thread has no span for is charged by what the oth
         CHECK(At(g_frames[0].cause_ns, Cause::Waiting) == 130 * Ms);
         CHECK(At(g_frames[0].cause_ns, Cause::Unknown) == 0);
         CHECK(g_frames[0].unknown_reasons == UnknownReason::PresenterGap);
+        CHECK(At(g_frames[0].inferred_ns, Cause::Shader) == 0);
+        CHECK(At(g_frames[0].inferred_ns, Cause::Waiting) == 130 * Ms);
     }
     SECTION("the strict decomposition leaves the gap Unknown") {
         Run run{Strict()};
@@ -1877,6 +1889,7 @@ TEST_CASE("Time the presenting thread has no span for is charged by what the oth
         CHECK(At(g_frames[0].cause_ns, Cause::Unknown) == 120 * Ms);
         CHECK(At(g_frames[0].cause_ns, Cause::Disk) == 0);
         CHECK((g_frames[0].unknown_reasons & UnknownReason::PresenterGap) == 0);
+        CHECK(Total(g_frames[0].inferred_ns) == 0);
     }
     SECTION("a window nobody recorded anything in stays Unknown") {
         Run run{SessionConfig{}};

@@ -40,6 +40,7 @@ Spikes::LongFrame MakeFrame(u64 id, u64 duration_ns) {
     frame.cause_ns[Shader] = duration_ns - duration_ns / 3;
     frame.cause_ns[Waiting] = duration_ns / 3;
     frame.activity_ns[Shader] = duration_ns;
+    frame.inferred_ns[Waiting] = duration_ns / 3;
     frame.primary_cause = Spikes::Cause::Shader;
     frame.confidence_permille = 1000;
     frame.present_result = Spikes::PresentResult::Success;
@@ -59,6 +60,7 @@ Spikes::AttributionSnapshot MakeSnapshot(u64 long_frames) {
     snapshot.unknown_wall_fraction = 0.125;
     snapshot.unknown_primary_frame_fraction = 0.5;
     snapshot.producer_unknown_wait_ns = 7;
+    snapshot.inferred_ns[Waiting] = 11;
     snapshot.process_created_ns = 5'000'000;
     snapshot.process_created_uncertainty_ns = 16'500'000;
     snapshot.first_host_present_ns = 2'500'000'000;
@@ -194,6 +196,9 @@ TEST_CASE("schema 2 normal run: golden members", "[report][schema2]") {
     CHECK(attribution["unknown_wall_fraction"] == 0.125);
     CHECK(attribution["unknown_primary_frame_fraction"] == 0.5);
     CHECK(attribution["producer_unknown_wait_ns"] == 7);
+    REQUIRE(attribution["inferred_ns"].size() == Spikes::CauseCount);
+    CHECK(attribution["inferred_ns"]["waiting"] == 11);
+    CHECK(attribution["inferred_ns"]["shader"] == 0);
     REQUIRE(attribution["long_frames"].size() == 2);
     CHECK(attribution["long_frames"][0] == Json::parse(Schema2::LongFrameJson(frames[0])));
     CHECK(attribution["long_frames"][1]["id"] == 42);
@@ -435,6 +440,9 @@ TEST_CASE("long frame json: exact integers, clamps and names", "[report][schema2
     CHECK(exact["counter_deltas"].empty());
     CHECK(exact["critical_work_ids"].empty());
     REQUIRE(exact["cause_ns"].size() == Spikes::CauseCount);
+    REQUIRE(exact["inferred_ns"].size() == Spikes::CauseCount);
+    CHECK(exact["inferred_ns"]["waiting"] == 33'333'333);
+    CHECK(exact["inferred_ns"]["shader"] == 0);
 
     SECTION("values past 2^53 are not rounded") {
         frame.start_ns = 9'007'199'254'740'993ull;

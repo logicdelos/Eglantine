@@ -83,9 +83,11 @@ void SetTitleId(u64 program_id);
 //       "lost_events", "dropped_boundaries", "sink_write_errors", "rejected_presents",
 //       "unknown_wall_fraction",
 //       "unknown_primary_frame_fraction", "producer_unknown_wait_ns",
+//       "inferred_ns": {<cause>: ns...} (sum over long frames and start-up),
 //       "long_frames": [LongFrame...] }
 //   LongFrame: { "id", "start_ns", "end_ns", "duration_ns", "cause_ns": {<cause>: ns...},
-//       "activity_ns": {<cause>: ns...}, "primary_cause", "confidence_permille",
+//       "activity_ns": {<cause>: ns...}, "inferred_ns": {<cause>: ns...} (part of cause_ns that is
+//       inferred: presenter_gap), "primary_cause", "confidence_permille",
 //       "unknown_reasons": [<name>...], "counter_deltas": {<event>: count, nonzero only},
 //       "critical_work_ids": [...], "present_result", "instrumentation_complete" }
 //   "startup": { "process_created": {"ns", "uncertainty_ns"} | null, "first_host_present_ns",
