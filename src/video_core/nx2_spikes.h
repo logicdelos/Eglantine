@@ -412,12 +412,16 @@ inline constexpr u32 MissingGpuTimestamp = 1u << 4;
 inline constexpr u32 AmbiguousDependency = 1u << 5;
 inline constexpr u32 LostSpans = 1u << 6;
 inline constexpr u32 ProducerUnknownWait = 1u << 7;
+/// Part of the frame is time the presenting thread has no span for, charged by what the other
+/// threads were doing (or Waiting): an inference, not a measurement.
+inline constexpr u32 PresenterGap = 1u << 8;
 } // namespace UnknownReason
 
 /// The names reports use, indexed by the bit number of an UnknownReason.
-inline constexpr std::array<std::string_view, 8> UnknownReasonNames{
+inline constexpr std::array<std::string_view, 9> UnknownReasonNames{
     "pre_instrumentation", "unlinked_guest",     "uninstrumented_driver", "scheduler_or_paging",
     "missing_gpu_timestamp", "ambiguous_dependency", "lost_spans",          "producer_unknown_wait",
+    "presenter_gap",
 };
 
 inline constexpr size_t MaxCriticalWork = 8;
@@ -469,6 +473,9 @@ struct SessionConfig {
     /// history never has fewer than 64 slots and a ring never fewer than four events, so budgets
     /// below about 100 KiB are exceeded.
     size_t buffer_bytes{size_t{16} << 20};
+    /// Charge the time the presenting thread has no span for by what the other threads were doing
+    /// (UnknownReason::PresenterGap) instead of leaving it Unknown. Off: the strict decomposition.
+    bool charge_presenter_gaps{true};
 };
 
 /// Starts a session: a new generation, empty buffers, recording on. False when one is running.

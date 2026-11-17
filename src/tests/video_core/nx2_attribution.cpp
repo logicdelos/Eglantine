@@ -53,8 +53,16 @@ u64 Total(const Times& times) {
     return total;
 }
 
-SessionConfig Config(u64 threshold_ns) {
+/// The strict decomposition most tests state: time the presenting thread has no span for is
+/// Unknown. The tests of the gap rule use a SessionConfig of their own (charging on, the default).
+SessionConfig Strict() {
     SessionConfig config;
+    config.charge_presenter_gaps = false;
+    return config;
+}
+
+SessionConfig Config(u64 threshold_ns) {
+    SessionConfig config = Strict();
     config.threshold_ns = threshold_ns;
     return config;
 }
@@ -76,7 +84,7 @@ void OnThread(F&& function) {
 /// Spans of the root (the test thread) are numbered from `root_seq`: the constructor spends the
 /// first sequence number on a probe span that ends before `base`.
 struct Run {
-    explicit Run(SessionConfig config = {}) {
+    explicit Run(SessionConfig config = Strict()) {
         g_frames.clear();
         SetLongFrameSink({CollectSink, nullptr});
         REQUIRE(BeginSession(config));
@@ -1810,4 +1818,73 @@ TEST_CASE("A long wait scope records one guest wait span", "[nx2][attribution]")
     CHECK(At(frame.cause_ns, Cause::CodeTranslation) >= LongWaitMinNs);
     CHECK(At(frame.cause_ns, Cause::CodeTranslation) < 200 * Ms);
     CHECK(Total(frame.cause_ns) == frame.duration_ns);
+}
+
+TEST_CASE("Time the presenting thread has no span for is charged by what the others were doing",
+          "[nx2][attribution]") {
+    SECTION("charged to the other threads' causes, the rest is Waiting") {
+        Run run{SessionConfig{}};
+        Present(run.T(0));
+        RecordSpan(Cause::Shader, run.T(0), run.T(30 * Ms));
+        OnThread([&] {
+            RegisterThread("worker");
+            RecordSpan(Cause::Disk, run.T(40 * Ms), run.T(70 * Ms));
+        });
+        OnThread([&] {
+            RegisterThread("guest core");
+            MarkGuestThread();
+            RecordSpan(Cause::CodeTranslation, run.T(60 * Ms), run.T(100 * Ms), 0, 1);
+        });
+        Present(run.T(150 * Ms));
+        run.Finish();
+        REQUIRE(g_frames.size() == 1);
+        const LongFrame& frame = g_frames[0];
+        // [30, 40) nobody works; [40, 60) the disk; [60, 100) the translation, which ends last of
+        // the two that overlap in [60, 70); [100, 150) nobody.
+        CHECK(At(frame.cause_ns, Cause::Shader) == 30 * Ms);
+        CHECK(At(frame.cause_ns, Cause::Disk) == 20 * Ms);
+        CHECK(At(frame.cause_ns, Cause::CodeTranslation) == 40 * Ms);
+        CHECK(At(frame.cause_ns, Cause::Waiting) == 60 * Ms);
+        CHECK(At(frame.cause_ns, Cause::Unknown) == 0);
+        CHECK(Total(frame.cause_ns) == 150 * Ms);
+        CHECK(frame.primary_cause == Cause::Waiting);
+        CHECK(frame.unknown_reasons == UnknownReason::PresenterGap);
+        CHECK(At(frame.activity_ns, Cause::Disk) == 30 * Ms);
+    }
+    SECTION("with nobody else working the gap is the presenter's own Waiting") {
+        Run run{SessionConfig{}};
+        Present(run.T(0));
+        RecordSpan(Cause::Shader, run.T(0), run.T(20 * Ms));
+        Present(run.T(150 * Ms));
+        run.Finish();
+        REQUIRE(g_frames.size() == 1);
+        CHECK(At(g_frames[0].cause_ns, Cause::Shader) == 20 * Ms);
+        CHECK(At(g_frames[0].cause_ns, Cause::Waiting) == 130 * Ms);
+        CHECK(At(g_frames[0].cause_ns, Cause::Unknown) == 0);
+        CHECK(g_frames[0].unknown_reasons == UnknownReason::PresenterGap);
+    }
+    SECTION("the strict decomposition leaves the gap Unknown") {
+        Run run{Strict()};
+        Present(run.T(0));
+        RecordSpan(Cause::Shader, run.T(0), run.T(30 * Ms));
+        OnThread([&] {
+            RegisterThread("worker");
+            RecordSpan(Cause::Disk, run.T(40 * Ms), run.T(70 * Ms));
+        });
+        Present(run.T(150 * Ms));
+        run.Finish();
+        REQUIRE(g_frames.size() == 1);
+        CHECK(At(g_frames[0].cause_ns, Cause::Unknown) == 120 * Ms);
+        CHECK(At(g_frames[0].cause_ns, Cause::Disk) == 0);
+        CHECK((g_frames[0].unknown_reasons & UnknownReason::PresenterGap) == 0);
+    }
+    SECTION("a window nobody recorded anything in stays Unknown") {
+        Run run{SessionConfig{}};
+        Present(run.T(0));
+        Present(run.T(150 * Ms));
+        run.Finish();
+        REQUIRE(g_frames.size() == 1);
+        CHECK(At(g_frames[0].cause_ns, Cause::Unknown) == 150 * Ms);
+        CHECK(g_frames[0].unknown_reasons == UnknownReason::UnlinkedGuest);
+    }
 }

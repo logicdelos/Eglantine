@@ -336,8 +336,9 @@ struct CumulativeEntry {
 class Resolver {
 public:
     Resolver(std::span<const ThreadState> threads, std::span<const std::pair<u64, u64>> losses,
-             u64 start, u64 end)
-        : states{threads}, loss_episodes{losses}, s{start}, e{end} {}
+             u64 start, u64 end, bool charge_presenter_gaps)
+        : states{threads}, loss_episodes{losses}, s{start}, e{end},
+          charge_gaps{charge_presenter_gaps} {}
 
     Decomp Run(std::span<const u32> roots) {
         for (const auto& [begin, finish] : loss_episodes) {
@@ -490,6 +491,7 @@ private:
     }
 
     void ResolveRoots(std::span<const u32> roots) {
+        root_ids.assign(roots.begin(), roots.end());
         std::vector<const std::vector<Leaf>*> lists;
         for (const u32 root : roots) {
             if (root >= 1 && root <= leaves.size()) {
@@ -540,8 +542,7 @@ private:
                 }
             }
             if (best == nullptr) {
-                Charge(Cause::Unknown, x, y, 0);
-                out.reasons |= UnknownReason::UnlinkedGuest;
+                ExpandRootGap(x, y);
             } else if (best->cause == Cause::Waiting) {
                 visited.clear();
                 ExpandWait(x, y, *best);
@@ -656,9 +657,49 @@ private:
     /// cause (when several are, the span that ends last is the critical one, as for a linked wait);
     /// where none is, the guest was idle or waiting itself and the time stays Waiting.
     void ExpandGuestWait(u64 x, u64 y, const Leaf& wait) {
+        ExpandByActivity(
+            x, y,
+            [this, &wait](size_t t) {
+                return states[t].guest && static_cast<u32>(t + 1) != wait.thread;
+            },
+            [this](u64 from, u64 to) {
+                Charge(Cause::Waiting, from, to, 0);
+                out.reasons |= UnknownReason::ProducerUnknownWait;
+                out.producer_unknown_wait_ns += to - from;
+            });
+    }
+
+    /// Charges [x, y) of a stretch where the presenting thread has no span (its own work between
+    /// the waits it records, waits shorter than the recording threshold) by what every other thread
+    /// was doing meanwhile, with the rule of a guest wait: where one is in a cause that is not
+    /// waiting, the time goes to the cause of the span that ends last; where none is, it stays
+    /// Waiting (the presenter's own time, not a cause of its own). It is a bounded guess, so the
+    /// frame carries PresenterGap. Only when no thread recorded anything in the window is the time
+    /// Unknown: there is nothing to attribute it to.
+    void ExpandRootGap(u64 x, u64 y) {
+        if (!charge_gaps || leaf_total == 0) {
+            Charge(Cause::Unknown, x, y, 0);
+            out.reasons |= UnknownReason::UnlinkedGuest;
+            return;
+        }
+        out.reasons |= UnknownReason::PresenterGap;
+        ExpandByActivity(
+            x, y,
+            [this](size_t t) {
+                return std::find(root_ids.begin(), root_ids.end(), static_cast<u32>(t + 1)) ==
+                       root_ids.end();
+            },
+            [this](u64 from, u64 to) { Charge(Cause::Waiting, from, to, 0); });
+    }
+
+    /// Charges [x, y) by the leaves of the threads `include` accepts that are not waiting or
+    /// Unknown: the span that ends last is the critical one where several overlap, and `uncovered`
+    /// takes the pieces no such leaf covers.
+    template <typename Include, typename Uncovered>
+    void ExpandByActivity(u64 x, u64 y, Include&& include, Uncovered&& uncovered) {
         const auto each = [&](auto&& emit) {
             for (size_t t = 0; t < leaves.size(); ++t) {
-                if (!states[t].guest || static_cast<u32>(t + 1) == wait.thread) {
+                if (!include(t)) {
                     continue;
                 }
                 const std::vector<Leaf>& list = leaves[t];
@@ -674,11 +715,6 @@ private:
                     emit(piece);
                 }
             }
-        };
-        const auto uncovered = [this](u64 from, u64 to) {
-            Charge(Cause::Waiting, from, to, 0);
-            out.reasons |= UnknownReason::ProducerUnknownWait;
-            out.producer_unknown_wait_ns += to - from;
         };
         size_t count{};
         each([&count](const Leaf&) { ++count; });
@@ -811,6 +847,8 @@ private:
     std::span<const std::pair<u64, u64>> loss_episodes;
     u64 s;
     u64 e;
+    std::vector<u32> root_ids; ///< The roots of the sweep that is running (ResolveRoots)
+    bool charge_gaps; ///< SessionConfig::charge_presenter_gaps
     std::vector<std::vector<Leaf>> leaves;
     /// The spans of the window that carry a work id, clipped to it, sorted by (work, thread, begin).
     /// A leaf belongs to a work when it lies inside one of that work's spans on its thread, which is
@@ -1648,7 +1686,8 @@ void Session::LogDiagnostics() const {
 
 Decomp Session::Decompose(u64 s, u64 e, std::span<const u32> roots) const {
     const u32 count = thread_count.load(std::memory_order_acquire);
-    Resolver resolver{std::span<const ThreadState>{states.data(), count}, losses, s, e};
+    Resolver resolver{std::span<const ThreadState>{states.data(), count}, losses, s, e,
+                      config.charge_presenter_gaps};
     Decomp result = resolver.Run(roots);
     if (resolver.PeakScratchBytes() > peak_scratch_bytes.load(std::memory_order_relaxed)) {
         peak_scratch_bytes.store(resolver.PeakScratchBytes(), std::memory_order_relaxed);
@@ -2146,7 +2185,7 @@ void MarkGuestThread() {
     if (s == nullptr) {
         return;
     }
-    ThreadBuf* t = ThisThread(*s);
+    ThreadBuf* t = ThisThread(*s, "guest core");
     if (t != nullptr && !t->guest.load(std::memory_order_relaxed)) {
         t->guest.store(true, std::memory_order_relaxed);
     }

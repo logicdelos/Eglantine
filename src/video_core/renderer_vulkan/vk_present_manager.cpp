@@ -607,6 +607,7 @@ void PresentManager::DiscardFrame(Frame* frame) {
         .pSignalSemaphores = nullptr,
     };
 
+    const VideoCommon::Nx2Spikes::SpanScope submit_wait{VideoCommon::Nx2Spikes::Cause::Waiting};
     std::scoped_lock submit_lock{scheduler.submit_mutex};
     void(device.GetGraphicsQueue().Submit(submit_info, *frame->present_done));
 }
@@ -791,6 +792,9 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
 
     // Submit the image copy/blit to the swapchain
     {
+        // The submit lock is shared with the worker's submissions and the queue can block: waiting
+        // before the host present, with no producer to name.
+        const VideoCommon::Nx2Spikes::SpanScope submit_wait{VideoCommon::Nx2Spikes::Cause::Waiting};
         std::scoped_lock submit_lock{scheduler.submit_mutex};
         switch (const VkResult result =
                     device.GetGraphicsQueue().Submit(submit_info, *frame->present_done)) {
