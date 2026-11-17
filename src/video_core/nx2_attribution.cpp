@@ -57,6 +57,7 @@ void ReadEventCounts(std::array<u64, static_cast<size_t>(Event::Count)>& counts)
 void SetAttributionCounting(bool on);
 size_t PeakRetainedHistoryBytes();
 size_t PeakResolverScratchBytes();
+u64 DrainedRingEvents();
 } // namespace Detail
 
 namespace {
@@ -1487,6 +1488,18 @@ size_t PeakRetainedHistoryBytes() {
 size_t PeakResolverScratchBytes() {
     std::scoped_lock lock{g_lifecycle_mutex};
     return g_owned != nullptr ? g_owned->peak_scratch_bytes.load(std::memory_order_relaxed) : 0;
+}
+
+/// The number of events of the calling thread's ring the consumer has taken so far (0 without a
+/// session), for the tests that must not outrun the consumer. It reads one existing counter and is
+/// on no recording path.
+u64 DrainedRingEvents() {
+    Session* s = ActiveSession();
+    if (s == nullptr) {
+        return 0;
+    }
+    const ThreadBuf* t = ThisThread(*s);
+    return t != nullptr ? t->head.load(std::memory_order_acquire) : 0;
 }
 } // namespace Detail
 

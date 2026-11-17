@@ -15,6 +15,7 @@
 namespace VideoCommon::Nx2Spikes::Detail {
 size_t PeakRetainedHistoryBytes();
 size_t PeakResolverScratchBytes();
+u64 DrainedRingEvents();
 } // namespace VideoCommon::Nx2Spikes::Detail
 
 namespace {
@@ -114,6 +115,16 @@ struct Run {
 
 u64 Present(u64 timestamp_ns, PresentResult result = PresentResult::Success, bool real = true) {
     return OnHostPresent({0, 0, timestamp_ns, real, result});
+}
+
+/// Returns true once the consumer has taken the `recorded` events this thread has recorded, so
+/// the next batch cannot overflow its ring.
+bool AwaitDrained(u64 recorded) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{30};
+    while (Detail::DrainedRingEvents() < recorded && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    return Detail::DrainedRingEvents() >= recorded;
 }
 
 } // Anonymous namespace
@@ -813,42 +824,126 @@ TEST_CASE("Rings and retained history share one fixed budget", "[nx2][attributio
 TEST_CASE("Span storage held by many producers over pruning windows stays inside the budget",
           "[nx2][attribution]") {
     SessionConfig config = Config(100 * Ms);
-    config.buffer_bytes = 512 * 1024;
-    Run run{config};
-    constexpr u64 Producers = 8;
+    config.buffer_bytes = 1024 * 1024;
+    constexpr u64 Producers = 16;
     constexpr u64 SpansPerBurst = 800;
-    constexpr u64 RingChunk = 64; // fewer than a ring holds, so a burst never overflows its ring
-    REQUIRE(run.base > 4'000 * Ms);
+    constexpr u64 RingChunk = 64; // a quarter of a ring (256 events), recorded between two drains
+    // Pruning only ever removes spans more than two seconds old on the recorder clock.
+    WaitUntil(5'000 * Ms);
+    Run run{config};
     // Spans and presents far enough in the past that each present prunes the burst before it.
     const u64 origin = run.base - 4'000 * Ms;
     Present(origin);
+    std::atomic<bool> drained{true};
     for (u64 round = 0; round < Producers; ++round) {
         const u64 begin = origin + (round + 1) * 20 * Ms;
         // One thread per burst: every producer keeps its own span vectors for the whole session.
         OnThread([&] {
             RegisterThread("burst producer");
+            u64 recorded = 0;
             for (u64 done = 0; done < SpansPerBurst; done += RingChunk) {
                 for (u64 i = 0; i < RingChunk; ++i) {
                     RecordSpan(Cause::Shader, begin, begin + 5 * Ms);
                 }
-                std::this_thread::sleep_for(std::chrono::milliseconds{5});
+                recorded += RingChunk;
+                if (!AwaitDrained(recorded)) {
+                    drained = false;
+                    return;
+                }
             }
         });
+        REQUIRE(drained.load());
         Present(begin + 15 * Ms);
         AwaitFrames(round + 1);
     }
-    run.Finish();
+    const AttributionSnapshot snap = run.Finish();
+    // Every burst was recorded in full, so the storage was exercised and nothing was refused...
+    CHECK(snap.lost_events == 0);
     const size_t peak = Detail::PeakRetainedHistoryBytes();
-    // Each burst alone is stored, so the storage was exercised...
-    CHECK(peak >= SpansPerBurst / 2 * 40);
+    CHECK(peak >= SpansPerBurst * 40);
     // ...and the storage of all producers together never exceeds the share of the budget that
     // is set aside for the history, although every producer filled its own vectors in turn.
     CHECK(peak <= config.buffer_bytes / 2);
 }
 
+namespace {
+
+struct CloseOutcome {
+    LongFrame frame;
+    u64 lost_events{};
+};
+
+/// A span begun on a fresh thread and ended from the test thread inside one long frame. With
+/// `fill_allowance` another thread first records spans, in the next frame's time, until the
+/// history has no room left, so the end of the first span finds none for its closed record.
+CloseOutcome RunCloseScenario(bool fill_allowance) {
+    SessionConfig config = Config(100 * Ms);
+    config.buffer_bytes = 256 * 1024; // rings of 64 events, a history of a few hundred records
+    Run run{config};
+    // The first two presents are resolved, and the history pruned for the first time, before
+    // anything below is recorded: nothing frees capacity between the fill and the end.
+    Present(run.T(0));
+    Present(run.T(1 * Ms));
+    AwaitFrames(1);
+    std::atomic<bool> drained{true};
+    SpanToken open{};
+    OnThread([&] {
+        RegisterThread("owner");
+        open = BeginSpan(Cause::Shader);
+        drained = AwaitDrained(1); // its open record is in the history before anything else
+    });
+    REQUIRE(drained.load());
+    REQUIRE(open.Valid());
+    if (fill_allowance) {
+        constexpr u64 Fill = 640; // more records than the history can hold
+        constexpr u64 Chunk = 32; // half a ring
+        OnThread([&] {
+            RegisterThread("filler");
+            u64 recorded = 0;
+            for (u64 done = 0; done < Fill; done += Chunk) {
+                for (u64 i = 0; i < Chunk; ++i) {
+                    RecordSpan(Cause::Shader, run.T(20'000 * Ms), run.T(20'005 * Ms));
+                }
+                recorded += Chunk;
+                if (!AwaitDrained(recorded)) {
+                    drained = false;
+                    return;
+                }
+            }
+        });
+        REQUIRE(drained.load());
+    }
+    EndSpan(open); // the owner's closed vector has to be allocated now
+    Present(run.T(10'000 * Ms)); // the long frame holds the span, not the filler's time
+    const AttributionSnapshot snap = run.Finish();
+    REQUIRE(g_frames.size() == 1);
+    return {g_frames[0], snap.lost_events};
+}
+
+} // Anonymous namespace
+
+TEST_CASE("A span that ends while the history has room is kept and its frame is complete",
+          "[nx2][attribution]") {
+    const CloseOutcome outcome = RunCloseScenario(false);
+    CHECK(outcome.lost_events == 0);
+    CHECK(outcome.frame.instrumentation_complete);
+    CHECK((outcome.frame.unknown_reasons & UnknownReason::LostSpans) == 0);
+}
+
+TEST_CASE("A span whose end finds no room in the history is counted as lost and marks its frame",
+          "[nx2][attribution]") {
+    const CloseOutcome outcome = RunCloseScenario(true);
+    // The filler's refused records lie after the frame, so only the refused close can touch it.
+    CHECK(outcome.lost_events > 0);
+    CHECK_FALSE(outcome.frame.instrumentation_complete);
+    CHECK((outcome.frame.unknown_reasons & UnknownReason::LostSpans) != 0);
+}
+
 TEST_CASE("Deeply nested spans with distinct work ids keep the resolver scratch linear",
           "[nx2][attribution]") {
     SessionConfig config = Config(10 * Ms);
+    // The rings are 8192 events each, so the 4096 spans below are recorded whatever the consumer
+    // is doing.
     config.buffer_bytes = size_t{32} << 20;
     Run run{config};
     constexpr u64 Spans = 4096;
@@ -875,24 +970,61 @@ TEST_CASE("Deeply nested spans with distinct work ids keep the resolver scratch 
     REQUIRE(g_frames.size() == 1);
     const LongFrame& frame = g_frames[0];
     const u64 covered = (2 * Spans - 1) * Unit;
-    if (frame.instrumentation_complete) {
-        CHECK(At(frame.cause_ns, Cause::Shader) == covered);
-        CHECK(At(frame.cause_ns, Cause::Waiting) == 10 * Ms - covered);
-        CHECK(At(frame.cause_ns, Cause::Unknown) == 10 * Ms);
-        CHECK(Total(frame.cause_ns) == 20 * Ms);
-        CHECK(At(frame.activity_ns, Cause::Shader) == covered);
-    } else {
-        // Whatever did not fit is counted and the frame says so; no wrong answer is reported as
-        // complete.
-        CHECK((snap.lost_events > 0 ||
-               (frame.unknown_reasons & UnknownReason::AmbiguousDependency) != 0));
-    }
+    CHECK(snap.lost_events == 0);
+    CHECK(frame.instrumentation_complete);
+    CHECK(At(frame.cause_ns, Cause::Shader) == covered);
+    CHECK(At(frame.cause_ns, Cause::Waiting) == 10 * Ms - covered);
+    CHECK(At(frame.cause_ns, Cause::Unknown) == 10 * Ms);
+    CHECK(Total(frame.cause_ns) == 20 * Ms);
+    CHECK(At(frame.activity_ns, Cause::Shader) == covered);
     // The scratch is a few hundred bytes per span, not one entry per span and ancestor pair
     // (which would be 4096 * 4096 entries here), and far inside the budget.
     const size_t scratch = Detail::PeakResolverScratchBytes();
     CHECK(scratch >= Spans * 64);
     CHECK(scratch <= Spans * 512);
     CHECK(scratch <= config.buffer_bytes / 2);
+}
+
+TEST_CASE("Nested spans that overflow a small ring are counted as lost and the frame says so",
+          "[nx2][attribution]") {
+    ResetBlock();
+    SetLongFrameSink({BlockFirstFrame, nullptr});
+    SessionConfig config = Config(10 * Ms);
+    config.buffer_bytes = 16 * 1024; // rings of 4 events
+    REQUIRE(BeginSession(config));
+    constexpr u64 Spans = 256;
+    constexpr u64 Unit = 1000; // ns
+    std::vector<WorkId> works;
+    for (u64 i = 0; i < Spans; ++i) {
+        works.push_back(NewWorkId());
+    }
+    const u64 base = NowNs();
+    Present(base);
+    Present(base + 20 * Ms); // the consumer stops in the sink with this frame
+    AwaitBlocked();
+    // It cannot drain now, so the 4-event ring takes four of the spans and loses the rest.
+    OnThread([&] {
+        RegisterThread("nested producer");
+        for (u64 i = 0; i < Spans; ++i) {
+            RecordSpan(Cause::Shader, base + 30 * Ms + (i + 1) * Unit,
+                       base + 30 * Ms + (2 * Spans - i) * Unit, works[i]);
+        }
+    });
+    Present(base + 60 * Ms);
+    g_block.release.store(true);
+    AwaitFrames(2);
+    EndSession();
+    SetLongFrameSink({});
+    const AttributionSnapshot snap = ReadAttributionSnapshot();
+    REQUIRE(g_frames.size() == 2);
+    const LongFrame& frame = g_frames[1];
+    CHECK(snap.lost_events >= Spans - 4);
+    CHECK_FALSE(snap.complete);
+    CHECK_FALSE(frame.instrumentation_complete);
+    CHECK((frame.unknown_reasons & UnknownReason::LostSpans) != 0);
+    CHECK(Total(frame.cause_ns) == 40 * Ms);
+    // What was kept is never more than the spans that were recorded cover.
+    CHECK(At(frame.cause_ns, Cause::Shader) <= (2 * Spans - 1) * Unit);
 }
 
 TEST_CASE("A wait chain whose candidates outnumber the leaves is reported, not resolved",
