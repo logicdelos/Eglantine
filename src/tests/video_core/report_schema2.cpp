@@ -114,6 +114,16 @@ Envelope::CacheReport MakeAcceptedCache() {
     report.stats.adopted = 650;
     report.stats.demand_wait_ns = 1'234'567;
     report.stats.evicted = 3;
+    report.stats.records = 812;
+    report.stats.demand_promoted = 11;
+    report.stats.demand_building = 12;
+    report.stats.demand_evicted = 13;
+    report.stats.demand_unknown = 14;
+    report.stats.held_back = 15;
+    report.stats.adopted_lead_ns = 16'000'001;
+    report.stats.late_records = 17;
+    report.stats.late_wait_ns = 18'000'002;
+    report.stats.late_wait_max_ns = 19'000'003;
     report.stats.checkpoints = 2;
     report.stats.bytes_committed = 4096;
     report.stats.write_status = Envelope::WriteStatus::Ok;
@@ -244,10 +254,13 @@ TEST_CASE("schema 2 normal run: golden members", "[report][schema2]") {
                               "pipeline_cache_uuid": "000102030405060708090a0b0c0d0eff"}},
       "files": [{"kind": "transferable", "status": "accepted", "reason": "none",
                  "expected": null, "found": null, "records": 812}],
-      "recorded": 5, "prepared": 700, "adopted": 650, "demand_promoted": 0,
+      "recorded": 5, "records": 812, "prepared": 700, "adopted": 650, "demand_promoted": 11,
+      "demand_building": 12, "demand_evicted": 13, "demand_unknown": 14,
       "demand_wait_ns": 1234567, "prepare_failures": 0, "records_skipped": 0,
       "write_status": "ok", "queue_high_water": 0, "memory_high_water_bytes": 0,
-      "budget_pauses": 0, "evicted": 3, "checkpoints": 2, "bytes_committed": 4096,
+      "budget_pauses": 0, "evicted": 3, "held_back": 15, "adopted_lead_ns": 16000001,
+      "late_records": 17, "late_wait_ns": 18000002, "late_wait_max_ns": 19000003,
+      "checkpoints": 2, "bytes_committed": 4096,
       "translate_cost": "not_separately_measured"
     })");
     Json actual_cache = report["cache"];

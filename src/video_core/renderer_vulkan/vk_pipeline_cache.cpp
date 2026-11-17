@@ -499,7 +499,7 @@ public:
     };
 
     PipelineCacheSession(const CE::CacheIdentity& identity_, const CE::PrepareOptions& options)
-        : identity{identity_}, scheduler{options, &Spikes::NewWorkId} {}
+        : identity{identity_}, scheduler{options, &Spikes::NewWorkId, &Spikes::NowNs} {}
 
     CE::CacheIdentity identity;
     std::vector<File> files;
@@ -1736,6 +1736,54 @@ void PipelineCache::RunPreparation(u64 generation) {
     }
 }
 
+namespace {
+/// Milliseconds of a Scheduler clock value (NowNs) after the first frame; negative before it.
+double MsSinceFirstFrame(u64 ns, u64 first_frame_ns) {
+    return (static_cast<double>(ns) - static_cast<double>(first_frame_ns)) / 1e6;
+}
+
+/// What preparation did over the run, and the records that were first used before they were
+/// ready: the counters of the cache block of the report with the times behind them.
+void LogPrepareSummary(const PipelineCacheSession& session, u64 first_frame_ns) {
+    CE::CacheStats stats;
+    session.scheduler.FillStats(stats);
+    if (stats.records == 0) {
+        return;
+    }
+    const double lead_ms =
+        stats.adopted != 0 ? static_cast<double>(stats.adopted_lead_ns) / 1e6 /
+                                 static_cast<double>(stats.adopted)
+                           : 0.0;
+    LOG_INFO(Render_Vulkan,
+             "Pipeline records: {} to prepare, {} prepared, {} adopted ({:.0f} ms before use on "
+             "average), {} released unused, builds held at the ready cap {} times; first used "
+             "before ready: {} while building (waited {:.1f} ms, longest {:.1f} ms), {} queued, {} "
+             "released; {} draws matched no record",
+             stats.records, stats.prepared, stats.adopted, lead_ms, stats.evicted, stats.held_back,
+             stats.demand_building,
+             static_cast<double>(stats.late_wait_ns) / 1e6,
+             static_cast<double>(stats.late_wait_max_ns) / 1e6, stats.demand_promoted,
+             stats.demand_evicted, stats.demand_unknown);
+    constexpr size_t MaxListed = 12;
+    const auto late = session.scheduler.LateRecords();
+    for (size_t index = 0; index < late.size() && index < MaxListed; ++index) {
+        const PP::Scheduler::LateRecord& record = late[index];
+        const char* const outcome =
+            record.outcome == PP::Scheduler::LateOutcome::Building  ? "building"
+            : record.outcome == PP::Scheduler::LateOutcome::Claimed ? "queued"
+                                                                    : "released";
+        LOG_INFO(Render_Vulkan,
+                 "Late record {}: recorded first use {:.1f} ms after the first frame, asked {:.1f} "
+                 "ms after it, {}, ready {}",
+                 record.rank, static_cast<double>(record.recorded_first_use_ns) / 1e6,
+                 MsSinceFirstFrame(record.demanded_ns, first_frame_ns), outcome,
+                 record.ready_ns != 0
+                     ? fmt::format("{:.1f} ms", MsSinceFirstFrame(record.ready_ns, first_frame_ns))
+                     : std::string{"never"});
+    }
+}
+} // Anonymous namespace
+
 void PipelineCache::FinishCacheSession() {
     if (!cache_session) {
         return;
@@ -1749,6 +1797,7 @@ void PipelineCache::FinishCacheSession() {
     disk_replay_workers.ClearRequests();
     disk_replay_workers.WaitForRequests();
     dropped.clear();
+    LogPrepareSummary(session, first_frame_ns);
     // Records still staged, then the files: readers close before the commit replaces them.
     serialization_thread.WaitForRequests();
     if (session.statistics) {
@@ -1827,6 +1876,10 @@ bool PipelineCache::TakePreparedCompute(const ComputePipelineCacheKey& key,
     }
     PP::Scheduler::Demand demand =
         RequestPrepared(*cache_session, key.Hash(), EncodeComputeKey(key));
+    if (demand.kind == PP::Scheduler::DemandKind::Claimed ||
+        demand.kind == PP::Scheduler::DemandKind::Unavailable) {
+        demanded_hash = key.Hash(); // In the file already: the build that follows says so
+    }
     if (demand.kind != PP::Scheduler::DemandKind::Ready) {
         return entry.pipeline != nullptr;
     }
@@ -3888,8 +3941,9 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(const ComputePipe
                                                                const ShaderInfo* shader,
                                                                std::span<const u64> keep_pointers) {
     const auto begin = std::chrono::steady_clock::now();
+    const bool from_disk = std::exchange(demanded_hash, 0) == key.Hash();
     SCOPE_EXIT {
-        ReportRuntimePipeline("Compute", begin, false, false);
+        ReportRuntimePipeline("Compute", begin, false, from_disk);
         ChargeRuntimeBuild(begin);
         last_runtime_build.store(std::chrono::steady_clock::now().time_since_epoch().count(),
                                  std::memory_order_relaxed);

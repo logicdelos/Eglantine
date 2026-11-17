@@ -96,11 +96,17 @@ void SetTitleId(u64 program_id);
 //   "first_120s": { "anchor": "first_real_host_present", "complete", "elapsed_ns", "frames",
 //       "frames_over_100ms", "max_ns", "crossing_tail_interval_ns", "scene_check" }
 //   "cache": { "identity": {...}, "files": [{"kind", "status": "accepted"|"rejected"|"missing",
-//       "reason", "expected", "found", "records"}...], "recorded", "prepared", "adopted",
-//       "demand_promoted", "demand_wait_ns", "prepare_failures", "records_skipped",
-//       "write_status", "queue_high_water", "memory_high_water_bytes", "budget_pauses",
-//       "evicted", "checkpoints", "bytes_committed", "translate_cost" (the text
-//       "not_separately_measured": translation is timed inside the build of a record) }
+//       "reason", "expected", "found", "records"}...], "recorded", "records" (the records the
+//       run tried to prepare), "prepared", "adopted", "demand_promoted" (found queued: the draw
+//       built it), "demand_building" (found building: the draw waited), "demand_evicted" (found
+//       released), "demand_unknown" (matched no record), "demand_wait_ns", "prepare_failures",
+//       "records_skipped", "write_status", "queue_high_water", "memory_high_water_bytes",
+//       "budget_pauses", "evicted", "held_back" (times builds waited at the ready cap),
+//       "adopted_lead_ns" (sum of first use minus ready over adopted objects), "late_records"
+//       (first used while building, queued or released), "late_wait_ns" and "late_wait_max_ns"
+//       (ready minus first use of those that were building), "checkpoints", "bytes_committed",
+//       "translate_cost" (the text "not_separately_measured": translation is timed inside the
+//       build of a record) }
 // <cause> is a Nx2Spikes::CauseName, <event> an Event name, "reason" a RejectReasonName.
 namespace Schema2 {
 

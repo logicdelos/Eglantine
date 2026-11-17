@@ -363,9 +363,13 @@ std::string CacheJson(const Envelope::CacheReport& report) {
     json["identity"] = reported ? HostIdentityJson(report.identity) : Json(nullptr);
     json["files"] = std::move(files);
     json["recorded"] = number(stats.recorded);
+    json["records"] = number(stats.records);
     json["prepared"] = number(stats.prepared);
     json["adopted"] = number(stats.adopted);
     json["demand_promoted"] = number(stats.demand_promoted);
+    json["demand_building"] = number(stats.demand_building);
+    json["demand_evicted"] = number(stats.demand_evicted);
+    json["demand_unknown"] = number(stats.demand_unknown);
     json["demand_wait_ns"] = number(stats.demand_wait_ns);
     json["prepare_failures"] = number(stats.prepare_failures);
     json["records_skipped"] = number(stats.records_skipped);
@@ -375,6 +379,11 @@ std::string CacheJson(const Envelope::CacheReport& report) {
     json["memory_high_water_bytes"] = number(stats.memory_high_water_bytes);
     json["budget_pauses"] = number(stats.budget_pauses);
     json["evicted"] = number(stats.evicted);
+    json["held_back"] = number(stats.held_back);
+    json["adopted_lead_ns"] = number(stats.adopted_lead_ns);
+    json["late_records"] = number(stats.late_records);
+    json["late_wait_ns"] = number(stats.late_wait_ns);
+    json["late_wait_max_ns"] = number(stats.late_wait_max_ns);
     json["checkpoints"] = number(stats.checkpoints);
     json["bytes_committed"] = number(stats.bytes_committed);
     // Translation is timed inside the build of a record (build_cost_us), never on its own.
