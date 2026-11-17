@@ -14,6 +14,7 @@
 #include <string_view>
 
 #include "common/assert.h"
+#include "common/baseline_settings.h"
 #include "common/logging.h"
 #include "common/settings.h"
 #include "common/string_util.h"
@@ -114,6 +115,9 @@ static struct option kLongOptions[] = {
     {"user-dir", required_argument, 0, 0x10C},
     {"list-settings", no_argument, 0, 0x10D},
     {"set", required_argument, 0, 0x10E},
+    {"baseline", no_argument, 0, 0x110},
+    {"baseline-allow", required_argument, 0, 0x111},
+    {"print-baseline", no_argument, 0, 0x112},
     {0, 0, 0, 0},
     // clang-format on
 };
@@ -459,6 +463,22 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
                 }
                 break;
             }
+            case 0x110:
+                p.baseline = true;
+                break;
+            case 0x111:
+                for (const auto& token : Settings::Baseline::SplitAllowList(optarg)) {
+                    if (token.empty() || token.front() == '=') {
+                        fail(std::string("invalid --baseline-allow '") + optarg +
+                             "': expected KEY[,KEY...], each KEY or KEY=VALUE");
+                    } else {
+                        p.baseline_allow.push_back(token);
+                    }
+                }
+                break;
+            case 0x112:
+                p.print_baseline = true;
+                break;
             case '?':
                 // getopt leaves the value of the option in optopt when its operand is missing at
                 // the end of the command line; it is 0 for an unknown long option. The options of
@@ -502,11 +522,15 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
     if (p.print_json && !p.print_version) {
         fail("--json is only valid together with --version");
     }
+    if (!p.baseline && !p.baseline_allow.empty()) {
+        fail("--baseline-allow needs --baseline");
+    }
     if ((p.report_path || p.run_seconds || p.run_frames) &&
-        (p.print_help || p.print_version || p.list_settings || p.pack_nup_source ||
-         p.unpack_nup_source || p.edit_nup_source)) {
+        (p.print_help || p.print_version || p.list_settings || p.print_baseline ||
+         p.pack_nup_source || p.unpack_nup_source || p.edit_nup_source)) {
         fail("--report, --run-seconds and --run-frames cannot be combined with --help, "
-             "--version, --list-settings, --pack-nup, --unpack-nup or --edit-nup");
+             "--version, --list-settings, --print-baseline, --pack-nup, --unpack-nup or "
+             "--edit-nup");
     }
     p.argv0 = argv[0];
     return p;
@@ -538,9 +562,11 @@ void ApplyLaunchParams(LaunchParams const& lp) noexcept {
     }
     if (lp.force_single_core) {
         Settings::values.use_multi_core = false;
+        Settings::Baseline::NoteSource("use_multi_core", "command line");
     }
     if (lp.force_null_render) {
         Settings::values.renderer_backend = Settings::RendererBackend::Null;
+        Settings::Baseline::NoteSource("backend", "command line");
     }
 
     if (lp.print_version && !lp.print_json) {
@@ -584,6 +610,12 @@ void ApplyLaunchParams(LaunchParams const& lp) noexcept {
             "--set <name=value>    Set one setting for this run only, after the configuration file is read;\n"
             "                      never saved. Can be repeated. An unknown name or an invalid value is a\n"
             "                      bad argument (exit code 64). The other command line options win over it\n"
+            "--baseline            Run on the baseline settings: after the config loads, every baseline\n"
+            "                      setting is reset to its default; refuses an EDEN_NX2_* switch that\n"
+            "                      --baseline-allow does not name (exit 64)\n"
+            "--baseline-allow KEY[,KEY...]  Declare a variation from the baseline; KEY=VALUE also sets\n"
+            "                      the setting (for example resolution_setup=6)\n"
+            "--print-baseline      Print the baseline version, hash and settings, and exit\n"
             "Exit codes: 0 normal or frame limit, 1 startup failure, 64 bad arguments, 70 guest crash,\n"
             "71 device lost, 72 shader or pipeline failure, 73 emulator crash, 74 report not written,\n"
             "75 restart, 124 --run-seconds reached, 130 interrupted. The codes after 1 apply only to\n"

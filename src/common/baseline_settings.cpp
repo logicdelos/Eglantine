@@ -295,6 +295,65 @@ bool OnBaseline(const std::vector<Deviation>& deviations,
     });
 }
 
+std::vector<std::string> SplitAllowList(std::string_view text) {
+    std::vector<std::string> items;
+    size_t begin = 0;
+    while (true) {
+        const size_t comma = text.find(',', begin);
+        if (comma == std::string_view::npos) {
+            items.emplace_back(text.substr(begin));
+            return items;
+        }
+        items.emplace_back(text.substr(begin, comma - begin));
+        begin = comma + 1;
+    }
+}
+
+std::vector<std::string> AllowedKeys(const std::vector<std::string>& items) {
+    std::vector<std::string> keys;
+    keys.reserve(items.size());
+    for (const auto& item : items) {
+        keys.emplace_back(item.substr(0, item.find('=')));
+    }
+    return keys;
+}
+
+std::string ApplyAllowedValues(Values& target, const std::vector<std::string>& items) {
+    for (const auto& item : items) {
+        const size_t equals = item.find('=');
+        if (equals == std::string::npos) {
+            continue;
+        }
+        const std::string key = item.substr(0, equals);
+        const std::string text = item.substr(equals + 1);
+        const auto found = target.linkage.by_key.find(key);
+        if (found == target.linkage.by_key.end() || !IsBaselineSetting(key, *found->second)) {
+            return "'" + key + "' is not a baseline setting";
+        }
+        BasicSetting& setting = *found->second;
+        setting.SetGlobal(true);
+        setting.LoadString(text);
+        if (setting.ToString() != text && setting.Canonicalize() != text) {
+            return "'" + text + "' is not accepted for '" + key + "' (written like '" +
+                   setting.DefaultToString() + "')";
+        }
+        NoteSource(key, "command line");
+    }
+    return {};
+}
+
+std::vector<std::string> UndeclaredSwitches(const std::vector<EnvironmentSwitch>& switches,
+                                            const std::vector<std::string>& items) {
+    const std::vector<std::string> keys = AllowedKeys(items);
+    std::vector<std::string> undeclared;
+    for (const auto& entry : switches) {
+        if (std::find(keys.begin(), keys.end(), entry.name) == keys.end()) {
+            undeclared.push_back(entry.name);
+        }
+    }
+    return undeclared;
+}
+
 void ResetToBaseline(Values& target) {
     for (const auto& [key, setting] : target.linkage.by_key) {
         if (IsBaselineSetting(key, *setting)) {

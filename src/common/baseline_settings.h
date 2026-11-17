@@ -93,6 +93,22 @@ void ClearNotedSources();
 [[nodiscard]] bool OnBaseline(const std::vector<Deviation>& deviations,
                               const std::vector<std::string>& declared);
 
+/// --baseline-allow takes "KEY[,KEY...]"; an item is a setting key, an EDEN_NX2_* switch name, or
+/// "KEY=VALUE". SplitAllowList cuts the argument at the commas (empty pieces are kept, so the
+/// caller can refuse them); AllowedKeys gives the key of every item, without any "=VALUE".
+[[nodiscard]] std::vector<std::string> SplitAllowList(std::string_view text);
+[[nodiscard]] std::vector<std::string> AllowedKeys(const std::vector<std::string>& items);
+
+/// Sets every "KEY=VALUE" item on the settings (after ResetToBaseline) and notes the command line
+/// as its source. Returns the first problem as text (not a baseline setting, a value the setting
+/// does not accept), empty on success. The value is written as ToString (enums as their number)
+/// or as the canonical name.
+[[nodiscard]] std::string ApplyAllowedValues(Values& target, const std::vector<std::string>& items);
+
+/// The set EDEN_NX2_* switches that no item names.
+[[nodiscard]] std::vector<std::string> UndeclaredSwitches(
+    const std::vector<EnvironmentSwitch>& switches, const std::vector<std::string>& items);
+
 /// Puts every baseline setting on its default and switchable ones on their global value.
 /// Controls, paths, profiles and everything else are left alone.
 void ResetToBaseline(Values& target);

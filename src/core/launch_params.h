@@ -59,6 +59,12 @@ struct LaunchParams {
     std::string parse_error{};
     // The first argument getopt did not understand; refused only by unattended runs.
     std::string unknown_option{};
+    // --baseline: reset every baseline setting to its default after the config loads and refuse an
+    // EDEN_NX2_* switch that is not declared. --baseline-allow KEY[,KEY...] declares variations;
+    // KEY=VALUE also sets the setting. --print-baseline prints the baseline and exits.
+    bool baseline = false;
+    std::vector<std::string> baseline_allow{};
+    bool print_baseline = false;
     u16 port = Network::DefaultRoomPort;
     bool use_multiplayer = false;
     bool fullscreen = false;

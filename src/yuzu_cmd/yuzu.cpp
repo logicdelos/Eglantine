@@ -39,6 +39,7 @@
 #include "common/fs/fs_util.h"
 #include "common/fs/path_util.h"
 #include "common/key_script.h"
+#include "common/baseline_settings.h"
 #include "common/logging.h"
 #include "common/nx2_bottleneck.h"
 #include "common/nx2_sampler.h"
@@ -629,6 +630,25 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     if (argument_error.empty()) {
         argument_error = CliSettings::Resolve(lp.setting_overrides, setting_overrides);
     }
+    if (argument_error.empty() && lp.baseline) {
+        // Checked before the run starts, on a scratch copy of the settings: a declared value that
+        // does not exist or is not accepted, and an EDEN_NX2_* switch that is set but not named.
+        const auto scratch = std::make_unique<Settings::Values>();
+        argument_error = Settings::Baseline::ApplyAllowedValues(*scratch, lp.baseline_allow);
+        Settings::Baseline::ClearNotedSources();
+        if (!argument_error.empty()) {
+            argument_error = "--baseline-allow: " + argument_error;
+        } else {
+            const auto undeclared = Settings::Baseline::UndeclaredSwitches(
+                Settings::Baseline::SetEnvironmentSwitches(), lp.baseline_allow);
+            if (!undeclared.empty()) {
+                argument_error = "--baseline refused: " + undeclared.front() +
+                                 " is set, which takes the run off the baseline. Unset it, or "
+                                 "declare it with --baseline-allow " +
+                                 undeclared.front();
+            }
+        }
+    }
     if (lp.report_path && !lp.report_conflict) {
         std::string report_error;
         const RunReport::PrepareResult prepared =
@@ -651,6 +671,10 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         startup_detail = argument_error;
         return SDL_APP_FAILURE;
     }
+    if (lp.print_baseline) {
+        fmt::print("{}", Settings::Baseline::PrintableText());
+        return SDL_APP_SUCCESS;
+    }
     if (unattended) {
         // SDL turns SIGINT and SIGTERM into a closed window; this run tells them apart.
         SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
@@ -662,6 +686,11 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     }
     std::optional<SdlConfig> config;
     config.emplace(lp.config_path);
+    if (lp.baseline) {
+        // After the config loads: the baseline wins over whatever the config holds.
+        Settings::Baseline::ResetToBaseline();
+        Settings::Baseline::ClearNotedSources();
+    }
     if (!setting_overrides.empty()) {
         // The configuration file is written when the object ends: do that now, so what --set
         // changes for this run is never saved. The overrides come before everything below reads
@@ -675,6 +704,14 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     Common::CreateDriverShaderCacheFolder();
 
     Core::ApplyLaunchParams(lp);
+    if (lp.baseline) {
+        // Declared values go on top of the baseline and of the command line overrides.
+        if (const std::string problem =
+                Settings::Baseline::ApplyAllowedValues(Settings::values, lp.baseline_allow);
+            !problem.empty()) {
+            LOG_ERROR(Frontend, "--baseline-allow: {}", problem);
+        }
+    }
     if (Common::RunOutcome::Active()) {
         std::vector<std::string> overridden_settings;
         for (const auto& request : lp.setting_overrides) {

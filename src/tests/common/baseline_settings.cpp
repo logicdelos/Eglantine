@@ -434,3 +434,45 @@ TEST_CASE("A program requirement is listed but does not leave the baseline", "[b
     CHECK_FALSE(Settings::Baseline::OnBaseline(deviations, {}));
     Settings::Baseline::ClearNotedSources();
 }
+
+TEST_CASE("--baseline-allow items are split, applied and checked", "[baseline_settings]") {
+    Settings::Baseline::ClearNotedSources();
+    const auto items = Settings::Baseline::SplitAllowList("use_docked_mode=0,EDEN_NX2_SPLIT");
+    REQUIRE(items.size() == 2);
+    CHECK(items[0] == "use_docked_mode=0");
+    CHECK(items[1] == "EDEN_NX2_SPLIT");
+    CHECK(Settings::Baseline::SplitAllowList("a,,b").size() == 3);
+    CHECK(Settings::Baseline::SplitAllowList("").size() == 1);
+
+    const auto keys = Settings::Baseline::AllowedKeys(items);
+    REQUIRE(keys.size() == 2);
+    CHECK(keys[0] == "use_docked_mode");
+    CHECK(keys[1] == "EDEN_NX2_SPLIT");
+
+    const auto values = std::make_unique<Settings::Values>();
+    Settings::Baseline::ResetToBaseline(*values);
+    CHECK(Settings::Baseline::ApplyAllowedValues(*values, items).empty());
+    CHECK(values->use_docked_mode.GetValue() == Settings::ConsoleMode::Handheld);
+    const auto deviations = Settings::Baseline::Deviations(*values, {});
+    REQUIRE(deviations.size() == 1);
+    CHECK(deviations[0].key == "use_docked_mode");
+    CHECK(deviations[0].source == "command line");
+    CHECK(Settings::Baseline::OnBaseline(deviations, keys));
+    CHECK_FALSE(Settings::Baseline::OnBaseline(deviations, {}));
+
+    // Not a baseline setting, not a setting at all, and a value the setting does not take.
+    CHECK_FALSE(Settings::Baseline::ApplyAllowedValues(*values, {"current_user=1"}).empty());
+    CHECK_FALSE(Settings::Baseline::ApplyAllowedValues(*values, {"no_such_setting=1"}).empty());
+    CHECK_FALSE(Settings::Baseline::ApplyAllowedValues(*values, {"anti_aliasing=nonsense"}).empty());
+    Settings::Baseline::ClearNotedSources();
+}
+
+TEST_CASE("An environment switch is refused unless it is named", "[baseline_settings]") {
+    const std::vector<Settings::Baseline::EnvironmentSwitch> switches{
+        {"EDEN_NX2_FENCE_BATCH", "0"}, {"EDEN_NX2_SPLIT", "1"}};
+    CHECK(Settings::Baseline::UndeclaredSwitches(switches, {}).size() == 2);
+    const auto undeclared = Settings::Baseline::UndeclaredSwitches(switches, {"EDEN_NX2_SPLIT"});
+    REQUIRE(undeclared.size() == 1);
+    CHECK(undeclared[0] == "EDEN_NX2_FENCE_BATCH");
+    CHECK(Settings::Baseline::UndeclaredSwitches(switches, {"EDEN_NX2_SPLIT,x"}).size() == 2);
+}
