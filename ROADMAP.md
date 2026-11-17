@@ -63,7 +63,7 @@ Status: released as [fork-v0.3.0](https://github.com/logicdelos/Eglantine/releas
 Done when: a scripted run of each tested game ends with the right exit code and a complete report, including after a forced crash.
 
 ### 0.4: Measured speed work
-Status: in progress. The measurement is done and the release build is being checked; not released yet.
+Status: released as [fork-v0.4.0](https://github.com/logicdelos/Eglantine/releases/tag/fork-v0.4.0) on 2026-11-17. None of the nine candidates showed a gain beyond the measured spread without a loss or a broken picture, so none was kept. Every game now runs on one default settings baseline with real frames by default, and the release gate passed against `fork-v0.3.0` on that baseline.
 
 **Significant change:** one general baseline of settings and real frames by default. Every speed candidate was measured on and off on both games, and only a measured gain would have been kept.
 

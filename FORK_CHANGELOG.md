@@ -45,9 +45,9 @@ Milestone 0.5, "Smoother first minutes": the report says where the first minutes
 - The Qt frontend does not report `process_created` or `frontend_load`.
 - The `Unknown` share of wall time is reported, not bounded: a run can have many frames whose cause is not known.
 
-## 0.4.0 (unreleased)
+## 0.4.0 (2026-11-17)
 
-Milestone 0.4, "Measured speed work": every speed change ships off by default behind an `EDEN_NX2_*` switch and is measured on and off before it is recommended. Nine candidates were measured on Fire Emblem: Fortune's Weave and Xenoblade Chronicles 2; a candidate is kept only with a gain beyond the measured spread on one game, no loss beyond the spread on the other and the picture within the limit. The figures, with scene, settings, hardware and method, are in the 0.4.0 release notes.
+Milestone 0.4, "Measured speed work": every speed change ships off by default behind an `EDEN_NX2_*` switch and is measured on and off before it is recommended. Nine candidates were measured on Fire Emblem: Fortune's Weave and Xenoblade Chronicles 2; a candidate is kept only with a gain beyond the measured spread on one game, no loss beyond the spread on the other and the picture within the limit. None met that rule, so none is in the release. The figures, with scene, settings, hardware and method, are in the 0.4.0 release notes. Verified on the as-shipped folder: the release gate passed against the `fork-v0.3.0` baseline on settings baseline 1 (three runs, no new error lines, pictures within the limit), the fresh-install test passed on both games in both stages, the unattended exit test passed 10 of 10 cases, and all 563 unit test cases passed. The speed matrix itself was measured on an earlier development build that still carried the nine switches.
 
 ### Accuracy policy
 
