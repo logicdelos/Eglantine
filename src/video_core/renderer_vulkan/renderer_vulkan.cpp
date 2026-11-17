@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <array>
 #include <cstring>
 #include <memory>
@@ -121,6 +122,43 @@ std::string BuildCommaSeparatedExtensions(
 /// second renderer in the same process (a title change) safe.
 std::atomic<u64> guest_frames_composited{};
 
+/// What the hidden-window path of Composite reports. One thread (the GPU thread) uses it.
+struct HiddenComposites {
+    u64 run{};           ///< consecutive Composite calls skipped for a hidden window
+    u64 logged_at_run{}; ///< `run` when the last line was written
+    std::chrono::steady_clock::time_point logged_at{};
+};
+HiddenComposites hidden_composites;
+
+constexpr std::chrono::seconds HIDDEN_COMPOSITE_LOG_INTERVAL{10};
+
+/// One line when a run of skipped frames starts, one per interval while it lasts.
+void NoteHiddenComposite() {
+    HiddenComposites& state = hidden_composites;
+    const auto now = std::chrono::steady_clock::now();
+    if (++state.run == 1) {
+        LOG_WARNING(Render_Vulkan, "Composite: window not shown, frames are not presented");
+        state.logged_at = now;
+        state.logged_at_run = state.run;
+    } else if (now - state.logged_at >= HIDDEN_COMPOSITE_LOG_INTERVAL) {
+        LOG_WARNING(Render_Vulkan, "Composite: window still not shown, {} frames not presented",
+                    state.run - state.logged_at_run);
+        state.logged_at = now;
+        state.logged_at_run = state.run;
+    }
+}
+
+/// One line when presenting resumes after a run of skipped frames.
+void NoteShownComposite() {
+    HiddenComposites& state = hidden_composites;
+    if (state.run != 0) {
+        LOG_INFO(Render_Vulkan, "Composite: window shown again after {} frames not presented",
+                 state.run);
+        state.run = 0;
+        state.logged_at_run = 0;
+    }
+}
+
 } // Anonymous namespace
 
 Device CreateDevice(const vk::Instance& instance, const vk::InstanceDispatch& dld, VkSurfaceKHR surface) {
@@ -226,8 +264,19 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     RenderAppletCaptureLayer(framebuffers);
 
     if (!render_window.IsShown()) {
+        // Nothing is presented, but the frame still ends for the per-frame resources: without the
+        // tick the descriptor payload of the frame never resets while the guest keeps drawing.
+        // The presenting path is held back by GetRenderFrame (the present fence of an older
+        // frame); with no present that backpressure is gone, and the rings TickFrame advances
+        // destroy buffers, views and framebuffers a fixed number of ticks after their last use
+        // without asking the GPU. So the frame's own submission is waited for on the device
+        // (a blocking semaphore wait, no spin) before anything is released.
+        NoteHiddenComposite();
+        scheduler.Wait(scheduler.Flush());
+        rasterizer.TickFrame();
         return;
     }
+    NoteShownComposite();
 
     RenderScreenshot(framebuffers);
     Frame* frame = present_manager.GetRenderFrame();

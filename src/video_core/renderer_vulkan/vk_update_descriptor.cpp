@@ -33,6 +33,8 @@ UpdateDescriptorQueue::~UpdateDescriptorQueue() = default;
 
 void UpdateDescriptorQueue::TickFrame() {
     ++sequence;
+    ++ticks;
+    last_tick = std::chrono::steady_clock::now();
     if (++frame_index >= FRAMES_IN_FLIGHT) {
         frame_index = 0;
     }
@@ -45,8 +47,27 @@ void UpdateDescriptorQueue::AcquireOverflow(Scheduler& scheduler, size_t reserve
                reserve, frame_payload_size);
     const size_t used = static_cast<size_t>(std::distance(payload_start, payload_cursor));
     if (used + reserve >= frame_payload_size) {
-        LOG_WARNING(Render_Vulkan, "Payload overflow (used={}, reserve={}, capacity={})",
-                    used, reserve, frame_payload_size);
+        using namespace std::chrono;
+        constexpr auto LOG_INTERVAL = seconds{5};
+        const auto now = steady_clock::now();
+        ++overflows;
+        if (overflows == 1 || now - last_log >= LOG_INTERVAL) {
+            // A tick count that does not move between two warnings means the frame never ends
+            // (nothing calls TickFrame), not that one frame needs more than the payload holds.
+            const auto since_tick =
+                last_tick == steady_clock::time_point{}
+                    ? -1
+                    : static_cast<long long>(duration_cast<milliseconds>(now - last_tick).count());
+            LOG_WARNING(Render_Vulkan,
+                        "Payload overflow (used={}, reserve={}, capacity={}): {} overflows and {} "
+                        "frame ticks since the previous warning, {} ticks in total, last tick {} ms "
+                        "ago (-1: never)",
+                        used, reserve, frame_payload_size, overflows - overflows_logged,
+                        ticks - ticks_at_last_log, ticks, since_tick);
+            overflows_logged = overflows;
+            ticks_at_last_log = ticks;
+            last_log = now;
+        }
         scheduler.WaitWorker();
         payload_cursor = payload_start;
         ++sequence;
