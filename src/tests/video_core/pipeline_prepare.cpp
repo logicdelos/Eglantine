@@ -101,6 +101,21 @@ Scheduler::Task BuildNext(Scheduler& scheduler, u64 generation) {
     return task;
 }
 
+// A clock the test moves by hand, so times are exact.
+u64 fake_now_ns = 0;
+
+u64 FakeClock() {
+    return fake_now_ns;
+}
+
+// One worker; the game counts as off the recorded order after `after_ns` of draws that match no
+// record.
+PrepareOptions Diverging(u32 ready_cap, u64 after_ns) {
+    PrepareOptions options = Options(1, ready_cap);
+    options.diverged_after_ns = after_ns;
+    return options;
+}
+
 u64 IndexBytes(size_t count, u32 length) {
     Scheduler probe{Options(), &NextWorkId};
     (void)probe.Begin(Run(count, length));
@@ -486,7 +501,7 @@ TEST_CASE("A record larger than the whole budget is skipped and the queue moves 
     CHECK(scheduler.StateOf(0) == State::Skipped);
 }
 
-TEST_CASE("The ready cap holds back builds at exactly the cap and not before",
+TEST_CASE("The ready cap holds builds back at exactly the cap, releases nothing and counts the wait",
           "[video_core][pipeline_prepare]") {
     Scheduler scheduler{Options(2, /*ready_cap=*/2), &NextWorkId};
     const u64 generation = scheduler.Begin(Run(3));
@@ -502,25 +517,142 @@ TEST_CASE("The ready cap holds back builds at exactly the cap and not before",
     CacheStats stats;
     scheduler.FillStats(stats);
     CHECK(stats.budget_pauses == 1); // one pause, however often it was asked
+    CHECK(stats.held_back == 0);     // workers are the limit here, not unused ready objects
 
-    // One ready and one building make the cap again, but the ready object is unused and the
-    // third record is waiting: the ready object is released and the third is built in its place,
-    // so ready plus building never goes past the cap.
+    // One ready and one building make the cap again. The ready object is unused, but it is the
+    // one the game reaches first: the third record waits instead of releasing it.
     REQUIRE(scheduler.BuildFinished(first.id, generation, true, std::make_shared<int>(1)));
+    for (int asked = 0; asked < 3; ++asked) {
+        const auto held = scheduler.Next(generation, PlentyOfRam);
+        CHECK(held.kind == Scheduler::TaskKind::Wait);
+        CHECK(held.evicted == nullptr);
+    }
+    CHECK(scheduler.ReadyCount() == 1);
+    scheduler.FillStats(stats);
+    CHECK(stats.held_back == 1); // once for the run of waits
+    CHECK(stats.evicted == 0);
+
+    // The draw adopts it: the slot is free and the third record is built.
+    const auto adopted = scheduler.Request(KeyHash(1), Key(1));
+    REQUIRE(adopted.kind == Scheduler::DemandKind::Ready);
+    CHECK(*std::static_pointer_cast<int>(adopted.results[0]) == 1);
     const auto third = scheduler.Next(generation, PlentyOfRam);
     REQUIRE(third.kind == Scheduler::TaskKind::Build);
     CHECK(third.id == 2);
-    REQUIRE(third.evicted != nullptr);
-    CHECK(*std::static_pointer_cast<int>(third.evicted) == 1);
-    CHECK(scheduler.ReadyCount() == 0);
+    CHECK(third.evicted == nullptr);
 
     // Two building again: the cap, and nothing is left to take.
     CHECK(scheduler.Next(generation, PlentyOfRam).kind == Scheduler::TaskKind::Wait);
     REQUIRE(scheduler.BuildFinished(second.id, generation, true, std::make_shared<int>(2)));
-
-    // The released record is built when its draw comes; the kept one is adopted.
-    CHECK(scheduler.Request(KeyHash(1), Key(1)).kind == Scheduler::DemandKind::Unavailable);
     CHECK(scheduler.Request(KeyHash(2), Key(2)).kind == Scheduler::DemandKind::Ready);
+}
+
+TEST_CASE("Records are built in recorded first-use order and the early ones are never released",
+          "[video_core][pipeline_prepare]") {
+    Scheduler scheduler{Options(1, /*ready_cap=*/3), &NextWorkId};
+    // Records 0 to 3 were first used at 0, 1, 2 and 3 ns: the order they are built in.
+    const u64 generation = scheduler.Begin(Run(4));
+    LoadAll(scheduler, generation, {1, 2, 3, 4});
+    for (EntryId expected = 0; expected < 3; ++expected) {
+        const auto build = BuildNext(scheduler, generation);
+        CHECK(build.id == expected);
+        REQUIRE(scheduler.BuildFinished(build.id, generation, true,
+                                        std::make_shared<int>(static_cast<int>(expected))));
+    }
+
+    // The cap is full of the three earliest records. The fourth waits, however often it is asked.
+    for (int asked = 0; asked < 5; ++asked) {
+        const auto held = scheduler.Next(generation, PlentyOfRam);
+        CHECK(held.kind == Scheduler::TaskKind::Wait);
+        CHECK(held.evicted == nullptr);
+    }
+    CHECK(scheduler.StateOf(0) == State::Ready);
+    CHECK(scheduler.StateOf(1) == State::Ready);
+    CHECK(scheduler.StateOf(2) == State::Ready);
+    CHECK(scheduler.StateOf(3) == State::Queued);
+    CacheStats stats;
+    scheduler.FillStats(stats);
+    CHECK(stats.prepared == 3);
+    CHECK(stats.evicted == 0);
+    CHECK(stats.held_back == 1);
+
+    // The game reaches the records in that order: each one adopted moves the frontier on.
+    REQUIRE(scheduler.Request(KeyHash(1), Key(1)).kind == Scheduler::DemandKind::Ready);
+    const auto fourth = BuildNext(scheduler, generation);
+    CHECK(fourth.id == 3);
+    CHECK(fourth.evicted == nullptr);
+    REQUIRE(scheduler.BuildFinished(fourth.id, generation, true, std::make_shared<int>(4)));
+    for (const u8 value : std::initializer_list<u8>{2, 3, 4}) {
+        REQUIRE(scheduler.Request(KeyHash(value), Key(value)).kind ==
+                Scheduler::DemandKind::Ready);
+    }
+    CHECK(scheduler.Next(generation, PlentyOfRam).kind == Scheduler::TaskKind::Done);
+    scheduler.FillStats(stats);
+    CHECK(stats.records == 4);
+    CHECK(stats.prepared == 4);
+    CHECK(stats.adopted == 4); // every prepared object was used
+    CHECK(stats.evicted == 0);
+    CHECK(stats.demand_building == 0);
+    CHECK(stats.late_records == 0);
+}
+
+TEST_CASE("The counters tell objects ready in time from the ones the game found late",
+          "[video_core][pipeline_prepare]") {
+    fake_now_ns = 0;
+    Scheduler scheduler{Options(2), &NextWorkId, &FakeClock};
+    const u64 generation = scheduler.Begin(Run(3));
+    LoadAll(scheduler, generation, {1, 2, 3});
+    const auto first = BuildNext(scheduler, generation);
+    const auto second = BuildNext(scheduler, generation);
+
+    fake_now_ns = 100;
+    REQUIRE(scheduler.BuildFinished(first.id, generation, true, std::make_shared<int>(1)));
+    // Ready at 100 and used at 350: 250 ns early.
+    fake_now_ns = 350;
+    REQUIRE(scheduler.Request(KeyHash(1), Key(1)).kind == Scheduler::DemandKind::Ready);
+
+    // Asked for at 500 while it builds, asked again at 600, ready at 900: it waited 400 ns,
+    // counted once.
+    fake_now_ns = 500;
+    REQUIRE(scheduler.Request(KeyHash(2), Key(2)).kind == Scheduler::DemandKind::Building);
+    fake_now_ns = 600;
+    REQUIRE(scheduler.Request(KeyHash(2), Key(2)).kind == Scheduler::DemandKind::Building);
+    fake_now_ns = 900;
+    REQUIRE(scheduler.BuildFinished(second.id, generation, true, std::make_shared<int>(2)));
+    // Not counted as early: its draw was waiting.
+    REQUIRE(scheduler.Request(KeyHash(2), Key(2)).kind == Scheduler::DemandKind::Ready);
+
+    // Asked for at 1000 while still queued: the draw builds it.
+    fake_now_ns = 1000;
+    REQUIRE(scheduler.Request(KeyHash(3), Key(3)).kind == Scheduler::DemandKind::Claimed);
+    // A key no record has.
+    CHECK(scheduler.Request(KeyHash(9), Key(9)).kind == Scheduler::DemandKind::Miss);
+
+    CacheStats stats;
+    scheduler.FillStats(stats);
+    CHECK(stats.records == 3);
+    CHECK(stats.prepared == 2);
+    CHECK(stats.adopted == 2);
+    CHECK(stats.adopted_lead_ns == 250);
+    CHECK(stats.demand_building == 1);
+    CHECK(stats.demand_promoted == 1);
+    CHECK(stats.demand_evicted == 0);
+    CHECK(stats.demand_unknown == 1);
+    CHECK(stats.late_records == 2);
+    CHECK(stats.late_wait_ns == 400);
+    CHECK(stats.late_wait_max_ns == 400);
+
+    const auto late = scheduler.LateRecords();
+    REQUIRE(late.size() == 2);
+    CHECK(late[0].rank == 1);
+    CHECK(late[0].recorded_first_use_ns == 1);
+    CHECK(late[0].outcome == Scheduler::LateOutcome::Building);
+    CHECK(late[0].demanded_ns == 500);
+    CHECK(late[0].ready_ns == 900);
+    CHECK(late[1].rank == 2);
+    CHECK(late[1].outcome == Scheduler::LateOutcome::Claimed);
+    CHECK(late[1].demanded_ns == 1000);
+    CHECK(late[1].ready_ns == 0);
 }
 
 TEST_CASE("A demand is never held back by the cap, the budget or the RAM pause",
@@ -837,9 +969,10 @@ TEST_CASE("Holding builds back does not hold back decoding", "[video_core][pipel
     CHECK(scheduler.Next(generation, PlentyOfRam, true).kind == Scheduler::TaskKind::Load);
 }
 
-TEST_CASE("Unused ready objects are released oldest first so the rest of the index is prepared",
+TEST_CASE("A game that left the recorded order has its unused ready objects released, oldest first",
           "[video_core][pipeline_prepare]") {
-    Scheduler scheduler{Options(1, /*ready_cap=*/2), &NextWorkId};
+    fake_now_ns = 10;
+    Scheduler scheduler{Diverging(/*ready_cap=*/2, /*after_ns=*/1000), &NextWorkId, &FakeClock};
     const u64 generation = scheduler.Begin(Run(4));
     LoadAll(scheduler, generation, {1, 2, 3, 4});
     std::weak_ptr<int> first_watch;
@@ -853,7 +986,18 @@ TEST_CASE("Unused ready objects are released oldest first so the rest of the ind
     }
     CHECK(scheduler.ReadyCount() == 2); // the cap, and the game has asked for neither
 
-    // Record 3 is built: the oldest ready object makes the room.
+    // Nothing has been asked for yet, or only what no record has for less than the bound: the
+    // records wait.
+    CHECK(scheduler.Next(generation, PlentyOfRam).kind == Scheduler::TaskKind::Wait);
+    fake_now_ns = 100;
+    CHECK(scheduler.Request(KeyHash(9), Key(9)).kind == Scheduler::DemandKind::Miss);
+    fake_now_ns = 1099; // one ns short of the bound
+    const auto short_of = scheduler.Next(generation, PlentyOfRam);
+    CHECK(short_of.kind == Scheduler::TaskKind::Wait);
+    CHECK(short_of.evicted == nullptr);
+
+    // At the bound record 3 is built: the oldest ready object makes the room.
+    fake_now_ns = 1100;
     auto third = scheduler.Next(generation, PlentyOfRam);
     REQUIRE(third.kind == Scheduler::TaskKind::Build);
     CHECK(third.id == 2);
@@ -865,7 +1009,7 @@ TEST_CASE("Unused ready objects are released oldest first so the rest of the ind
     CHECK(scheduler.ReadyCount() == 1);
     REQUIRE(scheduler.BuildFinished(third.id, generation, true, std::make_shared<int>(3)));
 
-    // And record 4: now the second one goes, not the newest.
+    // And record 4: the game still matches nothing, so the second one goes, not the newest.
     auto fourth = scheduler.Next(generation, PlentyOfRam);
     REQUIRE(fourth.kind == Scheduler::TaskKind::Build);
     CHECK(fourth.id == 3);
@@ -882,17 +1026,68 @@ TEST_CASE("Unused ready objects are released oldest first so the rest of the ind
     scheduler.FillStats(stats);
     CHECK(stats.prepared == 4);
     CHECK(stats.evicted == 2);
+    CHECK(stats.held_back == 1);
 
-    // A released record is built when its draw comes; a kept one is adopted.
+    // A released record is built when its draw comes, and says it was ready earlier; a kept one
+    // is adopted.
     CHECK(scheduler.Request(KeyHash(1), Key(1)).kind == Scheduler::DemandKind::Unavailable);
     const auto kept = scheduler.Request(KeyHash(4), Key(4));
     REQUIRE(kept.kind == Scheduler::DemandKind::Ready);
     CHECK(*std::static_pointer_cast<int>(kept.results[0]) == 4);
+    scheduler.FillStats(stats);
+    CHECK(stats.demand_evicted == 1);
+    CHECK(stats.late_records == 1);
+    const auto late = scheduler.LateRecords();
+    REQUIRE(late.size() == 1);
+    CHECK(late[0].outcome == Scheduler::LateOutcome::Released);
+    CHECK(late[0].ready_ns == 10);
+    CHECK(late[0].demanded_ns == 1100);
+}
+
+TEST_CASE("A draw that finds a record restarts the clock of a game that may have left the order",
+          "[video_core][pipeline_prepare]") {
+    fake_now_ns = 0;
+    Scheduler scheduler{Diverging(/*ready_cap=*/2, /*after_ns=*/1000), &NextWorkId, &FakeClock};
+    const u64 generation = scheduler.Begin(Run(4));
+    LoadAll(scheduler, generation, {1, 2, 3, 4});
+    for (const int value : {1, 2}) {
+        const auto build = BuildNext(scheduler, generation);
+        REQUIRE(scheduler.BuildFinished(build.id, generation, true,
+                                        std::make_shared<int>(value)));
+    }
+    // Record 1 is used; its slot goes to record 3. Ready (record 2) plus building (3) is the cap
+    // and record 4 is queued.
+    fake_now_ns = 100;
+    REQUIRE(scheduler.Request(KeyHash(1), Key(1)).kind == Scheduler::DemandKind::Ready);
+    REQUIRE(BuildNext(scheduler, generation).id == 2);
+
+    // Something no record has is asked for at 200. At 900 a record is found again (here an
+    // object of the same record used again), so a miss 1000 ns old at 1300 is not one.
+    fake_now_ns = 200;
+    CHECK(scheduler.Request(KeyHash(9), Key(9)).kind == Scheduler::DemandKind::Miss);
+    fake_now_ns = 900;
+    CHECK(scheduler.Request(KeyHash(1), Key(1)).kind == Scheduler::DemandKind::Unavailable);
+    fake_now_ns = 1300;
+    const auto still_waiting = scheduler.Next(generation, PlentyOfRam);
+    CHECK(still_waiting.kind == Scheduler::TaskKind::Wait);
+    CHECK(still_waiting.evicted == nullptr);
+
+    // Misses again from 1300: the bound is reached at 2300.
+    CHECK(scheduler.Request(KeyHash(9), Key(9)).kind == Scheduler::DemandKind::Miss);
+    fake_now_ns = 2299;
+    CHECK(scheduler.Next(generation, PlentyOfRam).kind == Scheduler::TaskKind::Wait);
+    fake_now_ns = 2300;
+    const auto released = scheduler.Next(generation, PlentyOfRam);
+    REQUIRE(released.kind == Scheduler::TaskKind::Build);
+    CHECK(released.id == 3);
+    REQUIRE(released.evicted != nullptr);
+    CHECK(*std::static_pointer_cast<int>(released.evicted) == 2);
 }
 
 TEST_CASE("A ready object is released only for a record that is waiting to be built",
           "[video_core][pipeline_prepare]") {
-    Scheduler scheduler{Options(1, /*ready_cap=*/2), &NextWorkId};
+    fake_now_ns = 0;
+    Scheduler scheduler{Diverging(/*ready_cap=*/2, /*after_ns=*/1000), &NextWorkId, &FakeClock};
     const u64 generation = scheduler.Begin(Run(3));
     LoadAll(scheduler, generation, {1, 2, 3});
     for (const int value : {1, 2}) {
@@ -900,6 +1095,10 @@ TEST_CASE("A ready object is released only for a record that is waiting to be bu
         REQUIRE(scheduler.BuildFinished(build.id, generation, true,
                                         std::make_shared<int>(value)));
     }
+    // The game has gone its own way for longer than the bound.
+    fake_now_ns = 100;
+    REQUIRE(scheduler.Request(KeyHash(9), Key(9)).kind == Scheduler::DemandKind::Miss);
+    fake_now_ns = 5000;
     // Builds held back for runtime compilation do not release anything.
     const auto held = scheduler.Next(generation, PlentyOfRam, true);
     CHECK(held.kind == Scheduler::TaskKind::Wait);

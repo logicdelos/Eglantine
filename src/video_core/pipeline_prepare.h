@@ -134,8 +134,7 @@ public:
 
     // ---- workers ----
     /// `hold_builds` keeps queued records queued (a draw can still claim them) while the caller
-    /// waits out a burst of runtime compilation; loads go on, and so does the release of ready
-    /// objects of a game that left the recorded order.
+    /// waits out a burst of runtime compilation; loads go on, nothing is released.
     [[nodiscard]] Task Next(u64 generation, u64 available_ram_bytes, bool hold_builds = false);
     void WaitForChange(u64 epoch, std::chrono::milliseconds timeout);
     LoadOutcome Loaded(EntryId id, u64 generation, u64 hash, std::span<const u8> key,
