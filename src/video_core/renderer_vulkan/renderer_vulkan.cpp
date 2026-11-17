@@ -266,9 +266,13 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     if (!render_window.IsShown()) {
         // Nothing is presented, but the frame still ends for the per-frame resources: without the
         // tick the descriptor payload of the frame never resets while the guest keeps drawing.
+        // The presenting path is held back by GetRenderFrame (the present fence of an older
+        // frame); with no present that backpressure is gone, and the rings TickFrame advances
+        // destroy buffers, views and framebuffers a fixed number of ticks after their last use
+        // without asking the GPU. So the frame's own submission is waited for on the device
+        // (a blocking semaphore wait, no spin) before anything is released.
         NoteHiddenComposite();
-        scheduler.Flush();
-        scheduler.WaitWorker();
+        scheduler.Wait(scheduler.Flush());
         rasterizer.TickFrame();
         return;
     }
