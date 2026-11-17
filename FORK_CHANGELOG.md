@@ -61,6 +61,10 @@ Additions for scripted runs of `eden-cli`. Not built or run yet at the time of w
 - With `--baseline` the configuration file is read and never written, whichever way the run ends, so it is byte-unchanged afterwards; when it does not exist, none is created and the defaults are used. A declared `--set` value that differs from the baseline is a deviation with the source `command line`.
 - A `--baseline-allow` item that is malformed, names nothing or declares a value its setting does not accept, `--baseline-allow` without `--baseline`, and a `--set` given twice or without `name=value` are now refused by the early scan (exit 64), before the user directory, the log or a report is created and before `--version --json` prints. An `EDEN_NX2_*` switch that is set but not declared, and a `--set` with an unknown name or a value the setting does not accept, are still refused after the user directory and the log are set up.
 
+### Fixed
+
+- Switch 2 shader translation: a DEPBAR on scoreboard 0 no longer depends on its wait list, a constant-buffer F2I with reserved bits set is refused instead of being translated with those bits dropped, and the register pressure count covers SHF and FSETP with an immediate and STG with a register.
+
 ## 0.3.0 (2026-11-16)
 
 Milestone 0.3, "Unattended runs": a scripted run ends by itself, says why in its exit code, and leaves one report file. Verified on the as-shipped folder: the release gate passed against the `fork-v0.2.0` baseline (three runs, no new error lines, pictures within the limit), and the unattended exit test passed 10 of 10 cases (bad arguments, frame limit, time limit and forced crash on Fire Emblem: Fortune's Weave and Xenoblade Chronicles 2). Other error paths were read from the code, not provoked.
