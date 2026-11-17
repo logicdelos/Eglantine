@@ -63,14 +63,16 @@ Status: released as [fork-v0.3.0](https://github.com/logicdelos/Eglantine/releas
 Done when: a scripted run of each tested game ends with the right exit code and a complete report, including after a forced crash.
 
 ### 0.4: Measured speed work
-Status: planned.
+Status: in progress. The measurement is done and the release build is being checked; not released yet.
 
-**Significant change:** speed changes from sibling forks and from this fork, each published with its before-and-after measurement.
+**Significant change:** one general baseline of settings and real frames by default. Every speed candidate was measured on and off on both games, and only a measured gain would have been kept.
 
-- Candidates: the GPU thread split at high accuracy, pinned GPU threads, fewer empty submits, texture decode and encode in one submit, a high-resolution timer for frame pacing.
-- Candidates that show no gain, or that break a picture, are left out and listed as such.
+- Baseline: every game is tested on the defaults of every emulation setting, one set for all games, with a version and a hash. See [fork-notes/baseline.md](fork-notes/baseline.md).
+- Real frames by default: the new setting "Allow running faster than real time" (`allow_speed_up`) is off, so your speed limit cannot be switched off or raised above 100 %. Turning it on gives the old behaviour.
+- Nine candidates were measured: the GPU thread split at high accuracy, pinned GPU threads, fewer empty submits, texture decode and encode in one submit, a high-resolution timer, zero-page trimming, protection changes without a lock, add-on packages in the shader precache, and a cheaper texture decoder set-up. None showed a gain beyond the measured spread without a loss or a broken picture, so none is in the release; the release notes list each with its numbers and the reason.
+- Accuracy policy: no new game-specific code; the existing exceptions are frozen and listed. See [fork-notes/accuracy-policy.md](fork-notes/accuracy-policy.md).
 
-Done when: every candidate has a recorded result on both games and the release notes carry the table.
+Done when: every candidate has a recorded result on both games, the release notes carry the table, and the release gate passes against 0.3.0.
 
 ### 0.5: Smoother first minutes
 Status: planned.

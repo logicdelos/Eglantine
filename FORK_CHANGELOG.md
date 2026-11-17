@@ -36,7 +36,7 @@ Left out, code removed. No switch from this list is in the release:
 
 ### Command line
 
-Additions for scripted runs of `eden-cli`. Not built or run yet at the time of writing.
+Additions for scripted runs of `eden-cli`. Built, with its unit tests passing, on the 0.4 release candidate; the release build is checked again by the release gate.
 
 - `eden-cli --version --json` prints one JSON object on one line on standard output and exits with 0: `name`, `fork_version`, `flavour`, `revision`, `branch`, `description`, `upstream_base`, `build_id`, `build_date`, `compiler`, `report_schema_version` and an `options` object (`discord_presence`, `mcp_server`, `opengl`, `update_checker`, `web_service`). `fork_version`, `flavour` and `upstream_base` are `null` when the build recorded none. It answers before the log, the crash handler, the configuration and the user directory are touched, and creates no window. Plain `--version` is unchanged. `--json` without `--version` is a bad argument.
 - New CMake variable `EGLANTINE_UPSTREAM_BASE` (empty by default): the upstream commit a build is based on, reported as `upstream_base`. Nothing computes it; a release build passes it with `-DEGLANTINE_UPSTREAM_BASE=<commit>`.

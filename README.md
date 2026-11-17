@@ -61,6 +61,7 @@ Version 1 of the baseline made Docked, SMAA and BUF the defaults; the runs in th
 - It carries its own fixes for the two tested games and for stability, listed per release in [FORK_CHANGELOG.md](FORK_CHANGELOG.md).
 - It ports selected fixes from other Eglantine forks, each credited to its author in the commit and in the release notes.
 - It adds a log line that names what limits the frame rate, and a command-line build that can run a game unattended: `eden-cli.exe --run-seconds`, `--run-frames` and `--report`, with exit codes that say how the run ended. See the [guide](fork-notes/unattended-runs.md).
+- From 0.4 (not released yet): one baseline of settings, the defaults, for every game; real frames by default, with "Allow running faster than real time" (`allow_speed_up`) off; no new game-specific code, with the existing exceptions frozen and listed ([accuracy policy](fork-notes/accuracy-policy.md)); and `eden-cli` options for scripted runs (`--version --json`, `--user-dir`, `--list-settings`, `--set`, `--control`). A speed change is kept only when a measurement on both tested games shows a gain; none of the nine 0.4 candidates did.
 - Long term, it adds a fast graphics path beside the existing one. See the [roadmap](ROADMAP.md).
 
 Everything else behaves as upstream does. The [user handbook](https://github.com/Eglantine-Community/docs/blob/38e8d2a962a6137731e67fc8e89163691a4521cd/content/user/README.mdx) applies unchanged.
