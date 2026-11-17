@@ -335,12 +335,13 @@ Response Commands::Stop() {
     return response;
 }
 
-// A client left without releasing keys: release the ones it holds without a time limit. A key
-// with a hold_ms deadline is a tap that finishes by itself, and stays until its deadline.
-void Commands::ReleaseSession(std::uint64_t session) {
+// Clients left without releasing keys: release the ones they hold without a time limit. `first`
+// to `last` are session numbers, both included; a key of a later session stays. A key with a
+// hold_ms deadline is a tap that finishes by itself, and stays until its deadline.
+void Commands::ReleaseSessions(std::uint64_t first, std::uint64_t last) {
     auto* keyboard = input.GetKeyboard();
     for (auto it = keys.begin(); it != keys.end();) {
-        if (it->second.session == session && !it->second.due) {
+        if (it->second.session >= first && it->second.session <= last && !it->second.due) {
             if (keyboard != nullptr) {
                 keyboard->ReleaseKey(it->first);
             }
@@ -358,7 +359,7 @@ void Commands::Poll() {
         shaders_building.store(static_cast<int>(system.GPU().ShaderNotify().NumBuildingNoReport()));
     }
     channel.Poll([this](const Request& request) { return HandleMain(request); },
-                 [this](std::uint64_t session) { ReleaseSession(session); });
+                 [this](std::uint64_t first, std::uint64_t last) { ReleaseSessions(first, last); });
 
     const auto now = std::chrono::steady_clock::now();
     auto* keyboard = input.GetKeyboard();

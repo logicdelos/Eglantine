@@ -60,9 +60,13 @@ public:
     using Direct = std::function<std::optional<Response>(const Request&)>;
     /// Called on the main thread from Poll.
     using Handler = std::function<Response(const Request&)>;
-    /// Called on the main thread from Poll, in order with the requests, when a client has left.
-    /// Everything that client's requests did is done by then; those of its successor are not.
-    using Disconnected = std::function<void(std::uint64_t session)>;
+    /// Called on the main thread from Poll, in order with the requests, when clients have left:
+    /// every client from session `first` to `last`, both included. Everything those clients'
+    /// requests did is done by then; those of their successors are not. Clients that left one
+    /// after the other with no request of the channel in between are reported in one call, so a
+    /// main loop that does not poll for a while (a long load) does not collect one record per
+    /// connection.
+    using Disconnected = std::function<void(std::uint64_t first, std::uint64_t last)>;
 
     /// The longest request line. A longer one is answered with an error; a stream that has no end
     /// of line within this many bytes is dropped.
@@ -70,8 +74,14 @@ public:
     /// How long a request may wait for the main thread to pick it up before it is answered with
     /// the "busy" error and cancelled.
     static constexpr std::chrono::seconds MainThreadTimeout{10};
+    /// How many requests may wait for the main thread at once, cancelled ones included. A request
+    /// that finds the queue full is answered with the "busy" error at once. The records of clients
+    /// that left cannot outnumber the requests by more than one, so the queue is bounded.
+    static constexpr std::size_t MaxQueuedRequests = 256;
 
-    Channel(std::unique_ptr<Transport> transport_, Direct direct_);
+    Channel(std::unique_ptr<Transport> transport_, Direct direct_,
+            std::chrono::milliseconds main_thread_timeout_ = MainThreadTimeout,
+            std::size_t max_queued_ = MaxQueuedRequests);
     ~Channel();
 
     Channel(const Channel&) = delete;
@@ -80,8 +90,8 @@ public:
     /// Opens the endpoint and starts the thread. Returns an error text, empty on success.
     [[nodiscard]] std::string Start(const std::string& name);
 
-    /// Main thread: runs the queued requests through `handler`, and tells `disconnected` when a
-    /// client has left, at its place in the order.
+    /// Main thread: runs the queued requests through `handler`, and tells `disconnected` when
+    /// clients have left, at their place in the order.
     void Poll(const Handler& handler, const Disconnected& disconnected);
 
     /// True once Stop was called.
@@ -91,6 +101,10 @@ public:
 
     /// Wakes the thread so it ends; the destructor joins it. Any thread.
     void Stop();
+
+    /// How many entries wait for Poll: requests, cancelled ones included, and markers for clients
+    /// that left. Any thread.
+    [[nodiscard]] std::size_t QueuedEntries();
 
 private:
     struct Pending;
@@ -103,12 +117,16 @@ private:
 
     std::unique_ptr<Transport> transport;
     Direct direct;
+    std::chrono::milliseconds main_thread_timeout;
+    std::size_t max_queued;
     std::thread thread;
     std::atomic<bool> stopping{false};
     std::uint64_t last_session = 0; // channel thread only
 
     std::mutex queue_mutex;
     std::deque<std::shared_ptr<Pending>> queue;
+    /// Requests (not markers) in `queue`, cancelled ones included, until Poll takes the queue.
+    std::size_t queued_requests = 0;
 };
 
 } // namespace Control

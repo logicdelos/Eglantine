@@ -113,6 +113,8 @@ add_executable(tests
     video_core/ampere_vote.cpp
     yuzu_cmd/cli_settings.cpp
     ../yuzu_cmd/cli_settings.cpp
+    yuzu_cmd/control_channel.cpp
+    ../yuzu_cmd/control_channel.cpp
     yuzu_cmd/frame_capture.cpp
     ../yuzu_cmd/frame_capture.cpp
     video_core/shader_attributes.cpp

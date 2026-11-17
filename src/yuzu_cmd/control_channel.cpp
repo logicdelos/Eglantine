@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <exception>
 
 #include "common/logging.h"
@@ -28,7 +29,10 @@ struct Channel::Pending {
     enum class State { Queued, Running, Done, Replied, Cancelled };
 
     Request request;
-    bool disconnect = false; // a marker for a client that left, not a request
+    /// A marker for the clients that left, sessions `request.session` to `last_session`, not a
+    /// request. Guarded by `queue_mutex` while it is in the queue.
+    bool disconnect = false;
+    std::uint64_t last_session = 0;
     std::mutex mutex;
     std::condition_variable cv;
     State state = State::Queued;
@@ -55,8 +59,10 @@ Json Render(const Json& id, const Response& response) {
 
 } // namespace
 
-Channel::Channel(std::unique_ptr<Transport> transport_, Direct direct_)
-    : transport{std::move(transport_)}, direct{std::move(direct_)} {}
+Channel::Channel(std::unique_ptr<Transport> transport_, Direct direct_,
+                 std::chrono::milliseconds main_thread_timeout_, std::size_t max_queued_)
+    : transport{std::move(transport_)}, direct{std::move(direct_)},
+      main_thread_timeout{main_thread_timeout_}, max_queued{max_queued_} {}
 
 Channel::~Channel() {
     Stop();
@@ -89,12 +95,19 @@ void Channel::ThreadMain() {
         transport->DropClient();
         {
             // In the queue like a request: the main thread cleans up after this client before it
-            // runs anything the next one sends.
-            auto marker = std::make_shared<Pending>();
-            marker->disconnect = true;
-            marker->request.session = session;
+            // runs anything the next one sends. When the record at the end of the queue is the
+            // previous client's, nothing the channel did lies between them: extend that record.
             std::scoped_lock lock{queue_mutex};
-            queue.push_back(std::move(marker));
+            if (!queue.empty() && queue.back()->disconnect &&
+                queue.back()->last_session + 1 == session) {
+                queue.back()->last_session = session;
+            } else {
+                auto marker = std::make_shared<Pending>();
+                marker->disconnect = true;
+                marker->request.session = session;
+                marker->last_session = session;
+                queue.push_back(std::move(marker));
+            }
         }
         LOG_INFO(Frontend, "Control channel: client {} disconnected", session);
     }
@@ -197,12 +210,19 @@ bool Channel::HandleLine(const std::string& line, std::uint64_t session) {
 Response Channel::RunOnMain(const std::shared_ptr<Pending>& pending) {
     {
         std::scoped_lock lock{queue_mutex};
+        if (queued_requests >= max_queued) {
+            // Cancelled requests wait in the queue too, so a main loop that does not poll cannot
+            // make it grow without limit.
+            return Response::Error("busy", "too many requests are waiting for the main loop");
+        }
+        ++queued_requests;
         queue.push_back(pending);
     }
-    const auto deadline = std::chrono::steady_clock::now() + MainThreadTimeout;
+    const auto deadline = std::chrono::steady_clock::now() + main_thread_timeout;
+    const auto slice = std::min<std::chrono::milliseconds>(100ms, main_thread_timeout);
     std::unique_lock lock{pending->mutex};
     for (;;) {
-        if (pending->cv.wait_for(lock, 100ms,
+        if (pending->cv.wait_for(lock, slice,
                                  [&] { return pending->state == Pending::State::Done; })) {
             return std::move(pending->response);
         }
@@ -219,15 +239,21 @@ Response Channel::RunOnMain(const std::shared_ptr<Pending>& pending) {
     }
 }
 
+std::size_t Channel::QueuedEntries() {
+    std::scoped_lock lock{queue_mutex};
+    return queue.size();
+}
+
 void Channel::Poll(const Handler& handler, const Disconnected& disconnected) {
     std::deque<std::shared_ptr<Pending>> batch;
     {
         std::scoped_lock lock{queue_mutex};
         batch.swap(queue);
+        queued_requests = 0;
     }
     for (const std::shared_ptr<Pending>& pending : batch) {
         if (pending->disconnect) {
-            disconnected(pending->request.session);
+            disconnected(pending->request.session, pending->last_session);
             continue;
         }
         {

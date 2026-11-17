@@ -52,7 +52,7 @@ private:
     Response Screenshot(const Request& request);
     Response Setting(const Request& request, bool change);
     Response Stop();
-    void ReleaseSession(std::uint64_t session);
+    void ReleaseSessions(std::uint64_t first, std::uint64_t last);
 
     Core::System& system;
     InputCommon::InputSubsystem& input;
