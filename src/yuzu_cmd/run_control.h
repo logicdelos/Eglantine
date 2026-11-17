@@ -611,20 +611,25 @@ struct ListedDirectories {
     return listed;
 }
 
-/// The loader's loose RomFS directory of `parent`: `romfs`, else the first directory listed
+/// The directory of a listing that is the loader's loose RomFS directory: the first one listed
 /// whose name is `romfs` in any letter case (Loader::FirstRomFSDirectoryIndex). Empty when there
 /// is none.
+[[nodiscard]] inline std::filesystem::path SelectRomFSDirectory(ListedDirectories listed) {
+    if (const auto index = Loader::FirstRomFSDirectoryIndex(listed.names)) {
+        return std::move(listed.paths[*index]);
+    }
+    return {};
+}
+
+/// The loader's loose RomFS directory of `parent`: `romfs`, else SelectRomFSDirectory over the
+/// listing of `parent`. Empty when there is none.
 [[nodiscard]] inline std::filesystem::path FindLooseRomFSDirectory(
     const std::filesystem::path& parent) {
     std::error_code ec;
     if (std::filesystem::path exact = parent / "romfs"; std::filesystem::is_directory(exact, ec)) {
         return exact;
     }
-    ListedDirectories listed = ListSubdirectories(parent);
-    if (const auto index = Loader::FirstRomFSDirectoryIndex(listed.names)) {
-        return std::move(listed.paths[*index]);
-    }
-    return {};
+    return SelectRomFSDirectory(ListSubdirectories(parent));
 }
 
 /// The size of the `main` in an ExeFS directory; 0 when there is none.
@@ -634,15 +639,18 @@ struct ListedDirectories {
     return ec ? 0 : static_cast<u64>(size);
 }
 
-/// The directory of `updates` the loader takes for an absent base RomFS
+/// The directory of a listing of `updates` the loader takes for an absent base RomFS
 /// (Loader::NewestUpdateDirectoryIndex, over the listing order); empty when there is none.
-[[nodiscard]] inline std::filesystem::path NewestUpdateDirectory(
-    const std::filesystem::path& updates) {
-    ListedDirectories listed = ListSubdirectories(updates);
+[[nodiscard]] inline std::filesystem::path SelectNewestUpdateDirectory(ListedDirectories listed) {
     if (const auto index = Loader::NewestUpdateDirectoryIndex(listed.names)) {
         return std::move(listed.paths[*index]);
     }
     return {};
+}
+
+[[nodiscard]] inline std::filesystem::path NewestUpdateDirectory(
+    const std::filesystem::path& updates) {
+    return SelectNewestUpdateDirectory(ListSubdirectories(updates));
 }
 
 } // namespace Detail

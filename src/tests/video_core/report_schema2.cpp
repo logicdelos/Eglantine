@@ -1190,6 +1190,69 @@ TEST_CASE("content stamp follows the update directory the loader selects among e
     CHECK(StampOf(source) != base);
 }
 
+namespace {
+
+/// A listing of `parent` that holds `names` in exactly this order, whatever order a host file
+/// system would give them.
+RunControl::Detail::ListedDirectories ListingOf(const std::filesystem::path& parent,
+                                                const std::vector<std::string>& names) {
+    RunControl::Detail::ListedDirectories listed;
+    for (const std::string& name : names) {
+        listed.paths.push_back(parent / name);
+        listed.names.push_back(name);
+    }
+    return listed;
+}
+
+} // Anonymous namespace
+
+// The listings below are given, not read from a file system, and some are in an order that
+// differs from the order of the names. Choosing among the names after sorting them (the earlier
+// behaviour of the identity) selects "1" for the update listing {"1", "01"} where the loader
+// takes "01", and "ROMFS" for the RomFS listing {"RomFS", "ROMFS"} where the loader takes
+// "RomFS"; the checks of those two listings fail on that behaviour.
+TEST_CASE("the identity selects the directory in listing order, as the loader does",
+          "[report][identity]") {
+    const std::filesystem::path updates{"updates"};
+    using RunControl::Detail::SelectNewestUpdateDirectory;
+    using RunControl::Detail::SelectRomFSDirectory;
+    using Names = std::vector<std::string>;
+
+    SECTION("update directories with the same number, in both listing orders") {
+        for (const Names& names : {Names{"1", "01"}, Names{"01", "1"}}) {
+            const auto listed = ListingOf(updates, names);
+            // the loader's rule over the same names gives the index; the identity gives the path
+            const std::optional<size_t> loader_index =
+                Loader::NewestUpdateDirectoryIndex(listed.names);
+            REQUIRE(loader_index.has_value());
+            CHECK(*loader_index == 1); // of equal numbers, the one listed last
+            CHECK(SelectNewestUpdateDirectory(listed) == listed.paths[*loader_index]);
+            CHECK(SelectNewestUpdateDirectory(listed) == updates / names[1]);
+        }
+    }
+    SECTION("update directories with a greater number listed before a smaller one") {
+        const auto listed = ListingOf(updates, {"655360", "100", "655360_old"});
+        CHECK(SelectNewestUpdateDirectory(listed) == updates / "655360");
+    }
+    SECTION("no update directory is a number") {
+        CHECK(SelectNewestUpdateDirectory(ListingOf(updates, {"old", "1x"})).empty());
+        CHECK(SelectNewestUpdateDirectory(ListingOf(updates, {})).empty());
+    }
+    SECTION("RomFS spellings, in both listing orders") {
+        const std::filesystem::path title{"title"};
+        for (const Names& names : {Names{"RomFS", "ROMFS"}, Names{"ROMFS", "RomFS"}}) {
+            const auto listed = ListingOf(title, {"exefs", names[0], names[1]});
+            const std::optional<size_t> loader_index =
+                Loader::FirstRomFSDirectoryIndex(listed.names);
+            REQUIRE(loader_index.has_value());
+            CHECK(*loader_index == 1); // the first RomFS spelling listed
+            CHECK(SelectRomFSDirectory(listed) == listed.paths[*loader_index]);
+            CHECK(SelectRomFSDirectory(listed) == title / names[0]);
+        }
+        CHECK(SelectRomFSDirectory(ListingOf(title, {"exefs", "romfs2"})).empty());
+    }
+}
+
 TEST_CASE("settings hash covers every switch that changes generated shaders",
           "[report][identity]") {
     const u64 base = RunControl::HostSettingsHash();
