@@ -1701,6 +1701,50 @@ TEST_CASE("Rings that deliver more at once than the history holds lose nothing",
     CHECK(Detail::PeakRetainedHistoryBytes() <= Config(Ms).buffer_bytes / 2);
 }
 
+TEST_CASE("Rings whose spans lie far apart in time lose nothing when the history cannot hold them",
+          "[nx2][attribution]") {
+    Run run{Config(Ms)};
+    constexpr u32 Producers = 6;
+    constexpr u64 SpansEach = 4000; // inside a ring (4096), together nearly twice the history
+    constexpr u64 WorkNs = 1000;
+    constexpr u64 Slot = 5 * Ms; // thread t works in [t * Slot, t * Slot + SpansEach * WorkNs)
+    // The threads' work does not overlap in time, whatever order they really ran in: the rings
+    // hold the 24,000 spans one ring after the other. A round of the same number of events from
+    // every ring would keep the later rings whole in the history until the first was taken.
+    const u64 start = run.T(0);
+    const u64 end = run.T(Ms + Producers * Slot);
+    Present(start);
+    REQUIRE(Detail::HoldConsumer(true));
+    std::vector<std::thread> threads;
+    for (u32 t = 0; t < Producers; ++t) {
+        threads.emplace_back([&run, t] {
+            RegisterThread("skewed producer");
+            for (u64 i = 0; i < SpansEach; ++i) {
+                const u64 begin = run.T(Ms + t * Slot + i * WorkNs);
+                RecordSpan(Cause::Shader, begin, begin + WorkNs);
+            }
+        });
+    }
+    for (std::thread& thread : threads) {
+        thread.join();
+    }
+    WaitUntil(end + 2 * Ms); // no cut at NowNs() holds a span back
+    Present(end);
+    REQUIRE(Detail::HoldConsumer(false));
+    AwaitFrames(1);
+    const AttributionSnapshot snap = run.Finish();
+    CHECK(snap.lost_events == 0);
+    CHECK(snap.complete);
+    REQUIRE(g_frames.size() == 1);
+    const LongFrame& frame = g_frames[0];
+    CHECK(frame.duration_ns == end - start);
+    CHECK(frame.instrumentation_complete);
+    CHECK((frame.unknown_reasons & UnknownReason::LostSpans) == 0);
+    CHECK(Total(frame.cause_ns) == end - start);
+    CHECK(At(frame.activity_ns, Cause::Shader) == Producers * SpansEach * WorkNs);
+    CHECK(Detail::PeakRetainedHistoryBytes() <= Config(Ms).buffer_bytes / 2);
+}
+
 TEST_CASE("Default history survives simultaneous 4x peak delivery before a delayed present",
           "[nx2][attribution][history]") {
     SessionConfig config;
