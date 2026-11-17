@@ -265,14 +265,23 @@ TEST_CASE("TXD register pressure covers the layer and a single destination",
     auto pressure = Shader::Ampere::PrepareRegisterPressure(txd(0, 216, 5, 0x3), 216);
     REQUIRE(pressure.valid);
     CHECK(pressure.instruction.Bits(24, 8) < 216);
-    // ... and one in the next group cannot be copied with the pair: rejected, not misread.
-    CHECK_FALSE(Shader::Ampere::PrepareRegisterPressure(txd(0, 218, 5, 0x3), 216).valid);
+    // ... and one in the next group is mapped to the adjacent low quartet, so the three
+    // coordinates stay consecutive and both groups are copied.
+    pressure = Shader::Ampere::PrepareRegisterPressure(txd(0, 218, 5, 0x3), 216);
+    REQUIRE(pressure.valid);
+    CHECK(pressure.instruction.Bits(24, 8) + 2 < 216);
+    CHECK(pressure.prefix.size() == 16);
     CHECK(Shader::Ampere::PrepareRegisterPressure(txd(0, 218, 1, 0x3), 216).valid);
     // A single channel writes one register, which may be the last of a group.
     pressure = Shader::Ampere::PrepareRegisterPressure(txd(247, 0, 1, 0x1), 216);
     REQUIRE(pressure.valid);
     CHECK(pressure.instruction.Bits(16, 8) < 216);
-    CHECK_FALSE(Shader::Ampere::PrepareRegisterPressure(txd(247, 0, 1, 0x3), 216).valid);
+    // Two channels starting on the last register of a group straddle two groups: the pair is
+    // mapped to adjacent low registers as well.
+    pressure = Shader::Ampere::PrepareRegisterPressure(txd(247, 0, 1, 0x3), 216);
+    REQUIRE(pressure.valid);
+    CHECK(pressure.instruction.Bits(16, 8) + 1 < 216);
+    CHECK(pressure.prefix.size() == 16);
 }
 
 TEST_CASE("Logged Kirby FMUL preserves high guest registers across uniform mirrors",
