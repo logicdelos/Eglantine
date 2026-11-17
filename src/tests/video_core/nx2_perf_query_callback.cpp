@@ -376,6 +376,27 @@ constexpr auto GuestReport = VideoCommon::QueryPropertiesFlags::IsAFence;
 constexpr u32 AcquireEqual = Tegra::Nx2SemaphoreWaiters::AcquireEqual;
 constexpr u32 AcquireGequal = Tegra::Nx2SemaphoreWaiters::AcquireGequal;
 
+// Switches Nx2Perf::Opt::QueryLanded off for its lifetime. On() publishes the environment's mask
+// first, so the mask restored afterwards is the one the process started with.
+class QueryLandedOff {
+public:
+    QueryLandedOff() {
+        static_cast<void>(VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::QueryLanded));
+        saved = VideoCommon::Nx2Perf::detail::live_off_mask.load(std::memory_order_relaxed);
+        VideoCommon::Nx2Perf::detail::live_off_mask.store(
+            saved | VideoCommon::Nx2Perf::Bit(VideoCommon::Nx2Perf::Opt::QueryLanded),
+            std::memory_order_relaxed);
+    }
+    ~QueryLandedOff() {
+        VideoCommon::Nx2Perf::detail::live_off_mask.store(saved, std::memory_order_relaxed);
+    }
+    QueryLandedOff(const QueryLandedOff&) = delete;
+    QueryLandedOff& operator=(const QueryLandedOff&) = delete;
+
+private:
+    u64 saved{};
+};
+
 } // namespace
 
 TEST_CASE("Nx2 queue word: a syncpoint publication never lowers a word the guest ran ahead",
@@ -457,6 +478,9 @@ TEST_CASE("Nx2 queue word: a guest release writes what it carries, a lower value
 
 TEST_CASE("Nx2 queue word: a flush of the cached publication keeps a word that moved ahead",
           "[video_core][nx2_queue_word]") {
+    // With query_landed on (the default) a landed report is not written again by a flush, so the
+    // flush rewrite under test only runs with the switch off.
+    const QueryLandedOff rewrite_flushes;
     WithQueueWords(Settings::GpuAccuracy::High, [](QueueWords& words) {
         StoreWord(words, 0x10);
         IssueReport(words, 0, Publication, 0x5c);
@@ -530,8 +554,13 @@ TEST_CASE("Nx2 queue word: issued releases predict an advance-only report as a k
     // The word is behind: the report advances it.
     REQUIRE(issued.Meets(address, 0x5c, AcquireEqual, [] { return 0x10U; }));
     REQUIRE_FALSE(issued.Meets(address, 0x64, AcquireGequal, [] { return 0x10U; }));
-    // The word wrapped.
+    // The word wrapped: the pending report (0x5c) is far ahead of 0xfffffff0 in signed distance.
+    REQUIRE(issued.Meets(address, 0x5c, AcquireEqual, [] { return 0xfffffff0U; }));
+    // A report of a small value advances a word that wrapped just as well.
+    issued.Settle(address);
+    issued.IssueAdvance(address, 0x05);
     REQUIRE(issued.Meets(address, 0x05, AcquireEqual, [] { return 0xfffffff0U; }));
+    REQUIRE_FALSE(issued.Meets(address, 0x5c, AcquireEqual, [] { return 0xfffffff0U; }));
     issued.Settle(address);
     REQUIRE_FALSE(issued.Any());
 }
