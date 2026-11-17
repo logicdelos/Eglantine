@@ -170,7 +170,7 @@ void EmuWindow_SDL3::ApplyPendingTitle() {
 }
 
 bool EmuWindow_SDL3::IsShown() const {
-    return is_shown;
+    return is_shown.load(std::memory_order_relaxed);
 }
 
 /// Called by the renderer on its thread after each presented frame: steps the TAS engine.
@@ -239,14 +239,24 @@ void EmuWindow_SDL3::OnEvent(SDL_Event& event) {
     switch (event.type) {
     case SDL_EVENT_WINDOW_RESIZED:
     case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+        return OnResize();
     case SDL_EVENT_WINDOW_MAXIMIZED:
     case SDL_EVENT_WINDOW_RESTORED:
+        // Leaving the minimized state must end it: SDL does not promise an exposed event after a
+        // restore, and a window left "not shown" stops the renderer presenting for good.
+        if (!is_shown.exchange(true)) {
+            LOG_INFO(Frontend, "Window restored");
+        }
         return OnResize();
     case SDL_EVENT_WINDOW_MINIMIZED:
-        is_shown = false;
+        if (is_shown.exchange(false)) {
+            LOG_INFO(Frontend, "Window minimized");
+        }
         return OnResize();
     case SDL_EVENT_WINDOW_EXPOSED:
-        is_shown = true;
+        if (!is_shown.exchange(true)) {
+            LOG_INFO(Frontend, "Window exposed");
+        }
         return OnResize();
     case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
         LOG_INFO(Frontend, "Window close requested");
