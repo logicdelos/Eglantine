@@ -10,6 +10,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <span>
@@ -163,6 +164,15 @@ private:
     bool use_descriptor_buffer{false};
     size_t frame_index{0};
     u64 sequence{};
+    // Overflow diagnostics (AcquireOverflow): the warning is rate limited and says whether the
+    // frame tick still runs, which separates a frame too big for the payload from a frame that
+    // never ends.
+    u64 ticks{};                    ///< TickFrame calls so far
+    u64 overflows{};                ///< overflows so far
+    u64 overflows_logged{};         ///< `overflows` when the last warning was written
+    u64 ticks_at_last_log{};        ///< `ticks` when the last warning was written
+    std::chrono::steady_clock::time_point last_tick{};
+    std::chrono::steady_clock::time_point last_log{};
     DescriptorUpdateEntry* payload_cursor = nullptr;
     DescriptorUpdateEntry* payload_start = nullptr;
     const DescriptorUpdateEntry* upload_start = nullptr;
