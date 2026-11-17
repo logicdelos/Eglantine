@@ -4,6 +4,7 @@
 #pragma once
 
 #include <chrono>
+#include <functional>
 #include <future>
 #include <memory>
 #include <optional>
@@ -46,9 +47,29 @@ private:
     std::future<bool> future;
 };
 
-/// Asks the renderer for a 16:9 frame `width` wide (clamped to 160..3840) and returns at once.
-/// Fails with `error` set when no game runs or another screenshot is in progress. Does not touch
-/// the emulation state: any thread may call it.
+/// The part of the renderer that a request needs. The emulator's renderer is wrapped by Begin
+/// below; a test supplies its own.
+class Target {
+public:
+    virtual ~Target() = default;
+
+    /// Whether a request is registered and not yet answered.
+    [[nodiscard]] virtual bool IsPending() const = 0;
+
+    /// Registers a request for a frame of `width` x `height`, written to `data`; `done(invert_y)`
+    /// is called when the frame is there. Must not be called while IsPending is true.
+    virtual void Request(u8* data, u32 width, u32 height, std::function<void(bool)> done) = 0;
+};
+
+/// Asks `target` for a 16:9 frame `width` wide (clamped to 160..3840) and returns at once. Fails
+/// with `error` set when another screenshot is in progress. Checking for a request in progress
+/// and registering the new one is one step under a lock shared by all callers of every Begin, so
+/// two threads (the control channel and an MCP worker) cannot both register. Waiting for the
+/// frame is not part of it.
+[[nodiscard]] std::optional<Pending> Begin(Target& target, u32 width, std::string& error);
+
+/// As above for the renderer of `system`. Fails with `error` set when no game runs. Does not
+/// touch the emulation state: any thread may call it.
 [[nodiscard]] std::optional<Pending> Begin(Core::System& system, u32 width, std::string& error);
 
 /// Encodes a frame as an opaque RGBA PNG.
