@@ -372,7 +372,7 @@ struct Values {
 #ifdef __ANDROID__
                                                     ScalingFilter::ScaleForce,
 #else
-                                                    // The baseline (docs/baseline.md): the filter
+                                                    // The baseline (fork-notes/baseline.md): the filter
                                                     // every game is tested with.
                                                     ScalingFilter::Buf,
 #endif

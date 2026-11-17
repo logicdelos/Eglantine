@@ -34,6 +34,25 @@ Test machine: Windows 11, AMD Ryzen 9 8940HX, NVIDIA GeForce RTX 5070 Ti Laptop 
 
 Frame-rate figures in this repository always come with the scene, settings, hardware and method used. This project makes no general frame-rate promise.
 
+### Baseline settings
+
+There is one set of settings, the same for every game: the defaults. A game is tested on them, so you can load a game without changing any setting. This fork has no per-game settings, and the baseline never changes with the game's title. The Qt front end keeps a prompt inherited from upstream that offers recommended settings when you start a few other games; it applies only what you accept and is not part of the baseline. If a tested game needed a different value, that would be recorded as a failed result, not hidden behind a per-game setting.
+
+| Setting | Baseline |
+|---|---|
+| Console mode | Docked |
+| Graphics backend | Vulkan |
+| GPU accuracy | High |
+| Resolution | 1x |
+| Anti-aliasing | SMAA |
+| Scaling filter | BUF |
+| Vertical sync | FIFO |
+| Speed limit | on, 100 % |
+| Asynchronous shader building | on |
+| Disk shader cache | on |
+
+Version 1 of the baseline made Docked, SMAA and BUF the defaults; the runs in the table above used them. Every game in the table is tested on the baseline, and a result on any other setting is labelled with the setting that differs: the 2x results above are the baseline with one declared variation, the resolution scale. Fire Emblem: Fortune's Weave and Xenoblade Chronicles 2 need no settings changes on the baseline. No promise is made for games that were not tested. The full list, its hash, its version history and the command-line options `--baseline`, `--baseline-allow`, `--print-baseline` and `--user-dir` are in [fork-notes/baseline.md](fork-notes/baseline.md).
+
 ## How this fork differs from Eglantine
 
 - It tracks upstream daily builds; each release names the upstream build it is based on.

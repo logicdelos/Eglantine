@@ -51,6 +51,18 @@ Command-line additions for scripted runs of `eden-cli`. Not built or run yet at 
 - A script in `EDEN_NX2_KEY_SCRIPT` with an item that has no colon or a number that cannot be read is now dropped as a whole, and an unattended run ends with exit code 1 (startup error); before, such items were skipped or ended the process with an uncaught exception.
 - Presented frames are now counted in every run, not only in unattended ones, so `frame>=` works without `--report`.
 
+## Unreleased
+
+### New
+
+- The baseline: the defaults of every emulation setting are the settings every game is tested on, there is one set for all games, and it does not change with a game's title. It has a version (1) and a hash, listed with its history in [fork-notes/baseline.md](fork-notes/baseline.md). `eden-cli` gets `--print-baseline`, `--baseline`, `--baseline-allow KEY[,KEY...]` (also `KEY=VALUE`) and `--user-dir <dir>`. The run report has a `baseline` object with the version, the hash, whether the run is on the baseline and every deviation with its source.
+
+### Changes
+
+- Default console mode is Docked, default anti-aliasing is SMAA and default scaling filter is BUF on desktop builds (they were handheld, FXAA and ScaleForce; Android keeps those). A configuration file that holds a value stored as the default follows the new default; a value chosen by the user is kept.
+- `dist/nx2_switches.txt` ships with no active line. `EDEN_NX2_SPLIT=2` and `EDEN_NX2_FENCE_BATCH=1` were set at every start of the Qt front end; both are what the code does when the switch is unset, so only the environment changes.
+- Opening a game in the Qt front end no longer writes an empty per-game configuration file.
+
 ## 0.3.0 (2026-11-16)
 
 Milestone 0.3, "Unattended runs": a scripted run ends by itself, says why in its exit code, and leaves one report file. Verified on the as-shipped folder: the release gate passed against the `fork-v0.2.0` baseline (three runs, no new error lines, pictures within the limit), and the unattended exit test passed 10 of 10 cases (bad arguments, frame limit, time limit and forced crash on Fire Emblem: Fortune's Weave and Xenoblade Chronicles 2). Other error paths were read from the code, not provoked.

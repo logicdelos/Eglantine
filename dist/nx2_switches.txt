@@ -7,7 +7,7 @@
 # needed: copy the lines you want into your own and restart.
 #
 # Every line below is off: with no switch set the emulator runs on the baseline settings, which
-# are the settings every game is tested on (docs/baseline.md). A switch you add is a deviation
+# are the settings every game is tested on (fork-notes/baseline.md). A switch you add is a deviation
 # from the baseline. Restart the emulator after editing.
 
 # --- Switches that are already on by default; listed only to turn them off ---

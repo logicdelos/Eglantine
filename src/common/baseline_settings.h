@@ -18,9 +18,9 @@ struct Values;
 
 /// The baseline settings are the settings every game is tested on: the default of every emulation
 /// setting, with every EDEN_NX2_* switch unset. There is no second table of values; the baseline
-/// is read from the settings themselves. docs/baseline.md lists it and keeps its history.
+/// is read from the settings themselves. fork-notes/baseline.md lists it and keeps its history.
 ///
-/// Raise this number, and add a line to the baseline history in docs/baseline.md, whenever a
+/// Raise this number, and add a line to the baseline history in fork-notes/baseline.md, whenever a
 /// default of a baseline setting changes or a baseline setting is added or removed.
 /// src/tests/common/baseline_settings.cpp pins the list for the current version.
 namespace Baseline {

@@ -27,9 +27,9 @@ constexpr bool kPinsPlatformSettings = false;
 constexpr u32 kPinnedVersion = 1;
 
 // Baseline version 1: the default of every persisted emulation setting, sorted by key. This is the
-// list in docs/baseline.md. Do not edit it to make the test pass: a default that changes, or a
+// list in fork-notes/baseline.md. Do not edit it to make the test pass: a default that changes, or a
 // setting that is added or removed, makes a new baseline. Raise Baseline::kBaselineVersion, add a
-// line to the baseline history in docs/baseline.md and write the new list as the pinned one.
+// line to the baseline history in fork-notes/baseline.md and write the new list as the pinned one.
 constexpr std::string_view kPinnedCommon[] = {
     "accelerate_astc=1",
     "anti_aliasing=2",
@@ -237,7 +237,7 @@ TEST_CASE("Baseline version 1 is pinned", "[baseline_settings]") {
     const auto values = std::make_unique<Settings::Values>();
     const std::string differences = Differences(*values);
     INFO("The baseline settings changed without a new baseline version. Raise "
-         "Baseline::kBaselineVersion, add a line to the baseline history in docs/baseline.md and "
+         "Baseline::kBaselineVersion, add a line to the baseline history in fork-notes/baseline.md and "
          "write the new list as the pinned one:\n"
          << differences);
     CHECK(differences.empty());
@@ -250,7 +250,7 @@ TEST_CASE("Baseline hash is pinned on the reference platforms", "[baseline_setti
     }
     const auto values = std::make_unique<Settings::Values>();
     const auto entries = Settings::Baseline::Entries(*values);
-    INFO("Raise Baseline::kBaselineVersion and update docs/baseline.md when the baseline changes");
+    INFO("Raise Baseline::kBaselineVersion and update fork-notes/baseline.md when the baseline changes");
     CHECK(Settings::Baseline::Hash(entries) == kPinnedHash);
 }
 

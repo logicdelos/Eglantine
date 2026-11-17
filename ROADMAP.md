@@ -4,6 +4,8 @@ Eglantine (logicdelos fork) is a fork of [Eglantine](https://github.com/Eglantin
 
 **Tested games.** This fork has been tested with two games only: **Fire Emblem: Fortune's Weave** and **Xenoblade Chronicles 2**. Other games may work as they do upstream, may work better, or may work worse; nobody has checked. Reports for other games are welcome.
 
+**Baseline.** Every game is tested on one set of settings, the defaults, so you can load a game without changing any setting; there are no per-game settings. A result on any other setting is labelled with the setting that differs. See [fork-notes/baseline.md](fork-notes/baseline.md).
+
 **Tested hardware.** One Windows 11 laptop: AMD Ryzen 9 8940HX, NVIDIA GeForce RTX 5070 Ti Laptop GPU, 16 GB RAM. Linux, macOS, AMD and Intel graphics are untested in this fork.
 
 ## Where this is going
