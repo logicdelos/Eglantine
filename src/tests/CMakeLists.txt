@@ -111,6 +111,8 @@ add_executable(tests
     video_core/ampere_f2i.cpp
     video_core/ampere_ldc.cpp
     video_core/ampere_vote.cpp
+    yuzu_cmd/cli_settings.cpp
+    ../yuzu_cmd/cli_settings.cpp
     video_core/shader_attributes.cpp
     video_core/indirect_reset.cpp
     video_core/ocarina_upscale.cpp

@@ -222,6 +222,29 @@ public:
         }
     }
 
+    [[nodiscard]] std::vector<std::pair<u32, std::string>> EnumChoices() const override final {
+        std::vector<std::pair<u32, std::string>> choices;
+        if constexpr (std::is_enum_v<Type>) {
+            for (const auto& [text, enumerator] : EnumMetadata<Type>::Canonicalizations()) {
+                if constexpr (ranged) {
+                    if (enumerator < minimum || maximum < enumerator) {
+                        continue;
+                    }
+                }
+                const u32 number = static_cast<u32>(std::underlying_type_t<Type>(enumerator));
+                const bool known =
+                    std::any_of(choices.begin(), choices.end(),
+                                [number](const auto& entry) { return entry.first == number; });
+                if (!known) {
+                    choices.emplace_back(number, std::string{text});
+                }
+            }
+            std::sort(choices.begin(), choices.end(),
+                      [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
+        }
+        return choices;
+    }
+
     /**
      * Gives us another way to identify the setting without having to go through a string.
      *

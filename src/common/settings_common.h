@@ -13,6 +13,8 @@
 #include <map>
 #include <string>
 #include <typeindex>
+#include <utility>
+#include <vector>
 #include "common/common_types.h"
 
 namespace Settings {
@@ -158,6 +160,17 @@ public:
      * @returns Canonicalized string representation of the internal data
      */
     [[nodiscard]] virtual std::string Canonicalize() const = 0;
+
+    /**
+     * The values an enum setting accepts, in ascending order, each with its canonical name. It is
+     * read from the static metadata of the enum type and never touches the value of the setting,
+     * so it is safe to call while the setting is in use.
+     *
+     * @returns The numbers and names of the values; empty when the setting is not an enum
+     */
+    [[nodiscard]] virtual std::vector<std::pair<u32, std::string>> EnumChoices() const {
+        return {};
+    }
 
     /*
      * Metadata

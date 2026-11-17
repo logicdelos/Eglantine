@@ -143,22 +143,14 @@ std::string Lowered(std::string_view text) {
 
 using Choices = std::vector<std::pair<long long, std::string>>;
 
-/// The numbers an enum setting accepts, with the name of each. The registry only offers
-/// LoadString (which clamps) and Canonicalize, so each number is tried and kept while the setting
-/// reads it back unchanged; the setting is put back as it was.
-Choices EnumChoices(BasicSetting& setting) {
-    constexpr long long limit = 4096;
-    const std::string saved = setting.ToString();
+/// The numbers an enum setting accepts, with the name of each. They come from the static metadata
+/// of the enum type (BasicSetting::EnumChoices): the setting itself is only read, never written,
+/// so describing or checking it cannot show another value to the threads that use it.
+Choices EnumChoices(const BasicSetting& setting) {
     Choices choices;
-    for (long long index = 0; index < limit; ++index) {
-        const std::string text = std::to_string(index);
-        setting.LoadString(text);
-        if (setting.ToString() != text) {
-            break;
-        }
-        choices.emplace_back(index, setting.Canonicalize());
+    for (auto& [number, name] : setting.EnumChoices()) {
+        choices.emplace_back(static_cast<long long>(number), std::move(name));
     }
-    setting.LoadString(saved);
     return choices;
 }
 
