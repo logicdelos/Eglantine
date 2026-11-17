@@ -2201,7 +2201,7 @@ private:
         }
         const auto now = system.CoreTiming().GetGlobalTimeNs();
         std::chrono::nanoseconds interval{};
-        if (Settings::values.use_speed_limit.GetValue() && Settings::SpeedLimit() != 0 &&
+        if (Settings::SpeedLimited() && Settings::SpeedLimit() != 0 &&
             !m_objects->mkw_movie_activity.Active(std::chrono::steady_clock::now())) {
             interval = std::chrono::nanoseconds{
                 100'000'000'000LL * swap_interval / refresh_rate / Settings::SpeedLimit()};
@@ -2284,7 +2284,7 @@ private:
             return;
         }
         m_frame_interval_locked = false;
-        const u32 speed = Settings::values.use_speed_limit.GetValue() ? Settings::SpeedLimit() : 100;
+        const u32 speed = Settings::SpeedLimited() ? Settings::SpeedLimit() : 100;
         const Nx2FrameInterval::Controller::Duration nominal{1000.0 / 60.0 * 100.0 /
                                                              (speed == 0 ? 100 : speed)};
         const u32 previous = m_frame_interval.Interval();
@@ -2340,7 +2340,7 @@ private:
     // sends 0x1003c during its boot logos and 0x2003c (two vblanks per frame, 30 fps) after; paced
     // at every vblank it ran at double speed. EDEN_NX2_SWAP_INTERVAL=<n> forces the interval.
     void PaceToVblank(u32 timing) {
-        if (!Settings::values.use_speed_limit.GetValue() || Settings::SpeedLimit() == 0) {
+        if (!Settings::SpeedLimited() || Settings::SpeedLimit() == 0) {
             return;
         }
         const auto movie_now = std::chrono::steady_clock::now();

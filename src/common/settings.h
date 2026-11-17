@@ -215,6 +215,12 @@ struct Values {
     SwitchableSetting<bool> use_speed_limit{
                                             linkage, true, "use_speed_limit", Category::Core, Specialization::Paired, true, true};
 
+    // Off (the default): the game never runs faster than real time, also with the frame limit off
+    // or above 100 %. On: with the limit off or above 100 % frames are sent as fast as they can
+    // be produced. General, never per game.
+    Setting<bool> allow_speed_up{linkage, false, "allow_speed_up", Category::Core,
+                                 Specialization::Default, true, true};
+
     SwitchableSetting<u16, true> speed_limit{linkage,
                                              100,
                                              0,
@@ -1091,7 +1097,12 @@ bool IsDockedMode();
 float Volume();
 
 // speed limit ops
+// The speed limit in force: the one of the current speed mode, at most 100 and never 0 unless
+// allow_speed_up is on. Every pacing decision uses this and SpeedLimited(); the use_speed_limit
+// setting itself is what the user chose and belongs to the interface.
 u16 SpeedLimit();
+// True when frames are paced to the speed limit: the limit is on, or allow_speed_up is off.
+bool SpeedLimited();
 void SetSpeedMode(const SpeedMode &mode);
 void ToggleStandardMode();
 void ToggleTurboMode();

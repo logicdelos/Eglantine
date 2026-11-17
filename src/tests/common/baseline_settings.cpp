@@ -32,6 +32,7 @@ constexpr u32 kPinnedVersion = 1;
 // line to the baseline history in fork-notes/baseline.md and write the new list as the pinned one.
 constexpr std::string_view kPinnedCommon[] = {
     "accelerate_astc=1",
+    "allow_speed_up=false",
     "anti_aliasing=2",
     "aspect_ratio=0",
     "astc_recompression=2",
@@ -168,10 +169,10 @@ constexpr std::string_view kPinnedPlatform[] = {
 
 #ifdef _WIN32
 constexpr std::string_view kPinnedHash =
-    "79af37a9cf061121162b4d3e6ddc2e6505e93eeb19c496a604b3645f212af0a6";
+    "57f9c3b773893b948dacca41e57da5d81d7502f203cd95f7e9bab65c3f4648db";
 #else
 constexpr std::string_view kPinnedHash =
-    "f102d7004e0da8189c21d3f874ef370dde83fc5017899612f43de84da19c5169";
+    "a4caf374a41520be82f05bdca2f46b9e7db2c1cb7ff4e81e34477f1dcedb032c";
 #endif
 
 bool IsPlatformKey(std::string_view key) {

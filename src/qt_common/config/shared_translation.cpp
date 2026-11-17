@@ -75,8 +75,14 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, speed_limit, tr("Limit Speed Percent"),
            tr("Controls the game's maximum rendering speed, but it's up to each game if it runs "
               "faster or not.\n200% for a 30 FPS game is 60 FPS, and for a "
-              "60 FPS game it will be 120 FPS.\nDisabling it means unlocking the framerate to the "
-              "maximum your PC can reach."));
+              "60 FPS game it will be 120 FPS.\nDisabling it only unlocks the framerate when "
+              "\"Allow running faster than real time\" is on."));
+    INSERT(Settings, allow_speed_up, tr("Allow running faster than real time"),
+           tr("Off: the game never runs faster than real time, also with the frame limit off or "
+              "above 100%.\n"
+              "On: with the limit off or above 100% the emulator sends frames to the game as fast "
+              "as it can; a game that times itself by the clock draws more frames, a game that "
+              "advances one step per frame runs fast."));
 
     INSERT(Settings, turbo_speed_limit, tr("Turbo Speed"),
            tr("When the Turbo Speed hotkey is pressed, the speed will be limited to this "
