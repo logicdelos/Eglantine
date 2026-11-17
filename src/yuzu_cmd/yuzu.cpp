@@ -712,6 +712,7 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
             LOG_ERROR(Frontend, "--baseline-allow: {}", problem);
         }
     }
+    RunReport::SetBaselineRequest(lp.baseline, Settings::Baseline::AllowedKeys(lp.baseline_allow));
     if (Common::RunOutcome::Active()) {
         std::vector<std::string> overridden_settings;
         for (const auto& request : lp.setting_overrides) {

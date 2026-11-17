@@ -37,6 +37,10 @@ enum class PrepareResult {
 /// the value they have now.
 void CaptureStart(const std::vector<std::string>& overridden_settings);
 
+/// Records whether --baseline was given and the keys --baseline-allow declared, for the report's
+/// baseline object (version, hash, on_baseline, deviations). Call it before CaptureStart.
+void SetBaselineRequest(bool requested, std::vector<std::string> declared);
+
 /// The program id of the loaded game, for the report's title_id.
 void SetTitleId(u64 program_id);
 

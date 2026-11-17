@@ -30,6 +30,7 @@ extern char** environ;
 #include <fmt/format.h>
 #include <nlohmann/json.hpp>
 
+#include "common/baseline_settings.h"
 #include "common/fs/fs_util.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
@@ -73,6 +74,8 @@ struct State {
     Json tunables = Json::object();
     Json initial_settings = Json::object();
     Json overridden_settings = Json::object();
+    bool baseline_requested = false; // --baseline was given
+    std::vector<std::string> baseline_declared; // keys of --baseline-allow
     std::optional<u64> title_id;
 };
 
@@ -370,6 +373,8 @@ std::string Document(State& state, Common::RunOutcome::Reason reason, int code,
         document["steps"] = StepsJson(*script);
     }
     document["tunables"] = state.tunables;
+    document["baseline"] =
+        Settings::Baseline::ReportJson(state.baseline_requested, state.baseline_declared);
     document["settings"] = std::move(settings);
     // Invalid UTF-8 (a detail quoting a game string) must not cost the whole report.
     return document.dump(2, ' ', false, Json::error_handler_t::replace) + '\n';
@@ -689,6 +694,8 @@ void RebuildCrashDocument(State& state) {
         settings["final"] = nullptr;
         Json rest = Json::object();
         rest["tunables"] = state.tunables;
+        rest["baseline"] =
+            Settings::Baseline::ReportJson(state.baseline_requested, state.baseline_declared);
         rest["settings"] = std::move(settings);
         // The members of `rest` continue the document: its opening brace is dropped, and its
         // closing one ends the document.
@@ -849,6 +856,14 @@ void CaptureStart(const std::vector<std::string>& overridden_settings) {
                                                   : ScalarOf(*found->second);
         }
     }
+    RebuildCrashDocument(state);
+}
+
+void SetBaselineRequest(bool requested, std::vector<std::string> declared) {
+    State& state = GetState();
+    std::scoped_lock lock{state.mutex};
+    state.baseline_requested = requested;
+    state.baseline_declared = std::move(declared);
     RebuildCrashDocument(state);
 }
 
