@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <optional>
 #include <string>
 #include <vector>
@@ -24,7 +25,8 @@ namespace {
 /// The shared loader without a front end: nothing to read or write beyond the generic values.
 class TestConfig final : public Config {
 public:
-    explicit TestConfig(const std::string& path) : Config(ConfigType::GlobalConfig) {
+    explicit TestConfig(const std::string& path, Mode config_mode = Mode::LoadAndSave)
+        : Config(ConfigType::GlobalConfig, config_mode) {
         Initialize(std::optional<std::string>{path});
     }
 
@@ -84,6 +86,15 @@ private:
 void WriteFile(const std::filesystem::path& file, const std::string& text) {
     std::ofstream stream{file, std::ios::binary | std::ios::trunc};
     stream << text;
+}
+
+/// The bytes of `file`, or nothing when it cannot be opened.
+std::optional<std::string> ReadFile(const std::filesystem::path& file) {
+    std::ifstream stream{file, std::ios::binary};
+    if (!stream) {
+        return std::nullopt;
+    }
+    return std::string{std::istreambuf_iterator<char>{stream}, std::istreambuf_iterator<char>{}};
 }
 
 /// "[Section]\nkey\default=<flag>\nkey=<value>\n" for one setting, in the layout the loader reads.
@@ -224,5 +235,65 @@ TEST_CASE("Debug settings that change a run are in the baseline and are reset",
         CHECK(after.empty());
         CHECK(Settings::Baseline::OnBaseline(after, {}));
     }
+    Settings::Baseline::ResetToBaseline();
+}
+
+TEST_CASE("A load-only config reads the file and never writes it", "[baseline_config]") {
+    const ScratchDirectory scratch{"eglantine_baseline_config_load_only"};
+    Settings::Baseline::ResetToBaseline();
+
+    // A sparse file: only [Core], with one chosen value.
+    const auto file = scratch.File("sparse-config.ini");
+    WriteFile(file, Stored(Settings::values.speed_limit, false, "150"));
+    const std::optional<std::string> before = ReadFile(file);
+    REQUIRE(before.has_value());
+
+    {
+        TestConfig config{Common::FS::PathToUTF8String(file), Config::Mode::LoadOnly};
+        CHECK(Settings::values.speed_limit.GetValue() == 150);
+        config.ReloadAllValues();
+        config.SaveAllValues();
+    }
+    CHECK(ReadFile(file) == before);
+    Settings::Baseline::ResetToBaseline();
+}
+
+TEST_CASE("A config that loads and saves still writes the file", "[baseline_config]") {
+    const ScratchDirectory scratch{"eglantine_baseline_config_load_save"};
+    Settings::Baseline::ResetToBaseline();
+
+    const auto file = scratch.File("sparse-config.ini");
+    WriteFile(file, Stored(Settings::values.speed_limit, false, "150"));
+    const std::optional<std::string> before = ReadFile(file);
+    REQUIRE(before.has_value());
+
+    {
+        const TestConfig config{Common::FS::PathToUTF8String(file)};
+        CHECK(Settings::values.speed_limit.GetValue() == 150);
+    }
+    const std::optional<std::string> after = ReadFile(file);
+    REQUIRE(after.has_value());
+    CHECK(after != before);
+    // The chosen value is kept.
+    CHECK(after->find("speed_limit=150") != std::string::npos);
+    Settings::Baseline::ResetToBaseline();
+}
+
+TEST_CASE("A load-only config does not create a missing file", "[baseline_config]") {
+    const ScratchDirectory scratch{"eglantine_baseline_config_missing"};
+    Settings::Baseline::ResetToBaseline();
+    Settings::values.speed_limit.SetValue(150);
+
+    const auto directory = scratch.File("absent");
+    const auto file = directory / "config.ini";
+    {
+        TestConfig config{Common::FS::PathToUTF8String(file), Config::Mode::LoadOnly};
+        // The defaults are used.
+        CHECK(Settings::values.speed_limit.GetValue() == 100);
+        config.ReloadAllValues();
+        config.SaveAllValues();
+    }
+    CHECK_FALSE(std::filesystem::exists(file));
+    CHECK_FALSE(std::filesystem::exists(directory));
     Settings::Baseline::ResetToBaseline();
 }

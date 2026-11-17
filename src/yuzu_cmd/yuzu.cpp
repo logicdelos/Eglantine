@@ -694,10 +694,13 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         Nx2Bottleneck::BeginRecording(Nx2Bottleneck::Now());
     }
     std::optional<SdlConfig> config;
-    config.emplace(lp.config_path);
+    // --baseline reads the configuration file but never creates or writes it, in every way the
+    // run can end, so the file is byte-unchanged afterwards.
+    config.emplace(lp.config_path,
+                   lp.baseline ? SdlConfig::Mode::LoadOnly : SdlConfig::Mode::LoadAndSave);
     if (lp.baseline || !setting_overrides.empty()) {
-        // The configuration file is written when the object ends: do that now, so what --baseline
-        // and --set change for this run is never saved.
+        // Otherwise the configuration file is written when the object ends: do that now, so what
+        // --set changes for this run is never saved.
         config.reset();
     }
     if (lp.baseline) {

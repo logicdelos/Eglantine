@@ -746,6 +746,8 @@ void ApplyLaunchParams(LaunchParams const& lp) noexcept {
             "--baseline            Run on the baseline settings: after the config loads, every baseline\n"
             "                      setting is reset to its default; refuses an EDEN_NX2_* switch, and a\n"
             "                      --set of a baseline setting, that --baseline-allow does not name (exit 64)\n"
+            "                      The configuration file is read and never written; a missing one is\n"
+            "                      not created and the defaults are used\n"
             "--baseline-allow KEY[,KEY...]  Declare a variation from the baseline; KEY=VALUE also sets\n"
             "                      the setting (for example resolution_setup=6)\n"
             "--print-baseline      Print the baseline version, hash and settings, and exit\n"

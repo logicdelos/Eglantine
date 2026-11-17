@@ -49,7 +49,8 @@ const std::array<int, 2> SdlConfig::default_ringcon_analogs{{
     0,
 }};
 
-SdlConfig::SdlConfig(const std::optional<std::string> config_path) {
+SdlConfig::SdlConfig(const std::optional<std::string> config_path, const Mode config_mode)
+    : Config(ConfigType::GlobalConfig, config_mode) {
     Initialize(config_path);
     ReadSdlValues();
     SaveSdlValues();
