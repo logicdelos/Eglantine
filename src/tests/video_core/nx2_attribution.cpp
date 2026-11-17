@@ -2255,7 +2255,14 @@ TEST_CASE("Repeating a state does not move where it began, and the previous stat
     Worker core;
     core.Do([&] {
         CHECK(RecordGuestState(GuestState::Running, run.T(10 * Ms)).state == GuestState::Off);
+    });
+    // Clock deltas need a baseline before any Running time has accumulated.
+    Detail::SampleGuestStates(run.T(10 * Ms));
+    core.Do([&] {
         CHECK(RecordGuestState(GuestState::Idle, run.T(30 * Ms)).state == GuestState::Running);
+    });
+    Detail::SampleGuestStates(run.T(30 * Ms));
+    core.Do([&] {
         CHECK(RecordGuestState(GuestState::Idle, run.T(40 * Ms)).state == GuestState::Idle);
     });
     Detail::SampleGuestStates(run.T(40 * Ms));
