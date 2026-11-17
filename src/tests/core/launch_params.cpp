@@ -110,3 +110,44 @@ TEST_CASE("Old options keep the unknown option policy", "[core][launch_params]")
     REQUIRE(config.parse_error.empty());
     REQUIRE_FALSE(config.unknown_option.empty());
 }
+
+TEST_CASE("--baseline refuses a --set of a baseline setting unless it is declared",
+          "[core][launch_params]") {
+    ScopedSystemTestContext context;
+    Core::System system;
+    const std::string refused =
+        "--baseline refused: --set resolution_setup changes a baseline setting, which takes the "
+        "run off the baseline. Drop --baseline, or declare it with --baseline-allow "
+        "resolution_setup";
+
+    SECTION("refused when not declared, before or after --baseline") {
+        REQUIRE(Parse(system, {"-g", "game.nsp", "--baseline", "--set", "resolution_setup=3"})
+                    .parse_error == refused);
+        REQUIRE(Parse(system, {"--set", "resolution_setup=3", "-g", "game.nsp", "--baseline"})
+                    .parse_error == refused);
+    }
+    SECTION("allowed when declared") {
+        const Core::LaunchParams lp =
+            Parse(system, {"-g", "game.nsp", "--set", "resolution_setup=3", "--baseline",
+                           "--baseline-allow", "resolution_setup"});
+        REQUIRE(lp.parse_error.empty());
+        REQUIRE(lp.setting_overrides.size() == 1);
+        REQUIRE(lp.setting_overrides[0].first == "resolution_setup");
+        REQUIRE(lp.baseline_allow == std::vector<std::string>{"resolution_setup"});
+    }
+    SECTION("a setting outside the baseline, or no --baseline, is not refused") {
+        REQUIRE(Parse(system, {"-g", "game.nsp", "--baseline", "--set", "log_filter=*:Debug"})
+                    .parse_error.empty());
+        REQUIRE(Parse(system, {"-g", "game.nsp", "--set", "resolution_setup=3"})
+                    .parse_error.empty());
+    }
+    SECTION("the same setting twice is a bad argument, declared or not") {
+        REQUIRE(Parse(system, {"-g", "game.nsp", "--baseline", "--baseline-allow",
+                               "resolution_setup", "--set", "resolution_setup=3", "--set",
+                               "resolution_setup=2"})
+                    .parse_error == "--set resolution_setup was given more than once");
+        REQUIRE(Parse(system, {"-g", "game.nsp", "--baseline", "--set", "resolution_setup=3",
+                               "--set", "resolution_setup=2"})
+                    .parse_error == "--set resolution_setup was given more than once");
+    }
+}

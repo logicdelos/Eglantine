@@ -502,6 +502,22 @@ std::vector<std::string> UndeclaredSwitches(const std::vector<EnvironmentSwitch>
     return undeclared;
 }
 
+std::vector<std::string> UndeclaredOverrides(const Values& source,
+                                             const std::vector<std::string>& names,
+                                             const std::vector<std::string>& items) {
+    const std::vector<std::string> keys = AllowedKeys(items);
+    std::vector<std::string> undeclared;
+    for (const auto& name : names) {
+        const auto found = source.linkage.by_key.find(name);
+        if (found != source.linkage.by_key.end() && IsBaselineSetting(name, *found->second) &&
+            std::find(keys.begin(), keys.end(), name) == keys.end() &&
+            std::find(undeclared.begin(), undeclared.end(), name) == undeclared.end()) {
+            undeclared.push_back(name);
+        }
+    }
+    return undeclared;
+}
+
 void ResetToBaseline(Values& target) {
     for (const auto& [key, setting] : target.linkage.by_key) {
         if (IsBaselineSetting(key, *setting)) {

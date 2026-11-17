@@ -95,7 +95,8 @@ struct EarlyOptions {
     bool version_json = false;
     // --user-dir <path> or --user-dir=<path> (or an abbreviation getopt accepts).
     std::optional<std::string> user_dir{};
-    // The first mistake in those options (no value, given twice); empty when there is none.
+    // The first mistake in those options (no value, given twice), a misused option of this fork,
+    // or a --set of a baseline setting that --baseline refuses; empty when there is none.
     std::string error{};
 };
 

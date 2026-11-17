@@ -412,6 +412,37 @@ TEST_CASE("The report object lists the deviations and the declared keys", "[base
     CHECK(declared["deviations"].size() == 1);
 }
 
+TEST_CASE("A --set of a baseline setting is refused unless it is declared", "[baseline_settings]") {
+    const auto values = std::make_unique<Settings::Values>();
+    using Settings::Baseline::UndeclaredOverrides;
+    // A baseline setting, named twice, is reported once.
+    const std::vector<std::string> pinned{"resolution_setup", "resolution_setup"};
+    CHECK(UndeclaredOverrides(*values, pinned, {}) == std::vector<std::string>{"resolution_setup"});
+    CHECK(UndeclaredOverrides(*values, pinned, {"EDEN_NX2_EXAMPLE"}) ==
+          std::vector<std::string>{"resolution_setup"});
+    // Declared bare or with a value.
+    CHECK(UndeclaredOverrides(*values, pinned, {"resolution_setup"}).empty());
+    CHECK(UndeclaredOverrides(*values, pinned, {"use_docked_mode", "resolution_setup=2"}).empty());
+    // A setting outside the baseline, and a name that is no setting, are not this check's matter.
+    CHECK(UndeclaredOverrides(*values, {"log_filter", "current_user", "no_such_setting"}, {})
+              .empty());
+
+    // Declared: the run stays on the baseline and the report names the command line.
+    Settings::Baseline::ClearNotedSources();
+    values->resolution_setup.SetValue(Settings::ResolutionSetup::Res2X);
+    Settings::Baseline::NoteSource("resolution_setup", "command line");
+    const auto deviations = Settings::Baseline::Deviations(*values, {});
+    Settings::Baseline::ClearNotedSources();
+    const auto report = Settings::Baseline::ReportJson(true, {"resolution_setup"}, deviations, {});
+    CHECK(report["requested"] == true);
+    CHECK(report["on_baseline"] == true);
+    REQUIRE(report["deviations"].size() == 1);
+    CHECK(report["deviations"][0]["key"] == "resolution_setup");
+    CHECK(report["deviations"][0]["source"] == "command line");
+    REQUIRE(report["declared"].size() == 1);
+    CHECK(report["declared"][0] == "resolution_setup");
+}
+
 TEST_CASE("The printed baseline starts with the version and the hash", "[baseline_settings]") {
     const std::string text = Settings::Baseline::PrintableText();
     const std::string head = "baseline_version=" +

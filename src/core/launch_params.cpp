@@ -122,6 +122,28 @@ static struct option kLongOptions[] = {
     // clang-format on
 };
 
+/// What --set and --control say when their operand is missing or not usable, whichever of
+/// ScanEarlyOptions and ParseLaunchParams sees it first.
+static constexpr std::string_view kSetOperandMessage =
+    "--set expects name=value, with a name and an equals sign";
+static constexpr std::string_view kControlOperandMessage =
+    "--control needs a name of 1 to 64 letters, digits, '.', '_' or '-', starting with a letter "
+    "or digit";
+
+/// Under --baseline, a --set of a baseline setting that no --baseline-allow item declares takes
+/// the run off the baseline: the message for the first one, empty when there is none.
+static std::string BaselineOverrideRefusal(const std::vector<std::string>& set_names,
+                                           const std::vector<std::string>& allow_items) {
+    const std::vector<std::string> undeclared =
+        Settings::Baseline::UndeclaredOverrides(Settings::values, set_names, allow_items);
+    if (undeclared.empty()) {
+        return {};
+    }
+    return "--baseline refused: --set " + undeclared.front() +
+           " changes a baseline setting, which takes the run off the baseline. Drop --baseline, "
+           "or declare it with --baseline-allow " + undeclared.front();
+}
+
 /// The long option getopt_long picks for `name`: spelled out in full, or an abbreviation that
 /// only one option (or several of the same kind) starts with. Null when there is none.
 static const struct option* FindLongOption(std::string_view name) {
@@ -173,6 +195,12 @@ std::string MisusedBranchOption(std::string_view word) {
         return {};
     }
     if (equals == std::string_view::npos && found->has_arg == required_argument) {
+        if (found->val == 0x10E) {
+            return std::string{kSetOperandMessage};
+        }
+        if (found->val == 0x120) {
+            return std::string{kControlOperandMessage};
+        }
         return std::string{"--"} + found->name + " needs an argument";
     }
     if (equals != std::string_view::npos && found->has_arg == no_argument) {
@@ -188,6 +216,9 @@ std::string MisusedBranchOption(std::string_view word) {
 EarlyOptions ScanEarlyOptions(int argc, char* argv[]) noexcept {
     bool version = false;
     bool json = false;
+    bool baseline_requested = false;
+    std::vector<std::string> allow_items;
+    std::vector<std::string> set_names;
     EarlyOptions early{};
     const auto fail = [&early](std::string message) {
         if (early.error.empty()) {
@@ -245,6 +276,26 @@ EarlyOptions ScanEarlyOptions(int argc, char* argv[]) noexcept {
             case 0x10C:
                 user_dir(value);
                 break;
+            case 0x10E:
+                // Only the name: the value may be a credential. A malformed request is left to
+                // ParseLaunchParams, which says what is wrong with it.
+                if (value) {
+                    if (const size_t name_end = value->find('=');
+                        name_end != std::string::npos && name_end != 0) {
+                        set_names.push_back(value->substr(0, name_end));
+                    }
+                }
+                break;
+            case 0x110:
+                baseline_requested = true;
+                break;
+            case 0x111:
+                if (value) {
+                    for (auto& item : Settings::Baseline::SplitAllowList(*value)) {
+                        allow_items.push_back(std::move(item));
+                    }
+                }
+                break;
             default:
                 break;
             }
@@ -277,6 +328,12 @@ EarlyOptions ScanEarlyOptions(int argc, char* argv[]) noexcept {
             if (takes_next && i + 1 < argc) {
                 ++i;
             }
+        }
+    }
+    // Refused here, before the user directory is touched and before --version --json prints.
+    if (baseline_requested) {
+        if (std::string refusal = BaselineOverrideRefusal(set_names, allow_items); !refusal.empty()) {
+            fail(std::move(refusal));
         }
     }
     early.version_json = version && json;
@@ -354,8 +411,7 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
                 if (p.control_name) {
                     fail("--control was given more than once");
                 } else if (!valid) {
-                    fail("--control needs a name of 1 to 64 letters, digits, '.', '_' or '-', "
-                         "starting with a letter or digit");
+                    fail(std::string{kControlOperandMessage});
                 } else {
                     p.control_name = name;
                 }
@@ -508,7 +564,7 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
                 const size_t equals = request.find('=');
                 if (equals == std::string_view::npos || equals == 0) {
                     // The text is not repeated: it may be a value, and the value may be a credential.
-                    fail("--set expects name=value, with a name and an equals sign");
+                    fail(std::string{kSetOperandMessage});
                     break;
                 }
                 std::string name{request.substr(0, equals)};
@@ -546,10 +602,9 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
                 if (optopt == 0x10C) {
                     fail("--user-dir needs a directory");
                 } else if (optopt == 0x10E) {
-                    fail("--set expects name=value, with a name and an equals sign");
+                    fail(std::string{kSetOperandMessage});
                 } else if (optopt == 0x120) {
-                    fail("--control needs a name of 1 to 64 letters, digits, '.', '_' or '-', "
-                         "starting with a letter or digit");
+                    fail(std::string{kControlOperandMessage});
                 } else {
                     // An unknown option, or an old one without its argument: only an automated
                     // run (--report, --run-seconds, --run-frames) refuses that. A misused option
@@ -591,6 +646,17 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
     }
     if (!p.baseline && !p.baseline_allow.empty()) {
         fail("--baseline-allow needs --baseline");
+    }
+    if (p.baseline) {
+        // The same refusal as ScanEarlyOptions, wherever --set and --baseline stand.
+        std::vector<std::string> set_names;
+        for (const auto& request : p.setting_overrides) {
+            set_names.push_back(request.first);
+        }
+        if (std::string refusal = BaselineOverrideRefusal(set_names, p.baseline_allow);
+            !refusal.empty()) {
+            fail(std::move(refusal));
+        }
     }
     if ((p.report_path || p.run_seconds || p.run_frames) &&
         (p.print_help || p.print_version || p.list_settings || p.print_baseline ||
@@ -678,8 +744,8 @@ void ApplyLaunchParams(LaunchParams const& lp) noexcept {
             "                      never saved. Can be repeated. An unknown name or an invalid value is a\n"
             "                      bad argument (exit code 64). The other command line options win over it\n"
             "--baseline            Run on the baseline settings: after the config loads, every baseline\n"
-            "                      setting is reset to its default; refuses an EDEN_NX2_* switch that\n"
-            "                      --baseline-allow does not name (exit 64)\n"
+            "                      setting is reset to its default; refuses an EDEN_NX2_* switch, and a\n"
+            "                      --set of a baseline setting, that --baseline-allow does not name (exit 64)\n"
             "--baseline-allow KEY[,KEY...]  Declare a variation from the baseline; KEY=VALUE also sets\n"
             "                      the setting (for example resolution_setup=6)\n"
             "--print-baseline      Print the baseline version, hash and settings, and exit\n"

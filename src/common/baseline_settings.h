@@ -139,6 +139,12 @@ void SetChangeHook(void (*hook)());
 [[nodiscard]] std::vector<std::string> UndeclaredSwitches(
     const std::vector<EnvironmentSwitch>& switches, const std::vector<std::string>& items);
 
+/// The names in `names` (the settings a --set request changes) that are baseline settings of
+/// `source` and that no item declares, each once, in order. --baseline refuses a run with one.
+[[nodiscard]] std::vector<std::string> UndeclaredOverrides(const Values& source,
+                                                           const std::vector<std::string>& names,
+                                                           const std::vector<std::string>& items);
+
 /// Puts every baseline setting on its default and switchable ones on their global value.
 /// Controls, paths, profiles and everything else are left alone.
 void ResetToBaseline(Values& target);

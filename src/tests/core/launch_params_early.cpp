@@ -215,3 +215,43 @@ TEST_CASE("No two long options share an id", "[launch_params]") {
         CHECK(names.contains(name));
     }
 }
+
+TEST_CASE("--baseline refuses a --set of a baseline setting that is not declared",
+          "[launch_params]") {
+    const std::string refused =
+        "--baseline refused: --set resolution_setup changes a baseline setting, which takes the "
+        "run off the baseline. Drop --baseline, or declare it with --baseline-allow "
+        "resolution_setup";
+    CHECK(Scan({"--baseline", "--set", "resolution_setup=3"}).error == refused);
+    // The order on the command line does not matter.
+    CHECK(Scan({"--set", "resolution_setup=3", "--baseline"}).error == refused);
+    CHECK(Scan({"--set=resolution_setup=3", "-g", "game.nsp", "--baseline"}).error == refused);
+    // Given twice, it is named once.
+    CHECK(Scan({"--baseline", "--set", "resolution_setup=3", "--set", "resolution_setup=2"})
+              .error == refused);
+    // --version --json is refused too, so the build identity is not printed.
+    const auto version = Scan({"--version", "--json", "--baseline", "--set", "resolution_setup=3"});
+    CHECK(version.version_json);
+    CHECK(version.error == refused);
+
+    // Declared, in either form the baseline accepts, before or after the --set.
+    CHECK(Scan({"--baseline", "--baseline-allow", "resolution_setup", "--set", "resolution_setup=3"})
+              .error.empty());
+    CHECK(Scan({"--set", "resolution_setup=3", "--baseline-allow=use_docked_mode,resolution_setup=2",
+                "--baseline"})
+              .error.empty());
+    // A setting outside the baseline, and --set without --baseline, are not refused.
+    CHECK(Scan({"--baseline", "--set", "log_filter=*:Debug"}).error.empty());
+    CHECK(Scan({"--set", "resolution_setup=3"}).error.empty());
+    CHECK(Scan({"--version", "--json", "--set", "resolution_setup=3"}).error.empty());
+    // The value is never read as an option, and the name of a malformed request is not guessed.
+    CHECK(Scan({"--baseline", "--set", "=3"}).error.empty());
+}
+
+TEST_CASE("A trailing --set or --control says what the full parse says", "[launch_params]") {
+    CHECK(Scan({"--version", "--json", "--set"}).error ==
+          "--set expects name=value, with a name and an equals sign");
+    CHECK(Scan({"--version", "--json", "--control"}).error ==
+          "--control needs a name of 1 to 64 letters, digits, '.', '_' or '-', starting with a "
+          "letter or digit");
+}
