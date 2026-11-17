@@ -496,7 +496,9 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                 } else if (flags & (1U << 19)) {
                     // NVN2 tracks QMD completion with a max release (bit 19) into a word other
                     // releases also advance: a plain write would move it backwards and leave
-                    // GEQ acquires waiting forever.
+                    // GEQ acquires waiting forever. The engine's own copy of the channel
+                    // syncpoint into that word only advances it for the same reason
+                    // (QueryPropertiesFlags::AdvanceOnly).
                     // ReduceSemaphore's unsigned MAX.
                     rasterizer->SignalFence(
                         [this, address, payload,
