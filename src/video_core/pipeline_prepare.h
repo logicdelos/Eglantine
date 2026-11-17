@@ -28,8 +28,15 @@
 //
 // with the terminal states Skipped (not buildable here, or the same key is already known),
 // Failed, Claimed (a draw took a queued record, the normal path builds it) and Cancelled.
-// Workers take tasks with Next and report them back; a draw asks with Request. A draw is never
-// denied anything: the budget, the ready cap and the RAM pause only hold back preparation.
+// Workers take tasks with Next and report them back; a draw asks with Request.
+//
+// Records are prepared in the order the first run reached them (Begin). Ready objects are kept
+// for their draws: once ready plus building reach the ready cap, builds are held back until a
+// draw adopts one, so the objects needed first are never the ones released. Only a game that has
+// stopped following the recorded order (draws matching no record for PrepareOptions::
+// diverged_after_ns while the cap holds) has its oldest unused ready objects released.
+// A draw is never denied anything: the budget, the ready cap and the RAM pause only hold back
+// preparation.
 //
 // Everything is guarded by one mutex (`mutex_`); the scheduler calls nothing while holding it
 // except destructors of the opaque payload and result objects (decoded records, never Vulkan
@@ -50,7 +57,7 @@ enum class State : u8 {
     Failed,
     Skipped,
     Cancelled,
-    Evicted, ///< Ready but unused while the ready cap held back others: released, built when drawn
+    Evicted, ///< Ready but unused while the game diverged from the recorded order: released
 };
 
 /// What the scheduler knows of one record before reading it: the index entry.
@@ -70,6 +77,8 @@ inline constexpr u64 ReadyBookkeepingBytes = 1024;
 class Scheduler {
 public:
     using WorkIdSource = u64 (*)();
+    /// Nanoseconds of any steady clock; null selects std::chrono::steady_clock.
+    using ClockSource = u64 (*)();
 
     enum class TaskKind : u8 {
         Load,  ///< Read and decode record `id`, then call Loaded, LoadSkipped or LoadFailed
@@ -85,8 +94,8 @@ public:
         u64 work{};  ///< Attribution id of this entry's work
         u64 epoch{}; ///< For WaitForChange
         std::shared_ptr<void> payload; ///< Build: what Loaded stored
-        /// Ready object released to make room under the ready cap (oldest unused first): the
-        /// caller destroys it, outside the scheduler's lock.
+        /// Ready object released because the game diverged from the recorded order: the caller
+        /// destroys it, outside the scheduler's lock.
         std::shared_ptr<void> evicted;
     };
 
@@ -112,7 +121,8 @@ public:
         std::vector<std::shared_ptr<void>> results;
     };
 
-    Scheduler(const CacheEnvelope::PrepareOptions& options, WorkIdSource work_ids);
+    Scheduler(const CacheEnvelope::PrepareOptions& options, WorkIdSource work_ids,
+              ClockSource clock = nullptr);
 
     /// Starts a generation over `candidates` (EntryId = position). Any earlier generation must
     /// have been cancelled. Returns the generation.
@@ -124,7 +134,8 @@ public:
 
     // ---- workers ----
     /// `hold_builds` keeps queued records queued (a draw can still claim them) while the caller
-    /// waits out a burst of runtime compilation; loads and evictions go on.
+    /// waits out a burst of runtime compilation; loads go on, and so does the release of ready
+    /// objects of a game that left the recorded order.
     [[nodiscard]] Task Next(u64 generation, u64 available_ram_bytes, bool hold_builds = false);
     void WaitForChange(u64 epoch, std::chrono::milliseconds timeout);
     LoadOutcome Loaded(EntryId id, u64 generation, u64 hash, std::span<const u8> key,
@@ -148,11 +159,32 @@ public:
     [[nodiscard]] u64 UsedBytes() const;
     [[nodiscard]] bool Running() const;
     [[nodiscard]] u64 Generation() const;
-    /// Fills prepared, adopted, demand_promoted, prepare_failures, queue_high_water,
-    /// memory_high_water_bytes, budget_pauses and evicted.
+    /// Fills records, prepared, adopted, demand_promoted, demand_building, demand_evicted,
+    /// demand_unknown, prepare_failures, queue_high_water, memory_high_water_bytes,
+    /// budget_pauses, evicted, held_back, adopted_lead_ns, late_records, late_wait_ns and
+    /// late_wait_max_ns.
     void FillStats(CacheEnvelope::CacheStats& stats) const;
 
+    /// How a record that was not ready at its first draw stood then.
+    enum class LateOutcome : u8 {
+        Building, ///< Being built: the draw waited for it (ready_ns is when it was done)
+        Claimed,  ///< Still queued: the draw built it itself
+        Released, ///< Ready earlier but released unused (ready_ns is when it had been ready)
+    };
+    struct LateRecord {
+        u32 rank{};
+        CacheEnvelope::FirstUse recorded_phase{};
+        u64 recorded_first_use_ns{}; ///< As the first run recorded it (since its first present)
+        LateOutcome outcome{};
+        u64 demanded_ns{}; ///< Clock value of the first draw that asked for it
+        u64 ready_ns{};    ///< Clock value it was ready; 0 when it never was
+    };
+    static constexpr size_t MaxLateRecords = 64;
+    /// The first MaxLateRecords records first used before they were ready, in the order asked.
+    [[nodiscard]] std::vector<LateRecord> LateRecords() const;
+
 private:
+    static constexpr size_t NoLate = ~size_t{0};
     struct Entry {
         Candidate candidate;
         State state{State::Indexed};
@@ -163,17 +195,29 @@ private:
         std::vector<u8> key;
         std::shared_ptr<void> payload;
         std::shared_ptr<void> result;
-        u64 ready_seq{}; ///< Order in which entries became Ready (eviction: smallest first)
+        u64 ready_seq{}; ///< Order in which entries became Ready (release: smallest first)
+        u64 ready_ns{};  ///< Clock value it became Ready
+        u64 demanded_ns{}; ///< Clock value of the first draw that found it not ready, 0 if none
+        size_t late_slot{NoLate};
     };
     struct Counters {
+        u64 records{};
         u64 prepared{};
         u64 adopted{};
         u64 demand_promoted{};
+        u64 demand_building{};
+        u64 demand_evicted{};
+        u64 demand_unknown{};
         u64 prepare_failures{};
         u64 queue_high_water{};
         u64 memory_high_water{};
         u64 budget_pauses{};
         u64 evicted{};
+        u64 held_back{};
+        u64 adopted_lead_ns{};
+        u64 late_records{};
+        u64 late_wait_ns{};
+        u64 late_wait_max_ns{};
     };
 
     [[nodiscard]] bool IsCurrent(EntryId id, u64 generation, State expected) const;
@@ -184,10 +228,13 @@ private:
     void SetPause(bool blocked);
     void NoteInFlight();
     [[nodiscard]] bool RamPaused(u64 available_ram_bytes);
+    [[nodiscard]] u64 Now() const;
+    void NoteLate(Entry& entry, LateOutcome outcome, u64 now);
     [[nodiscard]] Entry* Find(EntryId id, u64 generation, State expected);
 
     const CacheEnvelope::PrepareOptions options;
     const WorkIdSource work_ids;
+    const ClockSource clock;
     const u32 window;
 
     mutable std::mutex mutex_;
@@ -210,6 +257,10 @@ private:
     std::map<u64, EntryId> ready_order_; ///< Ready entries by ready_seq
     bool ram_paused_{};
     bool paused_{};
+    bool cap_held_{};            ///< Builds are being held at the ready cap (one count per run)
+    /// Clock value of the first draw that matched no record since one last did; 0 when none.
+    u64 miss_since_ns_{};
+    std::vector<LateRecord> late_;
     Counters counters_;
 };
 

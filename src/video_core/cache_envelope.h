@@ -247,7 +247,16 @@ struct CacheStats {
     u64 queue_high_water{};
     u64 memory_high_water_bytes{};
     u64 budget_pauses{};
-    u64 evicted{};          ///< Ready objects released unused under the ready cap, oldest first
+    u64 evicted{};          ///< Ready objects released unused: held back builds were stalled
+    u64 records{};          ///< Records of the accepted files the run tried to prepare
+    u64 demand_building{};  ///< Draws that found their record being built (they waited)
+    u64 demand_evicted{};   ///< Draws that found their record released (built again by the draw)
+    u64 demand_unknown{};   ///< Draws whose key matched no record: new, or not decoded yet
+    u64 held_back{};        ///< Times builds were held at the ready cap with nothing to release
+    u64 adopted_lead_ns{};  ///< Sum over adopted objects of (first use - ready): how early
+    u64 late_records{};     ///< Records first used while building, queued or released
+    u64 late_wait_ns{};     ///< Sum over records first used while building of (ready - first use)
+    u64 late_wait_max_ns{}; ///< The longest of those
     u64 checkpoints{};      ///< Generations committed before shutdown
     u64 bytes_committed{};  ///< Bytes of the transferable files committed (checkpoints and final)
     WriteStatus write_status{WriteStatus::NotAttempted};
@@ -271,6 +280,10 @@ struct PrepareOptions {
     u64 memory_budget_bytes{u64{256} << 20}; ///< Index, queued buffers, staging, bookkeeping
     u32 ready_cap{128};                   ///< Prepared but unused live pipelines
     u64 min_available_ram_bytes{u64{2} << 30}; ///< Optional admission pauses below this
+    /// Draws that match no record for this long while builds are held at the ready cap show that
+    /// the game is not following the recorded order: unused ready objects are then released,
+    /// oldest first, so the rest of the index is still prepared. A bound, not a measurement.
+    u64 diverged_after_ns{u64{10} * 1'000'000'000};
 };
 
 /// One record to append: the index fields the writer does not compute itself.

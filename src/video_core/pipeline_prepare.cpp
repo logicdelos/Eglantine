@@ -47,8 +47,10 @@ void WriteLe32(u8* data, u32 value) {
 
 } // Anonymous namespace
 
-Scheduler::Scheduler(const CacheEnvelope::PrepareOptions& options_, WorkIdSource work_ids_)
-    : options{options_}, work_ids{work_ids_}, window{(std::max)(MinWindow, options_.workers * 4)} {}
+Scheduler::Scheduler(const CacheEnvelope::PrepareOptions& options_, WorkIdSource work_ids_,
+                     ClockSource clock_)
+    : options{options_}, work_ids{work_ids_}, clock{clock_},
+      window{(std::max)(MinWindow, options_.workers * 4)} {}
 
 u64 Scheduler::Begin(std::span<const Candidate> candidates) {
     std::scoped_lock lock{mutex_};
@@ -87,7 +89,11 @@ u64 Scheduler::Begin(std::span<const Candidate> candidates) {
     ready_seq_ = 0;
     ready_order_.clear();
     ram_paused_ = paused_ = false;
+    cap_held_ = false;
+    miss_since_ns_ = 0;
+    late_.clear();
     counters_ = {};
+    counters_.records = candidates.size();
     counters_.memory_high_water = used_;
     ++generation_;
     running_ = true;
@@ -199,6 +205,9 @@ Scheduler::Task Scheduler::Next(u64 generation, u64 available_ram_bytes, bool ho
     }
     const bool ram_low = RamPaused(available_ram_bytes);
     bool cap_reached = u64{ready_} + building_ >= options.ready_cap;
+    if (!cap_reached) {
+        cap_held_ = false;
+    }
     bool blocked = ram_low;
     // Decode ahead first, up to the window: a decoded record is known by its key, so a draw that
     // needs it can claim it instead of building it a second time.
@@ -233,17 +242,29 @@ Scheduler::Task Scheduler::Next(u64 generation, u64 available_ram_bytes, bool ho
         return task;
     }
     if (!ram_low && !hold_builds && cap_reached && ready_ != 0 && !queued_.empty()) {
-        // Ready objects nobody has asked for would hold every remaining record back for ever:
-        // the one that became ready first is released (built again if its draw ever comes).
-        const auto oldest = ready_order_.begin();
-        Entry& victim = entries_[oldest->second];
-        ready_order_.erase(oldest);
-        Release(victim);
-        task.evicted = std::move(victim.result);
-        victim.state = State::Evicted;
-        --ready_;
-        ++counters_.evicted;
-        cap_reached = u64{ready_} + building_ >= options.ready_cap;
+        // The ready objects are the ones the game reaches first (records are prepared in the
+        // order it reached them), so they are kept and the builds behind them wait until a draw
+        // adopts one. Only when draws have stopped matching any record is the game off the
+        // recorded order: the objects nobody asked for would then hold the rest back for ever,
+        // so the one that became ready first is released (built again if its draw ever comes).
+        const u64 now = Now();
+        if (miss_since_ns_ != 0 && now - miss_since_ns_ >= options.diverged_after_ns) {
+            const auto oldest = ready_order_.begin();
+            Entry& victim = entries_[oldest->second];
+            ready_order_.erase(oldest);
+            Release(victim);
+            task.evicted = std::move(victim.result);
+            victim.state = State::Evicted;
+            --ready_;
+            ++counters_.evicted;
+            cap_reached = u64{ready_} + building_ >= options.ready_cap;
+            if (!cap_reached) {
+                cap_held_ = false;
+            }
+        } else if (!cap_held_) {
+            cap_held_ = true;
+            ++counters_.held_back;
+        }
     }
     if (!ram_low && !hold_builds && !cap_reached && !queued_.empty()) {
         const EntryId id = order_[*queued_.begin()];
@@ -352,14 +373,25 @@ bool Scheduler::BuildFinished(EntryId id, u64 generation, bool ok,
     }
     --building_;
     if (ok) {
+        const u64 now = Now();
         Release(*entry);
         Reserve(*entry, ReadyBookkeepingBytes);
         entry->result = std::move(result);
         entry->state = State::Ready;
         entry->ready_seq = ++ready_seq_;
+        entry->ready_ns = now;
         ready_order_.emplace(entry->ready_seq, id);
         ++ready_;
         ++counters_.prepared;
+        if (entry->demanded_ns != 0) {
+            // A draw asked for it while it was building and is waiting for this.
+            const u64 waited = now > entry->demanded_ns ? now - entry->demanded_ns : 0;
+            counters_.late_wait_ns += waited;
+            counters_.late_wait_max_ns = (std::max)(counters_.late_wait_max_ns, waited);
+            if (entry->late_slot != NoLate) {
+                late_[entry->late_slot].ready_ns = now;
+            }
+        }
     } else {
         ++counters_.prepare_failures;
         Finish(*entry, State::Failed);
@@ -374,9 +406,11 @@ Scheduler::Demand Scheduler::Request(u64 hash, std::span<const u8> key) {
     if (!running_) {
         return demand;
     }
+    const u64 now = Now();
     bool known = false;
     EntryId building = NoEntry;
     std::vector<EntryId> queued;
+    std::vector<EntryId> released;
     const auto [first, last] = identity_.equal_range(hash);
     for (auto it = first; it != last; ++it) {
         Entry& entry = entries_[it->second];
@@ -386,6 +420,9 @@ Scheduler::Demand Scheduler::Request(u64 hash, std::span<const u8> key) {
         known = true;
         switch (entry.state) {
         case State::Ready:
+            if (entry.demanded_ns == 0 && now > entry.ready_ns) {
+                counters_.adopted_lead_ns += now - entry.ready_ns;
+            }
             Release(entry);
             ready_order_.erase(entry.ready_seq);
             demand.results.push_back(std::move(entry.result));
@@ -399,9 +436,18 @@ Scheduler::Demand Scheduler::Request(u64 hash, std::span<const u8> key) {
         case State::Queued:
             queued.push_back(it->second);
             break;
+        case State::Evicted:
+            released.push_back(it->second);
+            break;
         default:
             break;
         }
+    }
+    // A draw that finds its record, in any state, shows the game is still on the recorded order.
+    if (known) {
+        miss_since_ns_ = 0;
+    } else if (miss_since_ns_ == 0) {
+        miss_since_ns_ = now;
     }
     demand.generation = generation_;
     if (!demand.results.empty()) {
@@ -411,10 +457,15 @@ Scheduler::Demand Scheduler::Request(u64 hash, std::span<const u8> key) {
         demand.kind = DemandKind::Building;
         demand.id = building;
         demand.work = entries_[building].work;
+        if (entries_[building].demanded_ns == 0) {
+            ++counters_.demand_building;
+            NoteLate(entries_[building], LateOutcome::Building, now);
+        }
     } else if (!queued.empty()) {
         for (const EntryId id : queued) {
             Entry& entry = entries_[id];
             queued_.erase(entry.rank);
+            NoteLate(entry, LateOutcome::Claimed, now);
             Finish(entry, State::Claimed);
             ++counters_.demand_promoted;
         }
@@ -422,7 +473,14 @@ Scheduler::Demand Scheduler::Request(u64 hash, std::span<const u8> key) {
         Changed();
     } else if (known) {
         demand.kind = DemandKind::Unavailable;
+        for (const EntryId id : released) {
+            if (entries_[id].demanded_ns == 0) {
+                ++counters_.demand_evicted;
+                NoteLate(entries_[id], LateOutcome::Released, now);
+            }
+        }
     } else {
+        ++counters_.demand_unknown;
         auto& seen = demanded_[hash];
         if (std::ranges::none_of(seen, [&](const std::vector<u8>& other) {
                 return SameKey(other, key);
@@ -431,6 +489,36 @@ Scheduler::Demand Scheduler::Request(u64 hash, std::span<const u8> key) {
         }
     }
     return demand;
+}
+
+u64 Scheduler::Now() const {
+    if (clock != nullptr) {
+        return clock();
+    }
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+}
+
+void Scheduler::NoteLate(Entry& entry, LateOutcome outcome, u64 now) {
+    // Clock values start at 0 only in tests: a first draw at 0 would not be told from none.
+    entry.demanded_ns = (std::max)(now, u64{1});
+    ++counters_.late_records;
+    if (late_.size() < MaxLateRecords) {
+        entry.late_slot = late_.size();
+        late_.push_back(LateRecord{.rank = entry.rank,
+                                   .recorded_phase = entry.candidate.meta.first_use_phase,
+                                   .recorded_first_use_ns = entry.candidate.meta.first_use_ns,
+                                   .outcome = outcome,
+                                   .demanded_ns = now,
+                                   .ready_ns = outcome == LateOutcome::Released ? entry.ready_ns
+                                                                                : u64{0}});
+    }
+}
+
+std::vector<Scheduler::LateRecord> Scheduler::LateRecords() const {
+    std::scoped_lock lock{mutex_};
+    return late_;
 }
 
 void Scheduler::Await(EntryId id, u64 generation) {
@@ -473,14 +561,23 @@ u64 Scheduler::Generation() const {
 
 void Scheduler::FillStats(CacheEnvelope::CacheStats& stats) const {
     std::scoped_lock lock{mutex_};
+    stats.records = counters_.records;
     stats.prepared = counters_.prepared;
     stats.adopted = counters_.adopted;
     stats.demand_promoted = counters_.demand_promoted;
+    stats.demand_building = counters_.demand_building;
+    stats.demand_evicted = counters_.demand_evicted;
+    stats.demand_unknown = counters_.demand_unknown;
     stats.prepare_failures = counters_.prepare_failures;
     stats.queue_high_water = counters_.queue_high_water;
     stats.memory_high_water_bytes = counters_.memory_high_water;
     stats.budget_pauses = counters_.budget_pauses;
     stats.evicted = counters_.evicted;
+    stats.held_back = counters_.held_back;
+    stats.adopted_lead_ns = counters_.adopted_lead_ns;
+    stats.late_records = counters_.late_records;
+    stats.late_wait_ns = counters_.late_wait_ns;
+    stats.late_wait_max_ns = counters_.late_wait_max_ns;
 }
 
 bool ForEachDriverBlobChunk(std::span<const u8> blob,
