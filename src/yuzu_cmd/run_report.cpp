@@ -190,7 +190,8 @@ Json SetTunables() {
             continue;
         }
         Json tunable = Json::object();
-        tunable["raw"] = std::string{text.substr(equals + 1)};
+        // A value is only reported when it is a plain number or word: a path or a script stays out.
+        tunable["raw"] = Settings::Baseline::PublicSwitchValue(text.substr(equals + 1));
         tunable["source"] = "environment";
         tunable["effective"] = Json::object();
         result[std::string{name}] = std::move(tunable);
@@ -795,6 +796,16 @@ bool FinishCrashReport(State& state) {
     return expected != CrashWriting;
 }
 
+/// Called by the renderer when shader ablation becomes active. If the report is being written at
+/// that moment, the report is current anyway and the snapshot is left alone.
+void RefreshCrashBaselineIfIdle() {
+    State& state = GetState();
+    std::unique_lock lock{state.mutex, std::try_to_lock};
+    if (lock.owns_lock()) {
+        RebuildCrashDocument(state);
+    }
+}
+
 } // Anonymous namespace
 
 PrepareResult Prepare(const std::string& destination, std::string& message) {
@@ -864,6 +875,13 @@ void SetBaselineRequest(bool requested, std::vector<std::string> declared) {
     std::scoped_lock lock{state.mutex};
     state.baseline_requested = requested;
     state.baseline_declared = std::move(declared);
+    RebuildCrashDocument(state);
+    Settings::Baseline::SetChangeHook(&RefreshCrashBaselineIfIdle);
+}
+
+void RefreshCrashSnapshot() {
+    State& state = GetState();
+    std::scoped_lock lock{state.mutex};
     RebuildCrashDocument(state);
 }
 

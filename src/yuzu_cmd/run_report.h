@@ -37,6 +37,10 @@ enum class PrepareResult {
 /// the value they have now.
 void CaptureStart(const std::vector<std::string>& overridden_settings);
 
+/// Takes the crash report's snapshot of the baseline object again, after something changed a
+/// setting or switched a diagnostics feature on while the game runs.
+void RefreshCrashSnapshot();
+
 /// Records whether --baseline was given and the keys --baseline-allow declared, for the report's
 /// baseline object (version, hash, on_baseline, deviations). Call it before CaptureStart.
 void SetBaselineRequest(bool requested, std::vector<std::string> declared);

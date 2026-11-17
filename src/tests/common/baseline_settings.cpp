@@ -380,7 +380,7 @@ TEST_CASE("Reset to baseline restores the defaults", "[baseline_settings]") {
 
 TEST_CASE("The report object lists the deviations and the declared keys", "[baseline_settings]") {
     const std::vector<Settings::Baseline::Deviation> none;
-    const auto clean = Settings::Baseline::ReportJson(true, {}, none);
+    const auto clean = Settings::Baseline::ReportJson(true, {}, none, {});
     CHECK(clean["version"] == Settings::Baseline::kBaselineVersion);
     CHECK(clean["hash"] == Settings::Baseline::Hash());
     CHECK(clean["requested"] == true);
@@ -389,11 +389,13 @@ TEST_CASE("The report object lists the deviations and the declared keys", "[base
     CHECK(clean["deviations"].empty());
     CHECK(clean["declared"].is_array());
     CHECK(clean["declared"].empty());
+    CHECK(clean["harness"].is_array());
+    CHECK(clean["harness"].empty());
 
     const std::vector<Settings::Baseline::Deviation> one{
         {"resolution_setup", "3", "6", "command line"},
     };
-    const auto changed = Settings::Baseline::ReportJson(false, {}, one);
+    const auto changed = Settings::Baseline::ReportJson(false, {}, one, {});
     CHECK(changed["requested"] == false);
     CHECK(changed["on_baseline"] == false);
     REQUIRE(changed["deviations"].size() == 1);
@@ -402,7 +404,7 @@ TEST_CASE("The report object lists the deviations and the declared keys", "[base
     CHECK(changed["deviations"][0]["effective"] == "6");
     CHECK(changed["deviations"][0]["source"] == "command line");
 
-    const auto declared = Settings::Baseline::ReportJson(true, {"resolution_setup"}, one);
+    const auto declared = Settings::Baseline::ReportJson(true, {"resolution_setup"}, one, {});
     CHECK(declared["on_baseline"] == true);
     REQUIRE(declared["declared"].size() == 1);
     CHECK(declared["declared"][0] == "resolution_setup");
@@ -484,4 +486,119 @@ TEST_CASE("An environment switch is refused unless it is named", "[baseline_sett
     REQUIRE(undeclared.size() == 1);
     CHECK(undeclared[0] == "EDEN_NX2_FENCE_BATCH");
     CHECK(Settings::Baseline::UndeclaredSwitches(switches, {"EDEN_NX2_SPLIT,x"}).size() == 2);
+}
+
+TEST_CASE("The harness variables are instrumentation: named, never valued, not deviations",
+          "[baseline_settings]") {
+    Settings::Baseline::ClearNotedSources();
+    const auto values = std::make_unique<Settings::Values>();
+    Settings::Baseline::ResetToBaseline(*values);
+
+    const std::vector<Settings::Baseline::EnvironmentSwitch> harness_only{
+        {"EDEN_NX2_KEY_SCRIPT", "sentinel-script-CCC"},
+        {"EDEN_NX2_DIAG_DIR", "/sentinel/dir/AAA"},
+        {"EDEN_NX2_HIDE_WINDOW", "1"},
+        {"EDEN_NX2_FRAME_CAPTURE", "sentinel-capture-BBB"},
+    };
+    // Not refused, not a deviation, on the baseline.
+    CHECK(Settings::Baseline::UndeclaredSwitches(harness_only, {}).empty());
+    const auto none = Settings::Baseline::Deviations(*values, harness_only);
+    CHECK(none.empty());
+    CHECK(Settings::Baseline::OnBaseline(none, {}));
+
+    const auto names = Settings::Baseline::HarnessSwitches(harness_only);
+    REQUIRE(names.size() == 4);
+    CHECK(names[0] == "EDEN_NX2_DIAG_DIR");
+    CHECK(names[1] == "EDEN_NX2_FRAME_CAPTURE");
+    CHECK(names[2] == "EDEN_NX2_HIDE_WINDOW");
+    CHECK(names[3] == "EDEN_NX2_KEY_SCRIPT");
+
+    // An ordinary switch next to them still leaves the baseline and is refused undeclared.
+    auto mixed = harness_only;
+    mixed.push_back({"EDEN_NX2_SPLIT", "/sentinel/ordinary/DDD"});
+    const auto undeclared = Settings::Baseline::UndeclaredSwitches(mixed, {});
+    REQUIRE(undeclared.size() == 1);
+    CHECK(undeclared[0] == "EDEN_NX2_SPLIT");
+    const auto deviations = Settings::Baseline::Deviations(*values, mixed);
+    REQUIRE(deviations.size() == 1);
+    CHECK(deviations[0].key == "EDEN_NX2_SPLIT");
+    CHECK(deviations[0].effective == "set");
+    CHECK_FALSE(Settings::Baseline::OnBaseline(deviations, {}));
+
+    // No value of any of them reaches the report object.
+    const auto report = Settings::Baseline::ReportJson(true, {}, deviations,
+                                                       Settings::Baseline::HarnessSwitches(mixed));
+    const std::string text = report.dump();
+    for (const char* sentinel : {"AAA", "BBB", "CCC", "DDD", "sentinel"}) {
+        CHECK(text.find(sentinel) == std::string::npos);
+    }
+    CHECK(report["harness"].size() == 4);
+    CHECK(report["on_baseline"] == false);
+
+    // Only these four are instrumentation.
+    CHECK_FALSE(Settings::Baseline::IsHarnessSwitch("EDEN_NX2_DIAG"));
+    CHECK_FALSE(Settings::Baseline::IsHarnessSwitch("EDEN_NX2_ABLATE_FILE"));
+    CHECK_FALSE(Settings::Baseline::IsHarnessSwitch("EDEN_NX2_LAB"));
+    Settings::Baseline::ClearNotedSources();
+}
+
+TEST_CASE("A report carries a value only when it is a plain number or word", "[baseline_settings]") {
+    using Settings::Baseline::PublicSwitchValue;
+    for (const char* plain : {"0", "1", "250", "-3", "0.75", "on", "off", "true", "false", "yes", "no"}) {
+        CHECK(PublicSwitchValue(plain) == plain);
+    }
+    for (const char* hidden : {"", "C:/dir/file", "/tmp/x", "a.txt", "1.", ".5", "-", "1e3", "12 34",
+                               "on,off", "123456789012345678901234567890"}) {
+        CHECK(PublicSwitchValue(hidden) == "set");
+    }
+}
+
+TEST_CASE("Shader ablation is a deviation once an entry is active", "[baseline_settings]") {
+    Settings::Baseline::ClearNotedSources();
+    const auto values = std::make_unique<Settings::Values>();
+    Settings::Baseline::ResetToBaseline(*values);
+    CHECK_FALSE(Settings::Baseline::ShaderAblationActive());
+    CHECK(Settings::Baseline::Deviations(*values, {}).empty());
+
+    Settings::Baseline::NoteShaderAblation();
+    CHECK(Settings::Baseline::ShaderAblationActive());
+    const auto deviations = Settings::Baseline::Deviations(*values, {});
+    REQUIRE(deviations.size() == 1);
+    CHECK(deviations[0].key == "shader_ablation");
+    CHECK(deviations[0].baseline == "off");
+    CHECK(deviations[0].effective == "on");
+    CHECK(deviations[0].source == "environment switch");
+    CHECK_FALSE(Settings::Baseline::OnBaseline(deviations, {}));
+
+    // A new run starts without it.
+    Settings::Baseline::ClearNotedSources();
+    CHECK_FALSE(Settings::Baseline::ShaderAblationActive());
+}
+
+TEST_CASE("A bare --baseline-allow item has to name a baseline setting or a switch",
+          "[baseline_settings]") {
+    Settings::Baseline::ClearNotedSources();
+    const auto values = std::make_unique<Settings::Values>();
+    Settings::Baseline::ResetToBaseline(*values);
+
+    // Valid: a baseline setting, a switch name.
+    CHECK(Settings::Baseline::ApplyAllowedValues(*values, {"use_speed_limit"}).empty());
+    CHECK(Settings::Baseline::ApplyAllowedValues(*values, {"quest_flag"}).empty());
+    CHECK(Settings::Baseline::ApplyAllowedValues(*values, {"EDEN_NX2_SPLIT"}).empty());
+    // A bare item changes nothing.
+    CHECK(Settings::Baseline::Deviations(*values, {}).empty());
+
+    // Not valid: unknown, outside the baseline, wrong case, no name after the prefix, empty.
+    for (const char* bad : {"no_such_setting", "volume", "current_user", "mcp_token",
+                            "eden_nx2_split", "EDEN_NX2_", "EDEN_NX2_a-b", "EDEN_OTHER", ""}) {
+        const std::string message = Settings::Baseline::ApplyAllowedValues(*values, {bad});
+        CHECK_FALSE(message.empty());
+    }
+    // The error names the item.
+    CHECK(Settings::Baseline::ApplyAllowedValues(*values, {"volume"}).find("volume") !=
+          std::string::npos);
+    // One bad item among good ones is an error.
+    CHECK_FALSE(
+        Settings::Baseline::ApplyAllowedValues(*values, {"use_speed_limit", "volume"}).empty());
+    Settings::Baseline::ClearNotedSources();
 }

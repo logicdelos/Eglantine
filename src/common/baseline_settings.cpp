@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdlib>
 #include <functional>
 #include <map>
@@ -76,7 +77,21 @@ bool IsBaselineSetting(const std::string& key, const BasicSetting& setting) {
     return included && setting.Save() && !IsExcludedKey(key);
 }
 
+/// The name of an EDEN_NX2_ switch: the prefix and at least one upper-case letter, digit or
+/// underscore. There is no table of the switches the readers know (each reader calls getenv with
+/// its own literal), so the grammar is what can be checked.
+bool IsSwitchName(std::string_view name) {
+    if (!name.starts_with(kSwitchPrefix) || name.size() == kSwitchPrefix.size()) {
+        return false;
+    }
+    return std::all_of(name.begin() + kSwitchPrefix.size(), name.end(), [](char c) {
+        return (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+    });
+}
+
 std::mutex source_mutex;
+std::atomic<bool> shader_ablation{false};
+std::atomic<void (*)()> change_hook{nullptr};
 
 std::map<std::string, std::string, std::less<>>& NotedSources() {
     static std::map<std::string, std::string, std::less<>> sources;
@@ -251,6 +266,7 @@ void NoteSource(std::string_view key, std::string_view source) {
 void ClearNotedSources() {
     const std::scoped_lock lock{source_mutex};
     NotedSources().clear();
+    shader_ablation.store(false, std::memory_order_release);
 }
 
 std::vector<EnvironmentSwitch> SetEnvironmentSwitches() {
@@ -278,6 +294,66 @@ std::vector<EnvironmentSwitch> SetEnvironmentSwitches() {
     return switches;
 }
 
+bool IsHarnessSwitch(std::string_view name) {
+    static constexpr std::array<std::string_view, 4> harness{
+        "EDEN_NX2_DIAG_DIR",
+        "EDEN_NX2_FRAME_CAPTURE",
+        "EDEN_NX2_HIDE_WINDOW",
+        "EDEN_NX2_KEY_SCRIPT",
+    };
+    return std::find(harness.begin(), harness.end(), name) != harness.end();
+}
+
+std::vector<std::string> HarnessSwitches(const std::vector<EnvironmentSwitch>& switches) {
+    std::vector<std::string> names;
+    for (const auto& entry : switches) {
+        if (IsHarnessSwitch(entry.name)) {
+            names.push_back(entry.name);
+        }
+    }
+    std::sort(names.begin(), names.end());
+    return names;
+}
+
+std::string PublicSwitchValue(std::string_view value) {
+    static constexpr std::array<std::string_view, 6> words{"on", "off", "true", "false", "yes", "no"};
+    if (std::find(words.begin(), words.end(), value) != words.end()) {
+        return std::string{value};
+    }
+    // A plain number: an optional minus sign, digits, and at most one decimal point with digits.
+    size_t index = !value.empty() && value.front() == '-' ? 1 : 0;
+    const size_t first_digit = index;
+    while (index < value.size() && value[index] >= '0' && value[index] <= '9') {
+        ++index;
+    }
+    bool plain = index > first_digit;
+    if (plain && index < value.size() && value[index] == '.') {
+        const size_t point = index++;
+        while (index < value.size() && value[index] >= '0' && value[index] <= '9') {
+            ++index;
+        }
+        plain = index > point + 1;
+    }
+    plain = plain && index == value.size() && value.size() <= 24;
+    return plain ? std::string{value} : std::string{"set"};
+}
+
+void NoteShaderAblation() {
+    if (!shader_ablation.exchange(true, std::memory_order_acq_rel)) {
+        if (const auto hook = change_hook.load(std::memory_order_acquire)) {
+            hook();
+        }
+    }
+}
+
+bool ShaderAblationActive() {
+    return shader_ablation.load(std::memory_order_acquire);
+}
+
+void SetChangeHook(void (*hook)()) {
+    change_hook.store(hook, std::memory_order_release);
+}
+
 std::vector<Deviation> Deviations(const Values& current,
                                   const std::vector<EnvironmentSwitch>& switches) {
     std::vector<Deviation> deviations;
@@ -302,7 +378,14 @@ std::vector<Deviation> Deviations(const Values& current,
         deviations.push_back({key, std::move(baseline), std::move(effective), std::move(source)});
     }
     for (const auto& entry : switches) {
-        deviations.push_back({entry.name, "unset", entry.value, "environment switch"});
+        // The harness variables are instrumentation, not a choice of the run.
+        if (!IsHarnessSwitch(entry.name)) {
+            deviations.push_back(
+                {entry.name, "unset", PublicSwitchValue(entry.value), "environment switch"});
+        }
+    }
+    if (ShaderAblationActive()) {
+        deviations.push_back({"shader_ablation", "off", "on", "environment switch"});
     }
     std::sort(deviations.begin(), deviations.end(),
               [](const Deviation& lhs, const Deviation& rhs) { return lhs.key < rhs.key; });
@@ -349,6 +432,15 @@ std::string ApplyAllowedValues(Values& target, const std::vector<std::string>& i
     for (const auto& item : items) {
         const size_t equals = item.find('=');
         if (equals == std::string::npos) {
+            // A bare item declares a setting that --baseline-allow may change by another route
+            // (the config file, the Qt window) or an EDEN_NX2_ switch. It has to name one.
+            const auto found = target.linkage.by_key.find(item);
+            const bool setting =
+                found != target.linkage.by_key.end() && IsBaselineSetting(item, *found->second);
+            if (!setting && !IsSwitchName(item)) {
+                return "'" + item +
+                       "' is neither a baseline setting nor an EDEN_NX2_ switch name";
+            }
             continue;
         }
         const std::string key = item.substr(0, equals);
@@ -374,7 +466,8 @@ std::vector<std::string> UndeclaredSwitches(const std::vector<EnvironmentSwitch>
     const std::vector<std::string> keys = AllowedKeys(items);
     std::vector<std::string> undeclared;
     for (const auto& entry : switches) {
-        if (std::find(keys.begin(), keys.end(), entry.name) == keys.end()) {
+        if (!IsHarnessSwitch(entry.name) &&
+            std::find(keys.begin(), keys.end(), entry.name) == keys.end()) {
             undeclared.push_back(entry.name);
         }
     }
@@ -395,7 +488,8 @@ void ResetToBaseline() {
 }
 
 nlohmann::json ReportJson(bool requested, const std::vector<std::string>& declared,
-                          const std::vector<Deviation>& deviations) {
+                          const std::vector<Deviation>& deviations,
+                          const std::vector<std::string>& harness) {
     using Json = nlohmann::json;
     Json list = Json::array();
     for (const auto& deviation : deviations) {
@@ -405,6 +499,10 @@ nlohmann::json ReportJson(bool requested, const std::vector<std::string>& declar
         item["effective"] = deviation.effective;
         item["source"] = deviation.source;
         list.push_back(std::move(item));
+    }
+    Json harness_list = Json::array();
+    for (const auto& name : harness) {
+        harness_list.push_back(name);
     }
     Json declared_list = Json::array();
     for (const auto& key : declared) {
@@ -417,11 +515,12 @@ nlohmann::json ReportJson(bool requested, const std::vector<std::string>& declar
     result["on_baseline"] = OnBaseline(deviations, declared);
     result["deviations"] = std::move(list);
     result["declared"] = std::move(declared_list);
+    result["harness"] = std::move(harness_list);
     return result;
 }
 
 nlohmann::json ReportJson(bool requested, const std::vector<std::string>& declared) {
-    return ReportJson(requested, declared, Deviations());
+    return ReportJson(requested, declared, Deviations(), HarnessSwitches(SetEnvironmentSwitches()));
 }
 
 std::string PrintableText() {

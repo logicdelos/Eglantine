@@ -82,6 +82,30 @@ void ClearNotedSources();
 /// The EDEN_NX2_* variables that are set in the process environment.
 [[nodiscard]] std::vector<EnvironmentSwitch> SetEnvironmentSwitches();
 
+/// The instrumentation class: the variables the test harness sets on every run to capture and
+/// drive it (diagnostics folder, frame capture, window hiding, key script). They are neither
+/// refused by --baseline nor deviations, and a report names them without their values. Nothing
+/// else joins this class: every other EDEN_NX2_* variable is an ordinary switch.
+[[nodiscard]] bool IsHarnessSwitch(std::string_view name);
+
+/// The names of the harness variables in `switches`, sorted. Never the values.
+[[nodiscard]] std::vector<std::string> HarnessSwitches(const std::vector<EnvironmentSwitch>& switches);
+
+/// The text of an environment variable's value that a report may carry: the value itself when it
+/// is a plain number or one of on, off, true, false, yes, no; "set" otherwise (a path, a script, a
+/// free text). Reports never carry the value of a variable that can hold a path.
+[[nodiscard]] std::string PublicSwitchValue(std::string_view value);
+
+/// Shader ablation (a diagnostics file that makes the renderer skip programs) is not a setting.
+/// The renderer calls NoteShaderAblation when it has read at least one active entry; from then on
+/// Deviations lists "shader_ablation" (baseline off, effective on, environment switch).
+void NoteShaderAblation();
+[[nodiscard]] bool ShaderAblationActive();
+
+/// A function called (once, from the thread that notes it) when the first ablation entry becomes
+/// active, so that a report snapshot taken earlier can be refreshed. May be null.
+void SetChangeHook(void (*hook)());
+
 /// Every baseline setting whose effective value is not its default, plus every set environment
 /// switch, sorted by key. A setting uses the source noted for it; otherwise "per-game config"
 /// when it uses a per-game value and "global config" when not.
@@ -116,9 +140,11 @@ void ResetToBaseline();
 
 /// The "baseline" object of a run report:
 /// {"version","hash","requested","on_baseline","deviations":[{"key","baseline","effective",
-/// "source"}],"declared":[key...]}.
+/// "source"}],"declared":[key...],"harness":[name...]}. "harness" names the harness variables that
+/// were set, sorted, and never carries a value.
 [[nodiscard]] nlohmann::json ReportJson(bool requested, const std::vector<std::string>& declared,
-                                        const std::vector<Deviation>& deviations);
+                                        const std::vector<Deviation>& deviations,
+                                        const std::vector<std::string>& harness);
 [[nodiscard]] nlohmann::json ReportJson(bool requested, const std::vector<std::string>& declared);
 
 /// The text `--print-baseline` writes: version, hash and one "key=value" line per entry.

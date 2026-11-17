@@ -7,6 +7,7 @@
 #pragma once
 
 #include <string>
+#include <string_view>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -90,15 +91,39 @@ struct LaunchParams {
 /// found by a scan of their own that does not use getopt, so it can run before ParseLaunchParams;
 /// ParseLaunchParams still parses them, to report mistakes and for the callers that skip the scan.
 struct EarlyOptions {
-    // --version together with --json (written out in full).
+    // --version together with --json, each spelled out or abbreviated as getopt accepts it.
     bool version_json = false;
-    // --user-dir <path> or --user-dir=<path>, as spelled.
+    // --user-dir <path> or --user-dir=<path> (or an abbreviation getopt accepts).
     std::optional<std::string> user_dir{};
     // The first mistake in those options (no value, given twice); empty when there is none.
     std::string error{};
 };
 
 EarlyOptions ScanEarlyOptions(int argc, char* argv[]) noexcept;
+
+/// The message for a word getopt rejected when it is one of the options this fork added
+/// (--report, --run-seconds, --run-frames, --json, --user-dir, --list-settings, --set,
+/// --baseline, --baseline-allow, --print-baseline, --control) used without its argument or with
+/// one it does not take; empty otherwise. ParseLaunchParams reports it as a parse error, with or
+/// without an unattended run.
+std::string MisusedBranchOption(std::string_view word);
+
+/// One entry of the long-option table that getopt_long, ScanEarlyOptions and ResolveLongOption
+/// all read.
+struct LongOptionEntry {
+    std::string_view name;
+    bool takes_argument;    // a required or an optional argument
+    bool requires_argument; // a required argument
+    int id;                 // the value getopt_long returns for it
+};
+
+/// A copy of the long-option table, in its order.
+std::vector<LongOptionEntry> LongOptionTable();
+
+/// The full name of the long option getopt_long picks for `name` (without the leading "--"): the
+/// option spelled out, or the one an abbreviation fits. Empty when no option fits or the
+/// abbreviation fits options of different kinds (ambiguous).
+std::string_view ResolveLongOption(std::string_view name);
 
 LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wchar_t *argv_w[]) noexcept;
 void ApplyLaunchParams(LaunchParams const& lp) noexcept;

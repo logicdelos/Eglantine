@@ -122,11 +122,69 @@ static struct option kLongOptions[] = {
     // clang-format on
 };
 
-/// See EarlyOptions. Walks the arguments the way getopt will, using the same tables: an option that
-/// takes an operand takes the next argument whatever it says, so a path or a --set value that
-/// starts with "--" is never read as an option. -p, -x and --program also take the argument after
-/// the one getopt consumes (ParseLaunchParams reads argv[optind] for them). Only the spelled-out
-/// --version, -v, --json and --user-dir count; an abbreviation is left to ParseLaunchParams.
+/// The long option getopt_long picks for `name`: spelled out in full, or an abbreviation that
+/// only one option (or several of the same kind) starts with. Null when there is none.
+static const struct option* FindLongOption(std::string_view name) {
+    const struct option* abbreviated = nullptr;
+    bool ambiguous = false;
+    for (const struct option* entry = kLongOptions; entry->name != nullptr; ++entry) {
+        const std::string_view full{entry->name};
+        if (full == name) {
+            return entry;
+        }
+        if (!name.empty() && full.starts_with(name)) {
+            if (abbreviated == nullptr) {
+                abbreviated = entry;
+            } else if (abbreviated->has_arg != entry->has_arg || abbreviated->val != entry->val) {
+                ambiguous = true;
+            }
+        }
+    }
+    return ambiguous ? nullptr : abbreviated;
+}
+
+std::vector<LongOptionEntry> LongOptionTable() {
+    std::vector<LongOptionEntry> table;
+    for (const struct option* entry = kLongOptions; entry->name != nullptr; ++entry) {
+        table.push_back({entry->name, entry->has_arg != no_argument,
+                         entry->has_arg == required_argument, entry->val});
+    }
+    return table;
+}
+
+std::string_view ResolveLongOption(std::string_view name) {
+    const struct option* const found = FindLongOption(name);
+    return found == nullptr ? std::string_view{} : std::string_view{found->name};
+}
+
+/// What getopt rejected, as a mistake with the options this fork added (--report, --run-seconds,
+/// --run-frames, --json, --user-dir, --list-settings, --set, --baseline, --baseline-allow,
+/// --print-baseline, --control: every option id from 0x108 up): such an option without its
+/// argument, or with one it does not take, is a bad command line whether or not the run is
+/// unattended. Empty for any other word, which keeps its older handling.
+std::string MisusedBranchOption(std::string_view word) {
+    if (!word.starts_with("--")) {
+        return {};
+    }
+    const std::string_view body = word.substr(2);
+    const size_t equals = body.find('=');
+    const struct option* const found = FindLongOption(body.substr(0, equals));
+    if (found == nullptr || found->val < 0x108) {
+        return {};
+    }
+    if (equals == std::string_view::npos && found->has_arg == required_argument) {
+        return std::string{"--"} + found->name + " needs an argument";
+    }
+    if (equals != std::string_view::npos && found->has_arg == no_argument) {
+        return std::string{"--"} + found->name + " does not take an argument";
+    }
+    return {};
+}
+
+/// See EarlyOptions. Follows getopt over the same option tables as ParseLaunchParams: which
+/// arguments an option takes (the next one whatever it looks like, or the text after "=" or in
+/// the same word), abbreviations, and the arguments -p and -x take on their own. An argument that
+/// an option takes is never read as an option.
 EarlyOptions ScanEarlyOptions(int argc, char* argv[]) noexcept {
     bool version = false;
     bool json = false;
@@ -136,7 +194,7 @@ EarlyOptions ScanEarlyOptions(int argc, char* argv[]) noexcept {
             early.error = std::move(message);
         }
     };
-    const auto take_user_dir = [&](const std::optional<std::string>& value) {
+    const auto user_dir = [&early, &fail](const std::optional<std::string>& value) {
         if (!value || value->empty()) {
             fail("--user-dir needs a directory");
         } else if (early.user_dir) {
@@ -150,54 +208,43 @@ EarlyOptions ScanEarlyOptions(int argc, char* argv[]) noexcept {
         if (arg == "--") {
             break;
         }
-        int extra_operands = 0;
         if (arg.starts_with("--")) {
             const std::string_view body = arg.substr(2);
-            const std::size_t equals = body.find('=');
-            const std::string_view name = body.substr(0, equals);
-            const bool attached = equals != std::string_view::npos;
-            const struct option* found = nullptr;
-            bool exact = false;
-            int matches = 0;
-            for (const struct option* entry = kLongOptions; entry->name != nullptr; ++entry) {
-                const std::string_view candidate{entry->name};
-                if (candidate == name) {
-                    found = entry;
-                    exact = true;
-                    matches = 1;
-                    break;
-                }
-                if (candidate.starts_with(name)) {
-                    found = entry;
-                    ++matches;
-                }
-            }
-            if (matches != 1) {
-                // Unknown or ambiguous: getopt reports it and takes no operand.
+            const size_t equals = body.find('=');
+            const struct option* const found = FindLongOption(body.substr(0, equals));
+            // An unknown option is left to ParseLaunchParams. A value given to an option that
+            // takes none makes getopt return an error and the option is not parsed.
+            if (found == nullptr || (equals != std::string_view::npos && found->has_arg == no_argument)) {
                 continue;
             }
             std::optional<std::string> value;
-            if (attached && found->has_arg != no_argument) {
+            if (equals != std::string_view::npos) {
                 value = std::string{body.substr(equals + 1)};
-            } else if (!attached && found->has_arg == required_argument && i + 1 < argc) {
-                value = std::string{argv[++i]};
+            } else if (found->has_arg == required_argument && i + 1 < argc) {
+                value = argv[++i];
             }
-            if (found->val == 'p' || found->val == 'x') {
-                extra_operands = 1;
+            switch (found->val) {
+            case 'v':
+                version = true;
+                break;
+            case 0x10B:
+                json = true;
+                break;
+            case 0x10C:
+                user_dir(value);
+                break;
+            default:
+                break;
             }
-            if (exact) {
-                if (found->val == 'v') {
-                    version = true;
-                } else if (found->val == 0x10B) {
-                    json = true;
-                } else if (found->val == 0x10C) {
-                    take_user_dir(value);
-                }
+            // --program and --filter take the next argument themselves (see ParseLaunchParams).
+            if ((found->val == 'p' || found->val == 'x') && i + 1 < argc) {
+                ++i;
             }
-        } else if (arg.size() > 1 && arg[0] == '-') {
-            for (std::size_t k = 1; k < arg.size(); ++k) {
+        } else if (arg.size() > 1 && arg.front() == '-') {
+            bool takes_next = false;
+            for (size_t k = 1; k < arg.size(); ++k) {
                 const char letter = arg[k];
-                const char* spec = letter == ':' ? nullptr : std::strchr(kShortOptions, letter);
+                const char* const spec = letter == ':' ? nullptr : std::strchr(kShortOptions, letter);
                 if (spec == nullptr) {
                     continue;
                 }
@@ -205,19 +252,20 @@ EarlyOptions ScanEarlyOptions(int argc, char* argv[]) noexcept {
                     version = true;
                 }
                 if (letter == 'p' || letter == 'x') {
-                    ++extra_operands;
+                    takes_next = true;
                 }
                 if (spec[1] == ':') {
-                    // Optional operands are attached only; a required one is the rest of this
-                    // argument or else the next argument.
+                    // The rest of the word is the argument; a required one without it is the next.
                     if (spec[2] != ':' && k + 1 == arg.size() && i + 1 < argc) {
                         ++i;
                     }
                     break;
                 }
             }
+            if (takes_next && i + 1 < argc) {
+                ++i;
+            }
         }
-        i += extra_operands;
     }
     early.version_json = version && json;
     return early;
@@ -490,11 +538,18 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
                 } else if (optopt == 0x120) {
                     fail("--control needs a name of 1 to 64 letters, digits, '.', '_' or '-', "
                          "starting with a letter or digit");
-                } else if (p.unknown_option.empty()) {
-                    // An unknown option, or an old one without its argument. Only an automated
-                    // run (--report, --run-seconds, --run-frames) refuses that, so nothing else
-                    // changes.
-                    p.unknown_option = optind > 0 ? argv[optind - 1] : argv[0];
+                } else {
+                    // An unknown option, or an old one without its argument: only an automated
+                    // run (--report, --run-seconds, --run-frames) refuses that. A misused option
+                    // of this fork's is refused whatever the run is.
+                    if (p.unknown_option.empty()) {
+                        p.unknown_option = optind > 0 ? argv[optind - 1] : argv[0];
+                    }
+                    if (const std::string misuse =
+                            MisusedBranchOption(optind > 0 ? argv[optind - 1] : argv[0]);
+                        !misuse.empty()) {
+                        fail(misuse);
+                    }
                 }
                 break;
             }

@@ -561,7 +561,9 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     // Options that must act before the user directory, the log, the crash handler and Core::System
     // exist. They are found by a scan of their own; the full parse needs a Core::System.
     const Core::EarlyOptions early = Core::ScanEarlyOptions(argc, argv);
-    if (early.version_json) {
+    // The build identity is printed only when the options the scan can see are in order, and
+    // before the user directory is touched.
+    if (early.version_json && early.error.empty()) {
         fmt::print("{}", VersionInfo::BuildInfoJson());
         std::fflush(stdout);
         return SDL_APP_SUCCESS;
@@ -619,8 +621,15 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     const bool unattended = lp.report_path || lp.run_seconds || lp.run_frames;
     std::string argument_error = lp.parse_error;
     if (argument_error.empty() && lp.user_dir != early.user_dir) {
-        // Only the spelled-out option was applied, before the user directory was first read.
-        argument_error = "--user-dir must be spelled out in full, not abbreviated";
+        // The scan applied the directory before the user directory was first read. Both follow
+        // getopt over the same option table, so this is a defensive check.
+        argument_error = "--user-dir was read differently by the early scan and the full parse; "
+                         "write it as --user-dir <path> or --user-dir=<path>";
+    }
+    if (argument_error.empty() && (lp.print_version && lp.print_json) != early.version_json) {
+        // --version --json answers from the early scan only, before anything is set up.
+        argument_error = "--version --json was read differently by the early scan and the full "
+                         "parse; write them as --version --json";
     }
     if (argument_error.empty() && unattended && !lp.unknown_option.empty()) {
         argument_error = "unknown option, or an option without its argument: " + lp.unknown_option;
@@ -698,11 +707,6 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         config.reset();
         CliSettings::Apply(setting_overrides);
     }
-    // Before anything loads a GPU driver.
-    Common::ConfigureDriverShaderCache(Settings::values.private_driver_shader_cache.GetValue(),
-                                       Settings::values.driver_shader_cache_size.GetValue());
-    Common::CreateDriverShaderCacheFolder();
-
     Core::ApplyLaunchParams(lp);
     if (lp.baseline) {
         // Declared values go on top of the baseline and of the command line overrides.
@@ -712,6 +716,13 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
             LOG_ERROR(Frontend, "--baseline-allow: {}", problem);
         }
     }
+    // Before anything loads a GPU driver, and after every source of the settings it reads
+    // (config file, baseline, command line, declared values): a declared
+    // private_driver_shader_cache or driver_shader_cache_size has to decide where the driver
+    // writes its cache, and this is the last point at which it can.
+    Common::ConfigureDriverShaderCache(Settings::values.private_driver_shader_cache.GetValue(),
+                                       Settings::values.driver_shader_cache_size.GetValue());
+    Common::CreateDriverShaderCacheFolder();
     RunReport::SetBaselineRequest(lp.baseline, Settings::Baseline::AllowedKeys(lp.baseline_allow));
     if (Common::RunOutcome::Active()) {
         std::vector<std::string> overridden_settings;
@@ -719,13 +730,6 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
             overridden_settings.push_back(request.first);
         }
         RunReport::CaptureStart(overridden_settings);
-    }
-
-    // The early scan missed --version --json (an abbreviated option): the same text, a little later.
-    if (lp.print_version && lp.print_json) {
-        fmt::print("{}", VersionInfo::BuildInfoJson());
-        std::fflush(stdout);
-        return SDL_APP_SUCCESS;
     }
 
     // Informational options already printed by ApplyLaunchParams; handle them before any
@@ -1040,6 +1044,10 @@ static void RunLiveKeys(InputCommon::InputSubsystem& input_subsystem, Core::Syst
             Settings::values.gpu_accuracy.SetValue(high ? Settings::GpuAccuracy::High
                                                         : Settings::GpuAccuracy::Low);
             system.ApplySettings();
+            // A change of a setting from outside the run: named as such in the baseline object,
+            // which the crash report keeps as a snapshot, so the snapshot is taken again.
+            Settings::Baseline::NoteSource("gpu_accuracy", "live control file");
+            RunReport::RefreshCrashSnapshot();
             LOG_INFO(Frontend, "Live keys: GPU accuracy {}", high ? "high" : "low");
             continue;
         }

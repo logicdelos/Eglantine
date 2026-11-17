@@ -36,6 +36,7 @@ add_executable(tests
     video_core/spirv_software_matrix.cpp
     common/baseline_settings.cpp
     common/baseline_config.cpp
+    core/launch_params_early.cpp
     common/bit_field.cpp
     common/cityhash.cpp
     common/container_hash.cpp
