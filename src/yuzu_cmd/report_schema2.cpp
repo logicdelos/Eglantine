@@ -392,7 +392,8 @@ std::string SessionJson(const RunControl::SessionInfo& session) {
     Json manifest = Json::object();
     manifest["entries"] = session.manifest.entries;
     manifest["over_cap"] = session.manifest.over_cap;
-    manifest["duration_ns"] = session.manifest.duration_ns;
+    manifest["duration_ns"] =
+        session.manifest.duration_ns ? Json(*session.manifest.duration_ns) : Json(nullptr);
     Json json = Json::object();
     json["title_id"] = Hex(session.title_id, 16);
     json["nonce"] = session.nonce != 0 ? Json(Hex(session.nonce, 16)) : Json(nullptr);

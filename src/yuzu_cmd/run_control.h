@@ -71,11 +71,12 @@ struct MarkerRejections {
     u64 refused{}; ///< Well formed and current, but MarkInteractive said no (duplicate, backdated)
 };
 
-/// What the content manifest of the identity assembly cost and covered.
+/// What the content manifest of the identity assembly cost and covered. The duration is attribution
+/// data: it is not measured (empty) when attribution is off.
 struct ManifestSummary {
     u64 entries{};
     bool over_cap{};
-    u64 duration_ns{};
+    std::optional<u64> duration_ns;
 };
 
 struct SessionInfo {
@@ -596,10 +597,14 @@ inline constexpr std::array<std::string_view, 15> ShaderGenerationSwitches{
 ///   settings_hash  HostSettingsHash
 /// The device and the shader format version are added by the pipeline cache, which owns them.
 /// The walk is a disk read of the cold start: it is a disk span of the attribution, and its
-/// duration, entry count and cap flag are in `summary` (and in the report).
+/// duration, entry count and cap flag are in `summary` (and in the report). The duration is read
+/// from `now_ns` only while attribution runs: with attribution off the walk is done (the
+/// caches need the identity) but no clock is read for it and `summary->duration_ns` stays empty.
 [[nodiscard]] inline HostIdentity AssembleHostIdentity(const HostIdentitySource& source,
-                                                       ManifestSummary* summary = nullptr) {
-    const u64 begin_ns = Spikes::NowNs();
+                                                       ManifestSummary* summary = nullptr,
+                                                       u64 (*now_ns)() = &Spikes::NowNs) {
+    const bool timed = summary != nullptr && Spikes::AttributionEnabled();
+    const u64 begin_ns = timed ? now_ns() : 0;
     Spikes::SpanScope disk{Spikes::Cause::Disk};
 
     HostIdentity host;
@@ -649,7 +654,10 @@ inline constexpr std::array<std::string_view, 15> ShaderGenerationSwitches{
     if (summary != nullptr) {
         summary->entries = manifest.Entries();
         summary->over_cap = manifest.OverCap();
-        summary->duration_ns = Spikes::NowNs() - begin_ns;
+        summary->duration_ns.reset();
+        if (timed) {
+            summary->duration_ns = now_ns() - begin_ns;
+        }
     }
     return host;
 }
@@ -717,12 +725,15 @@ inline void PublishHostIdentity(Core::System& system, u64 title_id) {
         &summary);
     VideoCommon::CacheEnvelope::SetHostIdentity(host);
     RecordManifest(summary);
+    const std::string manifest_ms =
+        summary.duration_ns
+            ? fmt::format("{:.1f}", static_cast<double>(*summary.duration_ns) / 1.0e6)
+            : std::string{"unavailable"};
     LOG_INFO(Frontend,
              "Nx2Cache identity title={:016x} version={} build={:016x} content={:016x} "
-             "settings={:016x} manifest_entries={} manifest_over_cap={} manifest_ms={:.1f}",
+             "settings={:016x} manifest_entries={} manifest_over_cap={} manifest_ms={}",
              host.title_id, host.game_version, host.build_id, host.content_stamp,
-             host.settings_hash, summary.entries, summary.over_cap,
-             static_cast<double>(summary.duration_ns) / 1.0e6);
+             host.settings_hash, summary.entries, summary.over_cap, manifest_ms);
     PublishSession(title_id);
 }
 

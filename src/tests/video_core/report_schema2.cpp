@@ -1075,3 +1075,68 @@ TEST_CASE("a disabled boot phase scope does nothing", "[report][schema2][startup
 
     CHECK(Spikes::ReadAttributionSnapshot().phases.size() == phases_before);
 }
+
+namespace {
+
+u64 clock_reads = 0;
+
+/// A clock that counts its reads and advances 1000 ns on each.
+u64 CountingClock() {
+    return 1000 * ++clock_reads;
+}
+
+/// Attribution on for the life of the object.
+class AttributionOn {
+public:
+    AttributionOn() {
+        REQUIRE(Spikes::BeginSession({}));
+    }
+    ~AttributionOn() {
+        Spikes::EndSession();
+    }
+    AttributionOn(const AttributionOn&) = delete;
+    AttributionOn& operator=(const AttributionOn&) = delete;
+};
+
+} // Anonymous namespace
+
+TEST_CASE("identity assembly reads no clock for the manifest when attribution is off",
+          "[report][identity]") {
+    REQUIRE_FALSE(Spikes::AttributionEnabled());
+    TempTree tree;
+    tree.Write("game.nsp", "game");
+    RunControl::HostIdentitySource source;
+    source.title_id = 0x0100000000001234ull;
+    source.game_path = tree.root / "game.nsp";
+
+    clock_reads = 0;
+    RunControl::ManifestSummary off;
+    off.duration_ns = 7; // a value left from an earlier assembly must not survive
+    const u64 stamp_off =
+        RunControl::AssembleHostIdentity(source, &off, &CountingClock).content_stamp;
+    CHECK(clock_reads == 0);
+    CHECK(off.entries == 1); // the walk itself still ran: the caches need the identity
+    CHECK_FALSE(off.duration_ns.has_value());
+    RunControl::SessionInfo session;
+    session.manifest = off;
+    const Json unavailable = Json::parse(Schema2::SessionJson(session));
+    CHECK(unavailable["content_manifest"]["duration_ns"].is_null());
+    CHECK(unavailable["content_manifest"]["entries"] == 1);
+
+    SECTION("with attribution on the manifest is timed with two reads") {
+        const AttributionOn attribution;
+        clock_reads = 0;
+        RunControl::ManifestSummary on;
+        const u64 stamp_on =
+            RunControl::AssembleHostIdentity(source, &on, &CountingClock).content_stamp;
+        CHECK(clock_reads == 2);
+        REQUIRE(on.duration_ns.has_value());
+        CHECK(*on.duration_ns == 1000);
+        CHECK(stamp_on == stamp_off);
+
+        // without a summary there is nothing to report, so nothing to time
+        clock_reads = 0;
+        static_cast<void>(RunControl::AssembleHostIdentity(source, nullptr, &CountingClock));
+        CHECK(clock_reads == 0);
+    }
+}
