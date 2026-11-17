@@ -474,6 +474,15 @@ TEST_CASE("Logged Pokopia masked dependency barrier fences shared memory and rej
               0xef98000000070000ULL);
         CHECK(copying.source_instruction_offsets[2] == copying.source_instruction_offsets[1] + 1);
     }
+    // Only scoreboard 0 waits on the async copy groups: another scoreboard emits no fence.
+    {
+        auto other = wait;
+        other.words[1] = 0x9000;
+        const Instruction copy{{0x02067fae, 0, 0x0f901c08, 0}};
+        const auto lowered = LowerToMaxwell(std::array{copy, other, Exit});
+        REQUIRE(lowered);
+        CHECK(lowered.source_instruction_offsets[2] == lowered.source_instruction_offsets[1]);
+    }
     for (u32 bit = 15; bit < 32; ++bit) {
         auto invalid = wait;
         invalid.words[1] ^= 1U << bit;

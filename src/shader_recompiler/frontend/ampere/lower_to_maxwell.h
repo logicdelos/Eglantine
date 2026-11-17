@@ -2399,7 +2399,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             // Any scoreboard (bits 44-46), count (38-43) and wait list (32-37) is the same no-op here.
             // DEPBAR.LE SB0, n (scoreboard 0x8000) waits on LDGSTS copy groups. The copies below
             // complete synchronously, so only make their shared memory stores visible.
-            const u32 scoreboard = insn.words[1] & ~0xfc0U;
+            // The wait list (bits 0-5) and count (6-11) do not pick the scoreboard.
+            const u32 scoreboard = insn.words[1] & ~0xfffU;
             if (insn.words[0] != 0x791a || (insn.words[1] & ~0x7fffU) != 0x8000 || insn.words[2]) {
                 return fail(index, "native dependency barrier mode");
             }
