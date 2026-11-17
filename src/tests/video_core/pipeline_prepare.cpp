@@ -492,22 +492,35 @@ TEST_CASE("The ready cap holds back builds at exactly the cap and not before",
     const u64 generation = scheduler.Begin(Run(3));
     LoadAll(scheduler, generation, {1, 2, 3});
 
-    const auto first = BuildNext(scheduler, generation);  // one building
+    const auto first = BuildNext(scheduler, generation);  // one building: under the cap
     const auto second = BuildNext(scheduler, generation); // two building: the cap
+    CHECK(first.evicted == nullptr);
+    CHECK(second.evicted == nullptr);
+    // Nothing is ready to release, so the third record waits, however often it is asked.
     CHECK(scheduler.Next(generation, PlentyOfRam).kind == Scheduler::TaskKind::Wait);
-    REQUIRE(scheduler.BuildFinished(first.id, generation, true, std::make_shared<int>(1)));
-    // One ready and one building still make the cap.
     CHECK(scheduler.Next(generation, PlentyOfRam).kind == Scheduler::TaskKind::Wait);
-    REQUIRE(scheduler.BuildFinished(second.id, generation, true, std::make_shared<int>(2)));
-    CHECK(scheduler.Next(generation, PlentyOfRam).kind == Scheduler::TaskKind::Wait);
-
     CacheStats stats;
     scheduler.FillStats(stats);
     CHECK(stats.budget_pauses == 1); // one pause, however often it was asked
 
-    // The game uses one: a slot is free and the third record is built.
-    REQUIRE(scheduler.Request(KeyHash(1), Key(1)).kind == Scheduler::DemandKind::Ready);
-    CHECK(BuildNext(scheduler, generation).id == 2);
+    // One ready and one building make the cap again, but the ready object is unused and the
+    // third record is waiting: the ready object is released and the third is built in its place,
+    // so ready plus building never goes past the cap.
+    REQUIRE(scheduler.BuildFinished(first.id, generation, true, std::make_shared<int>(1)));
+    const auto third = scheduler.Next(generation, PlentyOfRam);
+    REQUIRE(third.kind == Scheduler::TaskKind::Build);
+    CHECK(third.id == 2);
+    REQUIRE(third.evicted != nullptr);
+    CHECK(*std::static_pointer_cast<int>(third.evicted) == 1);
+    CHECK(scheduler.ReadyCount() == 0);
+
+    // Two building again: the cap, and nothing is left to take.
+    CHECK(scheduler.Next(generation, PlentyOfRam).kind == Scheduler::TaskKind::Wait);
+    REQUIRE(scheduler.BuildFinished(second.id, generation, true, std::make_shared<int>(2)));
+
+    // The released record is built when its draw comes; the kept one is adopted.
+    CHECK(scheduler.Request(KeyHash(1), Key(1)).kind == Scheduler::DemandKind::Unavailable);
+    CHECK(scheduler.Request(KeyHash(2), Key(2)).kind == Scheduler::DemandKind::Ready);
 }
 
 TEST_CASE("A demand is never held back by the cap, the budget or the RAM pause",
