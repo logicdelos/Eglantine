@@ -70,7 +70,7 @@ Additions for scripted runs of `eden-cli`. Built, with its unit tests passing, o
 ### Fixed
 
 - Switch 2 shader translation: a DEPBAR on scoreboard 0 no longer depends on its wait list, a constant-buffer F2I with reserved bits set is refused instead of being translated with those bits dropped, and the register pressure count covers SHF and FSETP with an immediate and STG with a register.
-- First run on a fresh profile (only the keys and the system folders) no longer logs errors for the play time database: saving play time creates its folder when it is missing.
+- First run on a fresh profile (only the keys and the system folders) no longer logs errors for the play time database or for empty user directory paths: saving play time creates its folder when it is missing, and a user directory that the configuration does not store (empty, as in a profile without a configuration file) keeps its default instead of being handed to the path manager as an empty path.
 
 ## 0.3.0 (2026-11-16)
 

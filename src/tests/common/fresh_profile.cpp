@@ -12,6 +12,7 @@
 
 #include "common/common_types.h"
 #include "common/fs/path_util.h"
+#include "frontend_common/config.h"
 #include "frontend_common/play_time_manager.h"
 
 namespace {
@@ -79,4 +80,24 @@ TEST_CASE("Play time is saved when its folder does not exist yet", "[fresh_profi
     CHECK(std::filesystem::is_regular_file(play_time_dir / "playtime.bin"));
     const PlayTime::PlayTimeManager reloaded;
     CHECK(reloaded.GetPlayTime(TestProgramId) == 42);
+}
+
+TEST_CASE("An empty configured user directory keeps the default path", "[fresh_profile]") {
+    const ScratchDirectory scratch{"fresh-profile-paths"};
+    const auto default_dir = scratch.path / "tas";
+    const auto configured_dir = scratch.path / "configured";
+    std::filesystem::create_directories(default_dir);
+    std::filesystem::create_directories(configured_dir);
+    // The TAS folder: no other test in this binary reads it.
+    const UserPathOverride override_path{Common::FS::EdenPath::TASDir, default_dir};
+    REQUIRE(Common::FS::GetEdenPath(Common::FS::EdenPath::TASDir) == default_dir);
+
+    // A fresh profile has no configuration file: every stored path reads back empty.
+    CHECK_FALSE(ApplyConfiguredEdenPath(Common::FS::EdenPath::TASDir, ""));
+    CHECK(Common::FS::GetEdenPath(Common::FS::EdenPath::TASDir) == default_dir);
+
+    // A stored directory still replaces the default.
+    CHECK(ApplyConfiguredEdenPath(Common::FS::EdenPath::TASDir,
+                                  Common::FS::PathToUTF8String(configured_dir)));
+    CHECK(Common::FS::GetEdenPath(Common::FS::EdenPath::TASDir) == configured_dir);
 }

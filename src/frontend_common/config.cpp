@@ -27,6 +27,14 @@
 
 namespace FS = Common::FS;
 
+bool ApplyConfiguredEdenPath(FS::EdenPath eden_path, const std::string& configured) {
+    if (configured.empty()) {
+        return false;
+    }
+    FS::SetEdenPath(eden_path, configured);
+    return true;
+}
+
 Config::Config(const ConfigType config_type, const Mode config_mode)
     : type(config_type), global{config_type == ConfigType::GlobalConfig}, mode{config_mode} {}
 
@@ -355,7 +363,7 @@ void Config::ReadDataStorageValues() {
     using namespace Common::FS;
 
     const auto setPath = [this](const EdenPath& path, const char* setting) {
-        SetEdenPath(path, ReadStringSetting(std::string(setting)));
+        ApplyConfiguredEdenPath(path, ReadStringSetting(std::string(setting)));
     };
 
     setPath(EdenPath::NANDDir, "nand_directory");
@@ -459,8 +467,8 @@ void Config::ReadScreenshotValues() {
     BeginGroup(Settings::TranslateCategory(Settings::Category::Screenshots));
 
     ReadCategory(Settings::Category::Screenshots);
-    FS::SetEdenPath(FS::EdenPath::ScreenshotsDir,
-                    ReadStringSetting(std::string("screenshot_path")));
+    ApplyConfiguredEdenPath(FS::EdenPath::ScreenshotsDir,
+                            ReadStringSetting(std::string("screenshot_path")));
 
     EndGroup();
 }
