@@ -110,16 +110,19 @@ u64 Sub(u64 a, u64 b) noexcept {
 // Producer side
 // ---------------------------------------------------------------------------------------------
 
-enum class EventType : u8 { Begin, End, Closed, Link };
+enum class EventType : u8 { Begin, End, Closed, Link, State };
+constexpr size_t EventTypeCount = 5;
 
 struct RingEvent {
     u64 seq{};      ///< The span's sequence number (on the thread that began it)
-    u64 begin_ns{}; ///< Begin, Closed: when it began. Link: when the wait was released
+    u64 begin_ns{}; ///< Begin, Closed: when it began. Link: when the wait was released. State: when
+                    ///< the thread entered the state
     u64 end_ns{};   ///< End, Closed
-    u64 work{};     ///< Begin, Closed: the span's work. Link: the producer
+    u64 work{};     ///< Begin, Closed: the span's work. Link: the producer. State: the handler
+                    ///< (service id << 32 | command)
     u64 amount{};
     u32 owner{}; ///< End, Link: registration id of the thread that began the span
-    u32 flags{};
+    u32 flags{};    ///< State: the GuestState
     EventType type{EventType::Begin};
     Cause cause{Cause::Unknown};
     DependencyKind kind{DependencyKind::Job};
@@ -140,7 +143,11 @@ struct ThreadBuf {
     std::atomic<u32> open_count{};
     std::atomic<u64> lost{};
     /// Events published per EventType (producer only; the consumer reads them for diagnostics).
-    std::array<std::atomic<u64>, 4> kinds{};
+    std::array<std::atomic<u64>, EventTypeCount> kinds{};
+    // Producer only: the last state RecordGuestState published (a repeat is not published again).
+    GuestState last_state{GuestState::Off};
+    u32 last_service{};
+    u32 last_command{};
     /// Set by MarkGuestThread: this thread runs guest code (set by the producer, read at drain).
     std::atomic<bool> guest{};
     // Overflow range [min, max] of the events this thread could not record. Only the owning thread
@@ -178,10 +185,32 @@ struct SpanRec {
     DependencyKind kind{DependencyKind::Job};
 };
 
+/// The handler a Service state carries, as one key: service id in the high half, command below.
+constexpr u64 HandlerKey(u32 service, u32 command) noexcept {
+    return (u64{service} << 32) | command;
+}
+
+/// A stretch of time shorter than this is not worth its own record: a core thread leaves the guest
+/// code for the host side of every system call, so the stretches of Other between two stretches of
+/// Running are merged into them when they are this short, and a repeat of the same state within
+/// this distance is one stretch. The time of a merged stretch reads as the state around it.
+constexpr u64 StateMergeNs = 20'000;
+
 struct ThreadState {
     std::vector<SpanRec> open;
     std::vector<SpanRec> closed;
     bool guest{}; ///< Copied from the ring at each drain
+    // What the thread reported with RecordGuestState. `states` holds the finished stretches in time
+    // order (begin_ns, end_ns, work = handler key, amount = GuestState; Off is never stored). The
+    // stretch open now is cur_*, and a short Other that follows a Running is held back in
+    // `pending` until the next stretch says whether it merges.
+    std::vector<SpanRec> states;
+    bool state_open{};
+    GuestState cur_state{GuestState::Off};
+    u64 cur_begin{};
+    u64 cur_handler{};
+    bool has_pending{};
+    SpanRec pending;
 };
 
 struct PendingLink {
@@ -209,6 +238,16 @@ struct Leaf {
     const SpanRec* span{};
     u32 thread{};
     u64 span_end{};
+};
+
+/// One stretch of a thread's reported state, clipped to the window of a decomposition. `finish` is
+/// where the stretch really ends (OpenEnd while it lasts), for choosing the handler to name.
+struct StateLeaf {
+    u64 t0{};
+    u64 t1{};
+    u64 finish{};
+    u64 handler{};
+    GuestState state{GuestState::Off};
 };
 
 /// One span that carries a work id, clipped to the window of a decomposition.
@@ -311,6 +350,8 @@ struct Decomp {
     bool complete{true};
     u64 producer_unknown_wait_ns{};
     std::unordered_map<WorkId, u64> work_ns;
+    WaitSplit wait{}; ///< How cause[Waiting] splits by guest activity (sums to it)
+    std::unordered_map<u64, u64> handler_ns; ///< HandlerKey -> ns of the Service class
 
     /// Adds the decomposition of the neighbouring part of the same interval.
     void Add(const Decomp& part) {
@@ -325,14 +366,53 @@ struct Decomp {
         for (const auto& [work, ns] : part.work_ns) {
             work_ns[work] += ns;
         }
+        for (size_t i = 0; i < WaitClassCount; ++i) {
+            wait[i] += part.wait[i];
+        }
+        for (const auto& [key, ns] : part.handler_ns) {
+            handler_ns[key] += ns;
+        }
     }
 };
 
 struct CumulativeEntry {
     u64 ts{};
     CauseTimes causes{};
+    WaitSplit wait{};
     bool complete{true};
 };
+
+/// The most handler keys the session totals keep; a key past it is not added (its time is still in
+/// the Service class).
+constexpr size_t MaxTotalHandlerKeys = 4096;
+
+void AddHandlers(std::unordered_map<u64, u64>& total, const std::unordered_map<u64, u64>& part) {
+    for (const auto& [key, ns] : part) {
+        if (total.size() < MaxTotalHandlerKeys || total.contains(key)) {
+            total[key] += ns;
+        }
+    }
+}
+
+/// The `limit` handlers with the most time, the longest first (the lower key on a tie).
+std::vector<WaitHandlerTime> TopHandlers(const std::unordered_map<u64, u64>& handlers,
+                                         size_t limit) {
+    std::vector<WaitHandlerTime> all;
+    all.reserve(handlers.size());
+    for (const auto& [key, ns] : handlers) {
+        all.push_back({static_cast<u32>(key >> 32), static_cast<u32>(key & 0xFFFFFFFFu), ns});
+    }
+    std::sort(all.begin(), all.end(), [](const WaitHandlerTime& a, const WaitHandlerTime& b) {
+        if (a.ns != b.ns) {
+            return a.ns > b.ns;
+        }
+        return HandlerKey(a.service, a.command) < HandlerKey(b.service, b.command);
+    });
+    if (all.size() > limit) {
+        all.resize(limit);
+    }
+    return all;
+}
 
 /// The decomposition of one window of the history. Consumer thread only.
 class Resolver {
@@ -363,6 +443,7 @@ public:
                 out.activity[CauseIdx(leaf.cause)] += leaf.t1 - leaf.t0;
             }
         }
+        BuildStateLeaves();
         std::sort(work_spans.begin(), work_spans.end(), [](const WorkSpan& a, const WorkSpan& b) {
             if (a.work != b.work) {
                 return a.work < b.work;
@@ -392,6 +473,106 @@ public:
     }
 
 private:
+    /// The stretches the threads reported with RecordGuestState, clipped to the window, per thread
+    /// in time order (the merged stretches, the one held back, the one open now).
+    void BuildStateLeaves() {
+        state_leaves.resize(states.size());
+        for (size_t i = 0; i < states.size(); ++i) {
+            const ThreadState& st = states[i];
+            std::vector<StateLeaf>& list = state_leaves[i];
+            const auto add = [&](u64 begin, u64 finish, u64 handler, GuestState state) {
+                const u64 t0 = std::max(begin, s);
+                const u64 t1 = std::min(finish, e);
+                if (t0 < t1) {
+                    list.push_back({t0, t1, finish, handler, state});
+                }
+            };
+            for (const SpanRec& rec : st.states) {
+                add(rec.begin_ns, rec.end_ns, rec.work, static_cast<GuestState>(rec.amount));
+            }
+            if (st.has_pending) {
+                add(st.pending.begin_ns, st.pending.end_ns, st.pending.work,
+                    static_cast<GuestState>(st.pending.amount));
+            }
+            if (st.state_open) {
+                add(st.cur_begin, OpenEnd, st.cur_handler, st.cur_state);
+            }
+            std::sort(list.begin(), list.end(),
+                      [](const StateLeaf& a, const StateLeaf& b) { return a.t0 < b.t0; });
+        }
+    }
+
+    /// Splits [from, to) of Waiting by what the guest did meanwhile (WaitClass), piece by piece
+    /// between the points where a reported state changes. At an instant a core running guest code
+    /// makes it GuestRunning; else a handler executing makes it Service (the one that ends last
+    /// is the one named, the lower thread on a tie); else a core thread on its host side makes it
+    /// HostOther; else, with every reporting thread idle, GuestIdle. An instant no thread reported
+    /// a state for is HostOther.
+    void SplitWaiting(u64 from, u64 to) {
+        if (to <= from) {
+            return;
+        }
+        split_points.clear();
+        split_points.push_back(from);
+        split_points.push_back(to);
+        for (const std::vector<StateLeaf>& list : state_leaves) {
+            auto it = std::partition_point(list.begin(), list.end(),
+                                           [from](const StateLeaf& l) { return l.t1 <= from; });
+            for (; it != list.end() && it->t0 < to; ++it) {
+                split_points.push_back(std::max(it->t0, from));
+                split_points.push_back(std::min(it->t1, to));
+            }
+        }
+        std::sort(split_points.begin(), split_points.end());
+        split_points.erase(std::unique(split_points.begin(), split_points.end()),
+                           split_points.end());
+        for (size_t p = 0; p + 1 < split_points.size(); ++p) {
+            const u64 a = split_points[p];
+            const u64 b = split_points[p + 1];
+            bool running = false;
+            bool other = false;
+            bool idle = false;
+            const StateLeaf* service = nullptr;
+            for (const std::vector<StateLeaf>& list : state_leaves) {
+                const auto it = std::partition_point(
+                    list.begin(), list.end(), [a](const StateLeaf& l) { return l.t1 <= a; });
+                if (it == list.end() || it->t0 > a) {
+                    continue;
+                }
+                switch (it->state) {
+                case GuestState::Running:
+                    running = true;
+                    break;
+                case GuestState::Idle:
+                    idle = true;
+                    break;
+                case GuestState::Other:
+                    other = true;
+                    break;
+                case GuestState::Service:
+                    if (service == nullptr || it->finish > service->finish) {
+                        service = &*it;
+                    }
+                    break;
+                case GuestState::Off:
+                    break;
+                }
+            }
+            WaitClass cls = WaitClass::HostOther;
+            if (running) {
+                cls = WaitClass::GuestRunning;
+            } else if (service != nullptr) {
+                cls = WaitClass::Service;
+            } else if (!other && idle) {
+                cls = WaitClass::GuestIdle;
+            }
+            out.wait[static_cast<size_t>(cls)] += b - a;
+            if (cls == WaitClass::Service) {
+                out.handler_ns[service->handler] += b - a;
+            }
+        }
+    }
+
     void BuildLeaves(u32 thread, const ThreadState& state, std::vector<Leaf>& result) {
         std::vector<const SpanRec*> spans;
         spans.reserve(state.open.size() + state.closed.size());
@@ -487,6 +668,9 @@ private:
 
     void Charge(Cause cause, u64 from, u64 to, WorkId work) {
         out.cause[CauseIdx(cause)] += to - from;
+        if (cause == Cause::Waiting) {
+            SplitWaiting(from, to);
+        }
         if (inferring) {
             out.inferred[CauseIdx(cause)] += to - from;
         }
@@ -842,11 +1026,14 @@ private:
         for (const std::vector<Leaf>& list : leaves) {
             c.leaves += list.capacity();
         }
+        for (const std::vector<StateLeaf>& list : state_leaves) {
+            c.leaves += list.capacity();
+        }
         c.root_points = root_points;
         c.pieces = wait_pieces;
-        c.wait_points = wait_points;
-        c.work_nodes = out.work_ns.size();
-        c.work_buckets = out.work_ns.bucket_count();
+        c.wait_points = wait_points + split_points.capacity();
+        c.work_nodes = out.work_ns.size() + out.handler_ns.size();
+        c.work_buckets = out.work_ns.bucket_count() + out.handler_ns.bucket_count();
         peak_scratch = std::max(peak_scratch, ScratchBytes(c) + ScratchFixedBytes);
     }
 
@@ -858,6 +1045,8 @@ private:
     bool charge_gaps; ///< SessionConfig::charge_presenter_gaps
     bool inferring{}; ///< Charges are inferences (ExpandRootGap is running)
     std::vector<std::vector<Leaf>> leaves;
+    std::vector<std::vector<StateLeaf>> state_leaves;
+    std::vector<u64> split_points; ///< Scratch of SplitWaiting
     /// The spans of the window that carry a work id, clipped to it, sorted by (work, thread, begin).
     /// A leaf belongs to a work when it lies inside one of that work's spans on its thread, which is
     /// how a producer owns the time of the spans nested in it that carry other work ids.
@@ -935,6 +1124,9 @@ struct Session {
     u64 primary_unknown{};
     u64 incomplete_long_frames{};
     AttributionSnapshot final_snap;
+    /// Under stats_mutex: the Service time of the long frames and the start-up, per handler key.
+    std::unordered_map<u64, u64> wait_handler_total;
+    std::atomic<bool> states_seen{}; ///< A State event was taken from a ring
 
     // Consumer-owned
     std::array<ThreadState, MaxThreads> states;
@@ -959,6 +1151,7 @@ struct Session {
     u64 anchor{};
     bool interactive_done{};
     CauseTimes cum_causes{};
+    WaitSplit cum_wait{};
     bool cum_complete{true};
     std::vector<CumulativeEntry> cum;
     size_t chunk_slots{};  ///< History use that makes the open interval resolve in part (0: never)
@@ -978,6 +1171,9 @@ struct Session {
     void ConsumerMain();
     void DrainAll();
     bool DrainThread(u32 id, ThreadBuf& buf, u64 tail, u64 limit);
+    void IngestState(u32 id, ThreadState& st, const RingEvent& event);
+    void StoreState(ThreadState& st, const SpanRec& rec);
+    void AppendState(ThreadState& st, const SpanRec& rec);
     void RelieveHistory(u64 stamp, const std::array<u64, MaxThreads>& tails, u32 count);
     bool ResolveInPart(u64 through);
     void HoldForTest();
@@ -1384,10 +1580,76 @@ bool Session::DrainThread(u32 id, ThreadBuf& buf, u64 tail, u64 limit) {
             pending_links.push_back({event.owner, event.seq, event.work, event.kind, 0});
             break;
         }
+        case EventType::State:
+            IngestState(id, state, event);
+            break;
         }
     }
     buf.head.store(stop_at, std::memory_order_release);
     return stop_at < tail;
+}
+
+/// Takes one State event of a thread: the stretch that was open ends where the new one begins.
+void Session::IngestState(u32 id, ThreadState& st, const RingEvent& event) {
+    states_seen.store(true, std::memory_order_relaxed);
+    const u64 at = event.begin_ns;
+    if (st.state_open) {
+        SpanRec rec;
+        rec.thread = id;
+        rec.begin_ns = st.cur_begin;
+        rec.end_ns = std::max(at, st.cur_begin);
+        rec.work = st.cur_handler;
+        rec.amount = static_cast<u64>(st.cur_state);
+        rec.open = false;
+        StoreState(st, rec);
+    }
+    const auto next = static_cast<GuestState>(event.flags);
+    st.state_open = next != GuestState::Off;
+    st.cur_state = next;
+    st.cur_begin = at;
+    st.cur_handler = event.work;
+}
+
+/// Keeps a finished stretch. A short Other right after a Running is held back; when the stretch
+/// that follows is Running again, the two merge and the Other reads as Running (the host side of a
+/// system call, which a busy core thread enters and leaves thousands of times a second).
+void Session::StoreState(ThreadState& st, const SpanRec& rec) {
+    const auto running = static_cast<u64>(GuestState::Running);
+    const auto other = static_cast<u64>(GuestState::Other);
+    if (rec.amount == other && rec.end_ns - rec.begin_ns < StateMergeNs && !st.has_pending &&
+        !st.states.empty() && st.states.back().amount == running) {
+        st.pending = rec;
+        st.has_pending = true;
+        return;
+    }
+    if (st.has_pending) {
+        st.has_pending = false;
+        const bool joins = !st.states.empty() && st.states.back().amount == rec.amount &&
+                           st.states.back().work == rec.work &&
+                           rec.begin_ns - st.states.back().end_ns <= StateMergeNs;
+        if (!joins) {
+            AppendState(st, st.pending);
+        }
+    }
+    AppendState(st, rec);
+}
+
+void Session::AppendState(ThreadState& st, const SpanRec& rec) {
+    if (!st.states.empty()) {
+        SpanRec& back = st.states.back();
+        if (back.amount == rec.amount && back.work == rec.work && rec.begin_ns >= back.end_ns &&
+            rec.begin_ns - back.end_ns <= StateMergeNs) {
+            back.end_ns = std::max(back.end_ns, rec.end_ns);
+            return;
+        }
+    }
+    if (!Reserve(st.states)) {
+        lost_consumer.fetch_add(1, std::memory_order_relaxed);
+        ++lost_history;
+        AddLoss(rec.begin_ns, rec.end_ns);
+        return;
+    }
+    st.states.push_back(rec);
 }
 
 /// Attaches the links whose span is in the history. A link whose span is not there yet is kept; it
@@ -1529,7 +1791,8 @@ void Session::NoteRetained() {
     const u32 count = thread_count.load(std::memory_order_acquire);
     size_t slots{};
     for (u32 i = 0; i < count; ++i) {
-        slots += states[i].open.capacity() + states[i].closed.capacity();
+        slots += states[i].open.capacity() + states[i].closed.capacity() +
+                 states[i].states.capacity();
     }
     const size_t bytes = slots * sizeof(SpanRec);
     if (bytes > peak_retained_bytes.load(std::memory_order_relaxed)) {
@@ -1551,7 +1814,9 @@ void Session::Prune(bool force) {
     for (u32 i = 0; i < count; ++i) {
         ThreadState& state = states[i];
         std::erase_if(state.closed, [floor](const SpanRec& r) { return r.end_ns <= floor; });
+        std::erase_if(state.states, [floor](const SpanRec& r) { return r.end_ns <= floor; });
         Trim(state.closed);
+        Trim(state.states);
         Trim(state.open);
     }
     // The losses of an interval resolved in part stay until its present has joined the parts.
@@ -1608,10 +1873,14 @@ bool Session::ResolveInPart(u64 through) {
     last_resolved_ts = through;
     if (have_prev && !interactive_done && cum.size() < MaxCumulative) {
         CauseTimes sum = cum_causes;
+        WaitSplit wait_sum = cum_wait;
         for (size_t i = 0; i < CauseCount; ++i) {
             sum[i] += carry.cause[i];
         }
-        cum.push_back({through, sum, cum_complete && carry.complete});
+        for (size_t i = 0; i < WaitClassCount; ++i) {
+            wait_sum[i] += carry.wait[i];
+        }
+        cum.push_back({through, sum, wait_sum, cum_complete && carry.complete});
     }
     Prune(true);
     return true;
@@ -1673,12 +1942,12 @@ bool Session::LostBetween(u64 s, u64 e) const {
 
 /// Names what was recorded and what was lost, by kind and by thread, when the session ends.
 void Session::LogDiagnostics() const {
-    std::array<u64, 4> total{};
+    std::array<u64, EventTypeCount> total{};
     u64 ring_lost = 0;
     const u32 count = thread_count.load(std::memory_order_acquire);
     for (u32 i = 0; i < count; ++i) {
         const ThreadBuf& buf = *threads[i];
-        std::array<u64, 4> own{};
+        std::array<u64, EventTypeCount> own{};
         u64 sum = 0;
         for (size_t k = 0; k < own.size(); ++k) {
             own[k] = buf.kinds[k].load(std::memory_order_relaxed);
@@ -1689,17 +1958,17 @@ void Session::LogDiagnostics() const {
         ring_lost += dropped;
         if (dropped != 0 || sum >= 10000) {
             LOG_INFO(HW_GPU,
-                     "Nx2Attribution thread {}: {} begin, {} end, {} closed, {} link events, {} "
-                     "lost in the ring",
-                     buf.name.data(), own[0], own[1], own[2], own[3], dropped);
+                     "Nx2Attribution thread {}: {} begin, {} end, {} closed, {} link, {} state "
+                     "events, {} lost in the ring",
+                     buf.name.data(), own[0], own[1], own[2], own[3], own[4], dropped);
         }
     }
     const u64 all = TotalLost();
     const u64 known = ring_lost + lost_history + lost_late;
     LOG_INFO(HW_GPU,
-             "Nx2Attribution events: {} begin, {} end, {} closed, {} link; lost: {} ring, {} "
-             "history, {} late, {} other",
-             total[0], total[1], total[2], total[3], ring_lost, lost_history, lost_late,
+             "Nx2Attribution events: {} begin, {} end, {} closed, {} link, {} state; lost: {} "
+             "ring, {} history, {} late, {} other",
+             total[0], total[1], total[2], total[3], total[4], ring_lost, lost_history, lost_late,
              all > known ? all - known : u64{0});
 }
 
@@ -1786,6 +2055,7 @@ void Session::ResolveStartup(u64 first_present) {
     }
     complete = complete && d.complete;
     ia.cause_ns = d.cause;
+    ia.waiting_ns = d.wait;
     ia.cause_ns[CauseIdx(Cause::Unknown)] += pre;
     ia.status = complete ? IntervalStatus::Complete : IntervalStatus::Incomplete;
     std::scoped_lock lock{stats_mutex};
@@ -1796,6 +2066,10 @@ void Session::ResolveStartup(u64 first_present) {
     for (size_t i = 0; i < CauseCount; ++i) {
         snap.inferred_ns[i] += d.inferred[i];
     }
+    for (size_t i = 0; i < WaitClassCount; ++i) {
+        snap.waiting_ns[i] += d.wait[i];
+    }
+    AddHandlers(wait_handler_total, d.handler_ns);
 }
 
 void Session::ResolveBoundary(const Item& item) {
@@ -1815,7 +2089,7 @@ void Session::ResolveBoundary(const Item& item) {
         prev_counters = item.counters;
         last_resolved_ts = first;
         last_root = item.root;
-        cum.push_back({first, {}, true});
+        cum.push_back({first, {}, {}, true});
         ResolveStartup(first);
         if (item.id == 1) {
             Prune();
@@ -1860,9 +2134,12 @@ void Session::ResolveBoundary(const Item& item) {
         for (size_t i = 0; i < CauseCount; ++i) {
             cum_causes[i] += d.cause[i];
         }
+        for (size_t i = 0; i < WaitClassCount; ++i) {
+            cum_wait[i] += d.wait[i];
+        }
         cum_complete = cum_complete && d.complete;
         if (cum.size() < MaxCumulative) {
-            cum.push_back({e, cum_causes, cum_complete});
+            cum.push_back({e, cum_causes, cum_wait, cum_complete});
         }
     }
 
@@ -1875,6 +2152,11 @@ void Session::ResolveBoundary(const Item& item) {
         frame.cause_ns = d.cause;
         frame.activity_ns = d.activity;
         frame.inferred_ns = d.inferred;
+        frame.waiting_ns = d.wait;
+        frame.waiting_observed = states_seen.load(std::memory_order_relaxed);
+        for (const WaitHandlerTime& h : TopHandlers(d.handler_ns, MaxWaitHandlers)) {
+            frame.waiting_handlers[frame.waiting_handler_count++] = h;
+        }
         u64 top = 0;
         u32 at_top = 0;
         Cause primary = Cause::Unknown;
@@ -1934,6 +2216,10 @@ void Session::ResolveBoundary(const Item& item) {
             for (size_t i = 0; i < CauseCount; ++i) {
                 snap.inferred_ns[i] += d.inferred[i];
             }
+            for (size_t i = 0; i < WaitClassCount; ++i) {
+                snap.waiting_ns[i] += d.wait[i];
+            }
+            AddHandlers(wait_handler_total, d.handler_ns);
             if (frame.primary_cause == Cause::Unknown) {
                 ++primary_unknown;
             }
@@ -1971,7 +2257,7 @@ void Session::SkipLostInterval(u64 until) {
         cum_causes[CauseIdx(Cause::Unknown)] += Sub(until, prev_ts);
         cum_complete = false;
         if (cum.size() < MaxCumulative) {
-            cum.push_back({until, cum_causes, false});
+            cum.push_back({until, cum_causes, cum_wait, false});
         }
     }
     last_resolved_ts = until;
@@ -2002,6 +2288,7 @@ void Session::ResolveMarker(const Item& item) {
                                         [](u64 value, const CumulativeEntry& c) { return value < c.ts; });
     const CumulativeEntry& base = *(after == cum.begin() ? after : std::prev(after));
     CauseTimes causes = base.causes;
+    WaitSplit wait = base.wait;
     bool complete = base.complete;
     if (base.ts < m) {
         if (base.ts >= pruned_through) {
@@ -2011,6 +2298,9 @@ void Session::ResolveMarker(const Item& item) {
             for (size_t i = 0; i < CauseCount; ++i) {
                 causes[i] += d.cause[i];
             }
+            for (size_t i = 0; i < WaitClassCount; ++i) {
+                wait[i] += d.wait[i];
+            }
             complete = complete && d.complete;
         } else {
             causes[CauseIdx(Cause::Unknown)] += m - base.ts; // its spans are no longer retained
@@ -2018,6 +2308,7 @@ void Session::ResolveMarker(const Item& item) {
         }
     }
     ia.cause_ns = causes;
+    ia.waiting_ns = wait;
     ia.status = complete ? IntervalStatus::Complete : IntervalStatus::Incomplete;
     interactive_done = true;
     cum.clear();
@@ -2039,6 +2330,8 @@ AttributionSnapshot Session::Snapshot() {
     result.dropped_boundaries = boundaries_dropped.load(std::memory_order_relaxed);
     result.sink_write_errors = sink_errors.load(std::memory_order_relaxed);
     result.rejected_presents = rejected.load(std::memory_order_relaxed);
+    result.waiting_handlers = TopHandlers(wait_handler_total, MaxTotalWaitHandlers);
+    result.waiting_observed = states_seen.load(std::memory_order_relaxed);
     result.process_created_ns = process_created_ns.load(std::memory_order_relaxed);
     result.process_created_uncertainty_ns =
         process_created_uncertainty_ns.load(std::memory_order_relaxed);
@@ -2223,6 +2516,73 @@ void MarkGuestThread() {
     if (t != nullptr && !t->guest.load(std::memory_order_relaxed)) {
         t->guest.store(true, std::memory_order_relaxed);
     }
+}
+
+namespace {
+constexpr size_t MaxServiceNames = 4096;
+std::mutex g_service_names_mutex;
+std::vector<std::string> g_service_names; // id - 1 -> name
+std::unordered_map<std::string, u32> g_service_ids;
+} // namespace
+
+u32 InternServiceName(std::string_view name) {
+    std::scoped_lock lock{g_service_names_mutex};
+    const std::string key{name};
+    if (const auto it = g_service_ids.find(key); it != g_service_ids.end()) {
+        return it->second;
+    }
+    if (g_service_names.size() >= MaxServiceNames) {
+        return 0;
+    }
+    g_service_names.push_back(key);
+    const auto id = static_cast<u32>(g_service_names.size());
+    g_service_ids.emplace(key, id);
+    return id;
+}
+
+std::string ServiceNameOf(u32 id) {
+    std::scoped_lock lock{g_service_names_mutex};
+    if (id == 0 || id > g_service_names.size()) {
+        return "unknown";
+    }
+    return g_service_names[id - 1];
+}
+
+GuestMark RecordGuestState(GuestState state, u64 ns, u32 service, u32 command) {
+    Session* s = ActiveSession();
+    if (s == nullptr) {
+        return {};
+    }
+    ThreadBuf* t = ThisThread(*s, state == GuestState::Service ? "service" : "guest core");
+    if (t == nullptr) {
+        NoteUnregisteredLoss(*s);
+        return {};
+    }
+    if (state != GuestState::Service) {
+        service = 0;
+        command = 0;
+    }
+    const GuestMark previous{t->last_state, t->last_service, t->last_command};
+    if (previous.state == state && previous.service == service && previous.command == command) {
+        return previous;
+    }
+    t->busy.exchange(1, std::memory_order_seq_cst);
+    RingEvent event;
+    event.type = EventType::State;
+    event.flags = static_cast<u32>(state);
+    event.work = HandlerKey(service, command);
+    event.begin_ns = ns != 0 ? ns : NowNs();
+    const bool ok = Push(*t, event, t->open_count.load(std::memory_order_relaxed));
+    if (ok) {
+        t->last_state = state;
+        t->last_service = service;
+        t->last_command = command;
+    }
+    t->busy.store(0, std::memory_order_release);
+    if (!ok) {
+        NoteLoss(*t, event.begin_ns, event.begin_ns);
+    }
+    return previous;
 }
 
 SpanToken BeginSpan(Cause cause, WorkId work, u64 amount) {

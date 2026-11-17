@@ -426,6 +426,36 @@ inline constexpr std::array<std::string_view, 9> UnknownReasonNames{
 
 inline constexpr size_t MaxCriticalWork = 8;
 
+/// Where the Waiting time of a frame went, by what the guest was doing while the waiting thread
+/// waited (the order of WaitClassNames, the index into a WaitSplit). Each stretch of Waiting is
+/// in exactly one class, so a WaitSplit sums to the Waiting it splits.
+///  * GuestRunning: a guest CPU core thread was executing translated guest code.
+///  * GuestIdle: every guest core thread that reported was idle (sleep, timer, vsync wait).
+///  * Service: no core was running, and a host-side service request handler was executing (the
+///    guest thread that sent it is blocked until it returns).
+///  * HostOther: host scheduling, locks and system call handling on a core thread that none of
+///    the above covers, and time before any state was reported.
+/// Where several apply at an instant: GuestRunning first, then Service, then HostOther; GuestIdle
+/// only when every thread that reported is idle.
+enum class WaitClass : u8 { GuestRunning, GuestIdle, Service, HostOther, Count };
+inline constexpr size_t WaitClassCount = static_cast<size_t>(WaitClass::Count);
+inline constexpr std::array<std::string_view, WaitClassCount> WaitClassNames{
+    "guest_running", "guest_idle", "service", "host_other",
+};
+using WaitSplit = std::array<u64, WaitClassCount>;
+
+/// Time of the Service class spent in one service command, named by the service and the command
+/// number (the high bit of `command` is set for a TIPC command): no game names, only the
+/// interface the guest called.
+struct WaitHandlerTime {
+    u32 service{}; ///< An id of InternServiceName, 0 when unknown
+    u32 command{};
+    u64 ns{};
+};
+/// The handlers a long frame names (the longest first), and the session totals.
+inline constexpr size_t MaxWaitHandlers = 4;
+inline constexpr size_t MaxTotalWaitHandlers = 8;
+
 /// One frame over the threshold. cause_ns is the exclusive wall-time decomposition of the frame
 /// and sums exactly to duration_ns (unresolved time is Unknown); activity_ns is the clipped sum
 /// over all threads and may exceed the duration. Fixed size: streamed to the report writer.
@@ -440,6 +470,13 @@ struct LongFrame {
     /// for, charged by what the other threads did (UnknownReason::PresenterGap). Per cause, so a
     /// table can mark it; cause_ns - inferred_ns is what spans cover.
     std::array<u64, CauseCount> inferred_ns{};
+    /// How the Waiting part of cause_ns splits by guest activity; sums to cause_ns[Waiting].
+    /// waiting_observed is false when no core or service thread reported a state in the session
+    /// (then everything would read HostOther, which says nothing).
+    WaitSplit waiting_ns{};
+    std::array<WaitHandlerTime, MaxWaitHandlers> waiting_handlers{}; ///< Service time, longest first
+    u32 waiting_handler_count{};
+    bool waiting_observed{};
     Cause primary_cause{Cause::Unknown}; ///< The largest cause_ns, Unknown on ties
     u32 confidence_permille{};           ///< 1000 - 1000 * Unknown / duration
     u32 unknown_reasons{};               ///< UnknownReason bits
@@ -586,6 +623,57 @@ private:
     u32 flags;
 };
 
+/// What the calling thread is doing, for the split of Waiting (WaitClass). A guest CPU core thread
+/// reports Running while it executes translated code, Idle while its core has nothing to run, and
+/// Other on its host side (system calls, scheduling, locks); a thread that serves a request of a
+/// guest service reports Service for the handler's duration and Off between requests. A thread
+/// that never reports is not part of the split.
+enum class GuestState : u8 { Off, Running, Idle, Service, Other };
+
+/// A state with the handler it carries (a Service state only).
+struct GuestMark {
+    GuestState state{GuestState::Off};
+    u32 service{};
+    u32 command{};
+};
+
+/// Records that the calling thread is in `state` from `ns` (0: now, read inside the publication, as
+/// BeginSpan does) and returns the state it was in. A change to the state it is in already, with
+/// the same handler, records nothing. Call only when AttributionEnabled(). Cost: one clock read
+/// and one 64-byte ring store, no lock and no allocation.
+GuestMark RecordGuestState(GuestState state, u64 ns = 0, u32 service = 0, u32 command = 0);
+
+/// Interns a service name for the handler of a Service state and returns its id (stable for the
+/// process, never 0), or 0 when the table (4096 names) is full. Takes a lock: callers cache the id.
+[[nodiscard]] u32 InternServiceName(std::string_view name);
+
+/// The name of an id of InternServiceName ("unknown" for 0 or an id never given).
+[[nodiscard]] std::string ServiceNameOf(u32 id);
+
+/// Reports the calling thread's state for a scope and puts back the one it had: a service handler
+/// on a thread that has a state of its own (a core thread) must not erase it. One relaxed load
+/// when recording is off.
+class GuestStateScope {
+public:
+    explicit GuestStateScope(GuestState state, u32 service = 0, u32 command = 0) {
+        if (AttributionEnabled()) {
+            previous = RecordGuestState(state, 0, service, command);
+            active = true;
+        }
+    }
+    ~GuestStateScope() {
+        if (active && AttributionEnabled()) {
+            RecordGuestState(previous.state, 0, previous.service, previous.command);
+        }
+    }
+    GuestStateScope(const GuestStateScope&) = delete;
+    GuestStateScope& operator=(const GuestStateScope&) = delete;
+
+private:
+    GuestMark previous;
+    bool active{};
+};
+
 /// Publishes a host present attempt. Returns its host_present_id when it qualifies
 /// (QualifiesAsHostPresent), 0 otherwise; a non-qualifying attempt is only counted (and keeps
 /// the interval open, it never ends or starts one).
@@ -641,6 +729,7 @@ struct IntervalAttribution {
     u64 duration_ns{};
     std::array<u64, CauseCount> cause_ns{}; ///< Sums to duration_ns
     IntervalStatus status{IntervalStatus::NotObserved};
+    WaitSplit waiting_ns{}; ///< Sums to cause_ns[Waiting]; meaningful when the snapshot says so
 };
 
 struct PhaseRecord {
@@ -680,6 +769,13 @@ struct AttributionSnapshot {
     /// The inferred part of the causes over all long frames and the startup intervals (the sum of
     /// LongFrame::inferred_ns plus the start-up's), per cause.
     std::array<u64, CauseCount> inferred_ns{};
+    /// How the Waiting part of the causes splits (WaitClass), over the same intervals as
+    /// inferred_ns, and the service commands that took most of its Service class (the longest
+    /// first, at most MaxTotalWaitHandlers). waiting_observed: a core or service thread reported a
+    /// state, so the split says something; otherwise it is all HostOther and the report omits it.
+    WaitSplit waiting_ns{};
+    std::vector<WaitHandlerTime> waiting_handlers;
+    bool waiting_observed{};
     u64 process_created_ns{}; ///< 0: not set
     u64 process_created_uncertainty_ns{};
     u64 first_host_present_ns{}; ///< 0: no present yet
