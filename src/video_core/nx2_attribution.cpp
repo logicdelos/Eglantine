@@ -186,6 +186,12 @@ struct Leaf {
     u64 span_end{};
 };
 
+/// Where a leaf is kept: the registration id of its thread and its position in that thread's list.
+struct LeafRef {
+    u32 thread{};
+    u32 index{};
+};
+
 /// What one retained span costs against SessionConfig::buffer_bytes: its record (a vector may hold
 /// twice what it uses) and the resolver's copies of it while a frame is decomposed (leaves and the
 /// sweep events), so rings plus history stay inside the one budget.
@@ -226,9 +232,6 @@ public:
             BuildLeaves(static_cast<u32>(i + 1), states[i], leaves[i]);
             for (const Leaf& leaf : leaves[i]) {
                 out.activity[CauseIdx(leaf.cause)] += leaf.t1 - leaf.t0;
-                if (leaf.work != 0) {
-                    by_work[leaf.work].push_back(&leaf);
-                }
             }
         }
         ResolveRoots(roots);
@@ -297,23 +300,31 @@ private:
             return Key{rec.begin_ns, OpenEnd - (rec.open ? OpenEnd : rec.end_ns), rec.seq};
         };
         std::map<Key, u32> active;
+        std::vector<WorkId> chain;      // distinct work ids around the segment, innermost first
+        std::vector<WorkId> leaf_chain; // the same for the last leaf of `result`
         u64 cur = s;
         for (size_t i = 0; i < events.size();) {
             const u64 t = events[i].t;
             if (t > cur && !active.empty()) {
                 const SpanRec* top = spans[active.rbegin()->second];
-                WorkId work{};
+                chain.clear();
                 for (auto it = active.rbegin(); it != active.rend(); ++it) {
-                    if (spans[it->second]->work != 0) {
-                        work = spans[it->second]->work;
-                        break;
+                    const WorkId id = spans[it->second]->work;
+                    if (id != 0 && std::find(chain.begin(), chain.end(), id) == chain.end()) {
+                        chain.push_back(id);
                     }
                 }
-                if (!result.empty() && result.back().span == top && result.back().t1 == cur) {
+                const WorkId work = chain.empty() ? WorkId{0} : chain.front();
+                if (!result.empty() && result.back().span == top && result.back().t1 == cur &&
+                    chain == leaf_chain) {
                     result.back().t1 = t;
                 } else {
                     result.push_back({cur, t, top->cause, work, top, thread,
                                       top->open ? OpenEnd : top->end_ns});
+                    leaf_chain = chain;
+                    for (const WorkId id : chain) {
+                        by_work[id].push_back({thread, static_cast<u32>(result.size() - 1)});
+                    }
                 }
             }
             for (; i < events.size() && events[i].t == t; ++i) {
@@ -409,13 +420,14 @@ private:
         const auto found = by_work.find(producer);
         std::vector<Leaf> cands;
         if (found != by_work.end()) {
-            for (const Leaf* leaf : found->second) {
-                if (leaf->thread == wait.thread || leaf->t1 <= x || leaf->t0 >= y) {
+            for (const LeafRef ref : found->second) {
+                const Leaf& leaf = leaves[ref.thread - 1][ref.index];
+                if (leaf.thread == wait.thread || leaf.t1 <= x || leaf.t0 >= y) {
                     continue;
                 }
-                Leaf clipped = *leaf;
-                clipped.t0 = std::max(leaf->t0, x);
-                clipped.t1 = std::min(leaf->t1, y);
+                Leaf clipped = leaf;
+                clipped.t0 = std::max(leaf.t0, x);
+                clipped.t1 = std::min(leaf.t1, y);
                 cands.push_back(clipped);
             }
         }
@@ -463,7 +475,9 @@ private:
     u64 s;
     u64 e;
     std::vector<std::vector<Leaf>> leaves;
-    std::unordered_map<WorkId, std::vector<const Leaf*>> by_work;
+    /// Every exclusive leaf under each distinct work id of the spans that enclose it (a producer's
+    /// work owns the time of the spans nested inside its own span).
+    std::unordered_map<WorkId, std::vector<LeafRef>> by_work;
     std::vector<WorkId> visited;
     Decomp out;
 };

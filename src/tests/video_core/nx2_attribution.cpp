@@ -336,6 +336,90 @@ TEST_CASE("A wait chain is followed through the producer's own wait", "[nx2][att
     CHECK((g_frames[0].unknown_reasons & UnknownReason::AmbiguousDependency) == 0);
 }
 
+TEST_CASE("A wait on a task's work is charged to the spans nested in it that carry other work",
+          "[nx2][attribution]") {
+    Run run;
+    const WorkId task = NewWorkId();
+    const WorkId driver = NewWorkId();
+    Present(run.T(0));
+    // A synchronous build: the task span runs 10-90 ms and the driver call inside it, which has
+    // its own work id, runs 30-70 ms. The root waits for the task for 0-100 ms.
+    OnThread([&] {
+        RegisterThread("pipeline worker");
+        RecordSpan(Cause::Shader, run.T(10 * Ms), run.T(90 * Ms), task);
+        RecordSpan(Cause::Pipeline, run.T(30 * Ms), run.T(70 * Ms), driver);
+    });
+    const SpanToken wait = run.NextRootToken();
+    RecordSpan(Cause::Waiting, run.T(0), run.T(100 * Ms));
+    LinkWait(wait, task, DependencyKind::Job);
+    Present(run.T(150 * Ms));
+    run.Finish();
+    REQUIRE(g_frames.size() == 1);
+    const LongFrame& frame = g_frames[0];
+    CHECK(At(frame.cause_ns, Cause::Shader) == 40 * Ms);
+    CHECK(At(frame.cause_ns, Cause::Pipeline) == 40 * Ms);
+    CHECK(At(frame.cause_ns, Cause::Waiting) == 20 * Ms);
+    CHECK(At(frame.cause_ns, Cause::Unknown) == 50 * Ms);
+    CHECK(Total(frame.cause_ns) == 150 * Ms);
+    // Activity counts every span once, whatever work ids enclose it.
+    CHECK(At(frame.activity_ns, Cause::Shader) == 40 * Ms);
+    CHECK(At(frame.activity_ns, Cause::Pipeline) == 40 * Ms);
+    CHECK(At(frame.activity_ns, Cause::Waiting) == 100 * Ms);
+}
+
+TEST_CASE("A wait on a worker's work reaches spans nested two levels down, past a span without work",
+          "[nx2][attribution]") {
+    Run run;
+    const WorkId worker = NewWorkId();
+    const WorkId driver = NewWorkId();
+    Present(run.T(0));
+    // The present thread waits for the worker 0-100 ms. The worker's span covers all of it, a span
+    // without work id runs 20-90 ms inside it and a driver call with its own work id 40-60 ms
+    // inside that.
+    OnThread([&] {
+        RegisterThread("present worker");
+        RecordSpan(Cause::Texture, run.T(0), run.T(100 * Ms), worker);
+        RecordSpan(Cause::Disk, run.T(20 * Ms), run.T(90 * Ms));
+        RecordSpan(Cause::Pipeline, run.T(40 * Ms), run.T(60 * Ms), driver);
+    });
+    const SpanToken wait = run.NextRootToken();
+    RecordSpan(Cause::Waiting, run.T(0), run.T(100 * Ms));
+    LinkWait(wait, worker, DependencyKind::Join);
+    Present(run.T(150 * Ms));
+    run.Finish();
+    REQUIRE(g_frames.size() == 1);
+    const Times& cause = g_frames[0].cause_ns;
+    CHECK(At(cause, Cause::Texture) == 30 * Ms);
+    CHECK(At(cause, Cause::Disk) == 50 * Ms);
+    CHECK(At(cause, Cause::Pipeline) == 20 * Ms);
+    CHECK(At(cause, Cause::Waiting) == 0);
+    CHECK(At(cause, Cause::Unknown) == 50 * Ms);
+    CHECK(Total(cause) == 150 * Ms);
+}
+
+TEST_CASE("A wait on the nested work itself still sees only that work", "[nx2][attribution]") {
+    Run run;
+    const WorkId task = NewWorkId();
+    const WorkId driver = NewWorkId();
+    Present(run.T(0));
+    OnThread([&] {
+        RegisterThread("pipeline worker");
+        RecordSpan(Cause::Shader, run.T(10 * Ms), run.T(90 * Ms), task);
+        RecordSpan(Cause::Pipeline, run.T(30 * Ms), run.T(70 * Ms), driver);
+    });
+    const SpanToken wait = run.NextRootToken();
+    RecordSpan(Cause::Waiting, run.T(0), run.T(100 * Ms));
+    LinkWait(wait, driver, DependencyKind::Job);
+    Present(run.T(150 * Ms));
+    run.Finish();
+    REQUIRE(g_frames.size() == 1);
+    const Times& cause = g_frames[0].cause_ns;
+    CHECK(At(cause, Cause::Pipeline) == 40 * Ms);
+    CHECK(At(cause, Cause::Shader) == 0);
+    CHECK(At(cause, Cause::Waiting) == 60 * Ms);
+    CHECK(Total(cause) == 150 * Ms);
+}
+
 TEST_CASE("A circular wait terminates and is marked ambiguous", "[nx2][attribution]") {
     Run run;
     const WorkId a = NewWorkId();
