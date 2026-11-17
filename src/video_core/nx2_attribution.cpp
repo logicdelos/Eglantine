@@ -127,6 +127,11 @@ struct RingEvent {
 };
 static_assert(sizeof(RingEvent) <= 64);
 
+/// The time a ring event is ordered by: when a span ended for its End, else when it began.
+constexpr u64 EventTime(const RingEvent& event) noexcept {
+    return event.type == EventType::End ? event.end_ns : event.begin_ns;
+}
+
 constexpr size_t GuestStateCount = 5; ///< GuestState values, Off included
 /// Slots of one thread's handler table: the first seven hold one handler each, the last takes the
 /// ones past them (read as the handler 0, "unknown").
@@ -1369,7 +1374,8 @@ struct Session {
     void StopConsumer();
     void ConsumerMain();
     void DrainAll();
-    bool DrainThread(u32 id, ThreadBuf& buf, u64 tail, u64 limit);
+    u64 RoundCutoff(const std::array<u64, MaxThreads>& tails, u32 count, u64 limit) const;
+    bool DrainThread(u32 id, ThreadBuf& buf, u64 tail, u64 limit, u64 until);
     void SampleStates(u64 now, bool force);
     void RelieveHistory(u64 stamp, const std::array<u64, MaxThreads>& tails, u32 count);
     bool ResolveInPart(u64 through);
@@ -1720,12 +1726,20 @@ void Session::DropPendingEnds() {
 }
 
 /// Takes the events of one ring from its head up to `tail` (a snapshot of the pass), at most
-/// `limit` of them, and says whether events up to `tail` are left.
-bool Session::DrainThread(u32 id, ThreadBuf& buf, u64 tail, u64 limit) {
+/// `limit` of them and none later than `until` (see EventTime), and says whether events up to
+/// `tail` are left.
+bool Session::DrainThread(u32 id, ThreadBuf& buf, u64 tail, u64 limit, u64 until) {
     ThreadState& state = states[id - 1];
     state.guest = buf.guest.load(std::memory_order_relaxed);
     const u64 head = buf.head.load(std::memory_order_relaxed);
-    const u64 stop_at = tail - head > limit ? head + limit : tail;
+    u64 stop_at = tail - head > limit ? head + limit : tail;
+    if (until != OpenEnd) {
+        u64 reach = head;
+        while (reach < stop_at && EventTime(buf.events[reach & buf.mask]) <= until) {
+            ++reach;
+        }
+        stop_at = reach;
+    }
     for (u64 i = head; i < stop_at; ++i) {
         const RingEvent& event = buf.events[i & buf.mask];
         switch (event.type) {
@@ -1908,9 +1922,12 @@ void Session::ApplyLinks(bool age) {
 }
 
 /// Takes everything the rings held when it began. With a history that can resolve in part it takes
-/// the rings in rounds of a few events each, oldest first on every ring, and frees history between
-/// the rounds (RelieveHistory): a ring that delivers more at once than the history has room for is
-/// not lost, it is taken in as many rounds as it needs.
+/// the rings in rounds of a few events each, oldest first, and frees history between the rounds
+/// (RelieveHistory): a ring that delivers more at once than the history has room for is not lost,
+/// it is taken in as many rounds as it needs. A round takes the same time from every ring (see
+/// RoundCutoff), not the same number of events: rings whose threads ran at different times would
+/// otherwise keep the later ones in the history until the earliest has been taken, and the history
+/// can be full of them before it is.
 void Session::DrainAll() {
     const u64 stamp = NowNs();
     const u32 count = thread_count.load(std::memory_order_acquire);
@@ -1929,8 +1946,9 @@ void Session::DrainAll() {
     }
     for (bool more = true; more;) {
         more = false;
+        const u64 until = chunk_slots != 0 ? RoundCutoff(tails, count, round) : OpenEnd;
         for (u32 i = 0; i < count; ++i) {
-            more = DrainThread(i + 1, *threads[i], tails[i], round) || more;
+            more = DrainThread(i + 1, *threads[i], tails[i], round, until) || more;
         }
         if (more) {
             RelieveHistory(stamp, tails, count);
@@ -1939,6 +1957,27 @@ void Session::DrainAll() {
     ApplyEnds();
     ApplyLinks();
     TakeLosses();
+}
+
+/// The time a round takes events up to: every ring gives its next `limit` events at most, and the
+/// ring that would reach the least far in time sets the limit for all. That ring gives all of its
+/// `limit` events (they are no later than the time it set), so every round takes something.
+u64 Session::RoundCutoff(const std::array<u64, MaxThreads>& tails, u32 count, u64 limit) const {
+    u64 until = OpenEnd;
+    for (u32 i = 0; i < count; ++i) {
+        const ThreadBuf& buf = *threads[i];
+        const u64 head = buf.head.load(std::memory_order_relaxed);
+        if (head >= tails[i]) {
+            continue;
+        }
+        const u64 stop_at = tails[i] - head > limit ? head + limit : tails[i];
+        u64 reach = 0;
+        for (u64 k = head; k < stop_at; ++k) {
+            reach = std::max(reach, EventTime(buf.events[k & buf.mask]));
+        }
+        until = std::min(until, reach);
+    }
+    return until;
 }
 
 /// Frees history in the middle of a pass. `tails` are the pass's snapshots of the rings; what is
@@ -1958,8 +1997,7 @@ void Session::RelieveHistory(u64 stamp, const std::array<u64, MaxThreads>& tails
     for (u32 i = 0; i < count; ++i) {
         const ThreadBuf& buf = *threads[i];
         for (u64 k = buf.head.load(std::memory_order_relaxed); k < tails[i]; ++k) {
-            const RingEvent& event = buf.events[k & buf.mask];
-            bound = std::min(bound, event.type == EventType::End ? event.end_ns : event.begin_ns);
+            bound = std::min(bound, EventTime(buf.events[k & buf.mask]));
         }
     }
     ApplyEnds(); // the spans of this pass are complete in what is resolved
