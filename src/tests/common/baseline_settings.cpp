@@ -410,3 +410,27 @@ TEST_CASE("The printed baseline starts with the version and the hash", "[baselin
     CHECK(text.find("\nanti_aliasing=2\n") != std::string::npos);
     CHECK(text.find("\nscaling_filter=16\n") != std::string::npos);
 }
+
+TEST_CASE("A program requirement is listed but does not leave the baseline", "[baseline_settings]") {
+    Settings::Baseline::ClearNotedSources();
+    const auto values = std::make_unique<Settings::Values>();
+    values->memory_layout_mode.SetGlobal(false);
+    values->memory_layout_mode.SetValue(Settings::MemoryLayout::Memory_12Gb);
+    Settings::Baseline::NoteSource("memory_layout_mode", Settings::Baseline::kProgramRequirement);
+
+    auto deviations = Settings::Baseline::Deviations(*values, {});
+    REQUIRE(deviations.size() == 1);
+    CHECK(deviations[0].key == "memory_layout_mode");
+    CHECK(deviations[0].baseline == "0");
+    CHECK(deviations[0].effective == "4");
+    CHECK(deviations[0].source == "program requirement");
+    CHECK(Settings::Baseline::OnBaseline(deviations, {}));
+
+    // A noted source is forgotten when it is noted as empty; the value then reads as the config's.
+    Settings::Baseline::NoteSource("memory_layout_mode", {});
+    deviations = Settings::Baseline::Deviations(*values, {});
+    REQUIRE(deviations.size() == 1);
+    CHECK(deviations[0].source == "per-game config");
+    CHECK_FALSE(Settings::Baseline::OnBaseline(deviations, {}));
+    Settings::Baseline::ClearNotedSources();
+}

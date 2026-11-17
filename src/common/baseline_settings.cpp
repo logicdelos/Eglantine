@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdlib>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <string>
@@ -210,6 +211,13 @@ std::string Hash() {
 
 void NoteSource(std::string_view key, std::string_view source) {
     const std::scoped_lock lock{source_mutex};
+    if (source.empty()) {
+        const auto it = NotedSources().find(key);
+        if (it != NotedSources().end()) {
+            NotedSources().erase(it);
+        }
+        return;
+    }
     NotedSources().insert_or_assign(std::string{key}, std::string{source});
 }
 
@@ -281,7 +289,9 @@ std::vector<Deviation> Deviations() {
 bool OnBaseline(const std::vector<Deviation>& deviations,
                 const std::vector<std::string>& declared) {
     return std::all_of(deviations.begin(), deviations.end(), [&declared](const Deviation& deviation) {
-        return std::find(declared.begin(), declared.end(), deviation.key) != declared.end();
+        // What the emulator sets for the program by itself is part of running it, not a choice.
+        return deviation.source == kProgramRequirement ||
+               std::find(declared.begin(), declared.end(), deviation.key) != declared.end();
     });
 }
 

@@ -6,14 +6,17 @@
 # user/config/nx2_switches.txt) wins over this one, so editing this file is never
 # needed: copy the lines you want into your own and restart.
 #
-# Restart the emulator after editing.
+# Every line below is off: with no switch set the emulator runs on the baseline settings, which
+# are the settings every game is tested on (docs/baseline.md). A switch you add is a deviation
+# from the baseline. Restart the emulator after editing.
 
-# --- Performance tuning defaults for Switch 2 ---
-# Offload GPU method/macro execution to a second (back) thread.
-EDEN_NX2_SPLIT=2
+# --- Switches that are already on by default; listed only to turn them off ---
+# Offload GPU method/macro execution to the back thread. On by default; 0 turns it off.
+#EDEN_NX2_SPLIT=0
 
-# Batch GPU fence syncpoints to reduce host driver overhead and smooth frametimes.
-EDEN_NX2_FENCE_BATCH=1
+# Batch GPU fence syncpoints to reduce host driver overhead and smooth frametimes. On by default;
+# 0 releases one fence at a time.
+#EDEN_NX2_FENCE_BATCH=0
 
 # Leave buffer downloads disabled on Switch 2 (default): forcing downloads (=1) copies back
 # buffers the CPU never touches, which adds mutex contention and lowers FPS (upstream reported a

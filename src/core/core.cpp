@@ -11,6 +11,7 @@
 #include <utility>
 
 #include "game_settings.h"
+#include "common/baseline_settings.h"
 #include "common/cpu_features.h"
 #include "audio_core/audio_core.h"
 #include "common/fs/fs.h"
@@ -445,11 +446,15 @@ struct System::Impl {
 
         // Switch 2 titles size their heap from the total memory and need the 12 GiB layout. Set it
         // as a per-game value, so RestoreGlobalState brings back the configured layout afterwards.
+        // The baseline report lists it as a program requirement, not as a choice.
+        Settings::Baseline::NoteSource("memory_layout_mode", {});
         if (switch2_program &&
             Settings::values.memory_layout_mode.GetValue() != Settings::MemoryLayout::Memory_12Gb) {
             LOG_INFO(Core, "Switch 2 program: using the 12 GiB memory layout");
             Settings::values.memory_layout_mode.SetGlobal(false);
             Settings::values.memory_layout_mode.SetValue(Settings::MemoryLayout::Memory_12Gb);
+            Settings::Baseline::NoteSource("memory_layout_mode",
+                                           Settings::Baseline::kProgramRequirement);
         }
 
         // The Switch 2 counter runs at 31.25 MHz and its SDK converts ticks with that constant

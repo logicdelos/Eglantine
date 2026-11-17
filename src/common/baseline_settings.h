@@ -45,6 +45,11 @@ struct Deviation {
     std::string source;
 };
 
+/// The source of a setting the emulator sets for a program by itself (for example the memory layout
+/// of a Switch 2 program). It is listed as a deviation but does not take a run off the baseline:
+/// no one chose it, and it is the same on every run of that program.
+inline constexpr std::string_view kProgramRequirement = "program requirement";
+
 /// An EDEN_NX2_* environment switch that is set. Every one is a deviation from the baseline.
 struct EnvironmentSwitch {
     std::string name;

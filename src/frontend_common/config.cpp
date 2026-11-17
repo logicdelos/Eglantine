@@ -73,6 +73,7 @@ void Config::Initialize(const std::string& config_name) {
     case ConfigType::PerGameConfig:
         config_loc = FS::PathToUTF8String(fs_config_loc / "custom" / FS::ToU8String(config_file));
         void(FS::CreateParentDir(config_loc));
+        file_existed = FS::Exists(fs_config_loc / "custom" / FS::ToU8String(config_file));
         SetUpIni();
         Reload();
         break;
@@ -106,6 +107,12 @@ void Config::WriteToIni() const {
         config_type = "Input Profile";
         break;
     }
+    // Opening a game must not leave a per-game file behind: there is one baseline for every game,
+    // and a per-game config exists only when someone made one.
+    if (type == ConfigType::PerGameConfig && !file_existed && !HasContent()) {
+        LOG_DEBUG(Config, "No game specific configuration to write to: {}", config_loc);
+        return;
+    }
     LOG_INFO(Config, "Writing {} configuration to: {}", config_type, config_loc);
     FILE* fp = nullptr;
 #ifdef _WIN32
@@ -127,10 +134,33 @@ void Config::WriteToIni() const {
     fclose(fp);
 }
 
+bool Config::HasContent() const {
+    CSimpleIniA::TNamesDepend sections;
+    config->GetAllSections(sections);
+    for (const auto& section : sections) {
+        CSimpleIniA::TNamesDepend keys;
+        config->GetAllKeys(section.pItem, keys);
+        for (const auto& key : keys) {
+            const std::string_view name{key.pItem};
+            const bool global_flag = name.ends_with("\\use_global") &&
+                                     std::string_view{config->GetValue(section.pItem, key.pItem, "")} == "true";
+            if (!global_flag) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 void Config::SetUpIni() {
     config = std::make_unique<CSimpleIniA>();
     config->SetUnicode(true);
     config->SetSpaces(false);
+
+    // A per-game config that does not exist is not created by reading it.
+    if (type == ConfigType::PerGameConfig && !file_existed) {
+        return;
+    }
 
     FILE* fp = nullptr;
 #ifdef _WIN32
