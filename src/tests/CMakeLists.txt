@@ -34,6 +34,7 @@ add_executable(tests
     video_core/spirv_fragment_shuffle.cpp
     video_core/mesh_fallback.cpp
     video_core/spirv_software_matrix.cpp
+    common/baseline_settings.cpp
     common/bit_field.cpp
     common/cityhash.cpp
     common/container_hash.cpp
