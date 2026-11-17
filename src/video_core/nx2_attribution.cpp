@@ -67,6 +67,7 @@ size_t PeakResolverScratchBytes();
 size_t ResolverScratchAllowance();
 u64 DrainedRingEvents();
 u64 UndrainedRingEvents();
+bool HoldConsumer(bool hold);
 } // namespace Detail
 
 namespace {
@@ -335,8 +336,9 @@ struct CumulativeEntry {
 class Resolver {
 public:
     Resolver(std::span<const ThreadState> threads, std::span<const std::pair<u64, u64>> losses,
-             u64 start, u64 end)
-        : states{threads}, loss_episodes{losses}, s{start}, e{end} {}
+             u64 start, u64 end, bool charge_presenter_gaps)
+        : states{threads}, loss_episodes{losses}, s{start}, e{end},
+          charge_gaps{charge_presenter_gaps} {}
 
     Decomp Run(std::span<const u32> roots) {
         for (const auto& [begin, finish] : loss_episodes) {
@@ -489,6 +491,7 @@ private:
     }
 
     void ResolveRoots(std::span<const u32> roots) {
+        root_ids.assign(roots.begin(), roots.end());
         std::vector<const std::vector<Leaf>*> lists;
         for (const u32 root : roots) {
             if (root >= 1 && root <= leaves.size()) {
@@ -539,8 +542,7 @@ private:
                 }
             }
             if (best == nullptr) {
-                Charge(Cause::Unknown, x, y, 0);
-                out.reasons |= UnknownReason::UnlinkedGuest;
+                ExpandRootGap(x, y);
             } else if (best->cause == Cause::Waiting) {
                 visited.clear();
                 ExpandWait(x, y, *best);
@@ -655,9 +657,49 @@ private:
     /// cause (when several are, the span that ends last is the critical one, as for a linked wait);
     /// where none is, the guest was idle or waiting itself and the time stays Waiting.
     void ExpandGuestWait(u64 x, u64 y, const Leaf& wait) {
+        ExpandByActivity(
+            x, y,
+            [this, &wait](size_t t) {
+                return states[t].guest && static_cast<u32>(t + 1) != wait.thread;
+            },
+            [this](u64 from, u64 to) {
+                Charge(Cause::Waiting, from, to, 0);
+                out.reasons |= UnknownReason::ProducerUnknownWait;
+                out.producer_unknown_wait_ns += to - from;
+            });
+    }
+
+    /// Charges [x, y) of a stretch where the presenting thread has no span (its own work between
+    /// the waits it records, waits shorter than the recording threshold) by what every other thread
+    /// was doing meanwhile, with the rule of a guest wait: where one is in a cause that is not
+    /// waiting, the time goes to the cause of the span that ends last; where none is, it stays
+    /// Waiting (the presenter's own time, not a cause of its own). It is a bounded guess, so the
+    /// frame carries PresenterGap. Only when no thread recorded anything in the window is the time
+    /// Unknown: there is nothing to attribute it to.
+    void ExpandRootGap(u64 x, u64 y) {
+        if (!charge_gaps || leaf_total == 0) {
+            Charge(Cause::Unknown, x, y, 0);
+            out.reasons |= UnknownReason::UnlinkedGuest;
+            return;
+        }
+        out.reasons |= UnknownReason::PresenterGap;
+        ExpandByActivity(
+            x, y,
+            [this](size_t t) {
+                return std::find(root_ids.begin(), root_ids.end(), static_cast<u32>(t + 1)) ==
+                       root_ids.end();
+            },
+            [this](u64 from, u64 to) { Charge(Cause::Waiting, from, to, 0); });
+    }
+
+    /// Charges [x, y) by the leaves of the threads `include` accepts that are not waiting or
+    /// Unknown: the span that ends last is the critical one where several overlap, and `uncovered`
+    /// takes the pieces no such leaf covers.
+    template <typename Include, typename Uncovered>
+    void ExpandByActivity(u64 x, u64 y, Include&& include, Uncovered&& uncovered) {
         const auto each = [&](auto&& emit) {
             for (size_t t = 0; t < leaves.size(); ++t) {
-                if (!states[t].guest || static_cast<u32>(t + 1) == wait.thread) {
+                if (!include(t)) {
                     continue;
                 }
                 const std::vector<Leaf>& list = leaves[t];
@@ -673,11 +715,6 @@ private:
                     emit(piece);
                 }
             }
-        };
-        const auto uncovered = [this](u64 from, u64 to) {
-            Charge(Cause::Waiting, from, to, 0);
-            out.reasons |= UnknownReason::ProducerUnknownWait;
-            out.producer_unknown_wait_ns += to - from;
         };
         size_t count{};
         each([&count](const Leaf&) { ++count; });
@@ -810,6 +847,8 @@ private:
     std::span<const std::pair<u64, u64>> loss_episodes;
     u64 s;
     u64 e;
+    std::vector<u32> root_ids; ///< The roots of the sweep that is running (ResolveRoots)
+    bool charge_gaps; ///< SessionConfig::charge_presenter_gaps
     std::vector<std::vector<Leaf>> leaves;
     /// The spans of the window that carry a work id, clipped to it, sorted by (work, thread, begin).
     /// A leaf belongs to a work when it lies inside one of that work's spans on its thread, which is
@@ -874,6 +913,8 @@ struct Session {
     u64 last_actual_id{};
     bool stop{};
     std::atomic<bool> abandon{};
+    std::atomic<bool> hold_consumer{}; ///< Tests: park the consumer between its passes
+    std::atomic<bool> consumer_held{}; ///< The consumer is parked
     std::thread consumer;
 
     // Snapshot state, under stats_mutex
@@ -918,12 +959,19 @@ struct Session {
     u64 carry_through{}; ///< 0: nothing of the open interval is resolved yet
     u64 lost_history{};  ///< Of lost_consumer: records the history had no room for
     u64 lost_late{};     ///< Of lost_consumer: spans that ended before a resolved time
+    /// The presents the consumer took from the queue and has not processed (consumer thread only).
+    /// A pass that has to free history processes the ones whose events it has all taken.
+    std::deque<Item> work;
+    bool relief_items{true}; ///< False while the session is finalized: open spans are marked first
 
     void StartConsumer();
     void StopConsumer();
     void ConsumerMain();
     void DrainAll();
-    void DrainThread(u32 id, ThreadBuf& buf);
+    bool DrainThread(u32 id, ThreadBuf& buf, u64 tail, u64 limit);
+    void RelieveHistory(u64 stamp, const std::array<u64, MaxThreads>& tails, u32 count);
+    bool ResolveInPart(u64 through);
+    void HoldForTest();
     void ApplyLinks();
     bool CloseSpan(const PendingEnd& end);
     void ApplyEnds();
@@ -1067,7 +1115,7 @@ void Session::StopConsumer() {
 void Session::ConsumerMain() {
     bool finalized = false;
     for (;;) {
-        std::deque<Item> batch;
+        HoldForTest();
         bool stopping{};
         {
             std::unique_lock lock{queue_mutex};
@@ -1075,29 +1123,39 @@ void Session::ConsumerMain() {
                 queue_cv.wait_for(lock, ConsumerPeriod, [this] { return stop || !queue.empty(); });
             }
             stopping = stop;
-            batch.swap(queue);
+            work.swap(queue);
         }
         if (abandon.load(std::memory_order_relaxed)) {
             return;
         }
+        const bool had_items = !work.empty();
         if (stopping && !finalized) {
             finalized = true;
+            relief_items = false;
             Quiesce();
             DrainAll();
             DropPendingEnds(); // their begins never came: counted, not hidden
             MarkOpenIncomplete();
+            relief_items = true;
         } else {
+            if (had_items) {
+                Quiesce(); // what began before the presents is published before the pass begins
+            }
             DrainAll();
         }
-        for (const Item& item : batch) {
+        while (!work.empty()) {
             Quiesce();
             DrainAll();
-            Process(item);
+            if (work.empty()) {
+                break; // the pass processed them
+            }
+            Process(work.front());
+            work.pop_front();
         }
         if (!stopping) {
             MaybeChunk();
         }
-        if (stopping && batch.empty()) {
+        if (stopping && !had_items) {
             return;
         }
     }
@@ -1238,12 +1296,14 @@ void Session::DropPendingEnds() {
     pending_ends.clear();
 }
 
-void Session::DrainThread(u32 id, ThreadBuf& buf) {
+/// Takes the events of one ring from its head up to `tail` (a snapshot of the pass), at most
+/// `limit` of them, and says whether events up to `tail` are left.
+bool Session::DrainThread(u32 id, ThreadBuf& buf, u64 tail, u64 limit) {
     ThreadState& state = states[id - 1];
     state.guest = buf.guest.load(std::memory_order_relaxed);
     const u64 head = buf.head.load(std::memory_order_relaxed);
-    const u64 tail = buf.tail.load(std::memory_order_acquire);
-    for (u64 i = head; i < tail; ++i) {
+    const u64 stop_at = tail - head > limit ? head + limit : tail;
+    for (u64 i = head; i < stop_at; ++i) {
         const RingEvent& event = buf.events[i & buf.mask];
         switch (event.type) {
         case EventType::Begin: {
@@ -1317,7 +1377,8 @@ void Session::DrainThread(u32 id, ThreadBuf& buf) {
         }
         }
     }
-    buf.head.store(tail, std::memory_order_release);
+    buf.head.store(stop_at, std::memory_order_release);
+    return stop_at < tail;
 }
 
 void Session::ApplyLinks() {
@@ -1336,15 +1397,73 @@ void Session::ApplyLinks() {
     }
 }
 
+/// Takes everything the rings held when it began. With a history that can resolve in part it takes
+/// the rings in rounds of a few events each, oldest first on every ring, and frees history between
+/// the rounds (RelieveHistory): a ring that delivers more at once than the history has room for is
+/// not lost, it is taken in as many rounds as it needs.
 void Session::DrainAll() {
+    const u64 stamp = NowNs();
     const u32 count = thread_count.load(std::memory_order_acquire);
+    std::array<u64, MaxThreads> tails{};
     for (u32 i = 0; i < count; ++i) {
-        DrainThread(i + 1, *threads[i]);
+        tails[i] = threads[i]->tail.load(std::memory_order_acquire);
+    }
+    u64 round = std::numeric_limits<u64>::max();
+    if (chunk_slots != 0) {
+        round = std::clamp<u64>(static_cast<u64>((history_cap - chunk_slots) /
+                                                 (2 * std::max<size_t>(count, 1))),
+                                8, 256);
+    }
+    for (bool more = true; more;) {
+        more = false;
+        for (u32 i = 0; i < count; ++i) {
+            more = DrainThread(i + 1, *threads[i], tails[i], round) || more;
+        }
+        if (more) {
+            RelieveHistory(stamp, tails, count);
+        }
     }
     ApplyEnds();
     ApplyLinks();
     TakeLosses();
     NoteRetained();
+}
+
+/// Frees history in the middle of a pass. `tails` are the pass's snapshots of the rings; what is
+/// still in them would reach its frame too late if it began or ended before a time that is
+/// resolved, so everything here stays below the oldest of it. The presents queued up to that time
+/// have all their events: they are processed (they would otherwise stop everything behind them),
+/// then the open interval is resolved in part, as MaybeChunk does, up to the time of the pass less
+/// the margin publication needs.
+void Session::RelieveHistory(u64 stamp, const std::array<u64, MaxThreads>& tails, u32 count) {
+    if (chunk_slots == 0 || history < chunk_slots) {
+        return;
+    }
+    u64 bound = OpenEnd;
+    for (u32 i = 0; i < count; ++i) {
+        const ThreadBuf& buf = *threads[i];
+        for (u64 k = buf.head.load(std::memory_order_relaxed); k < tails[i]; ++k) {
+            const RingEvent& event = buf.events[k & buf.mask];
+            bound = std::min(bound, event.type == EventType::End ? event.end_ns : event.begin_ns);
+        }
+    }
+    ApplyEnds(); // the spans of this pass are complete in what is resolved
+    ApplyLinks();
+    TakeLosses();
+    while (relief_items && !work.empty() && work.front().ts < bound) {
+        Process(work.front());
+        work.pop_front();
+    }
+    u64 through = std::min(Sub(stamp, ChunkMarginNs), Sub(bound, 1));
+    if (!work.empty()) {
+        through = std::min(through, work.front().ts);
+    } else {
+        std::scoped_lock lock{queue_mutex};
+        if (!queue.empty()) {
+            through = std::min(through, queue.front().ts);
+        }
+    }
+    ResolveInPart(through);
 }
 
 void Session::MarkOpenIncomplete() {
@@ -1433,16 +1552,22 @@ void Session::MaybeChunk() {
     const u64 stamp = NowNs();
     Quiesce();
     DrainAll();
-    const u64 through = Sub(stamp, ChunkMarginNs);
-    const u64 from = last_resolved_ts != 0 ? last_resolved_ts : start_ns;
-    if (through <= from) {
-        return;
-    }
     {
         std::scoped_lock lock{queue_mutex};
         if (!queue.empty()) {
             return; // a present is waiting: it resolves the interval whole and prunes
         }
+    }
+    ResolveInPart(Sub(stamp, ChunkMarginNs));
+}
+
+/// Resolves the open interval from the last resolved time up to `through`, keeps the result as
+/// the carry the present that ends the interval joins, and prunes what it used. False when there
+/// is nothing to resolve.
+bool Session::ResolveInPart(u64 through) {
+    const u64 from = last_resolved_ts != 0 ? last_resolved_ts : start_ns;
+    if (through <= from) {
+        return false;
     }
     std::vector<u32> roots;
     if (have_prev) {
@@ -1470,6 +1595,25 @@ void Session::MaybeChunk() {
         cum.push_back({through, sum, cum_complete && carry.complete});
     }
     Prune(true);
+    return true;
+}
+
+/// Parks the consumer between its passes while a test holds it (one relaxed load otherwise).
+void Session::HoldForTest() {
+    if (!hold_consumer.load(std::memory_order_acquire)) {
+        return;
+    }
+    consumer_held.store(true, std::memory_order_release);
+    for (;;) {
+        {
+            std::scoped_lock lock{queue_mutex};
+            if (stop || !hold_consumer.load(std::memory_order_acquire)) {
+                break;
+            }
+        }
+        std::this_thread::yield();
+    }
+    consumer_held.store(false, std::memory_order_release);
 }
 
 /// Takes the part of the interval (s, e] that MaybeChunk resolved, and says where the rest begins.
@@ -1542,7 +1686,8 @@ void Session::LogDiagnostics() const {
 
 Decomp Session::Decompose(u64 s, u64 e, std::span<const u32> roots) const {
     const u32 count = thread_count.load(std::memory_order_acquire);
-    Resolver resolver{std::span<const ThreadState>{states.data(), count}, losses, s, e};
+    Resolver resolver{std::span<const ThreadState>{states.data(), count}, losses, s, e,
+                      config.charge_presenter_gaps};
     Decomp result = resolver.Run(roots);
     if (resolver.PeakScratchBytes() > peak_scratch_bytes.load(std::memory_order_relaxed)) {
         peak_scratch_bytes.store(resolver.PeakScratchBytes(), std::memory_order_relaxed);
@@ -1944,6 +2089,25 @@ u64 UndrainedRingEvents() {
                               t->head.load(std::memory_order_acquire)
                         : 0;
 }
+
+/// Test hook: parks the consumer (true) until it has stopped taking events, or lets it go
+/// (false). False without a session or when the consumer does not park in time.
+bool HoldConsumer(bool hold) {
+    Session* s = ActiveSession();
+    if (s == nullptr) {
+        return false;
+    }
+    s->hold_consumer.store(hold, std::memory_order_release);
+    if (!hold) {
+        return true;
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+    while (!s->consumer_held.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    return s->consumer_held.load(std::memory_order_acquire);
+}
 } // namespace Detail
 
 bool BeginSession(const SessionConfig& config) {
@@ -2021,7 +2185,7 @@ void MarkGuestThread() {
     if (s == nullptr) {
         return;
     }
-    ThreadBuf* t = ThisThread(*s);
+    ThreadBuf* t = ThisThread(*s, "guest core");
     if (t != nullptr && !t->guest.load(std::memory_order_relaxed)) {
         t->guest.store(true, std::memory_order_relaxed);
     }

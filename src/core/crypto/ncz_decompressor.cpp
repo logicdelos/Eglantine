@@ -27,6 +27,7 @@
 #include "core/crypto/key_manager.h"
 #include "core/crypto/ncz_decompressor.h"
 #include "core/file_sys/vfs/vfs.h"
+#include "video_core/nx2_spikes.h"
 
 namespace Core::Crypto {
 
@@ -168,6 +169,9 @@ private:
         catch (const std::bad_alloc&) { return false; }
         const u32 csize = sizes[id];
         if (csize < want) {
+            // The read of the compressed block is a Disk span nested in this one: not charged twice.
+            const VideoCommon::Nx2Spikes::SpanScope decompress{
+                VideoCommon::Nx2Spikes::Cause::Decompression, 0, want};
             const auto comp = source->ReadBytes(csize, offsets[id]);
             if (comp.size() != csize ||
                 Common::Compression::DecompressDataZSTD(comp, cache) != want) return false;
@@ -365,6 +369,8 @@ private:
                 const u64 want = std::min<u64>(end - pos, out_buf.size());
                 std::size_t produced = 0;
                 while (produced < want) {
+                    const VideoCommon::Nx2Spikes::SpanScope decompress{
+                        VideoCommon::Nx2Spikes::Cause::Decompression, 0, want - produced};
                     if (in.pos >= in.size) {
                         const u64 remaining = file_size - read_pos;
                         const std::size_t chunk = static_cast<std::size_t>(

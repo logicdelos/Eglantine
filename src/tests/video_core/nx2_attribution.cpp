@@ -18,6 +18,7 @@ size_t PeakResolverScratchBytes();
 size_t ResolverScratchAllowance();
 u64 UndrainedRingEvents();
 u64 DrainedRingEvents();
+bool HoldConsumer(bool hold);
 } // namespace VideoCommon::Nx2Spikes::Detail
 
 namespace {
@@ -52,8 +53,16 @@ u64 Total(const Times& times) {
     return total;
 }
 
-SessionConfig Config(u64 threshold_ns) {
+/// The strict decomposition most tests state: time the presenting thread has no span for is
+/// Unknown. The tests of the gap rule use a SessionConfig of their own (charging on, the default).
+SessionConfig Strict() {
     SessionConfig config;
+    config.charge_presenter_gaps = false;
+    return config;
+}
+
+SessionConfig Config(u64 threshold_ns) {
+    SessionConfig config = Strict();
     config.threshold_ns = threshold_ns;
     return config;
 }
@@ -75,7 +84,7 @@ void OnThread(F&& function) {
 /// Spans of the root (the test thread) are numbered from `root_seq`: the constructor spends the
 /// first sequence number on a probe span that ends before `base`.
 struct Run {
-    explicit Run(SessionConfig config = {}) {
+    explicit Run(SessionConfig config = Strict()) {
         g_frames.clear();
         SetLongFrameSink({CollectSink, nullptr});
         REQUIRE(BeginSession(config));
@@ -1563,6 +1572,54 @@ TEST_CASE("One frame with more spans than the history holds is resolved in part,
     CHECK(Detail::PeakRetainedHistoryBytes() <= Config(Ms).buffer_bytes / 2);
 }
 
+TEST_CASE("Rings that deliver more at once than the history holds lose nothing",
+          "[nx2][attribution]") {
+    Run run{Config(Ms)};
+    constexpr u32 Producers = 6;
+    constexpr u64 SpansEach = 4000; // inside a ring (4096), together nearly twice the history
+    const u64 start = NowNs();
+    Present(start);
+    REQUIRE(Detail::HoldConsumer(true)); // every event waits in its ring until all are published
+    std::array<u64, Producers> expected{};
+    std::vector<std::thread> threads;
+    for (u32 t = 0; t < Producers; ++t) {
+        threads.emplace_back([&expected, t] {
+            RegisterThread("burst producer");
+            for (u64 i = 0; i < SpansEach; ++i) {
+                const u64 begin = NowNs();
+                u64 end = NowNs();
+                while (end - begin < 1000) {
+                    end = NowNs();
+                }
+                RecordSpan(Cause::Shader, begin, end);
+                expected[t] += end - begin;
+            }
+        });
+    }
+    for (std::thread& thread : threads) {
+        thread.join();
+    }
+    const u64 end = NowNs();
+    Present(end);
+    REQUIRE(Detail::HoldConsumer(false));
+    AwaitFrames(1);
+    const AttributionSnapshot snap = run.Finish();
+    u64 sum = 0;
+    for (const u64 value : expected) {
+        sum += value;
+    }
+    CHECK(snap.lost_events == 0);
+    CHECK(snap.complete);
+    REQUIRE(g_frames.size() == 1);
+    const LongFrame& frame = g_frames[0];
+    CHECK(frame.duration_ns == end - start);
+    CHECK(frame.instrumentation_complete);
+    CHECK((frame.unknown_reasons & UnknownReason::LostSpans) == 0);
+    CHECK(Total(frame.cause_ns) == end - start);
+    CHECK(At(frame.activity_ns, Cause::Shader) == sum);
+    CHECK(Detail::PeakRetainedHistoryBytes() <= Config(Ms).buffer_bytes / 2);
+}
+
 TEST_CASE("Losses mark only the frames they fall in, however many there are",
           "[nx2][attribution]") {
     SessionConfig config = Config(10 * Ms);
@@ -1632,7 +1689,9 @@ TEST_CASE("A wait for the guest is charged to the guest's translation", "[nx2][a
     CHECK(At(frame.cause_ns, Cause::Unknown) == 0);
     CHECK(Total(frame.cause_ns) == frame.duration_ns);
     CHECK(frame.primary_cause == Cause::CodeTranslation);
-    CHECK(frame.unknown_reasons == 0);
+    // The 30 ms the guest was not translating is Waiting with no known producer: the reason bit
+    // is the one that goes with producer_unknown_wait_ns, and no other reason applies.
+    CHECK(frame.unknown_reasons == UnknownReason::ProducerUnknownWait);
     CHECK(frame.instrumentation_complete);
     CHECK(snap.producer_unknown_wait_ns == 30 * Ms);
 }
@@ -1759,4 +1818,94 @@ TEST_CASE("A long wait scope records one guest wait span", "[nx2][attribution]")
     CHECK(At(frame.cause_ns, Cause::CodeTranslation) >= LongWaitMinNs);
     CHECK(At(frame.cause_ns, Cause::CodeTranslation) < 200 * Ms);
     CHECK(Total(frame.cause_ns) == frame.duration_ns);
+}
+
+TEST_CASE("Time the presenting thread has no span for is charged by what the others were doing",
+          "[nx2][attribution]") {
+    SECTION("charged to the other threads' causes, the rest is Waiting") {
+        Run run{SessionConfig{}};
+        Present(run.T(0));
+        RecordSpan(Cause::Shader, run.T(0), run.T(30 * Ms));
+        OnThread([&] {
+            RegisterThread("worker");
+            RecordSpan(Cause::Disk, run.T(40 * Ms), run.T(70 * Ms));
+        });
+        OnThread([&] {
+            RegisterThread("guest core");
+            MarkGuestThread();
+            RecordSpan(Cause::CodeTranslation, run.T(60 * Ms), run.T(100 * Ms), 0, 1);
+        });
+        Present(run.T(150 * Ms));
+        run.Finish();
+        REQUIRE(g_frames.size() == 1);
+        const LongFrame& frame = g_frames[0];
+        // [30, 40) nobody works; [40, 60) the disk; [60, 100) the translation, which ends last of
+        // the two that overlap in [60, 70); [100, 150) nobody.
+        CHECK(At(frame.cause_ns, Cause::Shader) == 30 * Ms);
+        CHECK(At(frame.cause_ns, Cause::Disk) == 20 * Ms);
+        CHECK(At(frame.cause_ns, Cause::CodeTranslation) == 40 * Ms);
+        CHECK(At(frame.cause_ns, Cause::Waiting) == 60 * Ms);
+        CHECK(At(frame.cause_ns, Cause::Unknown) == 0);
+        CHECK(Total(frame.cause_ns) == 150 * Ms);
+        CHECK(frame.primary_cause == Cause::Waiting);
+        CHECK(frame.unknown_reasons == UnknownReason::PresenterGap);
+        CHECK(At(frame.activity_ns, Cause::Disk) == 30 * Ms);
+    }
+    SECTION("with nobody else working the gap is the presenter's own Waiting") {
+        Run run{SessionConfig{}};
+        Present(run.T(0));
+        RecordSpan(Cause::Shader, run.T(0), run.T(20 * Ms));
+        Present(run.T(150 * Ms));
+        run.Finish();
+        REQUIRE(g_frames.size() == 1);
+        CHECK(At(g_frames[0].cause_ns, Cause::Shader) == 20 * Ms);
+        CHECK(At(g_frames[0].cause_ns, Cause::Waiting) == 130 * Ms);
+        CHECK(At(g_frames[0].cause_ns, Cause::Unknown) == 0);
+        CHECK(g_frames[0].unknown_reasons == UnknownReason::PresenterGap);
+    }
+    SECTION("the strict decomposition leaves the gap Unknown") {
+        Run run{Strict()};
+        Present(run.T(0));
+        RecordSpan(Cause::Shader, run.T(0), run.T(30 * Ms));
+        OnThread([&] {
+            RegisterThread("worker");
+            RecordSpan(Cause::Disk, run.T(40 * Ms), run.T(70 * Ms));
+        });
+        Present(run.T(150 * Ms));
+        run.Finish();
+        REQUIRE(g_frames.size() == 1);
+        CHECK(At(g_frames[0].cause_ns, Cause::Unknown) == 120 * Ms);
+        CHECK(At(g_frames[0].cause_ns, Cause::Disk) == 0);
+        CHECK((g_frames[0].unknown_reasons & UnknownReason::PresenterGap) == 0);
+    }
+    SECTION("a window nobody recorded anything in stays Unknown") {
+        Run run{SessionConfig{}};
+        Present(run.T(0));
+        Present(run.T(150 * Ms));
+        run.Finish();
+        REQUIRE(g_frames.size() == 1);
+        CHECK(At(g_frames[0].cause_ns, Cause::Unknown) == 150 * Ms);
+        CHECK(g_frames[0].unknown_reasons == UnknownReason::UnlinkedGuest);
+    }
+    SECTION("a decompression with a file read inside it shows as both, each time once") {
+        Run run{SessionConfig{}};
+        Present(run.T(0));
+        RecordSpan(Cause::Shader, run.T(0), run.T(30 * Ms));
+        OnThread([&] {
+            RegisterThread("guest core");
+            MarkGuestThread();
+            RecordSpan(Cause::Decompression, run.T(40 * Ms), run.T(100 * Ms), 0, 1 << 20);
+            RecordSpan(Cause::Disk, run.T(50 * Ms), run.T(60 * Ms), 0, 4096);
+        });
+        Present(run.T(150 * Ms));
+        run.Finish();
+        REQUIRE(g_frames.size() == 1);
+        const LongFrame& frame = g_frames[0];
+        CHECK(At(frame.cause_ns, Cause::Disk) == 10 * Ms);
+        CHECK(At(frame.cause_ns, Cause::Decompression) == 50 * Ms);
+        CHECK(At(frame.cause_ns, Cause::Waiting) == 60 * Ms);
+        CHECK(At(frame.cause_ns, Cause::Unknown) == 0);
+        CHECK(Total(frame.cause_ns) == 150 * Ms);
+        CHECK(At(frame.activity_ns, Cause::Decompression) == 50 * Ms);
+    }
 }

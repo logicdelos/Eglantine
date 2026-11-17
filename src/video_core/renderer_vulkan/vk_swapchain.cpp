@@ -158,6 +158,8 @@ bool Swapchain::Create(
     // Submitted work may still wait on the old acquire/present semaphores; destroying them under
     // it loses the device on MoltenVK (window moved to a display with a different scale).
     if (swapchain) {
+        // Recreating the swapchain waits for the whole device: waiting, with no producer to name.
+        const VideoCommon::Nx2Spikes::SpanScope idle_wait{VideoCommon::Nx2Spikes::Cause::Waiting};
         std::scoped_lock lock{scheduler.submit_mutex};
         const VkResult result = device.GetLogical().WaitIdle();
         if (result == VK_ERROR_DEVICE_LOST) {

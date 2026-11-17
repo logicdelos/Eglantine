@@ -31,6 +31,7 @@
 #include "core/hle/service/nx2_oot_time.h"
 #include "core/loader/nso.h"
 #include "core/memory.h"
+#include "video_core/nx2_spikes.h"
 
 #ifdef HAS_NCE
 #include "core/arm/nce/patcher.h"
@@ -112,6 +113,8 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         for (std::size_t i = 0; i < nso_header.segments.size(); ++i) {
             nso_file.Read(compressed_data.data(), nso_header.segments_compressed_size[i], nso_header.segments[i].offset);
             if (nso_header.IsSegmentCompressed(i)) {
+                const VideoCommon::Nx2Spikes::SpanScope decompress{
+                    VideoCommon::Nx2Spikes::Cause::Decompression, 0, nso_header.segments[i].size};
                 if (nso_header.IsZBICCompressed()) {
                     // ZBIC compression
                     const int r = Common::Compression::DecompressDataZBIC(

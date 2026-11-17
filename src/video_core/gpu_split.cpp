@@ -649,6 +649,7 @@ void GpuSplit::RunIdleHook() {
 
 void GpuSplit::BackLoop(std::stop_token stop_token) {
     Common::SetCurrentThreadName("GPUBack");
+    VideoCommon::Nx2Spikes::RegisterThread("GPUBack");
     on_back_thread = true;
     Nx2Bottleneck::MarkThread(Nx2Bottleneck::Thread::GpuBack);
     back_running.store(true, std::memory_order_release);
