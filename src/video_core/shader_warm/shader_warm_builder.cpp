@@ -9,7 +9,6 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <fstream>
@@ -61,7 +60,6 @@ fs::path TitleDir(u64 title_id) {
 struct ArchiveFile {
     std::string path; ///< Inside the RomFS, '/' separated (the archive identity)
     FileSys::VirtualFile file;
-    size_t dictionaries{}; ///< The zstd dictionary pack it decompresses with (index)
 };
 
 /// Appends every file under `dir` to `out`, recursively, with its '/' separated path.
@@ -82,8 +80,6 @@ struct GameFiles {
     std::unique_ptr<FileSys::NupContainer> nup;
     std::unique_ptr<Loader::AppLoader> loader;
     std::vector<FileSys::VirtualDir> romfs;
-    /// romfs[0, program_romfs) are the program packages (base and update), the rest add-ons.
-    size_t program_romfs{};
 };
 
 /// Opens the game file and collects its RomFS trees into `game`. Returns the error text when the
@@ -106,12 +102,10 @@ std::optional<std::string> OpenGame(Core::System& system, const fs::path& game_p
             return "The game file is not a valid package";
         }
         std::vector<size_t> packages;
-        const auto base = game.nup->FindBasePackage();
-        const auto update = game.nup->FindBestUpdatePackage();
-        if (base) {
+        if (const auto base = game.nup->FindBasePackage()) {
             packages.push_back(*base);
         }
-        if (update) {
+        if (const auto update = game.nup->FindBestUpdatePackage()) {
             packages.push_back(*update);
         }
         std::sort(packages.begin(), packages.end());
@@ -121,25 +115,6 @@ std::optional<std::string> OpenGame(Core::System& system, const fs::path& game_p
             }
             if (auto dir = game.nup->GetRomFSDir(package)) {
                 game.romfs.push_back(std::move(dir));
-            }
-        }
-        game.program_romfs = game.romfs.size();
-        // Add-on content after them: the Xenoblade Chronicles 2 Switch 2 Edition keeps all its
-        // game data in add-ons. A standalone update names the application as well as a base.
-        // Opt-in (default off): EDEN_NX2_WARM_ADDON=1 reads the add-ons too. Read once.
-        static const bool read_addons = [] {
-            const char* value = std::getenv("EDEN_NX2_WARM_ADDON");
-            return value != nullptr && value[0] == '1';
-        }();
-        if (read_addons && (base || update)) {
-            const u64 program_id = game.nup->GetPackages()[base ? *base : *update].title_id;
-            for (const size_t addon : game.nup->FindAddonPackages(program_id)) {
-                if (stop.stop_requested()) {
-                    return "Stopped";
-                }
-                if (auto dir = game.nup->GetRomFSDir(addon)) {
-                    game.romfs.push_back(std::move(dir));
-                }
             }
         }
     } else {
@@ -157,7 +132,6 @@ std::optional<std::string> OpenGame(Core::System& system, const fs::path& game_p
         if (auto dir = FileSys::ExtractRomFS(romfs)) {
             game.romfs.push_back(std::move(dir));
         }
-        game.program_romfs = game.romfs.size();
     }
     if (game.romfs.empty()) {
         return "The game has no RomFS";
@@ -536,45 +510,29 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
     // each package's effects, sorted by path inside a package (see ClassifyGameFile).
     std::vector<ArchiveFile> archives;
     std::vector<ArchiveFile> effects;
-    // Pack 0 serves the program packages, the newest one wins. An add-on is independent of the
-    // others: it reads its own pack, or the program's when it has none.
-    std::vector<FileSys::VirtualFile> dictionary_packs(1);
-    for (size_t index = 0; index < game.romfs.size(); ++index) {
+    ZstdDictionaries dictionaries;
+    FileSys::VirtualFile dictionary_pack;
+    for (const auto& romfs : game.romfs) {
         std::vector<ArchiveFile> files;
-        ListFiles(game.romfs[index], "", files);
+        ListFiles(romfs, "", files);
         std::sort(files.begin(), files.end(),
                   [](const ArchiveFile& a, const ArchiveFile& b) { return a.path < b.path; });
-        std::vector<ArchiveFile> package_archives;
         std::vector<ArchiveFile> package_effects;
-        FileSys::VirtualFile package_pack;
         for (auto& file : files) {
             switch (ClassifyGameFile(file.path)) {
             case GameFileKind::ShaderArchive:
-                package_archives.push_back(file);
+                archives.push_back(file);
                 break;
             case GameFileKind::Effect:
                 package_effects.push_back(file);
                 break;
             case GameFileKind::ZstdDictionaries:
-                package_pack = file.file;
+                dictionary_pack = file.file; // the newest package wins
                 break;
             case GameFileKind::Other:
                 break;
             }
         }
-        size_t pack = 0;
-        if (package_pack && index < game.program_romfs) {
-            dictionary_packs[0] = std::move(package_pack);
-        } else if (package_pack) {
-            pack = dictionary_packs.size();
-            dictionary_packs.push_back(std::move(package_pack));
-        }
-        for (auto* list : {&package_archives, &package_effects}) {
-            for (auto& file : *list) {
-                file.dictionaries = pack;
-            }
-        }
-        archives.insert(archives.end(), package_archives.begin(), package_archives.end());
         effects.insert(effects.end(), package_effects.begin(), package_effects.end());
     }
     archives.insert(archives.end(), effects.begin(), effects.end());
@@ -584,25 +542,18 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
     if (stop.stop_requested()) {
         return fail("Stopped");
     }
-    std::vector<std::unique_ptr<ZstdDictionaries>> dictionaries;
-    size_t dictionary_count = 0;
-    for (const auto& pack : dictionary_packs) {
-        auto& loaded = dictionaries.emplace_back(std::make_unique<ZstdDictionaries>());
-        if (!pack) {
-            continue;
-        }
+    if (dictionary_pack) {
         try {
-            loaded->Load(pack->ReadAllBytes());
+            dictionaries.Load(dictionary_pack->ReadAllBytes());
         } catch (const ArchiveError& e) {
             LOG_WARNING(Render_Vulkan, "Shader precache: zstd dictionary pack: {}", e.what());
         }
-        dictionary_count += loaded->Count();
     }
     // Without archives the file is written empty: the precache then has only the pipeline cache
     // of earlier sessions to build.
     result.archives = archives.size();
     LOG_INFO(Render_Vulkan, "Shader precache build: {} archives, {} zstd dictionaries",
-             archives.size(), dictionary_count);
+             archives.size(), dictionaries.Count());
 
     compute_out.open(compute_tmp, std::ios::binary | std::ios::trunc);
     if (!compute_out) {
@@ -685,8 +636,7 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
             LOG_DEBUG(Render_Vulkan, "Shader precache: {}: {}", archive.path, error);
         };
         try {
-            WalkArchive(data, name, dictionaries[archive.dictionaries].get(), on_record,
-                        on_member_error, stop);
+            WalkArchive(data, name, &dictionaries, on_record, on_member_error, stop);
         } catch (const ArchiveError& e) {
             ++archive_errors;
             LOG_WARNING(Render_Vulkan, "Shader precache: {}: {}", archive.path, e.what());

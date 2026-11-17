@@ -31,11 +31,11 @@ Left out, code removed:
 - `EDEN_NX2_ZERO_PAGE_TRIM` (all-zero guest pages out of the working set): no measurable change on either game.
 - `EDEN_NX2_PROTECT_NO_LOCK` (protection changes without the map/unmap lock): no measurable change on either game.
 - `EDEN_NX2_ASTC_CHEAP_UPLOAD` (cheaper per-block set-up in the ASTC decoder): no measurable change on either game.
+- `EDEN_NX2_WARM_ADDON` (the shader precache build also reads a `.nup`'s add-on packages): no measurable change on Fire Emblem: Fortune's Weave; its Xenoblade Chronicles 2 runs were incomplete.
 
-Still in, off by default, while their incomplete Xenoblade Chronicles 2 runs are repeated:
+Still in, off by default, while its incomplete Xenoblade Chronicles 2 runs are repeated:
 
 - `EDEN_NX2_HIRES_TIMER`: the host timer thread waits on a high resolution waitable timer (Windows 10 1803 or later only). No measurable change on Fire Emblem: Fortune's Weave.
-- `EDEN_NX2_WARM_ADDON`: the shader precache build also reads the add-on packages of a `.nup`. No measurable change on Fire Emblem: Fortune's Weave.
 
 ### Command line
 
