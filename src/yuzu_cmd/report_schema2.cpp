@@ -263,6 +263,7 @@ std::string LongFrameJson(const Spikes::LongFrame& frame) {
     json["duration_ns"] = frame.duration_ns;
     json["cause_ns"] = CausesJson(frame.cause_ns);
     json["activity_ns"] = CausesJson(frame.activity_ns);
+    json["inferred_ns"] = CausesJson(frame.inferred_ns);
     json["primary_cause"] = std::string{CauseNameOf(frame.primary_cause)};
     json["confidence_permille"] = frame.confidence_permille;
     json["unknown_reasons"] = std::move(reason_list);
@@ -290,6 +291,7 @@ std::string AttributionJsonHead(const Spikes::AttributionSnapshot& snapshot) {
         enabled ? Fraction(snapshot.unknown_primary_frame_fraction) : Json(nullptr);
     json["producer_unknown_wait_ns"] =
         enabled ? Json(snapshot.producer_unknown_wait_ns) : Json(nullptr);
+    json["inferred_ns"] = enabled ? CausesJson(snapshot.inferred_ns) : Json(nullptr);
     std::string text = Dump(json);
     text.pop_back(); // the closing brace: the writer appends the long frames and `]}`
     text += ",\"long_frames\":[";

@@ -19,6 +19,7 @@ size_t ResolverScratchAllowance();
 u64 UndrainedRingEvents();
 u64 DrainedRingEvents();
 bool HoldConsumer(bool hold);
+void ForceHistoryRelief(bool on);
 } // namespace VideoCommon::Nx2Spikes::Detail
 
 namespace {
@@ -1620,6 +1621,70 @@ TEST_CASE("Rings that deliver more at once than the history holds lose nothing",
     CHECK(Detail::PeakRetainedHistoryBytes() <= Config(Ms).buffer_bytes / 2);
 }
 
+TEST_CASE("A link whose owner is still in its ring does not age between the rounds of a pass",
+          "[nx2][attribution]") {
+    Run run{Config(Ms)};
+    constexpr u64 Spans = 4000; // 500 rounds of 8 before the owner's record, far past 8 attempts
+    const WorkId work = NewWorkId();
+    Present(run.T(0));
+    REQUIRE(Detail::HoldConsumer(true));
+    Detail::ForceHistoryRelief(true);
+    for (u64 i = 0; i < Spans; ++i) {
+        (void)run.NextRootToken();
+        RecordSpan(Cause::Texture, run.T(i * 1000), run.T(i * 1000 + 1000));
+    }
+    const SpanToken wait = run.NextRootToken();
+    RecordSpan(Cause::Waiting, run.T(10 * Ms), run.T(100 * Ms));
+    OnThread([&] {
+        RegisterThread("producer");
+        RecordSpan(Cause::Shader, run.T(20 * Ms), run.T(60 * Ms), work);
+    });
+    OnThread([&] {
+        RegisterThread("linker");
+        LinkWait(wait, work, DependencyKind::Job);
+    });
+    Present(run.T(150 * Ms));
+    REQUIRE(Detail::HoldConsumer(false));
+    AwaitFrames(1);
+    const AttributionSnapshot snap = run.Finish();
+    CHECK(snap.lost_events == 0);
+    CHECK(snap.complete);
+    REQUIRE(g_frames.size() == 1);
+    const LongFrame& frame = g_frames[0];
+    CHECK(At(frame.cause_ns, Cause::Shader) == 40 * Ms); // the link reached its wait
+    CHECK(At(frame.cause_ns, Cause::Waiting) == 50 * Ms);
+    CHECK(At(frame.cause_ns, Cause::Texture) == Spans * 1000);
+    CHECK(Total(frame.cause_ns) == 150 * Ms);
+}
+
+TEST_CASE("Ending a session resolves nothing in part before the open spans are marked",
+          "[nx2][attribution]") {
+    Run run{Config(Ms)};
+    Present(run.T(0));
+    Present(run.T(5 * Ms));
+    AwaitFrames(1); // the first present is behind the consumer: only the last interval is left
+    REQUIRE(Detail::HoldConsumer(true));
+    (void)BeginSpan(Cause::Shader); // never ended
+    Present(run.T(60 * Ms));
+    WaitUntil(run.T(62 * Ms)); // the pass runs past the interval's end plus the margin
+    OnThread([&] {
+        RegisterThread("later work");
+        for (u64 i = 0; i < 300; ++i) {
+            const u64 begin = NowNs();
+            u64 end = NowNs();
+            while (end - begin < 1000) {
+                end = NowNs();
+            }
+            RecordSpan(Cause::Disk, begin, end);
+        }
+    });
+    Detail::ForceHistoryRelief(true); // the rounds of the final pass relieve the history
+    run.Finish();
+    REQUIRE(g_frames.size() == 2);
+    CHECK(g_frames[1].end_ns == run.T(60 * Ms));
+    CHECK_FALSE(g_frames[1].instrumentation_complete); // the open span was marked first
+}
+
 TEST_CASE("Losses mark only the frames they fall in, however many there are",
           "[nx2][attribution]") {
     SessionConfig config = Config(10 * Ms);
@@ -1836,7 +1901,7 @@ TEST_CASE("Time the presenting thread has no span for is charged by what the oth
             RecordSpan(Cause::CodeTranslation, run.T(60 * Ms), run.T(100 * Ms), 0, 1);
         });
         Present(run.T(150 * Ms));
-        run.Finish();
+        const AttributionSnapshot snap = run.Finish();
         REQUIRE(g_frames.size() == 1);
         const LongFrame& frame = g_frames[0];
         // [30, 40) nobody works; [40, 60) the disk; [60, 100) the translation, which ends last of
@@ -1850,6 +1915,16 @@ TEST_CASE("Time the presenting thread has no span for is charged by what the oth
         CHECK(frame.primary_cause == Cause::Waiting);
         CHECK(frame.unknown_reasons == UnknownReason::PresenterGap);
         CHECK(At(frame.activity_ns, Cause::Disk) == 30 * Ms);
+        // What the spans cover is observed; only the gaps are inferred, per cause.
+        CHECK(At(frame.inferred_ns, Cause::Shader) == 0);
+        CHECK(At(frame.inferred_ns, Cause::Disk) == 20 * Ms);
+        CHECK(At(frame.inferred_ns, Cause::CodeTranslation) == 40 * Ms);
+        CHECK(At(frame.inferred_ns, Cause::Waiting) == 60 * Ms);
+        CHECK(At(frame.inferred_ns, Cause::Unknown) == 0);
+        CHECK(Total(frame.inferred_ns) == 120 * Ms);
+        CHECK(At(snap.inferred_ns, Cause::Disk) == 20 * Ms);
+        CHECK(At(snap.inferred_ns, Cause::Waiting) == 60 * Ms);
+        CHECK(Total(snap.inferred_ns) == 120 * Ms);
     }
     SECTION("with nobody else working the gap is the presenter's own Waiting") {
         Run run{SessionConfig{}};
@@ -1862,6 +1937,8 @@ TEST_CASE("Time the presenting thread has no span for is charged by what the oth
         CHECK(At(g_frames[0].cause_ns, Cause::Waiting) == 130 * Ms);
         CHECK(At(g_frames[0].cause_ns, Cause::Unknown) == 0);
         CHECK(g_frames[0].unknown_reasons == UnknownReason::PresenterGap);
+        CHECK(At(g_frames[0].inferred_ns, Cause::Shader) == 0);
+        CHECK(At(g_frames[0].inferred_ns, Cause::Waiting) == 130 * Ms);
     }
     SECTION("the strict decomposition leaves the gap Unknown") {
         Run run{Strict()};
@@ -1877,6 +1954,7 @@ TEST_CASE("Time the presenting thread has no span for is charged by what the oth
         CHECK(At(g_frames[0].cause_ns, Cause::Unknown) == 120 * Ms);
         CHECK(At(g_frames[0].cause_ns, Cause::Disk) == 0);
         CHECK((g_frames[0].unknown_reasons & UnknownReason::PresenterGap) == 0);
+        CHECK(Total(g_frames[0].inferred_ns) == 0);
     }
     SECTION("a window nobody recorded anything in stays Unknown") {
         Run run{SessionConfig{}};

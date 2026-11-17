@@ -436,6 +436,10 @@ struct LongFrame {
     u64 duration_ns{}; ///< end_ns - start_ns
     std::array<u64, CauseCount> cause_ns{};
     std::array<u64, CauseCount> activity_ns{};
+    /// The part of cause_ns that is inferred, not observed: time the presenting thread has no span
+    /// for, charged by what the other threads did (UnknownReason::PresenterGap). Per cause, so a
+    /// table can mark it; cause_ns - inferred_ns is what spans cover.
+    std::array<u64, CauseCount> inferred_ns{};
     Cause primary_cause{Cause::Unknown}; ///< The largest cause_ns, Unknown on ties
     u32 confidence_permille{};           ///< 1000 - 1000 * Unknown / duration
     u32 unknown_reasons{};               ///< UnknownReason bits
@@ -673,6 +677,9 @@ struct AttributionSnapshot {
     double unknown_wall_fraction{};          ///< Over all long frames and both startup intervals
     double unknown_primary_frame_fraction{}; ///< Long frames whose largest bucket is Unknown
     u64 producer_unknown_wait_ns{};
+    /// The inferred part of the causes over all long frames and the startup intervals (the sum of
+    /// LongFrame::inferred_ns plus the start-up's), per cause.
+    std::array<u64, CauseCount> inferred_ns{};
     u64 process_created_ns{}; ///< 0: not set
     u64 process_created_uncertainty_ns{};
     u64 first_host_present_ns{}; ///< 0: no present yet
