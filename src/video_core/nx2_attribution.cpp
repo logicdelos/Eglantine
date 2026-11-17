@@ -140,6 +140,8 @@ struct ThreadBuf {
     std::atomic<u64> lost{};
     /// Events published per EventType (producer only; the consumer reads them for diagnostics).
     std::array<std::atomic<u64>, 4> kinds{};
+    /// Set by MarkGuestThread: this thread runs guest code (set by the producer, read at drain).
+    std::atomic<bool> guest{};
     // Overflow range [min, max] of the events this thread could not record. Only the owning thread
     // writes it (compare-exchange, no lock); the consumer takes it with exchange.
     std::atomic<u64> loss_min{OpenEnd};
@@ -178,6 +180,7 @@ struct SpanRec {
 struct ThreadState {
     std::vector<SpanRec> open;
     std::vector<SpanRec> closed;
+    bool guest{}; ///< Copied from the ring at each drain
 };
 
 struct PendingLink {
@@ -554,6 +557,10 @@ private:
     void ExpandWait(u64 x, u64 y, const Leaf& wait) {
         const SpanRec& span = *wait.span;
         if (!span.linked) {
+            if ((span.flags & SpanFlags::GuestWait) != 0) {
+                ExpandGuestWait(x, y, wait);
+                return;
+            }
             Charge(Cause::Waiting, x, y, 0);
             out.reasons |= UnknownReason::ProducerUnknownWait;
             out.producer_unknown_wait_ns += y - x;
@@ -638,6 +645,97 @@ private:
         }
         visited.pop_back();
         NoteScratch({}); // the work totals have grown while this level held its candidates
+        live_pieces -= count;
+        wait_pieces -= cands.capacity();
+        wait_points -= points.capacity();
+    }
+
+    /// Charges [x, y) of a wait for the guest (SpanFlags::GuestWait) by what the guest threads were
+    /// doing meanwhile: where one of them is in a cause that is not waiting, the time goes to that
+    /// cause (when several are, the span that ends last is the critical one, as for a linked wait);
+    /// where none is, the guest was idle or waiting itself and the time stays Waiting.
+    void ExpandGuestWait(u64 x, u64 y, const Leaf& wait) {
+        const auto each = [&](auto&& emit) {
+            for (size_t t = 0; t < leaves.size(); ++t) {
+                if (!states[t].guest || static_cast<u32>(t + 1) == wait.thread) {
+                    continue;
+                }
+                const std::vector<Leaf>& list = leaves[t];
+                auto it = std::partition_point(list.begin(), list.end(),
+                                               [x](const Leaf& leaf) { return leaf.t1 <= x; });
+                for (; it != list.end() && it->t0 < y; ++it) {
+                    if (it->cause == Cause::Waiting || it->cause == Cause::Unknown) {
+                        continue;
+                    }
+                    Leaf piece = *it;
+                    piece.t0 = std::max(it->t0, x);
+                    piece.t1 = std::min(it->t1, y);
+                    emit(piece);
+                }
+            }
+        };
+        const auto uncovered = [this](u64 from, u64 to) {
+            Charge(Cause::Waiting, from, to, 0);
+            out.reasons |= UnknownReason::ProducerUnknownWait;
+            out.producer_unknown_wait_ns += to - from;
+        };
+        size_t count{};
+        each([&count](const Leaf&) { ++count; });
+        if (count == 0) {
+            uncovered(x, y);
+            return;
+        }
+        std::vector<Leaf> cands;
+        cands.reserve(count);
+        std::vector<size_t> group_first; // where the pieces of each thread begin
+        each([&](const Leaf& piece) {
+            if (cands.empty() || cands.back().thread != piece.thread) {
+                group_first.push_back(cands.size());
+            }
+            cands.push_back(piece);
+        });
+        std::vector<u64> points;
+        points.reserve(2 * count + 2);
+        points.push_back(x);
+        points.push_back(y);
+        for (const Leaf& leaf : cands) {
+            points.push_back(leaf.t0);
+            points.push_back(leaf.t1);
+        }
+        std::sort(points.begin(), points.end());
+        points.erase(std::unique(points.begin(), points.end()), points.end());
+        live_pieces += count;
+        wait_pieces += cands.capacity();
+        wait_points += points.capacity();
+        NoteScratch({});
+        std::vector<size_t> cursor = group_first;
+        for (size_t p = 0; p + 1 < points.size(); ++p) {
+            const u64 a = points[p];
+            const u64 b = points[p + 1];
+            const Leaf* best = nullptr;
+            for (size_t g = 0; g < group_first.size(); ++g) {
+                const size_t last = g + 1 < group_first.size() ? group_first[g + 1] : cands.size();
+                while (cursor[g] < last && cands[cursor[g]].t1 <= a) {
+                    ++cursor[g];
+                }
+                if (cursor[g] >= last || cands[cursor[g]].t0 > a) {
+                    continue;
+                }
+                const Leaf& leaf = cands[cursor[g]];
+                if (best == nullptr || leaf.span_end > best->span_end ||
+                    (leaf.span_end == best->span_end &&
+                     (leaf.thread < best->thread ||
+                      (leaf.thread == best->thread && leaf.span->seq < best->span->seq)))) {
+                    best = &leaf;
+                }
+            }
+            if (best == nullptr) {
+                uncovered(a, b);
+            } else {
+                Charge(best->cause, a, b, best->work);
+            }
+        }
+        NoteScratch({}); // the work totals have grown while the candidates were held
         live_pieces -= count;
         wait_pieces -= cands.capacity();
         wait_points -= points.capacity();
@@ -1142,6 +1240,7 @@ void Session::DropPendingEnds() {
 
 void Session::DrainThread(u32 id, ThreadBuf& buf) {
     ThreadState& state = states[id - 1];
+    state.guest = buf.guest.load(std::memory_order_relaxed);
     const u64 head = buf.head.load(std::memory_order_relaxed);
     const u64 tail = buf.tail.load(std::memory_order_acquire);
     for (u64 i = head; i < tail; ++i) {
@@ -1915,6 +2014,17 @@ u32 RegisterThread(std::string_view name) {
     }
     const ThreadBuf* buf = ThisThread(*s, name);
     return buf != nullptr ? buf->id : 0;
+}
+
+void MarkGuestThread() {
+    Session* s = ActiveSession();
+    if (s == nullptr) {
+        return;
+    }
+    ThreadBuf* t = ThisThread(*s);
+    if (t != nullptr && !t->guest.load(std::memory_order_relaxed)) {
+        t->guest.store(true, std::memory_order_relaxed);
+    }
 }
 
 SpanToken BeginSpan(Cause cause, WorkId work, u64 amount) {

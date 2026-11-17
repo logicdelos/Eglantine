@@ -38,6 +38,7 @@
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/nx2_sampler.h"
+#include "video_core/nx2_spikes.h"
 
 namespace VideoCommon {
 
@@ -665,6 +666,10 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
             back_idle.store(true, std::memory_order_relaxed);
             Nx2Bottleneck::BeginIdle(Nx2Bottleneck::Thread::GpuBack);
+            // The back thread idles because the front has nothing for it, which is the guest not
+            // having given the front work: one span per wait (the idle hook in between is work).
+            VideoCommon::Nx2Spikes::LongWaitScope spin_wait{
+                VideoCommon::Nx2Spikes::SpanFlags::GuestWait};
             // The front usually sends more within microseconds: spin briefly before sleeping.
             for (u32 spins = 0; spins < 8192 && available == read_position &&
                                 !hook_requested.load(std::memory_order_relaxed);
@@ -673,6 +678,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 available = published.load(std::memory_order_acquire);
             }
             Nx2Bottleneck::EndIdle(Nx2Bottleneck::Thread::GpuBack);
+            spin_wait.End();
             if (available == read_position) {
                 hook_requested.store(false, std::memory_order_seq_cst);
                 // The front may already see everything consumed: Drain() waits for back_quiet
@@ -687,6 +693,8 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             }
             if (available == read_position) {
                 Nx2Bottleneck::IdleScope idle{Nx2Bottleneck::Thread::GpuBack};
+                VideoCommon::Nx2Spikes::LongWaitScope sleep_wait{
+                    VideoCommon::Nx2Spikes::SpanFlags::GuestWait};
                 // Publish bumps `wake` when it sees back_waiting: read it before the last look
                 // at `published`, so a publish in between ends the wait at once.
                 back_waiting.store(true, std::memory_order_seq_cst);

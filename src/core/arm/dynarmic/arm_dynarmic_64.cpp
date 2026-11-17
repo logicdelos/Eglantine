@@ -508,6 +508,9 @@ void SyncJitPhaseHook() {
 
 HaltReason ArmDynarmic64::RunThread(Kernel::KThread* thread) {
     SyncJitPhaseHook();
+    if (VideoCommon::Nx2Spikes::AttributionEnabled()) {
+        VideoCommon::Nx2Spikes::MarkGuestThread();
+    }
     if (Nx2Sampler::GuestTracking()) [[unlikely]] {
         SnapshotGuestModules(m_system);
     }

@@ -13,6 +13,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "common/common_types.h"
@@ -333,6 +334,7 @@ inline constexpr u32 Incomplete = 1u << 0;      ///< Still open when the session
 inline constexpr u32 Failed = 1u << 1;          ///< The operation failed
 inline constexpr u32 Cancelled = 1u << 2;       ///< The operation was cancelled
 inline constexpr u32 ProducerUnknown = 1u << 3; ///< A wait that no LinkWait connected to work
+inline constexpr u32 GuestWait = 1u << 4; ///< A wait for the guest: see MarkGuestThread
 } // namespace SpanFlags
 
 /// One finished or open stretch of work on one thread. `parent` is the span open on the same
@@ -482,6 +484,12 @@ void EndSession();
 /// the first id). A thread that records without registering is registered as "unnamed".
 u32 RegisterThread(std::string_view name);
 
+/// Marks the calling thread as one that runs guest code (a CPU core thread). A wait recorded with
+/// SpanFlags::GuestWait is charged to the causes the guest threads were in while it lasted.
+/// Cheap and idempotent; call it where the thread runs guest code. Call only when
+/// AttributionEnabled().
+void MarkGuestThread();
+
 /// Opens a span on the calling thread and returns its token (invalid when recording is off).
 /// The span open on this thread becomes its parent. Call only when AttributionEnabled().
 SpanToken BeginSpan(Cause cause, WorkId work = 0, u64 amount = 0);
@@ -525,6 +533,46 @@ private:
     SpanToken token;
     u64 end_amount{};
     u32 flags{};
+};
+
+/// Waits shorter than this are not recorded by LongWaitScope: a thread that polls for work can
+/// idle thousands of times a second, and a span per poll would cost more than the attribution
+/// gains. The time of a dropped wait is not charged to Waiting (the thread was about to work), so
+/// a thread that polls faster than this shows the polls as time without a span.
+inline constexpr u64 LongWaitMinNs = 50'000;
+
+/// Records one Waiting span for an idle wait of the calling thread, only when it lasted at least
+/// LongWaitMinNs, as a single event when the wait ends (no event at the start). With
+/// SpanFlags::GuestWait the wait is a wait for the guest. Costs one relaxed load when recording is
+/// off, and two clock reads when on.
+class LongWaitScope {
+public:
+    explicit LongWaitScope(u32 wait_flags = 0)
+        : begin_ns{AttributionEnabled() ? NowNs() : 0}, flags{wait_flags} {}
+    ~LongWaitScope() {
+        End();
+    }
+    LongWaitScope(const LongWaitScope&) = delete;
+    LongWaitScope& operator=(const LongWaitScope&) = delete;
+
+    /// Ends the wait now (the destructor does nothing afterwards).
+    void End() {
+        if (begin_ns == 0) {
+            return;
+        }
+        const u64 start = std::exchange(begin_ns, 0);
+        if (!AttributionEnabled()) {
+            return;
+        }
+        const u64 end = NowNs();
+        if (end - start >= LongWaitMinNs) {
+            RecordSpan(Cause::Waiting, start, end, 0, 0, flags);
+        }
+    }
+
+private:
+    u64 begin_ns;
+    u32 flags;
 };
 
 /// Publishes a host present attempt. Returns its host_present_id when it qualifies

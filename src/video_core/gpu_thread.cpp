@@ -35,6 +35,7 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_spikes.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/renderer_base.h"
 
@@ -237,6 +238,9 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     // (title 1 waits ~25 times a second).
                     Profile::Scope scope{Profile::Zone::PendingSleep};
                     Nx2Bottleneck::IdleScope idle{Nx2Bottleneck::Thread::Gpu};
+                    // The wait for the guest: one attribution span, kept when long enough.
+                    VideoCommon::Nx2Spikes::LongWaitScope guest_wait{
+                        VideoCommon::Nx2Spikes::SpanFlags::GuestWait};
                     if (std::chrono::steady_clock::now() - last_progress <
                         std::chrono::microseconds{100}) {
 #if defined(ARCHITECTURE_x86_64)
@@ -255,6 +259,9 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
             } else {
                 Profile::Scope scope{Profile::Zone::Idle};
                 Nx2Bottleneck::IdleScope idle{Nx2Bottleneck::Thread::Gpu};
+                // The wait for the guest: one attribution span, kept when long enough.
+                VideoCommon::Nx2Spikes::LongWaitScope guest_wait{
+                    VideoCommon::Nx2Spikes::SpanFlags::GuestWait};
                 state.queue.PopWait(next, stop_token);
             }
             if (stop_token.stop_requested()) {
@@ -268,6 +275,8 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 list != nullptr && !next.block) {
                 // Held on purpose: not work.
                 Nx2Bottleneck::IdleScope idle{Nx2Bottleneck::Thread::Gpu};
+                // Pacing, not a wait for the guest: Waiting without the guest link.
+                VideoCommon::Nx2Spikes::LongWaitScope pacing_wait;
                 HoldForGpuLatency(*list, stop_token);
             }
             if (split.Active()) {
