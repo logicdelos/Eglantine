@@ -52,7 +52,7 @@ struct Fixture {
         prepared = RunReport::Prepare((directory / "report.json").string(), message) ==
                    RunReport::PrepareResult::Ready;
         RunReport::SetBaselineRequest(false, {});
-        RunReport::CaptureStart();
+        RunReport::CaptureStart({});
     }
 
     ~Fixture() {
