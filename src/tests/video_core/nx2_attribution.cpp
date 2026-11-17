@@ -1613,3 +1613,150 @@ TEST_CASE("Losses mark only the frames they fall in, however many there are",
     CHECK_FALSE(g_frames[4].instrumentation_complete);
     CHECK((g_frames[4].unknown_reasons & UnknownReason::LostSpans) != 0);
 }
+
+TEST_CASE("A wait for the guest is charged to the guest's translation", "[nx2][attribution]") {
+    Run run;
+    Present(run.T(0));
+    OnThread([&] {
+        RegisterThread("guest core");
+        MarkGuestThread();
+        RecordSpan(Cause::CodeTranslation, run.T(0), run.T(120 * Ms), 0, 1);
+    });
+    RecordSpan(Cause::Waiting, run.T(0), run.T(150 * Ms), 0, 0, SpanFlags::GuestWait);
+    Present(run.T(150 * Ms));
+    const AttributionSnapshot snap = run.Finish();
+    REQUIRE(g_frames.size() == 1);
+    const LongFrame& frame = g_frames[0];
+    CHECK(At(frame.cause_ns, Cause::CodeTranslation) == 120 * Ms);
+    CHECK(At(frame.cause_ns, Cause::Waiting) == 30 * Ms);
+    CHECK(At(frame.cause_ns, Cause::Unknown) == 0);
+    CHECK(Total(frame.cause_ns) == frame.duration_ns);
+    CHECK(frame.primary_cause == Cause::CodeTranslation);
+    CHECK(frame.unknown_reasons == 0);
+    CHECK(frame.instrumentation_complete);
+    CHECK(snap.producer_unknown_wait_ns == 30 * Ms);
+}
+
+TEST_CASE("A wait for a guest that is idle or waiting itself stays Waiting",
+          "[nx2][attribution]") {
+    Run run;
+    Present(run.T(0));
+    OnThread([&] {
+        RegisterThread("guest core");
+        MarkGuestThread();
+        // Its own wait is not work: it must not be taken for a cause.
+        RecordSpan(Cause::Waiting, run.T(20 * Ms), run.T(90 * Ms));
+    });
+    RecordSpan(Cause::Waiting, run.T(0), run.T(150 * Ms), 0, 0, SpanFlags::GuestWait);
+    Present(run.T(150 * Ms));
+    const AttributionSnapshot snap = run.Finish();
+    REQUIRE(g_frames.size() == 1);
+    const LongFrame& frame = g_frames[0];
+    CHECK(At(frame.cause_ns, Cause::Waiting) == 150 * Ms);
+    CHECK(At(frame.cause_ns, Cause::Unknown) == 0);
+    CHECK(Total(frame.cause_ns) == frame.duration_ns);
+    CHECK(frame.primary_cause == Cause::Waiting);
+    CHECK(snap.producer_unknown_wait_ns == 150 * Ms);
+}
+
+TEST_CASE("A wait for the guest splits between guest causes and waiting, and sums exactly",
+          "[nx2][attribution]") {
+    Run run;
+    Present(run.T(0));
+    OnThread([&] {
+        RegisterThread("guest core 0");
+        MarkGuestThread();
+        RecordSpan(Cause::Disk, run.T(10 * Ms), run.T(40 * Ms));
+    });
+    OnThread([&] {
+        RegisterThread("guest core 1");
+        MarkGuestThread();
+        RecordSpan(Cause::CodeTranslation, run.T(30 * Ms), run.T(90 * Ms), 0, 1);
+    });
+    // A host worker is not a guest thread: its span is no reason for the wait.
+    OnThread([&] {
+        RegisterThread("host worker");
+        RecordSpan(Cause::Shader, run.T(0), run.T(150 * Ms));
+    });
+    RecordSpan(Cause::Waiting, run.T(0), run.T(150 * Ms), 0, 0, SpanFlags::GuestWait);
+    Present(run.T(150 * Ms));
+    run.Finish();
+    REQUIRE(g_frames.size() == 1);
+    const LongFrame& frame = g_frames[0];
+    // 10-30 ms disk alone, 30-90 ms translation (it ends last where both run), 0-10 and 90-150
+    // ms nobody on the guest side.
+    CHECK(At(frame.cause_ns, Cause::Disk) == 20 * Ms);
+    CHECK(At(frame.cause_ns, Cause::CodeTranslation) == 60 * Ms);
+    CHECK(At(frame.cause_ns, Cause::Waiting) == 70 * Ms);
+    CHECK(At(frame.cause_ns, Cause::Shader) == 0);
+    CHECK(At(frame.cause_ns, Cause::Unknown) == 0);
+    CHECK(Total(frame.cause_ns) == 150 * Ms);
+    CHECK(At(frame.activity_ns, Cause::Shader) == 150 * Ms);
+}
+
+TEST_CASE("Without a wait, guest spans or a missing wait stay Unknown", "[nx2][attribution]") {
+    SECTION("no spans at all") {
+        Run run;
+        Present(run.T(0));
+        Present(run.T(150 * Ms));
+        run.Finish();
+        REQUIRE(g_frames.size() == 1);
+        CHECK(At(g_frames[0].cause_ns, Cause::Unknown) == 150 * Ms);
+        CHECK((g_frames[0].unknown_reasons & UnknownReason::UnlinkedGuest) != 0);
+        CHECK(Total(g_frames[0].cause_ns) == 150 * Ms);
+    }
+    SECTION("guest work while the render thread has no wait recorded") {
+        Run run;
+        Present(run.T(0));
+        OnThread([&] {
+            RegisterThread("guest core");
+            MarkGuestThread();
+            RecordSpan(Cause::CodeTranslation, run.T(0), run.T(100 * Ms), 0, 1);
+        });
+        Present(run.T(150 * Ms));
+        run.Finish();
+        REQUIRE(g_frames.size() == 1);
+        CHECK(At(g_frames[0].cause_ns, Cause::Unknown) == 150 * Ms);
+        CHECK(At(g_frames[0].cause_ns, Cause::CodeTranslation) == 0);
+        CHECK((g_frames[0].unknown_reasons & UnknownReason::UnlinkedGuest) != 0);
+    }
+}
+
+TEST_CASE("An unlinked wait without the guest flag keeps its meaning", "[nx2][attribution]") {
+    Run run;
+    Present(run.T(0));
+    OnThread([&] {
+        RegisterThread("guest core");
+        MarkGuestThread();
+        RecordSpan(Cause::CodeTranslation, run.T(0), run.T(120 * Ms), 0, 1);
+    });
+    RecordSpan(Cause::Waiting, run.T(0), run.T(150 * Ms));
+    Present(run.T(150 * Ms));
+    const AttributionSnapshot snap = run.Finish();
+    REQUIRE(g_frames.size() == 1);
+    CHECK(At(g_frames[0].cause_ns, Cause::Waiting) == 150 * Ms);
+    CHECK(At(g_frames[0].cause_ns, Cause::CodeTranslation) == 0);
+    CHECK(snap.producer_unknown_wait_ns == 150 * Ms);
+}
+
+TEST_CASE("A long wait scope records one guest wait span", "[nx2][attribution]") {
+    Run run;
+    Present(run.T(0));
+    OnThread([&] {
+        RegisterThread("guest core");
+        MarkGuestThread();
+        RecordSpan(Cause::CodeTranslation, run.T(0), run.T(200 * Ms), 0, 1);
+    });
+    {
+        LongWaitScope wait{SpanFlags::GuestWait};
+        WaitUntil(NowNs() + LongWaitMinNs);
+    }
+    Present(run.T(200 * Ms));
+    run.Finish();
+    REQUIRE(g_frames.size() == 1);
+    const LongFrame& frame = g_frames[0];
+    // The scope's span lies at real time inside the frame: the guest's translation takes it.
+    CHECK(At(frame.cause_ns, Cause::CodeTranslation) >= LongWaitMinNs);
+    CHECK(At(frame.cause_ns, Cause::CodeTranslation) < 200 * Ms);
+    CHECK(Total(frame.cause_ns) == frame.duration_ns);
+}
