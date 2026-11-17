@@ -147,7 +147,7 @@ PATH_REF_RE = re.compile(r"[\"<]([A-Za-z0-9_./\\-]+\.(?:json|toml|ini|ya?ml|csv|
 COMPARE_RE = re.compile(
     r"([A-Za-z_][\w.>:-]*(?:\([^()]*\))?)\s*([!=]=)\s*([A-Za-z_0-9][\w.>:-]*(?:\([^()]*\))?)"
 )
-ZERO_RE = re.compile(r"^(?:0|0[xX]0+|0[uU]?[lL]*|\{\}|nullptr|false|true)$")
+ZERO_RE = re.compile(r"^(?:(?:0|0[xX]0+)[uUlL]*|\{\}|nullptr|false|true)$")
 SAFE_OTHER_RE = re.compile(
     r"(?i)result|status|success|error|\bend\(|\bcend\(|\bnpos\b|nullopt|\bnull\b|\bnone\b|invalid"
 )
@@ -659,12 +659,13 @@ def main(argv=None):
     mode.add_argument("--name-digest", metavar="NAME", help="print the catalogue digest of a game name and exit")
     parser.add_argument("--allowlist", help="allow-list file (default: %s)" % ALLOWLIST_PATH)
     parser.add_argument("--json", action="store_true", help="machine-readable output")
+    parser.add_argument("--exact-case", action="store_true", help="with --name-digest: digest for the exact-case set")
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
         return 2 if exc.code else 0
     if args.name_digest is not None:
-        print(name_digest(args.name_digest))
+        print(name_digest(args.name_digest, args.exact_case))
         return 0
     if not args.base and not args.all:
         print("error: give --base REV or --all", file=sys.stderr)
