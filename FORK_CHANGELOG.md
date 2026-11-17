@@ -16,7 +16,7 @@ All runs were made on one Windows 11 laptop: AMD Ryzen 9 8940HX, NVIDIA GeForce 
 
 Milestone 0.4, "Measured speed work": every speed change ships off by default behind an `EDEN_NX2_*` switch and is measured on and off before it is recommended. None of the switches below has been measured yet; the results are to be filled from the measurement table. Each is described in `dist/nx2_switches.txt`; `=1` turns it on.
 
-### Experiments
+### Speed experiments (measurement build; the release keeps only those with a measured gain)
 
 - `EDEN_NX2_PIN_GPU_THREADS`: pins the front and back GPU threads to physical performance cores of their own and keeps the emulated CPU cores off them (Windows only). Results: to be filled from the measurement table.
 - `EDEN_NX2_SKIP_EMPTY_FLUSH`: a fence flush skips its Vulkan queue submit when nothing was recorded since the last submit. Results: to be filled from the measurement table.
@@ -28,11 +28,9 @@ Milestone 0.4, "Measured speed work": every speed change ships off by default be
 - `EDEN_NX2_WARM_ADDON`: the shader precache build also reads the add-on packages of a `.nup`. Results: to be filled from the measurement table.
 - `EDEN_NX2_ASTC_CHEAP_UPLOAD`: cheaper per-block set-up in the Vulkan GPU ASTC decoder, and the opaque-ASTC scan reads guest data in place. Results: to be filled from the measurement table.
 
-## Unreleased
+### Command line
 
-Command-line additions for scripted runs of `eden-cli`. Not built or run yet at the time of writing.
-
-### New
+Additions for scripted runs of `eden-cli`. Not built or run yet at the time of writing.
 
 - `eden-cli --version --json` prints one JSON object on one line on standard output and exits with 0: `name`, `fork_version`, `flavour`, `revision`, `branch`, `description`, `upstream_base`, `build_id`, `build_date`, `compiler`, `report_schema_version` and an `options` object (`discord_presence`, `mcp_server`, `opengl`, `update_checker`, `web_service`). `fork_version`, `flavour` and `upstream_base` are `null` when the build recorded none. It answers before the log, the crash handler, the configuration and the user directory are touched, and creates no window. Plain `--version` is unchanged. `--json` without `--version` is a bad argument.
 - New CMake variable `EGLANTINE_UPSTREAM_BASE` (empty by default): the upstream commit a build is based on, reported as `upstream_base`. Nothing computes it; a release build passes it with `-DEGLANTINE_UPSTREAM_BASE=<commit>`.
@@ -44,30 +42,23 @@ Command-line additions for scripted runs of `eden-cli`. Not built or run yet at 
 - The control channel has two more commands, `get` and `set`, on the settings registry that `--list-settings` and `--set` use. `get` takes `name` and returns the setting as one line of `--list-settings` does, plus `runtime_modifiable`. `set` takes `name` and `value` (a boolean, a number or a string, checked like `--set`) and changes the setting in memory for the rest of the run, then applies it to the running game as the settings dialog does; the channel does not write the configuration file. Only a setting that the registry marks as changeable while the game runs is accepted, anything else is refused with `not_modifiable`. A credential is neither shown nor changed: `get` returns its name without a value, and `set` refuses it.
 - `EDEN_NX2_KEY_SCRIPT` steps can wait for an event instead of a time: `frame>=600:4` (frames presented), `after first_frame+3:4`, `after shaders_idle+5:4` (the shader build queue stayed empty for 5 s) and `after prev+2:-4` (after the previous step). `@120` at the end of a step gives up after 120 s (300 s for an event step without it). A step that gives up ends an unattended run with reason `timeout`, exit code 124, and a detail naming the step; the remaining steps are not run. Steps still run in order. The timed forms `<seconds>:<code>` and `f<N>:<code>` work as before.
 - The report gets a `steps` list when `EDEN_NX2_KEY_SCRIPT` is set: for each step its `when`, `key`, `action`, `status` (`fired`, `timed_out`, `skipped` or `pending`) and when it fired, in script seconds, run seconds and frames. The crash report does not include it. The report schema stays at version 1: `steps` and `user_dir` are optional fields.
-- Because of the new option names, some abbreviations of long options are now ambiguous and getopt refuses them: `--s` (`--singlecore`, `--set`), `--co` and `--con` (`--config`, `--control`), `--us` and `--use` (`--user`, `--user-dir`). The full names, and `--conf` and longer, work as before.
-
-### Changed
-
+- Because of the new option names, some abbreviations of long options are now ambiguous and getopt refuses them: `--s` (`--singlecore`, `--set`), `--co` and `--con` (`--config`, `--control`), `--us` and `--use` (`--user`, `--user-dir`), `--pr` (`--program`, `--print-baseline`), and `--b` to `--baselin` (`--baseline`, `--baseline-allow`). The full names, and `--conf`, `--pro`, `--baseline-` and longer, work as before. Every other abbreviation that names one option is read as that option, by getopt and by the early scan of `--user-dir` and `--version --json` alike.
 - A script in `EDEN_NX2_KEY_SCRIPT` with an item that has no colon or a number that cannot be read is now dropped as a whole, and an unattended run ends with exit code 1 (startup error); before, such items were skipped or ended the process with an uncaught exception.
 - Presented frames are now counted in every run, not only in unattended ones, so `frame>=` works without `--report`.
 
-## Unreleased
+### Baseline settings
 
-### New
-
-- The baseline: the defaults of every emulation setting are the settings every game is tested on, there is one set for all games, and it does not change with a game's title. It has a version (1) and a hash, listed with its history in [fork-notes/baseline.md](fork-notes/baseline.md). `eden-cli` gets `--print-baseline`, `--baseline`, `--baseline-allow KEY[,KEY...]` (also `KEY=VALUE`) and `--user-dir <dir>`. The run report has a `baseline` object with the version, the hash, whether the run is on the baseline and every deviation with its source.
-
-### Changes
-
+- The baseline: the defaults of every emulation setting are the settings every game is tested on, there is one set for all games, and it does not change with a game's title. It has a version (1) and a hash, listed with its history in [fork-notes/baseline.md](fork-notes/baseline.md). `eden-cli` gets `--print-baseline`, `--baseline` and `--baseline-allow KEY[,KEY...]` (also `KEY=VALUE`). The run report has a `baseline` object with the version, the hash, whether the run is on the baseline and every deviation with its source.
 - Default console mode is Docked, default anti-aliasing is SMAA and default scaling filter is BUF on desktop builds (they were handheld, FXAA and ScaleForce; Android keeps those). A configuration file that holds a value stored as the default follows the new default; a value chosen by the user is kept.
 - `dist/nx2_switches.txt` ships with no active line. `EDEN_NX2_SPLIT=2` and `EDEN_NX2_FENCE_BATCH=1` were set at every start of the Qt front end; both are what the code does when the switch is unset, so only the environment changes.
 - Opening a game in the Qt front end no longer writes an empty per-game configuration file.
 - Real frames by default: the new setting `allow_speed_up` (off, general, never per game; "Allow running faster than real time") decides whether your speed limit may speed a game up. With it off the speed limit cannot be switched off and cannot exceed 100 %: a limit that is off, above 100 %, 0 or the turbo speed gives 100 %, and a limit below 100 % still slows it down. The multiplier a game asks for itself when it queues a frame without waiting for the display (swap interval 0, a doubled composition rate) is not capped, as in upstream; the log has one Info line when it changes. With it on, behaviour is what it was. The status bar shows the speed limit in force. With it off the frame limit setting cannot make a game run fast; frames above a game's own rate are a matter for frame generation, which this fork has not tested. Android keeps its own defaults, is untested, and has no screen for the setting.
 - The baseline list gains the debug settings that change a run (`debug_knobs`, `disable_macro_hle`, `disable_macro_jit`, `disable_web_applet`, `enable_all_controllers`, `perform_vulkan_check`, `quest_flag`, `use_auto_stub`, `use_dev_keys`) and `allow_speed_up`; version 1 was never released, so it stays version 1 (126 entries).
-- A declared value is applied before the driver shader cache is set up. A bare `--baseline-allow` item that is neither a baseline setting nor an `EDEN_NX2_` switch name is refused. A `eden-cli` option missing its argument is a bad argument with exit 64, with or without `--report`. The early scan for `--user-dir` and `--version` follows getopt (arguments of options, abbreviations, `--`), and a valid `--user-dir` is applied before `--version --json` prints.
+- A declared value is applied before the driver shader cache is set up. A bare `--baseline-allow` item that is neither a baseline setting nor an `EDEN_NX2_` switch name is refused. A `eden-cli` option missing its argument is a bad argument with exit 64, with or without `--report`. The early scan for `--user-dir` and `--version` follows getopt (arguments of options, abbreviations, `--`), and `--version --json` prints only when the options the scan can see are in order.
 - The report's `baseline` object has a new `harness` list: the measurement harness variables that were set (`EDEN_NX2_DIAG_DIR`, `EDEN_NX2_FRAME_CAPTURE`, `EDEN_NX2_HIDE_WINDOW`, `EDEN_NX2_KEY_SCRIPT`), by name, never by value. They do not need a declaration. The value of any other environment switch is written as `set` unless it is a plain number or on, off, true, false, yes, no. Shader ablation by the live control file shows as the deviation `shader_ablation`, and the live `gpu` command as a deviation of `gpu_accuracy`; the crash report snapshot is refreshed for both.
 - A variable that holds a path, a file name or a script is reported as `set` whatever its value looks like (the name decides first: a relative path can be `123` or `on`), in the deviations and in the `tunables` list. The crash report snapshot is now always refreshed when shader ablation begins: a request that arrives while the report is being updated is carried out when that update ends, and is no longer dropped.
-- `eden-cli --version --json` with a mistake in one of the options of this fork (an option missing its argument, or a value given to `--baseline`, `--json`, `--print-baseline`) is now a bad argument with exit 64, like the same mistake without `--version --json`; it used to print the build identity and exit 0.
+- `eden-cli --version --json` with a mistake in one of the options of this fork (an option missing its argument, or a value given to `--baseline`, `--json`, `--print-baseline` or `--list-settings`) is now a bad argument with exit 64, like the same mistake without `--version --json`; it used to print the build identity and exit 0.
+- With `--baseline` the configuration file is saved before the baseline replaces its values, so they are not written to it. A `--set` value that differs from the baseline is a deviation with the source `command line`, and takes the run off the baseline unless the setting is declared with `--baseline-allow`.
 
 ## 0.3.0 (2026-11-16)
 
