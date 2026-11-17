@@ -10,6 +10,7 @@
 #pragma once
 
 #include <cstddef>
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include "common/container/unordered_map.h"
@@ -140,6 +141,9 @@ protected:
     Core::System& system;
     /// Identifier string used to connect to the service.
     const char* service_name;
+    /// The id of service_name in the attribution recorder (0: not interned yet).
+    std::atomic<u32> attribution_id{0};
+    u32 AttributionServiceId();
     /// Function used to safely up-cast pointers to the derived class before invoking a handler.
     InvokerFn* handler_invoker;
     /// Maximum number of concurrent sessions that this service can handle.

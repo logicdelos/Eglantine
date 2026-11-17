@@ -35,6 +35,7 @@
 #include "core/hle/service/ipc_helpers.h"
 #include "core/hle/service/kernel_helpers.h"
 #include "core/hle/service/service.h"
+#include "video_core/nx2_spikes.h"
 #include "core/hle/service/unimplemented_registry.h"
 #include "core/hle/service/nx2_stub_interface.h"
 #include "core/hle/service/sm/sm.h"
@@ -402,11 +403,29 @@ void CountRequest(const std::string& service, u32 command, u32 type, u32 result)
     LOG_INFO(Service, "ipc summary ({} kinds){}", lines.size(), text);
     counts.clear();
 }
+
 } // Anonymous namespace
+
+u32 ServiceFrameworkBase::AttributionServiceId() {
+    if (!VideoCommon::Nx2Spikes::AttributionEnabled()) {
+        return 0;
+    }
+    u32 id = attribution_id.load(std::memory_order_relaxed);
+    if (id == 0) {
+        id = VideoCommon::Nx2Spikes::InternServiceName(service_name);
+        attribution_id.store(id, std::memory_order_relaxed);
+    }
+    return id;
+}
 
 /// Handles one IPC request by command type, counting it and reporting it to the trace hook.
 Result ServiceFrameworkBase::HandleSyncRequest(Kernel::KServerSession& session,
                                                HLERequestContext& ctx) {
+    // The time of the handler (the wait for the service lock included) is the Service class in
+    // the split of Waiting. One relaxed load when recording is off.
+    const VideoCommon::Nx2Spikes::GuestStateScope attribution_state{
+        VideoCommon::Nx2Spikes::GuestState::Service, AttributionServiceId(),
+        ctx.IsTipc() ? (ctx.GetCommand() | 0x80000000u) : ctx.GetCommand()};
     const auto guard = LockService();
     // Request words for a trace observer, copied before the reply overwrites them.
     const auto ipc_hook = Core::Trace::g_ipc_hook.load(std::memory_order_relaxed);

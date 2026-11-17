@@ -25,6 +25,7 @@
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/physical_core.h"
 #include "core/hle/kernel/svc.h"
+#include "video_core/nx2_spikes.h"
 
 namespace Kernel {
 
@@ -128,7 +129,9 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
                 }
             } else {
                 const u64 run_begin = Nx2Bottleneck::Now();
+                VideoCommon::Nx2Spikes::NoteGuestState(VideoCommon::Nx2Spikes::GuestState::Running);
                 hr = interface->RunThread(thread);
+                VideoCommon::Nx2Spikes::NoteGuestState(VideoCommon::Nx2Spikes::GuestState::Other);
                 Nx2Bottleneck::AddGuestRun(m_core_index, Nx2Bottleneck::Now() - run_begin);
             }
 
@@ -269,6 +272,9 @@ void PhysicalCore::Idle(KernelCore& kernel) {
         spin_us = process != nullptr && process->IsSwitch2() ? 100 : 0;
 #endif
     }
+    // This core has nothing to run until it returns: the split of Waiting counts it as idle.
+    const VideoCommon::Nx2Spikes::GuestStateScope idle_state{
+        VideoCommon::Nx2Spikes::GuestState::Idle};
     const auto spin = std::chrono::microseconds{spin_us};
     if (spin.count() > 0) {
         const auto deadline = std::chrono::steady_clock::now() + spin;
@@ -313,6 +319,8 @@ void PhysicalCore::YieldIdle(KernelCore& kernel, std::chrono::nanoseconds limit)
         m_yield_woken = false;
         m_yield_idle.store(true, std::memory_order_release);
     }
+    const VideoCommon::Nx2Spikes::GuestStateScope idle_state{
+        VideoCommon::Nx2Spikes::GuestState::Idle};
     const u64 begin = Nx2Bottleneck::Now();
     m_on_interrupt.wait_until(lock, deadline, [this] {
         return m_yield_woken || m_is_interrupted.load(std::memory_order_acquire);

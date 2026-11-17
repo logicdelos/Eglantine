@@ -674,6 +674,14 @@ private:
     bool active{};
 };
 
+/// Reports the calling thread's state until it reports another. One relaxed load when recording is
+/// off.
+inline void NoteGuestState(GuestState state) {
+    if (AttributionEnabled()) {
+        RecordGuestState(state);
+    }
+}
+
 /// Publishes a host present attempt. Returns its host_present_id when it qualifies
 /// (QualifiesAsHostPresent), 0 otherwise; a non-qualifying attempt is only counted (and keeps
 /// the interval open, it never ends or starts one).
