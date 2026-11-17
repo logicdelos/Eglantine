@@ -248,7 +248,7 @@ TEST_CASE("schema 2 normal run: golden members", "[report][schema2]") {
 
     const Json expected_first_120s = Json::parse(R"({
       "anchor": "first_real_host_present", "complete": true, "elapsed_ns": 120000000000,
-      "frames": 480, "frames_over_100ms": 2, "max_ns": 150000000,
+      "frames": 480, "frames_over_100ms": 2, "frames_with_history_loss": 0, "max_ns": 150000000,
       "crossing_tail_interval_ns": 16000000, "scene_check": "passed"
     })");
     CHECK(report["first_120s"] == expected_first_120s);
