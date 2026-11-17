@@ -5,6 +5,7 @@
 
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "common/common_types.h"
 #include "common/run_outcome.h"
@@ -15,6 +16,9 @@
 // the Nx2Bottleneck collector and the exit reason from Common::RunOutcome; this only checks the
 // destination, gathers the rest and writes the file (to a temporary name first, then renamed).
 namespace RunReport {
+
+/// `schema_version` of the report; `--version --json` names it as well.
+inline constexpr int kSchemaVersion = 2;
 
 enum class PrepareResult {
     Ready,
@@ -31,7 +35,22 @@ enum class PrepareResult {
 
 /// Records what is only known at the start: the environment variables that tune the emulator and
 /// the settings as they are (after the config file and the command line were applied).
-void CaptureStart();
+/// `overridden_settings` are the names set with --set; they appear in `settings.overrides` with
+/// the value they have now.
+void CaptureStart(const std::vector<std::string>& overridden_settings);
+
+/// Takes the crash report's snapshot of the baseline object again, after something changed a
+/// setting or switched a diagnostics feature on while the game runs.
+void RefreshCrashSnapshot();
+
+/// After a setting was changed from outside the run while it goes on (the live control file, a
+/// control channel `set`): names `source` as where its value came from in the baseline object and
+/// takes the crash report's snapshot again. `settings.initial` keeps the state at the start.
+void NoteSettingChange(std::string_view key, std::string_view source);
+
+/// Records whether --baseline was given and the keys --baseline-allow declared, for the report's
+/// baseline object (version, hash, on_baseline, deviations). Call it before CaptureStart.
+void SetBaselineRequest(bool requested, std::vector<std::string> declared);
 
 /// The program id of the loaded game, for the report's title_id.
 void SetTitleId(u64 program_id);
@@ -85,7 +104,7 @@ void SetTitleId(u64 program_id);
 // <cause> is a Nx2Spikes::CauseName, <event> an Event name, "reason" a RejectReasonName.
 namespace Schema2 {
 
-inline constexpr int SchemaVersion = 2;
+inline constexpr int SchemaVersion = kSchemaVersion;
 
 /// Creates the long-frame spool (a JSONL temporary file next to the report destination given to
 /// Prepare) and installs the Nx2Spikes long frame sink that appends LongFrameJson lines to it.
@@ -109,5 +128,19 @@ inline constexpr int SchemaVersion = 2;
 [[nodiscard]] std::string CacheJson(const VideoCommon::CacheEnvelope::CacheReport& report);
 
 } // namespace Schema2
+
+// The three functions below exist for tests of the report text; the emulator never calls them.
+
+/// The normal report's text as Publish would write it now (the metrics recording is consumed).
+[[nodiscard]] std::string NormalDocumentText(Common::RunOutcome::Reason reason, int code,
+                                             bool shutdown_complete, std::string_view detail);
+
+/// The crash report's text as a crash would write it now: the snapshot taken before the run, with
+/// the counters of the moment. Empty when the crash report is not armed (Prepare was not called).
+[[nodiscard]] std::string CrashDocumentText(std::string_view detail);
+
+/// A function that runs on the thread that holds the report's lock after a crash snapshot was
+/// formatted and before it is published; nullptr removes it.
+void SetSnapshotTestHook(void (*hook)());
 
 } // namespace RunReport

@@ -1116,6 +1116,7 @@ add_library(core STATIC
     hle/service/vi/application_root_service.h
     hle/service/vi/conductor.cpp
     hle/service/vi/conductor.h
+    hle/service/vi/conductor_pace.h
     hle/service/vi/container.cpp
     hle/service/vi/container.h
     hle/service/vi/display.h

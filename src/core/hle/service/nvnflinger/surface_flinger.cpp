@@ -37,14 +37,14 @@ void SurfaceFlinger::RemoveDisplay(u64 display_id) {
 }
 
 bool SurfaceFlinger::ComposeDisplay(s32* out_swap_interval, f32* out_compose_speed_scale,
-                                    u64 display_id) {
+                                    s32* out_queued_swap_interval, u64 display_id) {
     auto* const display = this->FindDisplay(display_id);
     if (!display || !display->stack.HasLayers()) {
         return false;
     }
 
     *out_swap_interval =
-        m_composer.ComposeLocked(out_compose_speed_scale, *display,
+        m_composer.ComposeLocked(out_compose_speed_scale, out_queued_swap_interval, *display,
                                  *nvdrv->GetDevice<Nvidia::Devices::nvdisp_disp0>(disp_fd));
     return true;
 }

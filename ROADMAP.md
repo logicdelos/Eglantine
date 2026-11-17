@@ -4,6 +4,8 @@ Eglantine (logicdelos fork) is a fork of [Eglantine](https://github.com/Eglantin
 
 **Tested games.** This fork has been tested with two games only: **Fire Emblem: Fortune's Weave** and **Xenoblade Chronicles 2**. Other games may work as they do upstream, may work better, or may work worse; nobody has checked. Reports for other games are welcome.
 
+**Baseline.** Every game is tested on one set of settings, the defaults, so you can load a game without changing any setting; there are no per-game settings. A result on any other setting is labelled with the setting that differs. See [fork-notes/baseline.md](fork-notes/baseline.md).
+
 **Tested hardware.** One Windows 11 laptop: AMD Ryzen 9 8940HX, NVIDIA GeForce RTX 5070 Ti Laptop GPU, 16 GB RAM. Linux, macOS, AMD and Intel graphics are untested in this fork.
 
 ## Where this is going
@@ -51,27 +53,29 @@ Status: released as [fork-v0.2.0](https://github.com/logicdelos/Eglantine/releas
 Done when: both games reach their reference scenes with no new error lines and pictures within the comparison limit.
 
 ### 0.3: Unattended runs
-Status: planned.
+Status: released as [fork-v0.3.0](https://github.com/logicdelos/Eglantine/releases/tag/fork-v0.3.0) on 2026-11-16. The release gate passed against `fork-v0.2.0`, and the unattended exit test passed 10 of 10 cases: bad arguments, a frame limit, a time limit and a forced crash, on both tested games.
 
 **Significant change:** the command-line build can run a game for a set time or number of frames and write a machine-readable result file.
 
-- `--report`, `--run-seconds`, `--run-frames`, and exit codes that say how the run ended.
+- `--report`, `--run-seconds`, `--run-frames`, and exit codes that say how the run ended. See [fork-notes/unattended-runs.md](fork-notes/unattended-runs.md).
 - Crash handler, log flush thread and log rotation.
 
 Done when: a scripted run of each tested game ends with the right exit code and a complete report, including after a forced crash.
 
 ### 0.4: Measured speed work
-Status: planned.
+Status: in progress. The measurement is done and the release build is being checked; not released yet.
 
-**Significant change:** speed changes from sibling forks and from this fork, each published with its before-and-after measurement.
+**Significant change:** one general baseline of settings and real frames by default. Every speed candidate was measured on and off on both games, and only a measured gain would have been kept.
 
-- Candidates: the GPU thread split at high accuracy, pinned GPU threads, fewer empty submits, texture decode and encode in one submit, a high-resolution timer for frame pacing.
-- Candidates that show no gain, or that break a picture, are left out and listed as such.
+- Baseline: every game is tested on the defaults of every emulation setting, one set for all games, with a version and a hash. See [fork-notes/baseline.md](fork-notes/baseline.md).
+- Real frames by default: the new setting "Allow running faster than real time" (`allow_speed_up`) is off, so your speed limit cannot be switched off or raised above 100 %. Turning it on gives the old behaviour.
+- Nine candidates were measured: the GPU thread split at high accuracy, pinned GPU threads, fewer empty submits, texture decode and encode in one submit, a high-resolution timer, zero-page trimming, protection changes without a lock, add-on packages in the shader precache, and a cheaper texture decoder set-up. None showed a gain beyond the measured spread without a loss or a broken picture, so none is in the release; the release notes list each with its numbers and the reason.
+- Accuracy policy: no new game-specific code; the existing exceptions are frozen and listed. See [fork-notes/accuracy-policy.md](fork-notes/accuracy-policy.md).
 
-Done when: every candidate has a recorded result on both games and the release notes carry the table.
+Done when: every candidate has a recorded result on both games, the release notes carry the table, and the release gate passes against 0.3.0.
 
 ### 0.5: Smoother first minutes
-Status: planned.
+Status: in progress; not released.
 
 **Significant change:** shaders and pipelines are recorded on the first run and prepared ahead on later runs, so the second launch has far fewer long frames.
 

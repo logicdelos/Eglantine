@@ -92,7 +92,7 @@ inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 re
     const u32 opcode = input.Bits(0, 12);
     switch (opcode) {
     case 0x802: case 0xa02: case 0xb08: case 0xd08: operand(16); break;
-    case 0x804: case 0x80c: operand(24); break;
+    case 0x804: case 0x80b: case 0x80c: operand(24); break; // 0x80b: FSETP with an immediate
     case 0x805: operand(16, 2); break;
     case 0x306: case 0x308: operand(16); operand(32); break; // I2F, MUFU
     case 0x433: case 0x633: operand(16); operand(24); break;
@@ -108,6 +108,7 @@ inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 re
     case 0x219: // SHF, register form: Rd, low word, shift amount, high word
     case 0x210: case 0x223: operand(16); operand(24); operand(32); operand(64); break;
     case 0x233: operand(16); operand(24); operand(32); break;
+    case 0x419: operand(16); operand(64); break; // SHF, immediate low word: Rd, shift amount in Rb
     case 0xa20: case 0x621: case 0x808: case 0x923: operand(16); operand(24); break;
     case 0x209: operand(16); operand(24); operand(32); break;
     case 0xc24: // IMAD with a uniform multiplier: Rd, Ra and the addend Rc are registers
@@ -155,7 +156,7 @@ inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 re
     }
     case 0x387: case 0x983:
         operand(opcode == 0x387 ? 32 : 16); operand(24); break;
-    case 0x981: case 0x986: {
+    case 0x981: case 0x986: case 0x386: { // 0x386: STG with a register address
         const u32 width = input.Bits(73, 3), count = width == 6 ? 4 : width == 5 ? 2 : 1;
         operand(opcode == 0x981 ? 16 : 32, count);
         operand(24, input.Bits(72, 1) ? 2 : 1); break;
@@ -2147,6 +2148,10 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 (unsigned_byte && (insn.Bits(24, 8) || (insn.words[3] & 0xc00001ffU))) ||
                 (opcode != 0xb05 && (insn.words[1] & ~(half ? 0x100000ffU :
                     0xffU | (absolute ? 0x40000000U : 0U) | (negate ? 0x80000000U : 0U)))) ||
+                // The constant-buffer form has no register source: Ra, bits 59-61 and the
+                // reserved word 3 bits must be clear.
+                (opcode == 0xb05 &&
+                 (insn.Bits(24, 8) || insn.Bits(59, 3) || (insn.words[3] & 0xc00001ffU))) ||
                 (opcode == 0xd05 && uniform_register(insn.Bits(32, 8)) == ~0U)) {
                 return fail(index, "native float-to-integer conversion mode");
             }
@@ -2399,7 +2404,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             // Any scoreboard (bits 44-46), count (38-43) and wait list (32-37) is the same no-op here.
             // DEPBAR.LE SB0, n (scoreboard 0x8000) waits on LDGSTS copy groups. The copies below
             // complete synchronously, so only make their shared memory stores visible.
-            const u32 scoreboard = insn.words[1] & ~0xfc0U;
+            // The wait list (bits 0-5) and count (6-11) do not pick the scoreboard.
+            const u32 scoreboard = insn.words[1] & ~0xfffU;
             if (insn.words[0] != 0x791a || (insn.words[1] & ~0x7fffU) != 0x8000 || insn.words[2]) {
                 return fail(index, "native dependency barrier mode");
             }

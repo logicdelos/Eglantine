@@ -35,6 +35,7 @@
 #endif
 
 #include "common/common_types.h"
+#include "common/baseline_settings.h"
 #include "common/logging.h"
 
 // Switch 2 draw and dispatch diagnostics, all off unless one of these is set:
@@ -720,6 +721,10 @@ private:
                 } else if (kind == "vs" || kind == "ps" || kind == "cs") {
                     ablated.emplace(kind == "vs" ? 'v' : kind == "ps" ? 'p' : 'c', value);
                 }
+            }
+            // An ablation that skips programs is a deviation from the baseline the report states.
+            if (!ablated.empty() || !ablated_keys.empty()) {
+                Settings::Baseline::NoteShaderAblation();
             }
             LOG_INFO(HW_GPU, "diag: ablating {} program(s) from {}", ablated.size() + ablated_keys.size(),
                      AblateFile().string());

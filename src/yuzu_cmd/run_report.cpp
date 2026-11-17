@@ -14,6 +14,7 @@
 #include <fstream>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -30,12 +31,16 @@ extern char** environ;
 #include <fmt/format.h>
 #include <nlohmann/json.hpp>
 
+#include "common/baseline_settings.h"
 #include "common/fs/fs_util.h"
+#include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/nx2_bottleneck.h"
+#include "common/key_script.h"
 #include "common/scm_rev.h"
 #include "common/settings.h"
 #include "common/settings_common.h"
+#include "common/settings_secret.h"
 #include "yuzu_cmd/run_control.h"
 #include "yuzu_cmd/run_report.h"
 
@@ -82,6 +87,9 @@ struct State {
     bool temporary_created = false; // Prepare created `temporary` (it did not exist before)
     Json tunables = Json::object();
     Json initial_settings = Json::object();
+    Json overridden_settings = Json::object();
+    bool baseline_requested = false; // --baseline was given
+    std::vector<std::string> baseline_declared; // keys of --baseline-allow
     std::optional<u64> title_id;
     // The long frame spool (Schema2::OpenLongFrameSpool): the file the recorder's sink appends to,
     // guarded against being closed while it writes.
@@ -89,6 +97,9 @@ struct State {
     NativeFile spool_file = NoFile;
     fs::path spool_path;
     bool spool_failed = false; // The spool could not be created: long frames were not stored
+    /// A change that the crash snapshot must show (shader ablation) happened while the mutex was
+    /// taken. Whoever holds the mutex rebuilds the snapshot after it unlocks (StateLock).
+    std::atomic<bool> refresh_pending{false};
 };
 
 State& GetState() {
@@ -202,7 +213,9 @@ Json SetTunables() {
             continue;
         }
         Json tunable = Json::object();
-        tunable["raw"] = std::string{text.substr(equals + 1)};
+        // A value is only reported when its variable is not a path variable and it is a plain
+        // number or word: a path or a script stays out, also when it looks like a number.
+        tunable["raw"] = Settings::Baseline::PublicSwitchValue(name, text.substr(equals + 1));
         tunable["source"] = "environment";
         tunable["effective"] = Json::object();
         result[std::string{name}] = std::move(tunable);
@@ -308,6 +321,33 @@ Json LimitsJson() {
     return json;
 }
 
+/// The user directory this run used: --user-dir, else the default one.
+std::string UserDirText() {
+    return Common::FS::PathToUTF8String(Common::FS::GetEdenPath(Common::FS::EdenPath::EdenDir));
+}
+
+/// The scripted input (EDEN_NX2_KEY_SCRIPT): one entry per step, with the time each one fired.
+/// `step` counts from 1. `fired_seconds` is on the script clock (it starts at the first poll of
+/// the main loop, near the start of the game), `fired_run_seconds` since the run began.
+Json StepsJson(const Common::KeyScript::Runner& runner) {
+    Json steps = Json::array();
+    for (const Common::KeyScript::Record& record : runner.Records()) {
+        Json entry = Json::object();
+        entry["step"] = record.index + 1;
+        entry["when"] = record.when;
+        entry["key"] = record.code < 0 ? -record.code : record.code;
+        entry["action"] = record.code < 0 ? "release" : "press";
+        entry["status"] = std::string{Common::KeyScript::StatusName(record.status)};
+        const bool fired = record.status == Common::KeyScript::Status::Fired;
+        entry["fired_seconds"] = fired ? Json(record.fired_seconds) : Json(nullptr);
+        entry["fired_run_seconds"] =
+            fired && record.fired_run_seconds ? Json(*record.fired_run_seconds) : Json(nullptr);
+        entry["fired_frames"] = fired ? Json(record.fired_frames) : Json(nullptr);
+        steps.push_back(std::move(entry));
+    }
+    return steps;
+}
+
 /// What the report holds, taken in one go (the recording is consumed): the schema 1 members as
 /// text up to the end of the last one (the document is not closed), and the snapshots the schema 2
 /// members are made from.
@@ -347,11 +387,13 @@ ReportParts Document(State& state, Common::RunOutcome::Reason reason, int code,
 
     Json settings = Json::object();
     settings["initial"] = state.initial_settings;
+    settings["overrides"] = state.overridden_settings;
     settings["final"] = ReportedSettings();
 
     Json document = Json::object();
     document["schema_version"] = Schema2::SchemaVersion;
     document["build"] = BuildJson();
+    document["user_dir"] = UserDirText();
     document["title_id"] = state.title_id ? Json(fmt::format("{:016X}", *state.title_id))
                                           : Json(nullptr);
     document["limits"] = LimitsJson();
@@ -361,7 +403,12 @@ ReportParts Document(State& state, Common::RunOutcome::Reason reason, int code,
     document["windows"] = std::move(windows);
     document["logs"] = std::move(logs);
     document["exit"] = std::move(exit_json);
+    if (const Common::KeyScript::Runner* script = Common::KeyScript::Current()) {
+        document["steps"] = StepsJson(*script);
+    }
     document["tunables"] = state.tunables;
+    document["baseline"] =
+        Settings::Baseline::ReportJson(state.baseline_requested, state.baseline_declared);
     document["settings"] = std::move(settings);
 
     ReportParts parts;
@@ -393,6 +440,28 @@ bool RenameNoReplace(const fs::path& from, const fs::path& to) {
 #endif
 }
 
+/// Writes the whole report text: the schema 1 members, the schema 2 members (with the spooled long
+/// frames) and the closing brace. False when the schema 2 members could not be written.
+bool WriteDocument(std::ostream& out, const State& state, const ReportParts& parts,
+                   bool shutdown_complete) {
+    out.write(parts.base.data(), static_cast<std::streamsize>(parts.base.size()));
+    std::ifstream spool;
+    if (!state.spool_path.empty()) {
+        spool.open(state.spool_path, std::ios::binary | std::ios::in);
+    }
+    const Schema2::MembersInput members{
+        .snapshot = parts.snapshot,
+        .cache = parts.cache,
+        .session = parts.session,
+        .spool = spool.is_open() ? &spool : nullptr,
+        .run_complete = shutdown_complete,
+        .spool_failed = state.spool_failed || (!state.spool_path.empty() && !spool.is_open()),
+    };
+    const bool members_written = Schema2::WriteMembers(out, members);
+    out << "\n}\n";
+    return members_written;
+}
+
 bool WriteReportFile(State& state, const ReportParts& parts, bool shutdown_complete) {
     std::error_code ec;
     {
@@ -402,21 +471,7 @@ bool WriteReportFile(State& state, const ReportParts& parts, bool shutdown_compl
             fs::remove(state.temporary, ec);
             return Fail("cannot open " + Common::FS::ToUTF8String(state.temporary.u8string()));
         }
-        out.write(parts.base.data(), static_cast<std::streamsize>(parts.base.size()));
-        std::ifstream spool;
-        if (!state.spool_path.empty()) {
-            spool.open(state.spool_path, std::ios::binary | std::ios::in);
-        }
-        const Schema2::MembersInput members{
-            .snapshot = parts.snapshot,
-            .cache = parts.cache,
-            .session = parts.session,
-            .spool = spool.is_open() ? &spool : nullptr,
-            .run_complete = shutdown_complete,
-            .spool_failed = state.spool_failed || (!state.spool_path.empty() && !spool.is_open()),
-        };
-        const bool members_written = Schema2::WriteMembers(out, members);
-        out << "\n}\n";
+        const bool members_written = WriteDocument(out, state, parts, shutdown_complete);
         out.flush();
         if (!members_written || !out) {
             out.close();
@@ -713,21 +768,10 @@ void CloseSpool(State& state) {
     }
 }
 
-/// Writes the crash report. False when a report was meant and could not be written; true when it
-/// was written, was not armed, or the normal report is already at the destination.
-bool WriteCrashReport(std::string_view detail) noexcept {
-    const int index = crash_document.load(std::memory_order_acquire);
-    if (index < 0) {
-        return true;
-    }
-    int expected = CrashArmed;
-    if (!crash_phase.compare_exchange_strong(expected, CrashWriting, std::memory_order_acq_rel)) {
-        return true;
-    }
-    const CrashDocument& document = crash_documents[index];
-
-    char middle[CrashMiddleCapacity];
-    CrashText text{middle, sizeof(middle)};
+/// The part of the crash report that changes at the moment of the crash: elapsed time, the
+/// counters and the exit object. Returns its length.
+size_t FormatCrashMiddle(char* buffer, size_t capacity, std::string_view detail) noexcept {
+    CrashText text{buffer, capacity};
     const double elapsed =
         Common::RunOutcome::Active() ? Common::RunOutcome::ElapsedSeconds() : 0.0;
     const auto milliseconds = static_cast<unsigned long long>(elapsed > 0.0 ? elapsed * 1000.0 : 0.0);
@@ -749,28 +793,59 @@ bool WriteCrashReport(std::string_view detail) noexcept {
     text.Add(",\"shutdown_complete\":false,\"metrics_complete\":false,\"detail\":\"");
     text.AddEscaped(detail, 64);
     text.Add("\"}");
+    return text.size;
+}
 
-    // The attribution of a crash: a safe scalar status, and what the long frame spool holds of
-    // complete lines (at most CrashSpoolCapacity bytes of it). Nothing is ever marked complete.
-    char attribution_head[CrashMembersCapacity];
-    char attribution_tail[CrashMembersCapacity];
-    const size_t head_size =
-        Schema2::CrashMembersHead(attribution_head, sizeof(attribution_head),
-                                  Spikes::AttributionEnabled(), Spikes::SessionConfig{}.threshold_ns);
-    const size_t tail_size = Schema2::CrashMembersTail(attribution_tail, sizeof(attribution_tail));
-    const bool attribution = head_size != 0 && tail_size != 0;
+/// The attribution members of a crash report; the spool lines are in crash_spool_buffer.
+struct CrashAttribution {
+    char head[CrashMembersCapacity];
+    char tail[CrashMembersCapacity];
+    size_t head_size = 0;
+    size_t tail_size = 0;
     size_t spool_size = 0;
-    if (attribution) {
-        spool_size = Schema2::JoinSpoolLines(
-            crash_spool_buffer, ReadCrashSpool(crash_spool_buffer, sizeof(crash_spool_buffer)));
+};
+
+/// The attribution of a crash: a safe scalar status, and what the long frame spool holds of
+/// complete lines (at most CrashSpoolCapacity bytes of it). Nothing is ever marked complete. False
+/// when the members cannot be formatted: the report then leaves them out.
+bool FormatCrashAttribution(CrashAttribution& out) noexcept {
+    out.head_size = Schema2::CrashMembersHead(out.head, sizeof(out.head),
+                                              Spikes::AttributionEnabled(),
+                                              Spikes::SessionConfig{}.threshold_ns);
+    out.tail_size = Schema2::CrashMembersTail(out.tail, sizeof(out.tail));
+    if (out.head_size == 0 || out.tail_size == 0) {
+        return false;
     }
+    out.spool_size = Schema2::JoinSpoolLines(
+        crash_spool_buffer, ReadCrashSpool(crash_spool_buffer, sizeof(crash_spool_buffer)));
+    return true;
+}
+
+/// Writes the crash report. False when a report was meant and could not be written; true when it
+/// was written, was not armed, or the normal report is already at the destination.
+bool WriteCrashReport(std::string_view detail) noexcept {
+    const int index = crash_document.load(std::memory_order_acquire);
+    if (index < 0) {
+        return true;
+    }
+    int expected = CrashArmed;
+    if (!crash_phase.compare_exchange_strong(expected, CrashWriting, std::memory_order_acq_rel)) {
+        return true;
+    }
+    const CrashDocument& document = crash_documents[index];
+
+    char middle[CrashMiddleCapacity];
+    const size_t middle_size = FormatCrashMiddle(middle, sizeof(middle), detail);
+
+    CrashAttribution members;
+    const bool attribution = FormatCrashAttribution(members);
 
     // Seeking is not needed: the file was empty when it was created.
     const bool written =
-        WriteCrashPart(document.head, document.head_size) && WriteCrashPart(middle, text.size) &&
-        (!attribution || (WriteCrashPart(attribution_head, head_size) &&
-                          WriteCrashPart(crash_spool_buffer, spool_size) &&
-                          WriteCrashPart(attribution_tail, tail_size))) &&
+        WriteCrashPart(document.head, document.head_size) && WriteCrashPart(middle, middle_size) &&
+        (!attribution || (WriteCrashPart(members.head, members.head_size) &&
+                          WriteCrashPart(crash_spool_buffer, members.spool_size) &&
+                          WriteCrashPart(members.tail, members.tail_size))) &&
         WriteCrashPart(document.tail, document.tail_size) && FlushCrashFile();
     const bool closed = CloseCrashFile();
     const bool published = written && closed && PublishCrashFile();
@@ -789,6 +864,10 @@ bool WriteCrashReport(std::string_view detail) noexcept {
     return CrashDestinationExists();
 }
 
+/// Runs on the thread that holds the state mutex, after a snapshot's text was formatted and
+/// before it is published. Only a test sets it.
+void (*snapshot_test_hook)() = nullptr;
+
 /// Formats the fixed parts of the crash report from what is known now. Called with the state
 /// mutex held, before the run and again when the title and the settings are known.
 void RebuildCrashDocument(State& state) {
@@ -799,6 +878,7 @@ void RebuildCrashDocument(State& state) {
     Json fixed = Json::object();
     fixed["schema_version"] = Schema2::SchemaVersion;
     fixed["build"] = BuildJson();
+    fixed["user_dir"] = UserDirText();
     fixed["title_id"] = state.title_id ? Json(fmt::format("{:016X}", *state.title_id))
                                       : Json(nullptr);
     fixed["limits"] = LimitsJson();
@@ -809,10 +889,13 @@ void RebuildCrashDocument(State& state) {
 
     const auto make_tail = [&state](bool with_settings) {
         Json settings = Json::object();
+        settings["overrides"] = state.overridden_settings;
         settings["initial"] = with_settings ? state.initial_settings : Json::object();
         settings["final"] = nullptr;
         Json rest = Json::object();
         rest["tunables"] = state.tunables;
+        rest["baseline"] =
+            Settings::Baseline::ReportJson(state.baseline_requested, state.baseline_declared);
         rest["settings"] = std::move(settings);
         // The members of `rest` continue the document: its opening brace is dropped, and its
         // closing one ends the document.
@@ -824,6 +907,9 @@ void RebuildCrashDocument(State& state) {
     std::string tail = make_tail(true);
     if (tail.size() > CrashTailCapacity) {
         tail = make_tail(false);
+    }
+    if (snapshot_test_hook != nullptr) {
+        snapshot_test_hook();
     }
     if (head.size() > CrashHeadCapacity || tail.size() > CrashTailCapacity) {
         return;
@@ -912,11 +998,56 @@ bool FinishCrashReport(State& state) {
     return expected != CrashWriting;
 }
 
+/// Rebuilds the crash snapshot when a refresh is pending, unless another thread holds the mutex:
+/// that thread looks again after it unlocks (StateLock), so a request is never dropped.
+void DrainPendingRefresh(State& state) {
+    while (state.refresh_pending.load(std::memory_order_seq_cst)) {
+        std::unique_lock lock{state.mutex, std::try_to_lock};
+        if (!lock.owns_lock()) {
+            return;
+        }
+        // Cleared with the mutex held and before the snapshot is evaluated: a request that
+        // arrives later sets it again.
+        state.refresh_pending.store(false, std::memory_order_seq_cst);
+        RebuildCrashDocument(state);
+    }
+}
+
+/// The state mutex, and the duty that comes with it: after unlocking, a refresh that was requested
+/// while the mutex was held (and that its holder may have evaluated before) is carried out.
+class StateLock {
+public:
+    explicit StateLock(State& state_) : state{state_}, lock{state_.mutex} {}
+    StateLock(const StateLock&) = delete;
+    StateLock& operator=(const StateLock&) = delete;
+    ~StateLock() {
+        lock.unlock();
+        try {
+            DrainPendingRefresh(state);
+        } catch (...) {
+            // The snapshot keeps its previous text; the report itself is not affected.
+        }
+    }
+
+private:
+    State& state;
+    std::unique_lock<std::mutex> lock;
+};
+
+/// Called by the renderer when shader ablation becomes active. The flag that makes the baseline
+/// object show it is already set; this makes the crash snapshot show it as well. Never dropped:
+/// when the mutex is busy its holder rebuilds the snapshot after it unlocks.
+void RequestCrashBaselineRefresh() {
+    State& state = GetState();
+    state.refresh_pending.store(true, std::memory_order_seq_cst);
+    DrainPendingRefresh(state);
+}
+
 } // Anonymous namespace
 
 PrepareResult Prepare(const std::string& destination, std::string& message) {
     State& state = GetState();
-    std::scoped_lock lock{state.mutex};
+    StateLock lock{state};
     std::error_code ec;
     const fs::path path{Common::FS::ToU8String(destination)};
     if (!path.has_filename()) {
@@ -958,17 +1089,47 @@ PrepareResult Prepare(const std::string& destination, std::string& message) {
     return PrepareResult::Ready;
 }
 
-void CaptureStart() {
+void CaptureStart(const std::vector<std::string>& overridden_settings) {
     State& state = GetState();
-    std::scoped_lock lock{state.mutex};
+    StateLock lock{state};
     state.tunables = SetTunables();
     state.initial_settings = ReportedSettings();
+    state.overridden_settings = Json::object();
+    for (const std::string& name : overridden_settings) {
+        if (const auto found = Settings::values.linkage.by_key.find(name);
+            found != Settings::values.linkage.by_key.end()) {
+            // A credential is named but its value is never written to the report.
+            state.overridden_settings[name] = Settings::IsSecretSetting(name)
+                                                  ? Json("<redacted>")
+                                                  : ScalarOf(*found->second);
+        }
+    }
     RebuildCrashDocument(state);
+}
+
+void SetBaselineRequest(bool requested, std::vector<std::string> declared) {
+    State& state = GetState();
+    StateLock lock{state};
+    state.baseline_requested = requested;
+    state.baseline_declared = std::move(declared);
+    RebuildCrashDocument(state);
+    Settings::Baseline::SetChangeHook(&RequestCrashBaselineRefresh);
+}
+
+void RefreshCrashSnapshot() {
+    State& state = GetState();
+    StateLock lock{state};
+    RebuildCrashDocument(state);
+}
+
+void NoteSettingChange(std::string_view key, std::string_view source) {
+    Settings::Baseline::NoteSource(key, source);
+    RefreshCrashSnapshot();
 }
 
 void SetTitleId(u64 program_id) {
     State& state = GetState();
-    std::scoped_lock lock{state.mutex};
+    StateLock lock{state};
     state.title_id = program_id;
     RebuildCrashDocument(state);
 }
@@ -1006,7 +1167,7 @@ bool Schema2::OpenLongFrameSpool(std::string& message) {
 bool Publish(Common::RunOutcome::Reason reason, int code, bool shutdown_complete,
              std::string_view detail) {
     State& state = GetState();
-    std::scoped_lock lock{state.mutex};
+    StateLock lock{state};
     if (!state.prepared) {
         return true;
     }
@@ -1052,6 +1213,41 @@ void ExitWithFailure(std::string_view detail) {
         }
     }
     std::exit(code);
+}
+
+std::string NormalDocumentText(Common::RunOutcome::Reason reason, int code, bool shutdown_complete,
+                               std::string_view detail) {
+    State& state = GetState();
+    StateLock lock{state};
+    std::ostringstream out;
+    // The text either way: a test checks what it holds.
+    (void)WriteDocument(out, state, Document(state, reason, code, shutdown_complete, detail),
+                        shutdown_complete);
+    return out.str();
+}
+
+std::string CrashDocumentText(std::string_view detail) {
+    const int index = crash_document.load(std::memory_order_acquire);
+    if (index < 0) {
+        return {};
+    }
+    const CrashDocument& document = crash_documents[index];
+    char middle[CrashMiddleCapacity];
+    const size_t middle_size = FormatCrashMiddle(middle, sizeof(middle), detail);
+    std::string text{document.head, document.head_size};
+    text.append(middle, middle_size);
+    CrashAttribution members;
+    if (FormatCrashAttribution(members)) {
+        text.append(members.head, members.head_size);
+        text.append(crash_spool_buffer, members.spool_size);
+        text.append(members.tail, members.tail_size);
+    }
+    text.append(document.tail, document.tail_size);
+    return text;
+}
+
+void SetSnapshotTestHook(void (*hook)()) {
+    snapshot_test_hook = hook;
 }
 
 } // namespace RunReport

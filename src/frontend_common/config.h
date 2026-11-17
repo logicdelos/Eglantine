@@ -42,6 +42,13 @@ public:
         InputProfile,
     };
 
+    /// LoadOnly reads the file like LoadAndSave but never creates, writes or migrates it, and
+    /// creates no directory: a missing file stays missing and the defaults are used.
+    enum class Mode {
+        LoadAndSave,
+        LoadOnly,
+    };
+
     virtual ~Config() = default;
 
     void ClearControlPlayerValues() const;
@@ -56,7 +63,8 @@ public:
                                        Settings::BasicSetting& setting);
 
 protected:
-    explicit Config(ConfigType config_type = ConfigType::GlobalConfig);
+    explicit Config(ConfigType config_type = ConfigType::GlobalConfig,
+                    Mode mode = Mode::LoadAndSave);
 
     void Initialize(const std::string& config_name = "config");
     void Initialize(std::optional<std::string> config_path);
@@ -228,9 +236,15 @@ protected:
     const ConfigType type;
     std::unique_ptr<CSimpleIniA> config;
     std::string config_loc;
+    /// Whether the file existed when the config was opened. A per-game config that did not exist
+    /// is created only when it holds something besides "use global" flags.
+    bool file_existed{true};
     const bool global;
+    const Mode mode;
 
 private:
+    /// True when the ini holds anything besides "\use_global=true" flags.
+    [[nodiscard]] bool HasContent() const;
     void WritePreparedSetting(const std::string& key, const std::string& adjusted_value,
                               const std::optional<std::string>& adjusted_default_value,
                               const std::optional<bool>& use_global);

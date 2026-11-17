@@ -81,7 +81,8 @@ void Request(Reason reason, std::string_view detail = {}) noexcept;
 /// Stopped by the same request, for loops that take a token (loading shader caches).
 [[nodiscard]] std::stop_token StopToken() noexcept;
 
-/// One finished game frame. Asks for a stop when the frame limit is reached.
+/// One finished game frame. Counted in every run; asks for a stop when the frame limit of an
+/// unattended run is reached.
 void NoteFrame() noexcept;
 
 /// The reason on record, None when nothing was requested.
@@ -93,7 +94,8 @@ void NoteFrame() noexcept;
 /// flag, which StopRequested converts. Call after anything that installs handlers of its own.
 void InstallSignalHandlers();
 
-/// Frames presented since Begin, counted whether or not there is a frame limit.
+/// Frames presented since the start of the process (since Begin in an unattended run), counted
+/// whether or not there is a frame limit.
 [[nodiscard]] u64 FramesPresented() noexcept;
 
 // A crash of the emulator itself. The crash handlers (common/windows/crash_handler.cpp) call these

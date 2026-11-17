@@ -19,20 +19,21 @@ constexpr size_t Index(Opt opt) {
 
 } // namespace
 
-TEST_CASE("Nx2Perf default mask keeps every switch on", "[nx2_perf]") {
-    REQUIRE(ParseOffMask(false, "", "") == u64{0});
+TEST_CASE("Nx2Perf default mask has only the opt-in switches off", "[nx2_perf]") {
+    REQUIRE(ParseOffMask(false, "", "") == OptInMask());
 }
 
 TEST_CASE("Nx2Perf bank_once_per_frame is on by default and off under SAFE", "[nx2_perf]") {
     REQUIRE(opt_names[Index(Opt::BankOncePerFrame)] == "bank_once_per_frame");
     REQUIRE(!IsOff(ParseOffMask(false, "", ""), Index(Opt::BankOncePerFrame)));
     REQUIRE(IsOff(ParseOffMask(true, "", ""), Index(Opt::BankOncePerFrame)));
-    REQUIRE(ParseOffMask(false, "", "bank_once_per_frame") == Bit(Opt::BankOncePerFrame));
+    REQUIRE(ParseOffMask(false, "", "bank_once_per_frame") ==
+            (OptInMask() | Bit(Opt::BankOncePerFrame)));
 }
 
 TEST_CASE("Nx2Perf OFF=bind_memo flips only its bit", "[nx2_perf]") {
     const auto mask = ParseOffMask(false, "", "bind_memo");
-    REQUIRE(mask == Bit(Opt::BindMemo));
+    REQUIRE(mask == (OptInMask() | Bit(Opt::BindMemo)));
     REQUIRE(!IsOff(mask, Index(Opt::IndexRebind)));
 }
 
@@ -49,7 +50,7 @@ TEST_CASE("Nx2Perf SAFE is the default-off set", "[nx2_perf]") {
 
 TEST_CASE("Nx2Perf lists of names", "[nx2_perf]") {
     REQUIRE(ParseOffMask(false, "", "bounds,draw_preamble") ==
-            (Bit(Opt::Bounds) | Bit(Opt::DrawPreamble)));
+            (OptInMask() | Bit(Opt::Bounds) | Bit(Opt::DrawPreamble)));
     REQUIRE(ParseOffMask(true, "front_run,download_batch", "") ==
             (DefaultOffMask() & ~(Bit(Opt::FrontRun) | Bit(Opt::DownloadBatch))));
 }
@@ -58,7 +59,8 @@ TEST_CASE("compute_rebuild_async: on by default", "[nx2_perf]") {
     REQUIRE(opt_names[Index(Opt::ComputeRebuildAsync)] == "compute_rebuild_async");
     REQUIRE(!IsOff(DefaultOffMask(), Index(Opt::ComputeRebuildAsync)));
     REQUIRE(!IsOff(ParseOffMask(false, "", ""), Index(Opt::ComputeRebuildAsync)));
-    REQUIRE(ParseOffMask(false, "", "compute_rebuild_async") == Bit(Opt::ComputeRebuildAsync));
+    REQUIRE(ParseOffMask(false, "", "compute_rebuild_async") ==
+            (OptInMask() | Bit(Opt::ComputeRebuildAsync)));
 }
 
 TEST_CASE("compute_preload_variants: on by default", "[nx2_perf]") {
@@ -66,14 +68,15 @@ TEST_CASE("compute_preload_variants: on by default", "[nx2_perf]") {
     REQUIRE(!IsOff(DefaultOffMask(), Index(Opt::ComputePreloadVariants)));
     REQUIRE(!IsOff(ParseOffMask(false, "", ""), Index(Opt::ComputePreloadVariants)));
     REQUIRE(ParseOffMask(false, "", "compute_preload_variants") ==
-            Bit(Opt::ComputePreloadVariants));
+            (OptInMask() | Bit(Opt::ComputePreloadVariants)));
 }
 
 TEST_CASE("stale_target_skip: on by default", "[nx2_perf]") {
     REQUIRE(opt_names[Index(Opt::StaleTargetSkip)] == "stale_target_skip");
     REQUIRE(!IsOff(DefaultOffMask(), Index(Opt::StaleTargetSkip)));
     REQUIRE(!IsOff(ParseOffMask(false, "", ""), Index(Opt::StaleTargetSkip)));
-    REQUIRE(ParseOffMask(false, "", "stale_target_skip") == Bit(Opt::StaleTargetSkip));
+    REQUIRE(ParseOffMask(false, "", "stale_target_skip") ==
+            (OptInMask() | Bit(Opt::StaleTargetSkip)));
 }
 
 TEST_CASE("geometry_consistency and build_order_priority: on by default", "[nx2_perf]") {

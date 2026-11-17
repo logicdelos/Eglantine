@@ -28,6 +28,7 @@
 #include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/settings.h"
+#include "common/settings_secret.h"
 #include "common/time_zone.h"
 
 #if defined(__linux__ ) && defined(ARCHITECTURE_arm64)
@@ -122,8 +123,8 @@ void LogSettings() {
     std::deque<std::string> settings_list;
     for (auto& [category, settings] : values.linkage.by_category) {
         for (const auto& setting : settings) {
-            // Hide the token secrets, for security reasons.
-            if (setting->Id() != values.eden_token.Id() && setting->Id() != values.mcp_token.Id()) {
+            // Hide the credentials, for security reasons.
+            if (!IsSecretSetting(setting->GetLabel())) {
                 auto const is_default = setting->ToString() == setting->DefaultToString();
                 auto const name = fmt::format(
                     "{:c}{:c} {}.{}",
@@ -451,19 +452,31 @@ void SetConfiguringGlobal(bool is_global) {
     configuring_global = is_global;
 }
 
+bool SpeedLimited() {
+    return values.use_speed_limit.GetValue() || !values.allow_speed_up.GetValue();
+}
+
 u16 SpeedLimit() {
+    u16 limit = 100;
     switch (SpeedMode(values.current_speed_mode)) {
     case SpeedMode::Standard:
-        return values.speed_limit.GetValue();
+        limit = values.speed_limit.GetValue();
+        break;
     case SpeedMode::Turbo:
-        return values.turbo_speed_limit.GetValue();
+        limit = values.turbo_speed_limit.GetValue();
+        break;
     case SpeedMode::Slow:
-        return values.slow_speed_limit.GetValue();
+        limit = values.slow_speed_limit.GetValue();
+        break;
     default:
         UNIMPLEMENTED();
     }
-
-    return 100;
+    if (!values.allow_speed_up.GetValue() &&
+        (!values.use_speed_limit.GetValue() || limit == 0 || limit > 100)) {
+        // The limit being off, 0 or above real time is not allowed to speed the game up.
+        return 100;
+    }
+    return limit;
 }
 
 void SetSpeedMode(const SpeedMode& mode) {

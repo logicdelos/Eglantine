@@ -38,6 +38,8 @@
 #include "common/driver_shader_cache.h"
 #include "common/fs/fs_util.h"
 #include "common/fs/path_util.h"
+#include "common/key_script.h"
+#include "common/baseline_settings.h"
 #include "common/logging.h"
 #include "common/nx2_bottleneck.h"
 #include "common/nx2_sampler.h"
@@ -64,9 +66,14 @@
 #include "video_core/gpu.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
+#include "video_core/shader_notify.h"
 #include "video_core/shader_warm/shader_warm_builder.h"
+#include "yuzu_cmd/cli_settings.h"
+#include "yuzu_cmd/control_commands.h"
 #include "yuzu_cmd/run_control.h"
 #include "yuzu_cmd/run_report.h"
+#include "yuzu_cmd/user_dir.h"
+#include "yuzu_cmd/version_info.h"
 #include "yuzu_cmd/emu_window/emu_window_sdl3.h"
 #ifdef HAS_OPENGL
 #include "yuzu_cmd/emu_window/emu_window_sdl3_gl.h"
@@ -200,6 +207,8 @@ struct SdlState {
     InputCommon::InputSubsystem input_subsystem{};
     std::unique_ptr<EmuWindow_SDL3> emu_window;
     bool network_initialized{};
+    // Control channel (only with --control): destroyed before the system shuts down.
+    std::unique_ptr<Control::Commands> control;
 #ifdef YUZU_ENABLE_MCP
     // Built-in MCP server (only with --mcp): destroyed before the system shuts down.
     std::unique_ptr<CliMcpHost> mcp_host;
@@ -540,9 +549,6 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     // SDL calls SDL_AppIterate back to back by default, which kept a host core at 100% polling
     // input; 240 Hz is plenty for input and the key script.
     SDL_SetHint(SDL_HINT_MAIN_CALLBACK_RATE, "240");
-    SdlState* state = new SdlState();
-    *appstate = state;
-
 #ifdef _WIN32
     // A launcher that redirected a stream keeps it; only an unredirected one goes to the
     // parent's console.
@@ -566,6 +572,33 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         setrlimit(RLIMIT_NOFILE, &rl);
     }
 #endif
+
+    // Options that must act before the user directory, the log, the crash handler and Core::System
+    // exist. They are found by a scan of their own; the full parse needs a Core::System.
+    const Core::EarlyOptions early = Core::ScanEarlyOptions(argc, argv);
+    // The build identity is printed only when the options the scan can see are in order, and
+    // before the user directory is touched.
+    if (early.version_json && early.error.empty()) {
+        fmt::print("{}", VersionInfo::BuildInfoJson());
+        std::fflush(stdout);
+        return SDL_APP_SUCCESS;
+    }
+    // A bad --user-dir ends the run here, with the code of bad arguments: there is no log, no
+    // report and no Common::RunOutcome yet, and the default user directory is left alone.
+    std::string user_dir_error = early.error;
+    if (user_dir_error.empty() && early.user_dir) {
+        user_dir_error = UserDir::Use(*early.user_dir);
+        if (!user_dir_error.empty()) {
+            user_dir_error = "--user-dir: " + user_dir_error;
+        }
+    }
+    if (!user_dir_error.empty()) {
+        fmt::print(stderr, "{}\n", user_dir_error);
+        std::exit(Common::RunOutcome::ExitCode(Common::RunOutcome::Reason::BadArguments));
+    }
+
+    SdlState* state = new SdlState();
+    *appstate = state;
 
     Common::Log::Initialize();
     Common::Log::SetColorConsoleBackendEnabled(true);
@@ -602,8 +635,36 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     // order, and says how (Common::RunOutcome, RunReport). Without them none of that is active.
     const bool unattended = lp.report_path || lp.run_seconds || lp.run_frames;
     std::string argument_error = lp.parse_error;
+    if (argument_error.empty() && lp.user_dir != early.user_dir) {
+        // The scan applied the directory before the user directory was first read. Both follow
+        // getopt over the same option table, so this is a defensive check.
+        argument_error = "--user-dir was read differently by the early scan and the full parse; "
+                         "write it as --user-dir <path> or --user-dir=<path>";
+    }
+    if (argument_error.empty() && (lp.print_version && lp.print_json) != early.version_json) {
+        // --version --json answers from the early scan only, before anything is set up.
+        argument_error = "--version --json was read differently by the early scan and the full "
+                         "parse; write them as --version --json";
+    }
     if (argument_error.empty() && unattended && !lp.unknown_option.empty()) {
         argument_error = "unknown option, or an option without its argument: " + lp.unknown_option;
+    }
+    // --set: every name and value is checked before anything starts; the settings change below.
+    std::vector<CliSettings::Resolved> setting_overrides;
+    if (argument_error.empty()) {
+        argument_error = CliSettings::Resolve(lp.setting_overrides, setting_overrides);
+    }
+    if (argument_error.empty() && lp.baseline) {
+        // Checked before the run starts: an EDEN_NX2_* switch that is set but not named. The
+        // --baseline-allow items themselves were checked by the early scan and the full parse.
+        const auto undeclared = Settings::Baseline::UndeclaredSwitches(
+            Settings::Baseline::SetEnvironmentSwitches(), lp.baseline_allow);
+        if (!undeclared.empty()) {
+            argument_error = "--baseline refused: " + undeclared.front() +
+                             " is set, which takes the run off the baseline. Unset it, or "
+                             "declare it with --baseline-allow " +
+                             undeclared.front();
+        }
     }
     if (lp.report_path && !lp.report_conflict) {
         std::string report_error;
@@ -626,6 +687,10 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         startup_reason = Common::RunOutcome::Reason::BadArguments;
         startup_detail = argument_error;
         return SDL_APP_FAILURE;
+    }
+    if (lp.print_baseline) {
+        fmt::print("{}", Settings::Baseline::PrintableText());
+        return SDL_APP_SUCCESS;
     }
     if (unattended) {
         // SDL turns SIGINT and SIGTERM into a closed window; this run tells them apart.
@@ -655,20 +720,64 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
             frontend_load.emplace(Spikes::BootPhase::FrontendLoad);
         }
     }
-    SdlConfig config{lp.config_path};
-    // Before anything loads a GPU driver.
+    std::optional<SdlConfig> config;
+    // --baseline reads the configuration file but never creates or writes it, in every way the
+    // run can end, so the file is byte-unchanged afterwards.
+    config.emplace(lp.config_path,
+                   lp.baseline ? SdlConfig::Mode::LoadOnly : SdlConfig::Mode::LoadAndSave);
+    if (lp.baseline || !setting_overrides.empty()) {
+        // Otherwise the configuration file is written when the object ends: do that now, so what
+        // --set changes for this run is never saved.
+        config.reset();
+    }
+    if (lp.baseline) {
+        // After the config loads: the baseline wins over whatever the config holds.
+        Settings::Baseline::ResetToBaseline();
+        Settings::Baseline::ClearNotedSources();
+    }
+    if (!setting_overrides.empty()) {
+        // The overrides come before everything below reads a setting, and the other command line
+        // options still have the last word.
+        CliSettings::Apply(setting_overrides);
+        for (const CliSettings::Resolved& entry : setting_overrides) {
+            Settings::Baseline::NoteSource(entry.setting->GetLabel(), "command line");
+        }
+    }
+    Core::ApplyLaunchParams(lp);
+    if (lp.baseline) {
+        // Declared values go on top of the baseline and of the command line overrides.
+        if (const std::string problem =
+                Settings::Baseline::ApplyAllowedValues(Settings::values, lp.baseline_allow);
+            !problem.empty()) {
+            LOG_ERROR(Frontend, "--baseline-allow: {}", problem);
+        }
+    }
+    // Before anything loads a GPU driver, and after every source of the settings it reads
+    // (config file, baseline, command line, declared values): a declared
+    // private_driver_shader_cache or driver_shader_cache_size has to decide where the driver
+    // writes its cache, and this is the last point at which it can.
     Common::ConfigureDriverShaderCache(Settings::values.private_driver_shader_cache.GetValue(),
                                        Settings::values.driver_shader_cache_size.GetValue());
     Common::CreateDriverShaderCacheFolder();
-
-    Core::ApplyLaunchParams(lp);
+    RunReport::SetBaselineRequest(lp.baseline, Settings::Baseline::AllowedKeys(lp.baseline_allow));
     if (Common::RunOutcome::Active()) {
-        RunReport::CaptureStart();
+        std::vector<std::string> overridden_settings;
+        for (const auto& request : lp.setting_overrides) {
+            overridden_settings.push_back(request.first);
+        }
+        RunReport::CaptureStart(overridden_settings);
     }
 
     // Informational options already printed by ApplyLaunchParams; handle them before any
     // archive operation so --help/--version never packs, unpacks or edits.
     if (lp.print_help || lp.print_version) {
+        return SDL_APP_SUCCESS;
+    }
+
+    // The settings as they are now: the configuration file, then --set, then the other options.
+    if (lp.list_settings) {
+        fmt::print("{}", CliSettings::ListJsonLines());
+        std::fflush(stdout);
         return SDL_APP_SUCCESS;
     }
 
@@ -687,6 +796,25 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     if (lp.filepath.empty()) {
         LOG_CRITICAL(Frontend, "Failed to load ROM: No ROM specified");
         return SDL_APP_FAILURE;
+    }
+
+    if (lp.control_name) {
+        // Opened before the game loads, so a supervisor can connect and watch it start.
+        state->control = std::make_unique<Control::Commands>(
+            state->system, state->input_subsystem, [] {
+                live_quit_requested = true;
+                Common::RunOutcome::Request(Common::RunOutcome::Reason::Requested,
+                                            "stop requested through the control channel");
+            });
+        if (const std::string error = state->control->Start(*lp.control_name); !error.empty()) {
+            LOG_CRITICAL(Frontend, "Control channel: {}", error);
+            std::fprintf(stderr, "Control channel: %s\n", error.c_str());
+            startup_reason = Common::RunOutcome::Reason::StartupError;
+            startup_detail = "control channel: " + error;
+            Common::RunOutcome::Request(Common::RunOutcome::Reason::StartupError, startup_detail);
+            state->control.reset();
+            return SDL_APP_FAILURE;
+        }
     }
 
     state->network_initialized = Network::Init();
@@ -930,7 +1058,8 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     return SDL_APP_CONTINUE;
 }
 // EDEN_NX2_KEY_SCRIPT="seconds:code,seconds:-code,..." (or "@<file>"): press (code) or release (-code) keyboard
-// keys, by SDL scancode, that many seconds after start. Lets hidden test runs drive menus.
+// keys, by SDL scancode, that many seconds after start. Lets hidden test runs drive menus. A step can
+// also wait for an event ("frame>=600:4", "after shaders_idle+5@120:4"): see common/key_script.h.
 double Nx2KeyClockSeconds(); // emu_window_sdl3.cpp
 
 // EDEN_NX2_DIAG_DIR=<dir>: keys.txt there is read and removed while the game runs, for scripted
@@ -983,6 +1112,9 @@ static void RunLiveKeys(InputCommon::InputSubsystem& input_subsystem, Core::Syst
             Settings::values.gpu_accuracy.SetValue(high ? Settings::GpuAccuracy::High
                                                         : Settings::GpuAccuracy::Low);
             system.ApplySettings();
+            // A change of a setting from outside the run: named as such in the baseline object,
+            // which the crash report keeps as a snapshot, so the snapshot is taken again.
+            RunReport::NoteSettingChange("gpu_accuracy", "live control file");
             LOG_INFO(Frontend, "Live keys: GPU accuracy {}", high ? "high" : "low");
             continue;
         }
@@ -1012,54 +1144,84 @@ static void RunLiveKeys(InputCommon::InputSubsystem& input_subsystem, Core::Syst
     std::filesystem::remove(taken, error);
 }
 
-static void RunKeyScript(InputCommon::InputSubsystem& input_subsystem, Core::System& system) {
-    struct KeyEvent {
-        double seconds; // when frame is 0
-        u64 frame;      // "f<frame>:code": after that many presents
-        int code;
-    };
-    static const std::vector<KeyEvent> script = [] {
-        std::vector<KeyEvent> events;
-        if (const char* text = std::getenv("EDEN_NX2_KEY_SCRIPT")) {
-            // "@<file>" reads the list from a file: long scripts in the environment slow down
-            // every getenv in the process.
-            std::string list{text};
-            if (!list.empty() && list[0] == '@') {
-                std::ifstream file{list.substr(1)};
-                list.assign(std::istreambuf_iterator<char>{file}, {});
-            }
-            size_t start = 0;
-            while (start < list.size()) {
-                const size_t end = (std::min)(list.find(',', start), list.size());
-                const std::string item = list.substr(start, end - start);
-                if (const size_t colon = item.find(':'); colon != std::string::npos) {
-                    const std::string when = item.substr(0, colon);
-                    const int code = std::stoi(item.substr(colon + 1));
-                    if (!when.empty() && when[0] == 'f') {
-                        events.push_back({0.0, std::stoull(when.substr(1)), code});
-                    } else {
-                        events.push_back({std::stod(when), 0, code});
-                    }
-                }
-                start = end + 1;
-            }
-        }
-        return events;
-    }();
-    static size_t next = 0;
-    const double elapsed = Nx2KeyClockSeconds();
-    const u64 frame = Core::g_nx2_present_count.load();
-    while (next < script.size() && (script[next].frame != 0 ? script[next].frame <= frame
-                                                            : script[next].seconds <= elapsed)) {
-        const int code = script[next].code;
-        LOG_INFO(Frontend, "Key script: {} key {} at {:.1f} s (frame {})",
-                 code < 0 ? "release" : "press", code < 0 ? -code : code, elapsed, frame);
-        if (code < 0) {
-            input_subsystem.GetKeyboard()->ReleaseKey(static_cast<std::size_t>(-code));
+// Reads EDEN_NX2_KEY_SCRIPT (or the file it names with "@": long scripts in the environment slow
+// down every getenv in the process); the syntax is in common/key_script.h. A script with an error
+// is dropped as a whole, and an unattended run ends as a startup error, so a half-read script
+// never presses the rest at the wrong moments.
+static Common::KeyScript::Runner* LoadKeyScript() {
+    const char* text = std::getenv("EDEN_NX2_KEY_SCRIPT");
+    if (text == nullptr) {
+        return nullptr;
+    }
+    std::string list{text};
+    std::string error;
+    if (!list.empty() && list[0] == '@') {
+        std::ifstream file{list.substr(1)};
+        if (file) {
+            list.assign(std::istreambuf_iterator<char>{file}, {});
         } else {
-            input_subsystem.GetKeyboard()->PressKey(static_cast<std::size_t>(code));
+            error = "cannot read the script file " + list.substr(1);
         }
-        ++next;
+    }
+    Common::KeyScript::ParseResult parsed;
+    if (error.empty()) {
+        parsed = Common::KeyScript::Parse(list);
+        error = parsed.error;
+    }
+    if (!error.empty()) {
+        LOG_CRITICAL(Frontend, "EDEN_NX2_KEY_SCRIPT is not used: {}", error);
+        Common::RunOutcome::Request(Common::RunOutcome::Reason::StartupError,
+                                    "EDEN_NX2_KEY_SCRIPT: " + error);
+        return nullptr;
+    }
+    if (parsed.steps.empty()) {
+        return nullptr;
+    }
+    // Never freed: the report writer can read it from the watchdog thread while the process ends.
+    auto* runner = new Common::KeyScript::Runner{std::move(parsed.steps)};
+    Common::KeyScript::SetCurrent(runner);
+    return runner;
+}
+
+static void RunKeyScript(InputCommon::InputSubsystem& input_subsystem, Core::System& system) {
+    static Common::KeyScript::Runner* const script = LoadKeyScript();
+    if (script != nullptr && !script->GetProgress().finished) {
+        Common::KeyScript::Observation now;
+        now.seconds = Nx2KeyClockSeconds();
+        if (Common::RunOutcome::Active()) {
+            now.run_seconds = Common::RunOutcome::ElapsedSeconds();
+        }
+        now.present_count = Core::g_nx2_present_count.load();
+        now.frames = Common::RunOutcome::FramesPresented();
+        if (system.IsPoweredOn()) {
+            now.shaders_building = system.GPU().ShaderNotify().NumBuildingNoReport();
+        }
+        const Common::KeyScript::PollResult result = script->Poll(now);
+        for (const size_t index : result.fired) {
+            const Common::KeyScript::Step& step = script->GetStep(index);
+            const int code = step.code;
+            const bool timed = step.trigger == Common::KeyScript::Trigger::Seconds ||
+                               step.trigger == Common::KeyScript::Trigger::PresentCount;
+            LOG_INFO(Frontend, "Key script: {} key {} at {:.1f} s (frame {}){}",
+                     code < 0 ? "release" : "press", code < 0 ? -code : code, now.seconds,
+                     now.present_count, timed ? std::string{} : " [" + step.when + "]");
+            if (code < 0) {
+                input_subsystem.GetKeyboard()->ReleaseKey(static_cast<std::size_t>(-code));
+            } else {
+                input_subsystem.GetKeyboard()->PressKey(static_cast<std::size_t>(code));
+            }
+        }
+        if (result.timed_out) {
+            // Exit code 124, reason timeout, as for --run-seconds; the detail names the step and
+            // the report's steps list says which ones ran. Outside an unattended run the
+            // request does nothing and the rest of the script is simply dropped.
+            const Common::KeyScript::Step& step = script->GetStep(*result.timed_out);
+            const std::string detail =
+                fmt::format("key script step {} ({}) did not happen within {} s",
+                            *result.timed_out + 1, step.when, step.timeout.value_or(0.0));
+            LOG_ERROR(Frontend, "Key script: {}; the steps after it are skipped", detail);
+            Common::RunOutcome::Request(Common::RunOutcome::Reason::Timeout, detail);
+        }
     }
     RunLiveKeys(input_subsystem, system);
 }
@@ -1070,6 +1232,9 @@ extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
         return SDL_APP_SUCCESS;
     }
     RunKeyScript(state->input_subsystem, state->system);
+    if (state->control) {
+        state->control->Poll();
+    }
 #ifdef YUZU_ENABLE_MCP
     if (state->mcp_host) {
         state->mcp_host->DrainMainThread();
@@ -1139,6 +1304,7 @@ extern "C" void SDL_AppQuit(void *appstate, SDL_AppResult result) {
         // grace period covers the teardown, and a deadline reached meanwhile does not rename it.
         RecordFallbackReason(result);
     }
+    state->control.reset(); // joins the channel thread before the system goes away
 #ifdef YUZU_ENABLE_MCP
     state->mcp_server.reset(); // stops serving before the system goes away
     state->mcp_host.reset();

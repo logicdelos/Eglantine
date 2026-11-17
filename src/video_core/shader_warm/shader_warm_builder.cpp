@@ -124,8 +124,8 @@ std::optional<std::string> OpenGame(Core::System& system, const fs::path& game_p
             }
         }
         game.program_romfs = game.romfs.size();
-        // Add-on content after them: the Xenoblade Chronicles 2 Switch 2 Edition keeps all its
-        // game data in add-ons. A standalone update names the application as well as a base.
+        // Add-on content after them: a game can keep all its game data in add-ons. A standalone
+        // update names the application as well as a base.
         // Opt-in (default off): EDEN_NX2_WARM_ADDON=1 reads the add-ons too (WarmAddonsEnabled;
         // the choice is part of the precache file's identity).
         if (WarmAddonsEnabled() && (base || update)) {

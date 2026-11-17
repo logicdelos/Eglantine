@@ -66,10 +66,11 @@ void CheckPreferences(const Settings::Values& settings, bool global = false) {
 }
 } // namespace
 
-TEST_CASE("Display filter defaults use ScaleForce and FXAA", "[game_presets]") {
+TEST_CASE("Display and console defaults are the baseline: Docked, SMAA, BUF", "[game_presets]") {
     auto settings = std::make_unique<Settings::Values>();
-    CHECK(settings->scaling_filter.GetDefault() == Settings::ScalingFilter::ScaleForce);
-    CHECK(settings->anti_aliasing.GetDefault() == Settings::AntiAliasing::Fxaa);
+    CHECK(settings->scaling_filter.GetDefault() == Settings::ScalingFilter::Buf);
+    CHECK(settings->anti_aliasing.GetDefault() == Settings::AntiAliasing::Smaa);
+    CHECK(settings->use_docked_mode.GetDefault() == Settings::ConsoleMode::Docked);
 }
 
 TEST_CASE("Catalogue recommendations refer to valid per-game settings", "[game_presets]") {

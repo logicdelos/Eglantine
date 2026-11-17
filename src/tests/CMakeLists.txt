@@ -14,6 +14,7 @@ add_executable(tests
     core/nx2_oot_time.cpp
     video_core/unbacked_image_policy.cpp
     core/builtin_patches.cpp
+    core/launch_params.cpp
     core/gpu_dirty_memory_manager.cpp
     video_core/macro_dma_forward.cpp
     video_core/gpu_timestamp.cpp
@@ -33,6 +34,13 @@ add_executable(tests
     video_core/spirv_fragment_shuffle.cpp
     video_core/mesh_fallback.cpp
     video_core/spirv_software_matrix.cpp
+    common/baseline_settings.cpp
+    common/baseline_config.cpp
+    core/launch_params_early.cpp
+    common/speed_limit.cpp
+    core/conductor_pace.cpp
+    yuzu_cmd/run_report_documents.cpp
+    ../yuzu_cmd/run_report.cpp
     common/bit_field.cpp
     common/cityhash.cpp
     common/container_hash.cpp
@@ -41,6 +49,7 @@ add_executable(tests
     common/fibers.cpp
     common/game_presets.cpp
     common/host_memory.cpp
+    common/key_script.cpp
     common/page_table.cpp
     common/progress_counter.cpp
     common/param_package.cpp
@@ -115,6 +124,12 @@ add_executable(tests
     video_core/ampere_f2i.cpp
     video_core/ampere_ldc.cpp
     video_core/ampere_vote.cpp
+    yuzu_cmd/cli_settings.cpp
+    ../yuzu_cmd/cli_settings.cpp
+    yuzu_cmd/control_channel.cpp
+    ../yuzu_cmd/control_channel.cpp
+    yuzu_cmd/frame_capture.cpp
+    ../yuzu_cmd/frame_capture.cpp
     video_core/shader_attributes.cpp
     video_core/indirect_reset.cpp
     video_core/ocarina_upscale.cpp
@@ -131,7 +146,11 @@ if (ENABLE_UPDATE_CHECKER)
         ../frontend_common/update_installer.cpp)
 endif()
 
-target_link_libraries(tests PRIVATE common core input_common video_core)
+target_link_libraries(tests PRIVATE common core input_common video_core frontend_common)
+if (MSVC)
+    # tests/core/launch_params.cpp includes <getopt.h>: the bundled getopt that core links.
+    target_link_libraries(tests PRIVATE getopt)
+endif()
 
 if (ENABLE_MCP_SERVER)
     target_sources(tests PRIVATE mcp/protocol.cpp)

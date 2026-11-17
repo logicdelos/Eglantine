@@ -61,6 +61,8 @@ add_library(
     assert.cpp
     assert.h
     atomic_ops.h
+    baseline_settings.cpp
+    baseline_settings.h
     bit_field.h
     bit_util.h
     bounded_threadsafe_queue.h
@@ -106,6 +108,8 @@ add_library(
     host_memory.h
     input.h
     intrusive_red_black_tree.h
+    key_script.cpp
+    key_script.h
     literals.h
     log_ring.h
     logging.cpp
@@ -148,6 +152,8 @@ add_library(
     settings_enums.h
     settings_input.cpp
     settings_input.h
+    settings_secret.cpp
+    settings_secret.h
     settings_setting.h
     slot_vector.h
     socket_types.h

@@ -311,10 +311,12 @@ std::stop_token StopToken() noexcept {
 }
 
 void NoteFrame() noexcept {
+    // Counted in every run: the scripted input and the control channel read the count. Only the
+    // frame limit needs an active run.
+    const u64 seen = frames_seen.fetch_add(1, std::memory_order_relaxed) + 1;
     if (!active.load(std::memory_order_relaxed)) {
         return;
     }
-    const u64 seen = frames_seen.fetch_add(1, std::memory_order_relaxed) + 1;
     const u64 target = frame_target.load(std::memory_order_relaxed);
     if (target != 0 && seen >= target && !stop.load(std::memory_order_relaxed)) {
         Request(Reason::FrameLimit, "the --run-frames limit was reached");

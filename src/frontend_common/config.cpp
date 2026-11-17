@@ -27,8 +27,8 @@
 
 namespace FS = Common::FS;
 
-Config::Config(const ConfigType config_type)
-    : type(config_type), global{config_type == ConfigType::GlobalConfig} {}
+Config::Config(const ConfigType config_type, const Mode config_mode)
+    : type(config_type), global{config_type == ConfigType::GlobalConfig}, mode{config_mode} {}
 
 void Config::ReadGlobalSettingEarly(const std::string& config_name,
                                     Settings::BasicSetting& setting) {
@@ -66,19 +66,26 @@ void Config::Initialize(const std::string& config_name) {
     switch (type) {
     case ConfigType::GlobalConfig:
         config_loc = FS::PathToUTF8String(fs_config_loc / config_file);
-        void(FS::CreateParentDir(config_loc));
+        if (mode == Mode::LoadAndSave) {
+            void(FS::CreateParentDir(config_loc));
+        }
         SetUpIni();
         Reload();
         break;
     case ConfigType::PerGameConfig:
         config_loc = FS::PathToUTF8String(fs_config_loc / "custom" / FS::ToU8String(config_file));
-        void(FS::CreateParentDir(config_loc));
+        if (mode == Mode::LoadAndSave) {
+            void(FS::CreateParentDir(config_loc));
+        }
+        file_existed = FS::Exists(fs_config_loc / "custom" / FS::ToU8String(config_file));
         SetUpIni();
         Reload();
         break;
     case ConfigType::InputProfile:
         config_loc = FS::PathToUTF8String(fs_config_loc / "input" / config_file);
-        void(FS::CreateParentDir(config_loc));
+        if (mode == Mode::LoadAndSave) {
+            void(FS::CreateParentDir(config_loc));
+        }
         SetUpIni();
         break;
     }
@@ -88,12 +95,18 @@ void Config::Initialize(const std::optional<std::string> config_path) {
     const std::filesystem::path default_sdl_config_path =
         FS::GetEdenPath(FS::EdenPath::ConfigDir) / "sdl2-config.ini";
     config_loc = config_path.value_or(FS::PathToUTF8String(default_sdl_config_path));
-    void(FS::CreateParentDir(config_loc));
+    if (mode == Mode::LoadAndSave) {
+        void(FS::CreateParentDir(config_loc));
+    }
     SetUpIni();
     Reload();
 }
 
 void Config::WriteToIni() const {
+    if (mode == Mode::LoadOnly) {
+        LOG_DEBUG(Config, "Load-only configuration, not written: {}", config_loc);
+        return;
+    }
     std::string config_type;
     switch (type) {
     case ConfigType::GlobalConfig:
@@ -105,6 +118,12 @@ void Config::WriteToIni() const {
     case ConfigType::InputProfile:
         config_type = "Input Profile";
         break;
+    }
+    // Opening a game must not leave a per-game file behind: there is one baseline for every game,
+    // and a per-game config exists only when someone made one.
+    if (type == ConfigType::PerGameConfig && !file_existed && !HasContent()) {
+        LOG_DEBUG(Config, "No game specific configuration to write to: {}", config_loc);
+        return;
     }
     LOG_INFO(Config, "Writing {} configuration to: {}", config_type, config_loc);
     FILE* fp = nullptr;
@@ -127,23 +146,52 @@ void Config::WriteToIni() const {
     fclose(fp);
 }
 
+bool Config::HasContent() const {
+    CSimpleIniA::TNamesDepend sections;
+    config->GetAllSections(sections);
+    for (const auto& section : sections) {
+        CSimpleIniA::TNamesDepend keys;
+        config->GetAllKeys(section.pItem, keys);
+        for (const auto& key : keys) {
+            const std::string_view name{key.pItem};
+            const bool global_flag = name.ends_with("\\use_global") &&
+                                     std::string_view{config->GetValue(section.pItem, key.pItem, "")} == "true";
+            if (!global_flag) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 void Config::SetUpIni() {
     config = std::make_unique<CSimpleIniA>();
     config->SetUnicode(true);
     config->SetSpaces(false);
 
+    // A per-game config that does not exist is not created by reading it.
+    if (type == ConfigType::PerGameConfig && !file_existed) {
+        return;
+    }
+
     FILE* fp = nullptr;
 #ifdef _WIN32
     _wfopen_s(&fp, Common::UTF8ToUTF16W(config_loc).data(), L"rb, ccs=UTF-8");
-    if (fp == nullptr) {
+    if (fp == nullptr && mode == Mode::LoadAndSave) {
         fp = _wfopen(Common::UTF8ToUTF16W(config_loc).data(), L"wb, ccs=UTF-8");
     }
 #else
     fp = fopen(config_loc.c_str(), "rb");
-    if (fp == nullptr) {
+    if (fp == nullptr && mode == Mode::LoadAndSave) {
         fp = fopen(config_loc.c_str(), "wb");
     }
 #endif
+
+    if (fp == nullptr && mode == Mode::LoadOnly) {
+        // Not created: the defaults are used.
+        LOG_INFO(Config, "No configuration file at {}, using the defaults", config_loc);
+        return;
+    }
 
     if (fp == nullptr) {
         LOG_ERROR(Frontend, "Config file could not be loaded!");

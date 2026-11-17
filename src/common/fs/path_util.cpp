@@ -163,6 +163,41 @@ public:
         LEGACY_PATH(LegacyEden, EDEN_LEGACY)
 #undef LEGACY_PATH
 #endif
+        GenerateUserPaths(eden_path, eden_path_config, eden_path_cache);
+#ifdef _WIN32
+        GenerateLegacyPath(EmuPath::RyujinxDir, GetAppDataRoamingDirectory() / RYUJINX_DIR);
+#else
+        // In Ryujinx's infinite wisdom, it places EVERYTHING in the config directory on UNIX
+        // This is incredibly stupid and violates a million XDG standards, but whatever
+        GenerateLegacyPath(EmuPath::RyujinxDir, GetDataDirectory("XDG_CONFIG_HOME") / RYUJINX_DIR);
+#endif
+    }
+
+    /// Puts every path of the user directory below `root`, in the portable layout: the data
+    /// directories directly in it, the configuration in "config" and the cache in "cache". The
+    /// legacy paths of other emulators stay where they were. Nothing is created on disk.
+    void UseUserDirectory(const fs::path& root) {
+        GenerateUserPaths(root, root / CONFIG_DIR, root / CACHE_DIR);
+    }
+
+private:
+    PathManagerImpl() {
+        Reinitialize();
+    }
+
+    ~PathManagerImpl() = default;
+
+    void GenerateEdenPath(EdenPath eden_path, const fs::path& new_path) {
+        // Defer path creation
+        SetEdenPathImpl(eden_path, new_path);
+    }
+
+    void GenerateLegacyPath(EmuPath legacy_path, const fs::path& new_path) {
+        SetLegacyPathImpl(legacy_path, new_path);
+    }
+
+    void GenerateUserPaths(const fs::path& eden_path, const fs::path& eden_path_config,
+                           const fs::path& eden_path_cache) {
         // data
         GenerateEdenPath(EdenPath::EdenDir, eden_path);
         GenerateEdenPath(EdenPath::AmiiboDir, eden_path / AMIIBO_DIR);
@@ -187,29 +222,6 @@ public:
         // cache
         GenerateEdenPath(EdenPath::CacheDir, eden_path_cache);
         GenerateEdenPath(EdenPath::ShaderDir, eden_path_cache / SHADER_DIR);
-#ifdef _WIN32
-        GenerateLegacyPath(EmuPath::RyujinxDir, GetAppDataRoamingDirectory() / RYUJINX_DIR);
-#else
-        // In Ryujinx's infinite wisdom, it places EVERYTHING in the config directory on UNIX
-        // This is incredibly stupid and violates a million XDG standards, but whatever
-        GenerateLegacyPath(EmuPath::RyujinxDir, GetDataDirectory("XDG_CONFIG_HOME") / RYUJINX_DIR);
-#endif
-    }
-
-private:
-    PathManagerImpl() {
-        Reinitialize();
-    }
-
-    ~PathManagerImpl() = default;
-
-    void GenerateEdenPath(EdenPath eden_path, const fs::path& new_path) {
-        // Defer path creation
-        SetEdenPathImpl(eden_path, new_path);
-    }
-
-    void GenerateLegacyPath(EmuPath legacy_path, const fs::path& new_path) {
-        SetLegacyPathImpl(legacy_path, new_path);
     }
 
     ::Common::unordered_map<EdenPath, fs::path> eden_paths;
@@ -295,6 +307,10 @@ fs::path RemoveTrailingSeparators(const fs::path& path) {
 
 void SetAppDirectory(const std::string& app_directory) {
     PathManagerImpl::GetInstance().Reinitialize(app_directory);
+}
+
+void UseUserDirectory(const fs::path& root) {
+    PathManagerImpl::GetInstance().UseUserDirectory(root);
 }
 
 const fs::path& GetEdenPath(EdenPath eden_path) {
