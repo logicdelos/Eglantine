@@ -520,7 +520,6 @@ public:
     std::atomic<u64> uncommitted{};      ///< Records of all writers not committed yet
     std::atomic<u64> last_commit_ns{};   ///< Spikes::NowNs() of the session start or last commit
     PP::CommittedSizes committed_sizes;  ///< Per file, parallel to `files`
-    std::atomic<u64> committed_bytes{};  ///< Total of `committed_sizes`, readable from any thread
     std::atomic<u64> checkpoints{};      ///< Commits made before the session ended
     std::atomic<bool> checkpoint_queued{};
     bool window_checkpoint_done{};       ///< GPU thread only
@@ -614,14 +613,8 @@ void PublishSession(PipelineCacheSession& session) {
     report.stats.demand_wait_ns = session.demand_wait_ns.load(std::memory_order_relaxed);
     report.stats.write_status = session.write_status;
     report.stats.checkpoints = session.checkpoints.load(std::memory_order_relaxed);
-    report.stats.bytes_committed = session.committed_bytes.load(std::memory_order_relaxed);
+    report.stats.bytes_committed = session.committed_sizes.Total();
     CE::PublishCacheReport(std::move(report));
-}
-
-/// The committed size of the session: the sizes of its files as they are on disk, not the bytes
-/// this run has written. The checkpoint interval is scaled by it.
-void RefreshCommittedBytes(PipelineCacheSession& session) {
-    session.committed_bytes.store(session.committed_sizes.Total(), std::memory_order_relaxed);
 }
 
 /// Appends one record to the new generation of its file. Runs on the serialization thread, which
@@ -703,15 +696,12 @@ bool CommitFile(PipelineCacheSession& session, size_t index, bool keep_reader) {
     // A writer that only holds the previous generation again is dropped, the file stays as it is.
     bool ok = true;
     if (pending != 0) {
-        const u64 bytes = file.writer->Bytes();
-        ok = file.writer->Commit();
-        session.committed_sizes.Committed(index, ok, bytes);
+        ok = PP::CommitGeneration(session.committed_sizes, index, *file.writer);
         if (!ok) {
             session.skipped.fetch_add(pending, std::memory_order_relaxed);
         }
     }
     file.writer.reset();
-    RefreshCommittedBytes(session);
     if (keep_reader) {
         CE::CacheIdentity identity = session.identity;
         identity.kind = file.kind;
@@ -1573,15 +1563,14 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         file.kind = kind;
         file.path = path;
         file.max_bytes = max_bytes;
-        CE::RemoveStaleTemp(path);
-        file.reader = CE::EnvelopeReader::Open(path, MakeCacheIdentity(kind), file.load);
+        // An accepted generation is the committed file from the start; the first checkpoint
+        // rewrites all of it, so its interval is scaled by this size.
+        file.reader = PP::OpenCommittedFile(session->committed_sizes, path, MakeCacheIdentity(kind),
+                                            file.load);
         file.load.kind = kind;
         if (!file.reader && file.load.reason != CE::RejectReason::Missing) {
             LOG_WARNING(Render_Vulkan, "{}", CE::CacheRejectLine(file.load));
         }
-        // An accepted generation is the committed file from the start; the first checkpoint
-        // rewrites all of it, so its interval is scaled by this size.
-        session->committed_sizes.AddFile(path, file.reader != nullptr);
         session->files.push_back(std::move(file));
     };
     open_file(CE::PayloadKind::Transferable, pipeline_cache_filename,
@@ -1590,7 +1579,6 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         open_file(CE::PayloadKind::TransferableMesh, mesh_pipeline_cache_filename,
                   CE::MaxTransferableBytes / 4);
     }
-    RefreshCommittedBytes(*session);
 
     vulkan_pipeline_cache_filename.clear();
     if (use_vulkan_pipeline_cache) {
@@ -2420,7 +2408,7 @@ void PipelineCache::TickFrame() {
         if (!session.checkpoint_queued.load(std::memory_order_relaxed) &&
             PP::CheckpointDue(session.uncommitted.load(std::memory_order_relaxed),
                               now - session.last_commit_ns.load(std::memory_order_relaxed),
-                              session.committed_bytes.load(std::memory_order_relaxed),
+                              session.committed_sizes.Total(),
                               window_over)) {
             session.window_checkpoint_done = session.window_checkpoint_done || window_over;
             session.checkpoint_queued.store(true, std::memory_order_relaxed);

@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
@@ -269,25 +270,45 @@ inline constexpr u64 FirstWindowNs = u64{120} * 1'000'000'000;
 
 /// The size of each committed cache file of a session and their total: the file sizes as they
 /// are on disk now, not the bytes this run has written. `CheckpointDue` scales its interval by
-/// the total. Files are added in the order the session keeps them.
+/// the total. Files are counted in the order the session keeps them. The session changes it
+/// through OpenCommittedFile and CommitGeneration only.
 class CommittedSizes {
 public:
-    /// Adds a file. One accepted at load counts the size it has on disk from the start; one that
-    /// was rejected or is missing counts nothing (the next generation is not seeded from it).
-    /// Returns its index.
-    size_t AddFile(const std::filesystem::path& path, bool accepted);
-
-    /// A commit of file `index` that wrote `generation_bytes`. A commit that succeeded replaces
-    /// the count of the file (the generation holds the records of the previous one, so the sizes
-    /// are not summed); one that failed leaves the previous file and its count as they are.
-    void Committed(size_t index, bool succeeded, u64 generation_bytes) noexcept;
-
-    [[nodiscard]] u64 FileBytes(size_t index) const noexcept;
-    [[nodiscard]] u64 Total() const noexcept;
+    /// The total, published at every change; readable from any thread.
+    [[nodiscard]] u64 Total() const noexcept {
+        return total.load(std::memory_order_relaxed);
+    }
+    /// The count of file `index`; 0 for an unknown file. Not safe against a concurrent change.
+    [[nodiscard]] u64 FileBytes(size_t index) const noexcept {
+        return index < bytes.size() ? bytes[index] : u64{0};
+    }
 
 private:
+    friend std::unique_ptr<CacheEnvelope::EnvelopeReader> OpenCommittedFile(
+        CommittedSizes& sizes, const std::filesystem::path& path,
+        const CacheEnvelope::CacheIdentity& expected, CacheEnvelope::CacheLoadResult& load);
+    friend bool CommitGeneration(CommittedSizes& sizes, size_t index,
+                                 CacheEnvelope::EnvelopeWriter& writer);
+    void Publish() noexcept;
+
     std::vector<u64> bytes;
+    std::atomic<u64> total{};
 };
+
+/// Opens the cache file at `path` for a session and counts it as file number `sizes` has so far
+/// (the session's files are opened in one fixed order). A temporary file of a generation that
+/// never committed is removed first. An accepted file counts the size it has on disk from the
+/// start; one that is rejected or missing counts nothing (the next generation is not seeded from
+/// it) and the result is null, `load` telling why.
+[[nodiscard]] std::unique_ptr<CacheEnvelope::EnvelopeReader> OpenCommittedFile(
+    CommittedSizes& sizes, const std::filesystem::path& path,
+    const CacheEnvelope::CacheIdentity& expected, CacheEnvelope::CacheLoadResult& load);
+
+/// Commits `writer` as the new generation of file number `index`. On success the count of the
+/// file becomes the size of the generation (it holds the records of the previous one, so the
+/// sizes are not summed); on failure the previous file stays in place and keeps its count.
+[[nodiscard]] bool CommitGeneration(CommittedSizes& sizes, size_t index,
+                                    CacheEnvelope::EnvelopeWriter& writer);
 
 inline constexpr u32 NoRecord = ~u32{0};
 

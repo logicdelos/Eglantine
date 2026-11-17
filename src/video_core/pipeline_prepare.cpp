@@ -610,33 +610,38 @@ std::vector<u32> RemapRecords(std::span<const CacheEnvelope::IndexEntry> before,
     return mapped;
 }
 
-size_t CommittedSizes::AddFile(const std::filesystem::path& path, bool accepted) {
+void CommittedSizes::Publish() noexcept {
+    u64 sum = 0;
+    for (const u64 size : bytes) {
+        sum += size;
+    }
+    total.store(sum, std::memory_order_relaxed);
+}
+
+std::unique_ptr<CacheEnvelope::EnvelopeReader> OpenCommittedFile(
+    CommittedSizes& sizes, const std::filesystem::path& path,
+    const CacheEnvelope::CacheIdentity& expected, CacheEnvelope::CacheLoadResult& load) {
+    CacheEnvelope::RemoveStaleTemp(path);
+    auto reader = CacheEnvelope::EnvelopeReader::Open(path, expected, load);
     u64 size = 0;
-    if (accepted) {
+    if (reader) {
         std::error_code error;
         const auto on_disk = std::filesystem::file_size(path, error);
         size = error ? u64{0} : static_cast<u64>(on_disk);
     }
-    bytes.push_back(size);
-    return bytes.size() - 1;
+    sizes.bytes.push_back(size);
+    sizes.Publish();
+    return reader;
 }
 
-void CommittedSizes::Committed(size_t index, bool succeeded, u64 generation_bytes) noexcept {
-    if (succeeded && index < bytes.size()) {
-        bytes[index] = generation_bytes;
+bool CommitGeneration(CommittedSizes& sizes, size_t index, CacheEnvelope::EnvelopeWriter& writer) {
+    const u64 generation_bytes = writer.Bytes();
+    const bool ok = writer.Commit();
+    if (ok && index < sizes.bytes.size()) {
+        sizes.bytes[index] = generation_bytes;
     }
-}
-
-u64 CommittedSizes::FileBytes(size_t index) const noexcept {
-    return index < bytes.size() ? bytes[index] : u64{0};
-}
-
-u64 CommittedSizes::Total() const noexcept {
-    u64 total = 0;
-    for (const u64 size : bytes) {
-        total += size;
-    }
-    return total;
+    sizes.Publish();
+    return ok;
 }
 
 } // namespace VideoCommon::PipelinePrepare

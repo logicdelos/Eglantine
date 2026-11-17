@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <future>
 #include <initializer_list>
 #include <memory>
@@ -1003,14 +1004,11 @@ void WriteGeneration(const fs::path& path, const CE::CacheIdentity& identity, u3
     REQUIRE(writer->Commit());
 }
 
-/// Opens one file the way the pipeline cache does at load: the reader of an accepted file is
-/// kept, and the file is registered in `sizes` with whether it was accepted.
+/// Opens one file through the function the pipeline cache opens its files with.
 std::unique_ptr<CE::EnvelopeReader> OpenFile(CommittedSizes& sizes, const fs::path& path,
                                              const CE::CacheIdentity& expected) {
     CE::CacheLoadResult load;
-    auto reader = CE::EnvelopeReader::Open(path, expected, load);
-    sizes.AddFile(path, reader != nullptr);
-    return reader;
+    return OpenCommittedFile(sizes, path, expected, load);
 }
 
 /// What a file left by a build that is not this one looks like: rejected on opening.
@@ -1097,6 +1095,12 @@ TEST_CASE("A rejected or missing file does not delay the first checkpoint",
     const fs::path missing_path = dir.path / "transferable_mesh.bin";
     WriteForeignGeneration(rejected_path, CE::PayloadKind::Transferable, LargeRecordCount);
     REQUIRE(fs::file_size(rejected_path) * CheckpointNsPerByte > CheckpointMinIntervalNs);
+    // A generation that never committed left its temporary file next to the missing one.
+    const fs::path stale = fs::path(missing_path).concat(".tmp");
+    {
+        std::ofstream(stale, std::ios::binary) << "x";
+    }
+    REQUIRE(fs::exists(stale));
 
     CommittedSizes sizes;
     const auto rejected = OpenFile(sizes, rejected_path,
@@ -1106,12 +1110,53 @@ TEST_CASE("A rejected or missing file does not delay the first checkpoint",
     REQUIRE_FALSE(rejected);
     REQUIRE_FALSE(missing);
     CHECK(sizes.Total() == 0);
+    CHECK_FALSE(fs::exists(stale));
     // The next generation starts empty, so the minimum interval is the whole wait.
     CHECK_FALSE(CheckpointDue(1, CheckpointMinIntervalNs - 1, sizes.Total(), false));
     CHECK(CheckpointDue(1, CheckpointMinIntervalNs, sizes.Total(), false));
 }
 
-TEST_CASE("A commit replaces the committed size of its file and a failed one keeps it",
+TEST_CASE("A commit replaces the committed size of its file and the total is the sum of the files",
+          "[video_core][pipeline_prepare]") {
+    const ScratchDir dir;
+    const fs::path main_path = dir.path / "transferable.bin";
+    const fs::path mesh_path = dir.path / "transferable_mesh.bin";
+    const CE::CacheIdentity main_identity = CacheIdentityOf(CE::PayloadKind::Transferable);
+    const CE::CacheIdentity mesh_identity = CacheIdentityOf(CE::PayloadKind::TransferableMesh);
+    WriteGeneration(main_path, main_identity, LargeRecordCount);
+    WriteGeneration(mesh_path, mesh_identity, 4);
+    const u64 first_main = fs::file_size(main_path);
+    const u64 mesh = fs::file_size(mesh_path);
+
+    CommittedSizes sizes;
+    auto main_reader = OpenFile(sizes, main_path, main_identity);
+    const auto mesh_reader = OpenFile(sizes, mesh_path, mesh_identity);
+    REQUIRE(main_reader);
+    REQUIRE(mesh_reader);
+    REQUIRE(sizes.Total() == first_main + mesh);
+
+    // The next generation of the main file holds the old records and one more.
+    auto writer = CE::EnvelopeWriter::Create(main_path, main_identity,
+                                             CE::MaxBytes(main_identity.kind));
+    REQUIRE(writer);
+    REQUIRE(writer->Seed(*main_reader) == LargeRecordCount);
+    const std::vector<u8> fresh(RecordBytes, static_cast<u8>(0xee));
+    REQUIRE(writer->Append({}, fresh) == CE::AppendResult::Ok);
+    const u64 second_main = writer->Bytes();
+    REQUIRE(second_main > first_main);
+    main_reader.reset(); // an open file cannot be replaced on every host
+    REQUIRE(CommitGeneration(sizes, 0, *writer));
+
+    // The count of the file is the size of the new file, not of the two generations together,
+    // the other file is untouched and the total is their sum.
+    CHECK(sizes.FileBytes(0) == fs::file_size(main_path));
+    CHECK(sizes.FileBytes(0) == second_main);
+    CHECK(sizes.FileBytes(1) == mesh);
+    CHECK(sizes.Total() == sizes.FileBytes(0) + sizes.FileBytes(1));
+    CHECK(sizes.Total() == fs::file_size(main_path) + fs::file_size(mesh_path));
+}
+
+TEST_CASE("A commit that fails keeps the committed size and leaves no partial file",
           "[video_core][pipeline_prepare]") {
     const ScratchDir dir;
     const fs::path path = dir.path / "transferable.bin";
@@ -1124,31 +1169,34 @@ TEST_CASE("A commit replaces the committed size of its file and a failed one kee
     REQUIRE(reader);
     REQUIRE(sizes.Total() == first_generation);
 
-    // A generation that is dropped before it replaces the file leaves the file and its count.
-    {
-        auto writer = CE::EnvelopeWriter::Create(path, identity, CE::MaxBytes(identity.kind));
-        REQUIRE(writer);
-        REQUIRE(writer->Seed(*reader) == LargeRecordCount);
-        const std::vector<u8> fresh(RecordBytes, static_cast<u8>(0xee));
-        REQUIRE(writer->Append({}, fresh) == CE::AppendResult::Ok);
-        sizes.Committed(0, false, writer->Bytes());
-    }
-    CHECK(sizes.FileBytes(0) == first_generation);
-    CHECK(sizes.Total() == first_generation);
-    CHECK(fs::file_size(path) == first_generation);
-
-    // A commit that succeeds counts the size of the new file, not the two sizes added up.
     auto writer = CE::EnvelopeWriter::Create(path, identity, CE::MaxBytes(identity.kind));
     REQUIRE(writer);
     REQUIRE(writer->Seed(*reader) == LargeRecordCount);
     const std::vector<u8> fresh(RecordBytes, static_cast<u8>(0xee));
     REQUIRE(writer->Append({}, fresh) == CE::AppendResult::Ok);
-    const u64 second_generation = writer->Bytes();
+    REQUIRE(writer->Bytes() > first_generation);
     reader.reset();
-    REQUIRE(writer->Commit());
-    sizes.Committed(0, true, second_generation);
-    CHECK(second_generation > first_generation);
-    CHECK(sizes.FileBytes(0) == fs::file_size(path));
-    CHECK(sizes.Total() == second_generation);
-    CHECK(sizes.Total() < first_generation + second_generation);
+
+    // The place of the file is taken by a directory that is not empty, so the new generation
+    // cannot replace it (the old file is moved aside to stay intact).
+    const fs::path aside = dir.path / "previous.bin";
+    fs::rename(path, aside);
+    fs::create_directory(path);
+    {
+        std::ofstream(path / "occupied", std::ios::binary) << "x";
+    }
+
+    CHECK_FALSE(CommitGeneration(sizes, 0, *writer));
+    CHECK(sizes.FileBytes(0) == first_generation);
+    CHECK(sizes.Total() == first_generation);
+    // Neither the temporary file of the failed generation nor a partial file is left behind.
+    CHECK_FALSE(fs::exists(fs::path(path).concat(".tmp")));
+    CHECK(fs::is_directory(path));
+    CHECK(fs::file_size(aside) == first_generation);
+    size_t entries = 0;
+    for (const auto& entry : fs::directory_iterator(dir.path)) {
+        static_cast<void>(entry);
+        ++entries;
+    }
+    CHECK(entries == 2); // the directory and the old file
 }
