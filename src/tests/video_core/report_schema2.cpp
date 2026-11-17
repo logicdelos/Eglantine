@@ -349,7 +349,7 @@ TEST_CASE("schema 2 reports shared history loss without changing coverage",
     snapshot.complete = false;
     snapshot.lost_events = 2;
     snapshot.first_120s.frames_with_history_loss = 2;
-    const Json attr = Json::parse(Schema2::AttributionJsonHead(snapshot));
+    const Json attr = Json::parse(Schema2::AttributionJsonHead(snapshot) + "]}");
     CHECK(attr["lost_events"] == 2);
     CHECK(attr["complete"] == false);
     CHECK(attr["history_loss"] ==
@@ -361,7 +361,7 @@ TEST_CASE("schema 2 reports shared history loss without changing coverage",
     CHECK(Json::parse(Schema2::LongFrameJson(frame))["history_loss"] == false);
     frame.history_loss = true;
     CHECK(Json::parse(Schema2::LongFrameJson(frame))["history_loss"] == true);
-    const Json disabled = Json::parse(Schema2::AttributionJsonHead({}));
+    const Json disabled = Json::parse(Schema2::AttributionJsonHead({}) + "]}");
     CHECK(disabled["history_loss"].is_null());
     CHECK(Json::parse(Schema2::First120sJson({}))["frames_with_history_loss"].is_null());
 }
