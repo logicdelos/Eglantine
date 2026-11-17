@@ -18,6 +18,7 @@ size_t PeakResolverScratchBytes();
 size_t ResolverScratchAllowance();
 u64 UndrainedRingEvents();
 u64 DrainedRingEvents();
+bool HoldConsumer(bool hold);
 } // namespace VideoCommon::Nx2Spikes::Detail
 
 namespace {
@@ -1560,6 +1561,54 @@ TEST_CASE("One frame with more spans than the history holds is resolved in part,
     CHECK((frame.unknown_reasons & UnknownReason::LostSpans) == 0);
     CHECK(Total(frame.cause_ns) == end - start);
     CHECK(At(frame.activity_ns, Cause::Shader) == expected);
+    CHECK(Detail::PeakRetainedHistoryBytes() <= Config(Ms).buffer_bytes / 2);
+}
+
+TEST_CASE("Rings that deliver more at once than the history holds lose nothing",
+          "[nx2][attribution]") {
+    Run run{Config(Ms)};
+    constexpr u32 Producers = 6;
+    constexpr u64 SpansEach = 4000; // inside a ring (4096), together nearly twice the history
+    const u64 start = NowNs();
+    Present(start);
+    REQUIRE(Detail::HoldConsumer(true)); // every event waits in its ring until all are published
+    std::array<u64, Producers> expected{};
+    std::vector<std::thread> threads;
+    for (u32 t = 0; t < Producers; ++t) {
+        threads.emplace_back([&expected, t] {
+            RegisterThread("burst producer");
+            for (u64 i = 0; i < SpansEach; ++i) {
+                const u64 begin = NowNs();
+                u64 end = NowNs();
+                while (end - begin < 1000) {
+                    end = NowNs();
+                }
+                RecordSpan(Cause::Shader, begin, end);
+                expected[t] += end - begin;
+            }
+        });
+    }
+    for (std::thread& thread : threads) {
+        thread.join();
+    }
+    const u64 end = NowNs();
+    Present(end);
+    REQUIRE(Detail::HoldConsumer(false));
+    AwaitFrames(1);
+    const AttributionSnapshot snap = run.Finish();
+    u64 sum = 0;
+    for (const u64 value : expected) {
+        sum += value;
+    }
+    CHECK(snap.lost_events == 0);
+    CHECK(snap.complete);
+    REQUIRE(g_frames.size() == 1);
+    const LongFrame& frame = g_frames[0];
+    CHECK(frame.duration_ns == end - start);
+    CHECK(frame.instrumentation_complete);
+    CHECK((frame.unknown_reasons & UnknownReason::LostSpans) == 0);
+    CHECK(Total(frame.cause_ns) == end - start);
+    CHECK(At(frame.activity_ns, Cause::Shader) == sum);
     CHECK(Detail::PeakRetainedHistoryBytes() <= Config(Ms).buffer_bytes / 2);
 }
 
