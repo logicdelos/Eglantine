@@ -16,6 +16,10 @@ All runs were made on one Windows 11 laptop: AMD Ryzen 9 8940HX, NVIDIA GeForce 
 
 Milestone 0.4, "Measured speed work": every speed change ships off by default behind an `EDEN_NX2_*` switch and is measured on and off before it is recommended. None of the switches below has been measured yet; the results are to be filled from the measurement table. Each is described in `dist/nx2_switches.txt`; `=1` turns it on.
 
+### Accuracy policy
+
+- `tools/check_accuracy_policy.py` freezes the existing per-game exceptions in `tools/accuracy_policy_allowlist.json` and fails any change that adds one (title or program id literals and comparisons, game names, shader or build hashes, workaround switches, layout and patch constants, override paths, per-game data files). The rule is in `fork-notes/accuracy-policy.md`; its tests are in `tools/integration/test_accuracy_policy.py`. No emulator behaviour changes.
+
 ### Speed experiments (measurement build; the release keeps only those with a measured gain)
 
 - `EDEN_NX2_PIN_GPU_THREADS`: pins the front and back GPU threads to physical performance cores of their own and keeps the emulated CPU cores off them (Windows only). Results: to be filled from the measurement table.
