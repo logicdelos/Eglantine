@@ -460,9 +460,20 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
                 break;
             }
             case '?':
-                // An unknown option, or one without its argument. Only an automated run
-                // (--report, --run-seconds, --run-frames) refuses it, so nothing else changes.
-                if (p.unknown_option.empty()) {
+                // getopt leaves the value of the option in optopt when its operand is missing at
+                // the end of the command line; it is 0 for an unknown long option. The options of
+                // this fork that take an operand refuse that always.
+                if (optopt == 0x10C) {
+                    fail("--user-dir needs a directory");
+                } else if (optopt == 0x10E) {
+                    fail("--set expects name=value, with a name and an equals sign");
+                } else if (optopt == 0x120) {
+                    fail("--control needs a name of 1 to 64 letters, digits, '.', '_' or '-', "
+                         "starting with a letter or digit");
+                } else if (p.unknown_option.empty()) {
+                    // An unknown option, or an old one without its argument. Only an automated
+                    // run (--report, --run-seconds, --run-frames) refuses that, so nothing else
+                    // changes.
                     p.unknown_option = optind > 0 ? argv[optind - 1] : argv[0];
                 }
                 break;
