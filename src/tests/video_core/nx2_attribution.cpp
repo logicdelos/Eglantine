@@ -436,6 +436,34 @@ TEST_CASE("A wait on the nested work itself still sees only that work", "[nx2][a
     CHECK(Total(cause) == 150 * Ms);
 }
 
+TEST_CASE("A stretch under a span without work is not charged to work that ended before it",
+          "[nx2][attribution]") {
+    Run run;
+    const WorkId first = NewWorkId();
+    const WorkId second = NewWorkId();
+    Present(run.T(0));
+    // All on the present thread: a Disk span with work `first` runs 0-50 ms, a Shader span without
+    // work 10-100 ms (it starts inside the first one and outlives it), a Shader span with work
+    // `second` 100-160 ms. Nothing runs 160-200 ms.
+    RecordSpan(Cause::Disk, run.T(0), run.T(50 * Ms), first);
+    RecordSpan(Cause::Shader, run.T(10 * Ms), run.T(100 * Ms));
+    RecordSpan(Cause::Shader, run.T(100 * Ms), run.T(160 * Ms), second);
+    Present(run.T(200 * Ms));
+    run.Finish();
+    REQUIRE(g_frames.size() == 1);
+    const LongFrame& frame = g_frames[0];
+    CHECK(At(frame.cause_ns, Cause::Disk) == 10 * Ms);
+    CHECK(At(frame.cause_ns, Cause::Shader) == 150 * Ms);
+    CHECK(At(frame.cause_ns, Cause::Unknown) == 40 * Ms);
+    CHECK(Total(frame.cause_ns) == 200 * Ms);
+    // `first` is charged 0-10 ms (Disk) and 10-50 ms (Shader, inside it): 50 ms. `second` is
+    // charged 60 ms, so it ranks first. A stretch merged across 50 ms into the earlier Shader
+    // piece would give `first` 100 ms and the other order.
+    REQUIRE(frame.critical_work_count == 2);
+    CHECK(frame.critical_work_ids[0] == second);
+    CHECK(frame.critical_work_ids[1] == first);
+}
+
 TEST_CASE("A circular wait terminates and is marked ambiguous", "[nx2][attribution]") {
     Run run;
     const WorkId a = NewWorkId();

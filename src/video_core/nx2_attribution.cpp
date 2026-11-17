@@ -358,7 +358,8 @@ private:
                 const SpanRec* top = spans[active.rbegin()->second];
                 const WorkId work =
                     active_work.empty() ? WorkId{0} : spans[active_work.rbegin()->second]->work;
-                if (!result.empty() && result.back().span == top && result.back().t1 == cur) {
+                if (!result.empty() && result.back().span == top && result.back().work == work &&
+                    result.back().t1 == cur) {
                     result.back().t1 = t;
                 } else {
                     result.push_back({cur, t, top->cause, work, top, thread,
