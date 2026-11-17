@@ -695,17 +695,23 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     }
     std::optional<SdlConfig> config;
     config.emplace(lp.config_path);
+    if (lp.baseline || !setting_overrides.empty()) {
+        // The configuration file is written when the object ends: do that now, so what --baseline
+        // and --set change for this run is never saved.
+        config.reset();
+    }
     if (lp.baseline) {
         // After the config loads: the baseline wins over whatever the config holds.
         Settings::Baseline::ResetToBaseline();
         Settings::Baseline::ClearNotedSources();
     }
     if (!setting_overrides.empty()) {
-        // The configuration file is written when the object ends: do that now, so what --set
-        // changes for this run is never saved. The overrides come before everything below reads
-        // a setting, and the other command line options still have the last word.
-        config.reset();
+        // The overrides come before everything below reads a setting, and the other command line
+        // options still have the last word.
         CliSettings::Apply(setting_overrides);
+        for (const CliSettings::Resolved& entry : setting_overrides) {
+            Settings::Baseline::NoteSource(entry.setting->GetLabel(), "command line");
+        }
     }
     Core::ApplyLaunchParams(lp);
     if (lp.baseline) {
