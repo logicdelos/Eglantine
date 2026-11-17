@@ -11,6 +11,7 @@
 
 #include <memory>
 #include <string>
+#include "common/fs/path_util.h"
 #include "common/settings.h"
 
 // May be defined on command line by system provided packages (FreeBSD devel/simpleini)
@@ -261,3 +262,13 @@ private:
     std::vector<ConfigArray> array_stack;
     std::vector<std::string> key_stack;
 };
+
+/**
+ * Applies a user directory read from the configuration. An empty value means none was stored: a
+ * fresh profile has no configuration file yet, and a configuration may leave a path blank. The
+ * default path then stays, and nothing is logged. A stored value goes to Common::FS::SetEdenPath,
+ * which keeps the default and logs an error if it is not a directory.
+ *
+ * @returns Whether the value was handed to Common::FS::SetEdenPath
+ */
+bool ApplyConfiguredEdenPath(Common::FS::EdenPath eden_path, const std::string& configured);

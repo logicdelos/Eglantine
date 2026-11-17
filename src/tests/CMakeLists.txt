@@ -36,6 +36,7 @@ add_executable(tests
     video_core/spirv_software_matrix.cpp
     common/baseline_settings.cpp
     common/baseline_config.cpp
+    common/fresh_profile.cpp
     core/launch_params_early.cpp
     common/speed_limit.cpp
     core/conductor_pace.cpp
@@ -58,7 +59,6 @@ add_executable(tests
     common/ring_buffer.cpp
     common/scratch_buffer.cpp
     common/slot_vector.cpp
-    common/undefined_fix.cpp
     common/unique_function.cpp
     common/zstd_compression.cpp
     core/core_timing.cpp

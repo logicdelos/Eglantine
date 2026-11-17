@@ -74,6 +74,14 @@ std::optional<std::filesystem::path> GetCurrentUserPlayTimePath() {
         return false;
     }
 
+    // A fresh profile has no play time folder yet: create it, as the other writers of the user
+    // directory do (keys, logs, the virtual file system).
+    if (!Common::FS::CreateParentDirs(filename.value())) {
+        LOG_ERROR(Frontend, "Failed to create the play time folder: {}",
+                  Common::FS::PathToUTF8String(filename.value().parent_path()));
+        return false;
+    }
+
     Common::FS::IOFile file{filename.value(), Common::FS::FileAccessMode::Write,
                             Common::FS::FileType::BinaryFile};
     if (!file.IsOpen()) {
