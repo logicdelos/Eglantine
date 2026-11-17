@@ -59,7 +59,8 @@ private:
     const std::filesystem::path previous;
 };
 
-constexpr u64 TestProgramId = 0x0100000000010000ULL;
+/// Any non-zero key: the play time database drops entry 0 when it saves.
+constexpr u64 TestEntry = 7;
 
 } // namespace
 
@@ -74,12 +75,13 @@ TEST_CASE("Play time is saved when its folder does not exist yet", "[fresh_profi
 
     {
         PlayTime::PlayTimeManager manager;
-        manager.SetPlayTime(TestProgramId, 42);
+        manager.SetPlayTime(TestEntry, 42);
     } // Saved on destruction.
 
     CHECK(std::filesystem::is_regular_file(play_time_dir / "playtime.bin"));
     const PlayTime::PlayTimeManager reloaded;
-    CHECK(reloaded.GetPlayTime(TestProgramId) == 42);
+    const u64 seconds = reloaded.GetPlayTime(TestEntry);
+    CHECK(seconds == 42);
 }
 
 TEST_CASE("An empty configured user directory keeps the default path", "[fresh_profile]") {
