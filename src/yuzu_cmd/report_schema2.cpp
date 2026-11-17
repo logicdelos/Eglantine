@@ -105,13 +105,39 @@ Json CausesJson(const std::array<u64, Spikes::CauseCount>& values) {
     return json;
 }
 
-Json IntervalJson(const Spikes::IntervalAttribution& interval, bool enabled) {
+Json WaitSplitJson(const Spikes::WaitSplit& split) {
+    Json json = Json::object();
+    for (size_t i = 0; i < Spikes::WaitClassCount; ++i) {
+        json[std::string{Spikes::WaitClassNames[i]}] = split[i];
+    }
+    return json;
+}
+
+/// The service commands behind the Service class: the service name and command number only (the
+/// high bit of `command` marks a TIPC command), never anything the guest supplied.
+Json WaitHandlersJson(const Spikes::WaitHandlerTime* handlers, size_t count) {
+    Json list = Json::array();
+    for (size_t i = 0; i < count; ++i) {
+        Json entry = Json::object();
+        entry["service"] = Spikes::ServiceNameOf(handlers[i].service);
+        entry["command"] = handlers[i].command;
+        entry["ns"] = handlers[i].ns;
+        list.push_back(std::move(entry));
+    }
+    return list;
+}
+
+Json IntervalJson(const Spikes::IntervalAttribution& interval, bool enabled,
+                  bool waiting_observed) {
     const bool observed = enabled && interval.status != Spikes::IntervalStatus::NotObserved;
     Json json = Json::object();
     json["duration_ns"] = observed ? Json(interval.duration_ns) : Json(nullptr);
     json["cause_ns"] = observed ? CausesJson(interval.cause_ns) : Json(nullptr);
     json["status"] = std::string{
         IntervalStatusName(enabled ? interval.status : Spikes::IntervalStatus::NotObserved)};
+    if (observed && waiting_observed) {
+        json["waiting_breakdown_ns"] = WaitSplitJson(interval.waiting_ns);
+    }
     return json;
 }
 
@@ -264,6 +290,12 @@ std::string LongFrameJson(const Spikes::LongFrame& frame) {
     json["cause_ns"] = CausesJson(frame.cause_ns);
     json["activity_ns"] = CausesJson(frame.activity_ns);
     json["inferred_ns"] = CausesJson(frame.inferred_ns);
+    if (frame.waiting_observed) {
+        json["waiting_breakdown_ns"] = WaitSplitJson(frame.waiting_ns);
+        json["waiting_service_top"] = WaitHandlersJson(
+            frame.waiting_handlers.data(),
+            std::min<size_t>(frame.waiting_handler_count, Spikes::MaxWaitHandlers));
+    }
     json["primary_cause"] = std::string{CauseNameOf(frame.primary_cause)};
     json["confidence_permille"] = frame.confidence_permille;
     json["unknown_reasons"] = std::move(reason_list);
@@ -292,6 +324,11 @@ std::string AttributionJsonHead(const Spikes::AttributionSnapshot& snapshot) {
     json["producer_unknown_wait_ns"] =
         enabled ? Json(snapshot.producer_unknown_wait_ns) : Json(nullptr);
     json["inferred_ns"] = enabled ? CausesJson(snapshot.inferred_ns) : Json(nullptr);
+    if (enabled && snapshot.waiting_observed) {
+        json["waiting_breakdown_ns"] = WaitSplitJson(snapshot.waiting_ns);
+        json["waiting_service_top"] =
+            WaitHandlersJson(snapshot.waiting_handlers.data(), snapshot.waiting_handlers.size());
+    }
     std::string text = Dump(json);
     text.pop_back(); // the closing brace: the writer appends the long frames and `]}`
     text += ",\"long_frames\":[";
@@ -323,9 +360,10 @@ std::string StartupJson(const Spikes::AttributionSnapshot& snapshot) {
     json["first_host_present_ns"] =
         enabled && snapshot.first_host_present_ns != 0 ? Json(snapshot.first_host_present_ns)
                                                        : Json(nullptr);
-    json["process_to_first_present"] = IntervalJson(snapshot.process_to_first_present, enabled);
+    json["process_to_first_present"] =
+        IntervalJson(snapshot.process_to_first_present, enabled, snapshot.waiting_observed);
     json["first_present_to_interactive"] =
-        IntervalJson(snapshot.first_present_to_interactive, enabled);
+        IntervalJson(snapshot.first_present_to_interactive, enabled, snapshot.waiting_observed);
     json["interactive_scene"] = InteractiveSceneJson(snapshot);
     json["phases"] = std::move(phases);
     return Dump(json);

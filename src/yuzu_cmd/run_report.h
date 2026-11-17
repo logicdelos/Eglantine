@@ -84,15 +84,23 @@ void SetTitleId(u64 program_id);
 //       "unknown_wall_fraction",
 //       "unknown_primary_frame_fraction", "producer_unknown_wait_ns",
 //       "inferred_ns": {<cause>: ns...} (sum over long frames and start-up),
+//       "waiting_breakdown_ns": {<wait_class>: ns...} (optional: the part of the waiting cause, over
+//       the same frames and start-up, by what the guest did meanwhile; sums to cause "waiting"),
+//       "waiting_service_top": [{"service", "command", "ns"}...] (optional: the commands that took
+//       most of the "service" class, at most 8, longest first),
 //       "long_frames": [LongFrame...] }
 //   LongFrame: { "id", "start_ns", "end_ns", "duration_ns", "cause_ns": {<cause>: ns...},
 //       "activity_ns": {<cause>: ns...}, "inferred_ns": {<cause>: ns...} (part of cause_ns that is
 //       inferred: presenter_gap), "primary_cause", "confidence_permille",
 //       "unknown_reasons": [<name>...], "counter_deltas": {<event>: count, nonzero only},
-//       "critical_work_ids": [...], "present_result", "instrumentation_complete" }
+//       "critical_work_ids": [...], "present_result", "instrumentation_complete",
+//       "waiting_breakdown_ns": {<wait_class>: ns...} (optional; sums to cause_ns "waiting"),
+//       "waiting_service_top": [{"service", "command", "ns"}...] (optional, at most 4) }
 //   "startup": { "process_created": {"ns", "uncertainty_ns"} | null, "first_host_present_ns",
-//       "process_to_first_present": {"duration_ns", "cause_ns", "status"},
-//       "first_present_to_interactive": {"duration_ns", "cause_ns", "status"},
+//       "process_to_first_present": {"duration_ns", "cause_ns", "status",
+//           "waiting_breakdown_ns" (optional)},
+//       "first_present_to_interactive": {"duration_ns", "cause_ns", "status",
+//           "waiting_breakdown_ns" (optional)},
 //       "interactive_scene": {"id", "marker_ns", "origin", "scene_check", "status"},
 //       "phases": [{"phase", "outcome", "begin_ns", "end_ns"}...] }
 //   "first_120s": { "anchor": "first_real_host_present", "complete", "elapsed_ns", "frames",
@@ -110,6 +118,9 @@ void SetTitleId(u64 program_id);
 //       "translate_cost" (the text "not_separately_measured": translation is timed inside the
 //       build of a record) }
 // <cause> is a Nx2Spikes::CauseName, <event> an Event name, "reason" a RejectReasonName.
+// <wait_class> is guest_running | guest_idle | service | host_other. The waiting keys appear only
+// when a core or service thread reported a state; "command" is the service command number, with
+// the high bit set for a TIPC command; no game names, only the service interface name.
 namespace Schema2 {
 
 inline constexpr int SchemaVersion = kSchemaVersion;
