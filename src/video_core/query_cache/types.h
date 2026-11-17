@@ -11,6 +11,10 @@ namespace VideoCommon {
 enum class QueryPropertiesFlags : u32 {
     HasTimeout = 1 << 0,
     IsAFence = 1 << 1,
+    /// A one-word release that only advances its word (signed distance): the engine publishes a
+    /// counter into a word the guest's own releases advance too (the queue syncpoint word), and
+    /// a stale value must not move that word backwards (Tegra::Nx2WordAdvances).
+    AdvanceOnly = 1 << 2,
 };
 DECLARE_ENUM_FLAG_OPERATORS(QueryPropertiesFlags)
 

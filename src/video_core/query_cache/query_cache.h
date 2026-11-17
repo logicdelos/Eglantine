@@ -38,6 +38,21 @@ namespace VideoCommon {
 
 using Maxwell = Tegra::Engines::Maxwell3D;
 
+/// Stores a one-word report result in the guest word at `pointer`. `advance_only` reports
+/// (QueryPropertiesFlags::AdvanceOnly) leave a word that is ahead of them alone. Returns whether
+/// the word was written.
+inline bool WriteReportWord(u8* pointer, u32 value, bool advance_only) {
+    if (advance_only) {
+        u32 current{};
+        std::memcpy(&current, pointer, sizeof(current));
+        if (!Tegra::Nx2WordAdvances(current, value)) {
+            return false;
+        }
+    }
+    std::memcpy(pointer, &value, sizeof(value));
+    return true;
+}
+
 struct SyncValuesStruct {
     VAddr address;
     u64 value;
@@ -244,6 +259,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
                                            QueryPropertiesFlags flags, u32 payload, u32 subreport) {
     const bool has_timestamp = True(flags & QueryPropertiesFlags::HasTimeout);
     const bool is_fence = True(flags & QueryPropertiesFlags::IsAFence);
+    const bool advance_only = !has_timestamp && True(flags & QueryPropertiesFlags::AdvanceOnly);
     static const GPUVAddr watch = [] {
         const char* value = std::getenv("EDEN_NX2_SEM_WATCH");
         return value ? GPUVAddr{std::strtoull(value, nullptr, 16)} : GPUVAddr{};
@@ -280,8 +296,8 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             u8* const pointer_timestamp = impl->device_memory.template GetPointer<u8>(cpu_addr + 8);
             std::memcpy(pointer_timestamp, &timestamp, sizeof(timestamp));
             std::memcpy(pointer, &value, sizeof(value));
-        } else {
-            std::memcpy(pointer, &payload, sizeof(payload));
+        } else if (!WriteReportWord(pointer, payload, advance_only)) {
+            return;
         }
         Tegra::Nx2SemaphoreWaiters::Get().OnWrite(cpu_addr, payload);
         return;
@@ -294,6 +310,9 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     }
     if (is_fence) {
         query->flags |= QueryFlagBits::IsFence;
+    }
+    if (advance_only) {
+        query->flags |= QueryFlagBits::AdvanceOnly;
     }
     QueryLocation query_location{};
     query_location.stream_id.Assign(static_cast<u32>(streamer_id));
@@ -351,6 +370,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         query_base->value += op_streamer->GetAmendValue();
         op_streamer->SetAccumulationValue(query_base->value);
         const DAddr query_cpu_addr = query_base->guest_address;
+        bool written = true;
         if (True(query_base->flags & QueryFlagBits::HasTimestamp)) {
             const u64 timestamp = impl->gpu.GetTicks();
             u8* const pointer_timestamp =
@@ -358,15 +378,22 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             std::memcpy(pointer_timestamp, &timestamp, sizeof(timestamp));
             std::memcpy(pointer, &query_base->value, sizeof(query_base->value));
         } else {
-            const u32 value = static_cast<u32>(query_base->value);
-            std::memcpy(pointer, &value, sizeof(value));
+            written = WriteReportWord(pointer, static_cast<u32>(query_base->value),
+                                      True(query_base->flags & QueryFlagBits::AdvanceOnly));
+            if (!written && Nx2Sampler::DependencyTraceEnabled()) {
+                // The word is ahead of the report: nothing is written, so nothing latches.
+                LOG_INFO(HW_GPU, "dep query-kept query={} device={:#x} value={:#x}",
+                         fmt::ptr(query_base), query_cpu_addr, query_base->value);
+            }
         }
-        if (Nx2Sampler::DependencyTraceEnabled()) {
-            LOG_INFO(HW_GPU, "dep query-ready query={} device={:#x} value={:#x}",
-                     fmt::ptr(query_base), query_cpu_addr, query_base->value);
+        if (written) {
+            if (Nx2Sampler::DependencyTraceEnabled()) {
+                LOG_INFO(HW_GPU, "dep query-ready query={} device={:#x} value={:#x}",
+                         fmt::ptr(query_base), query_cpu_addr, query_base->value);
+            }
+            Tegra::Nx2SemaphoreWaiters::Get().OnWrite(query_cpu_addr,
+                                                      static_cast<u32>(query_base->value));
         }
-        Tegra::Nx2SemaphoreWaiters::Get().OnWrite(query_cpu_addr,
-                                                  static_cast<u32>(query_base->value));
         if (!is_synced) [[likely]] {
             if (Nx2Perf::On(Nx2Perf::Opt::QueryLanded)) {
                 // query_landed: the report stays cached until a later fence frees it, and a flush
@@ -389,7 +416,11 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         // is predicted. Any other report writes a result not known yet, and one outside a fence
         // waits for some later fence to take it.
         if (counter_type == QueryType::Payload && is_fence) {
-            Tegra::Nx2IssuedReleases::Get().Issue(cpu_addr, payload, has_timestamp);
+            if (advance_only) {
+                Tegra::Nx2IssuedReleases::Get().IssueAdvance(cpu_addr, payload);
+            } else {
+                Tegra::Nx2IssuedReleases::Get().Issue(cpu_addr, payload, has_timestamp);
+            }
         } else {
             Tegra::Nx2IssuedReleases::Get().IssueUnpredicted(cpu_addr, has_timestamp, !is_fence);
         }
@@ -712,7 +743,8 @@ bool QueryCacheBase<Traits>::SemiFlushQueryDirty(QueryCacheBase<Traits>::QueryLo
             std::memcpy(ptr, &query_base->value, sizeof(query_base->value));
             return false;
         }
-        std::memcpy(ptr, &value_l, sizeof(value_l));
+        // An advance-only report written by a flush keeps the word it finds ahead of it as well.
+        WriteReportWord(ptr, value_l, True(query_base->flags & QueryFlagBits::AdvanceOnly));
         return false;
     }
     return True(query_base->flags & QueryFlagBits::IsHostManaged) &&

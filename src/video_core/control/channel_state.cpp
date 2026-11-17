@@ -149,9 +149,12 @@ void ChannelState::Nx2WriteSyncpointWord() {
     if (word == 0 || Nx2QueueSyncpointWord(word + 0x1000) != word) {
         return; // No queue, or its region is gone
     }
-    // As a one-word release: it lands in order with the releases around it.
+    // As a one-word release: it lands in order with the releases around it. The guest's own
+    // releases advance the word with counts the syncpoint does not follow (a queue's compute
+    // completions are counted in it too), so the syncpoint value only ever advances the word.
     dma_pusher.rasterizer->Query(
-        word, VideoCommon::QueryType::Payload, VideoCommon::QueryPropertiesFlags::IsAFence,
+        word, VideoCommon::QueryType::Payload,
+        VideoCommon::QueryPropertiesFlags::IsAFence | VideoCommon::QueryPropertiesFlags::AdvanceOnly,
         dma_pusher.system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(nx2_syncpoint), 0);
 }
 

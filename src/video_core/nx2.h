@@ -619,6 +619,15 @@ inline u64 Nx2QueueSyncpointWord(u64 address) {
     return 0;
 }
 
+/// Whether `value` may be published into a queue syncpoint word that holds `current`: the word
+/// only moves forward. The distance is signed, so a counter that wrapped still advances the word
+/// and a word reset to 0xffffffff takes any small value. Only the engine's own publication of the
+/// channel syncpoint asks (QueryPropertiesFlags::AdvanceOnly): a guest release writes what the
+/// guest meant, a lower value included.
+[[nodiscard]] constexpr bool Nx2WordAdvances(u32 current, u32 value) {
+    return static_cast<s32>(value - current) >= 0;
+}
+
 namespace Nx2SemaphoreFenceLean {
 inline std::atomic<u32> pending{};
 // GPU-front-thread statistics; bounded to the most recent 4096 completed suspensions.
@@ -823,7 +832,7 @@ public:
         }
         std::scoped_lock lk{mutex};
         return std::ranges::any_of(releases, [device_address](const Release& r) {
-            return r.address == device_address && r.reduction == PlainWrite;
+            return r.address == device_address && r.reduction < 0;
         });
     }
 
@@ -836,6 +845,12 @@ public:
     /// must write through the Settle that takes the write.
     void IssueReduction(u64 device_address, u32 op, bool is_signed, u32 payload) {
         Push({device_address, payload, static_cast<s8>(op), is_signed, true, false});
+    }
+
+    /// A report that only advances its word (QueryPropertiesFlags::AdvanceOnly): it stores
+    /// `value` unless the word is already ahead of it (Nx2WordAdvances).
+    void IssueAdvance(u64 device_address, u32 value) {
+        Push({device_address, value, AdvanceOnly, false, true, false});
     }
 
     /// A queued write no acquire may count on: it and the releases issued after it are not
@@ -862,7 +877,7 @@ public:
         }
         std::scoped_lock lk{mutex};
         return std::ranges::any_of(releases, [&](const Release& r) {
-            return r.reduction != PlainWrite && r.address - device_address < size;
+            return r.reduction >= 0 && r.address - device_address < size;
         });
     }
 
@@ -930,10 +945,15 @@ public:
             if (r.address != device_address || !r.predicted || r.landing) {
                 return false;
             }
-            word = r.reduction == PlainWrite
-                       ? r.value
-                       : ReduceSemaphore(static_cast<u32>(r.reduction), r.is_signed,
-                                         word ? *word : read(), r.value);
+            if (r.reduction == PlainWrite) {
+                word = r.value;
+            } else if (r.reduction == AdvanceOnly) {
+                const u32 now = word ? *word : read();
+                word = Nx2WordAdvances(now, r.value) ? r.value : now;
+            } else {
+                word = ReduceSemaphore(static_cast<u32>(r.reduction), r.is_signed,
+                                       word ? *word : read(), r.value);
+            }
             if (Nx2SemaphoreWaiters::Satisfies(operation, value, *word)) {
                 return true;
             }
@@ -942,7 +962,10 @@ public:
     }
 
 private:
+    // Release::reduction: PlainWrite and AdvanceOnly are stores (negative), the rest is
+    // ReduceSemaphore's op.
     static constexpr s8 PlainWrite = -1;
+    static constexpr s8 AdvanceOnly = -2;
 
     struct Release {
         u64 address;
