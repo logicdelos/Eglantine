@@ -303,6 +303,7 @@ std::string LongFrameJson(const Spikes::LongFrame& frame) {
     json["critical_work_ids"] = std::move(work);
     json["present_result"] = std::string{PresentResultName(frame.present_result)};
     json["instrumentation_complete"] = frame.instrumentation_complete;
+    json["history_loss"] = frame.history_loss;
     return Dump(json);
 }
 
@@ -314,6 +315,21 @@ std::string AttributionJsonHead(const Spikes::AttributionSnapshot& snapshot) {
     json["enabled"] = enabled;
     json["complete"] = enabled ? Json(snapshot.complete) : Json(nullptr);
     json["lost_events"] = enabled ? Json(snapshot.lost_events) : Json(nullptr);
+    Json history_loss = nullptr;
+    if (enabled) {
+        constexpr std::array names{"begin_capacity", "closed_capacity", "transfer_capacity"};
+        static_assert(names.size() == Spikes::HistoryLossCauseCount);
+        history_loss = Json::object();
+        for (size_t i = 0; i < names.size(); ++i) {
+            const auto& loss = snapshot.history_loss[i];
+            if (loss.count != 0) {
+                history_loss[names[i]] = {{"count", loss.count},
+                                          {"first_drop_ns", loss.first_drop_ns},
+                                          {"last_drop_ns", loss.last_drop_ns}};
+            }
+        }
+    }
+    json["history_loss"] = std::move(history_loss);
     json["dropped_boundaries"] = enabled ? Json(snapshot.dropped_boundaries) : Json(nullptr);
     json["sink_write_errors"] = enabled ? Json(snapshot.sink_write_errors) : Json(nullptr);
     json["rejected_presents"] = enabled ? Json(snapshot.rejected_presents) : Json(nullptr);
@@ -379,6 +395,8 @@ std::string First120sJson(const Spikes::AttributionSnapshot& snapshot) {
     json["elapsed_ns"] = anchored ? Json(window.elapsed_ns) : Json(nullptr);
     json["frames"] = anchored ? Json(window.frames) : Json(nullptr);
     json["frames_over_100ms"] = anchored ? Json(window.frames_over_threshold) : Json(nullptr);
+    json["frames_with_history_loss"] =
+        anchored ? Json(window.frames_with_history_loss) : Json(nullptr);
     json["max_ns"] = anchored ? Json(window.max_ns) : Json(nullptr);
     json["crossing_tail_interval_ns"] =
         complete ? Json(window.crossing_tail_interval_ns) : Json(nullptr);

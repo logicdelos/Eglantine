@@ -491,6 +491,7 @@ struct LongFrame {
     u32 critical_work_count{};
     PresentResult present_result{PresentResult::Success};
     bool instrumentation_complete{}; ///< No lost or still-open spans touched the frame
+    bool history_loss{}; ///< Shared span capacity dropped records touching this interval
 };
 
 /// The monotonic clock of every attribution timestamp.
@@ -760,6 +761,16 @@ struct FirstWindow {
     u64 frames_over_threshold{};
     u64 max_ns{};
     u64 crossing_tail_interval_ns{}; ///< The interval that crossed the window's end
+    u64 frames_with_history_loss{}; ///< Resolved intervals flagged for shared history loss
+};
+
+enum class HistoryLossCause : u8 { BeginCapacity, ClosedCapacity, TransferCapacity, Count };
+inline constexpr size_t HistoryLossCauseCount = static_cast<size_t>(HistoryLossCause::Count);
+
+struct HistoryLossSummary {
+    u64 count{};
+    u64 first_drop_ns{}; ///< Consumer clock at the first drop, not the event timestamp
+    u64 last_drop_ns{};
 };
 
 /// Everything the report needs from the recorder, immutable.
@@ -768,6 +779,7 @@ struct AttributionSnapshot {
     bool complete{}; ///< No lost spans, no write failure, session ended with producers joined
     u64 threshold_ns{};
     u64 lost_events{};
+    std::array<HistoryLossSummary, HistoryLossCauseCount> history_loss{};
     u64 dropped_boundaries{}; ///< Present boundaries lost; each leaves an unattributed gap
     u64 sink_write_errors{};
     u64 rejected_presents{}; ///< Present attempts that did not qualify

@@ -81,6 +81,9 @@ void SetTitleId(u64 program_id);
 //   "schema_version": 2
 //   "attribution": { "source": "host_present_submission", "threshold_ns", "enabled", "complete",
 //       "lost_events", "dropped_boundaries", "sink_write_errors", "rejected_presents",
+//       "history_loss": {<capacity_cause>: {"count", "first_drop_ns", "last_drop_ns"}...}
+//       (nonzero causes only: begin_capacity, closed_capacity, transfer_capacity; timestamps
+//       mark detection on the consumer clock, not the span interval),
 //       "unknown_wall_fraction",
 //       "unknown_primary_frame_fraction", "producer_unknown_wait_ns",
 //       "inferred_ns": {<cause>: ns...} (sum over long frames and start-up),
@@ -96,6 +99,7 @@ void SetTitleId(u64 program_id);
 //       inferred: presenter_gap), "primary_cause", "confidence_permille",
 //       "unknown_reasons": [<name>...], "counter_deltas": {<event>: count, nonzero only},
 //       "critical_work_ids": [...], "present_result", "instrumentation_complete",
+//       "history_loss" (boolean; a shared-capacity loss episode touched this frame),
 //       "waiting_breakdown_ns": {<wait_class>: ns...} (optional; sums to cause_ns "waiting"),
 //       "waiting_service_top": [{"service", "command", "ns"}...] (optional, at most 4) }
 //   "startup": { "process_created": {"ns", "uncertainty_ns"} | null, "first_host_present_ns",
@@ -106,7 +110,9 @@ void SetTitleId(u64 program_id);
 //       "interactive_scene": {"id", "marker_ns", "origin", "scene_check", "status"},
 //       "phases": [{"phase", "outcome", "begin_ns", "end_ns"}...] }
 //   "first_120s": { "anchor": "first_real_host_present", "complete", "elapsed_ns", "frames",
-//       "frames_over_100ms", "max_ns", "crossing_tail_interval_ns", "scene_check" }
+//       "frames_over_100ms", "frames_with_history_loss", "max_ns", "crossing_tail_interval_ns",
+//       "scene_check" } ("complete" only measures elapsed coverage; the loss count covers all
+//       resolved frames ending in the window, not just long frames).
 //   "cache": { "identity": {...}, "files": [{"kind", "status": "accepted"|"rejected"|"missing",
 //       "reason", "expected", "found", "records"}...], "recorded", "records" (the records the
 //       run tried to prepare), "prepared", "adopted", "demand_promoted" (found queued: the draw

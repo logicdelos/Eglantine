@@ -266,6 +266,12 @@ struct PendingEnd {
     u32 flags{};
 };
 
+struct LossEpisode {
+    u64 begin;
+    u64 end;
+    bool history;
+};
+
 struct Leaf {
     u64 t0{};
     u64 t1{};
@@ -539,14 +545,14 @@ std::vector<WaitHandlerTime> TopHandlers(const std::unordered_map<u64, u64>& han
 /// The decomposition of one window of the history. Consumer thread only.
 class Resolver {
 public:
-    Resolver(std::span<const ThreadState> threads, std::span<const std::pair<u64, u64>> losses,
+    Resolver(std::span<const ThreadState> threads, std::span<const LossEpisode> losses,
              u64 start, u64 end, bool charge_presenter_gaps)
         : states{threads}, loss_episodes{losses}, s{start}, e{end},
           charge_gaps{charge_presenter_gaps} {}
 
     Decomp Run(std::span<const u32> roots) {
-        for (const auto& [begin, finish] : loss_episodes) {
-            if (finish > s && begin <= e) {
+        for (const auto& loss : loss_episodes) {
+            if (loss.end > s && loss.begin <= e) {
                 out.reasons |= UnknownReason::LostSpans;
                 out.complete = false;
                 break;
@@ -1229,7 +1235,7 @@ private:
     }
 
     std::span<const ThreadState> states;
-    std::span<const std::pair<u64, u64>> loss_episodes;
+    std::span<const LossEpisode> loss_episodes;
     u64 s;
     u64 e;
     std::vector<u32> root_ids; ///< The roots of the sweep that is running (ResolveRoots)
@@ -1325,7 +1331,7 @@ struct Session {
     std::array<ThreadState, MaxThreads> states;
     std::vector<PendingLink> pending_links;
     std::vector<PendingEnd> pending_ends;
-    std::vector<std::pair<u64, u64>> losses;
+    std::vector<LossEpisode> losses;
     size_t history{}; ///< Slots of span storage owned: the capacities of every open/closed vector
     std::atomic<size_t> peak_retained_bytes{}; ///< Most bytes of span storage held at once
     mutable std::atomic<size_t> peak_scratch_bytes{}; ///< Most resolver scratch held at once
@@ -1374,7 +1380,8 @@ struct Session {
     void DropPendingEnds();
     void SkipLostInterval(u64 until);
     void TakeLosses();
-    void AddLoss(u64 begin, u64 end);
+    void AddLoss(u64 begin, u64 end, bool history_loss = false);
+    void DropHistory(u64 begin, u64 end, HistoryLossCause cause);
     void Quiesce();
     void MarkOpenIncomplete();
     void Prune(bool force = false);
@@ -1391,7 +1398,7 @@ struct Session {
     AttributionSnapshot Snapshot();
     void Mirror();
     void MaybeChunk();
-    bool LostBetween(u64 s, u64 e) const;
+    bool LostBetween(u64 s, u64 e, bool history_only = false) const;
     Joined TakeCarry(u64 s, u64 e);
     void LogDiagnostics() const;
 };
@@ -1573,41 +1580,55 @@ void Session::Quiesce() {
     }
 }
 
-void Session::AddLoss(u64 begin, u64 end) {
+void Session::AddLoss(u64 begin, u64 end, bool history_loss) {
     end = std::max(begin, end);
     // The episodes are sorted and apart: one within LossMergeNs of another is merged with it, so
     // an episode covers only the time its losses fell in and a frame is marked incomplete only
     // when an episode touches it.
-    using Episode = std::pair<u64, u64>;
     const auto first = std::lower_bound(
         losses.begin(), losses.end(), begin,
-        [](const Episode& episode, u64 value) { return episode.second + LossMergeNs < value; });
+        [](const LossEpisode& episode, u64 value) { return episode.end + LossMergeNs < value; });
     auto last = first;
-    while (last != losses.end() && last->first <= end + LossMergeNs) {
+    while (last != losses.end() && last->begin <= end + LossMergeNs) {
+        history_loss |= last->history;
         ++last;
     }
     if (first == last) {
-        losses.insert(first, Episode{begin, end});
+        losses.insert(first, LossEpisode{begin, end, history_loss});
     } else {
-        const u64 low = std::min(begin, first->first);
-        const u64 high = std::max(end, (last - 1)->second);
+        const u64 low = std::min(begin, first->begin);
+        const u64 high = std::max(end, (last - 1)->end);
         const auto merged = losses.erase(first + 1, last) - 1;
-        *merged = Episode{low, high};
+        *merged = LossEpisode{low, high, history_loss};
     }
     if (losses.size() > MaxLossEpisodes) {
         // Merge the two closest, which widens the episodes by the least.
         size_t best = 0;
         u64 narrowest = ~u64{};
         for (size_t i = 0; i + 1 < losses.size(); ++i) {
-            const u64 gap = losses[i + 1].first - losses[i].second;
+            const u64 gap = losses[i + 1].begin - losses[i].end;
             if (gap < narrowest) {
                 narrowest = gap;
                 best = i;
             }
         }
-        losses[best].second = losses[best + 1].second;
+        losses[best].end = losses[best + 1].end;
+        losses[best].history |= losses[best + 1].history;
         losses.erase(losses.begin() + static_cast<std::ptrdiff_t>(best) + 1);
     }
+}
+
+void Session::DropHistory(u64 begin, u64 end, HistoryLossCause cause) {
+    const u64 drop_ns = NowNs();
+    lost_consumer.fetch_add(1, std::memory_order_relaxed);
+    ++lost_history;
+    AddLoss(begin, end, true);
+    const std::scoped_lock lock{stats_mutex};
+    auto& summary = snap.history_loss[static_cast<size_t>(cause)];
+    if (summary.count++ == 0) {
+        summary.first_drop_ns = drop_ns;
+    }
+    summary.last_drop_ns = drop_ns;
 }
 
 void Session::TakeLosses() {
@@ -1677,9 +1698,7 @@ bool Session::CloseSpan(const PendingEnd& end) {
     }
     if (!Reserve(owner.closed)) {
         // The finished record does not fit: lost like a span refused at its Begin.
-        lost_consumer.fetch_add(1, std::memory_order_relaxed);
-        ++lost_history;
-        AddLoss(rec.begin_ns, rec.end_ns);
+        DropHistory(rec.begin_ns, rec.end_ns, HistoryLossCause::TransferCapacity);
         return true;
     }
     if (last_resolved_ts != 0 && rec.end_ns <= last_resolved_ts) {
@@ -1712,9 +1731,7 @@ bool Session::DrainThread(u32 id, ThreadBuf& buf, u64 tail, u64 limit) {
         switch (event.type) {
         case EventType::Begin: {
             if (!Reserve(state.open)) {
-                lost_consumer.fetch_add(1, std::memory_order_relaxed);
-                ++lost_history;
-                AddLoss(event.begin_ns, event.begin_ns);
+                DropHistory(event.begin_ns, event.begin_ns, HistoryLossCause::BeginCapacity);
                 break;
             }
             SpanRec rec;
@@ -1746,9 +1763,7 @@ bool Session::DrainThread(u32 id, ThreadBuf& buf, u64 tail, u64 limit) {
         }
         case EventType::Closed: {
             if (!Reserve(state.closed)) {
-                lost_consumer.fetch_add(1, std::memory_order_relaxed);
-                ++lost_history;
-                AddLoss(event.begin_ns, event.end_ns);
+                DropHistory(event.begin_ns, event.end_ns, HistoryLossCause::ClosedCapacity);
                 break;
             }
             if (last_resolved_ts != 0 && event.end_ns <= last_resolved_ts) {
@@ -2042,8 +2057,8 @@ void Session::Prune(bool force) {
     }
     // The losses of an interval resolved in part stay until its present has joined the parts.
     const u64 loss_floor = carry_through != 0 ? std::min(floor, carry_from) : floor;
-    std::erase_if(losses, [loss_floor](const std::pair<u64, u64>& l) {
-        return l.second <= loss_floor;
+    std::erase_if(losses, [loss_floor](const LossEpisode& l) {
+        return l.end <= loss_floor;
     });
 }
 
@@ -2156,9 +2171,10 @@ Joined Session::TakeCarry(u64 s, u64 e) {
 }
 
 /// Whether a loss episode touches (s, e].
-bool Session::LostBetween(u64 s, u64 e) const {
-    return std::any_of(losses.begin(), losses.end(),
-                       [s, e](const std::pair<u64, u64>& l) { return l.second > s && l.first <= e; });
+bool Session::LostBetween(u64 s, u64 e, bool history_only) const {
+    return std::any_of(losses.begin(), losses.end(), [s, e, history_only](const LossEpisode& l) {
+        return l.end > s && l.begin <= e && (!history_only || l.history);
+    });
 }
 
 /// Names what was recorded and what was lost, by kind and by thread, when the session ends.
@@ -2333,6 +2349,7 @@ void Session::ResolveBoundary(const Item& item) {
         SkipLostInterval(s);
     }
     const bool degraded = timeout || unregistered_new || gap;
+    const bool history_loss = LostBetween(s, e, true);
 
     // What MaybeChunk resolved while the interval was open is joined with the rest here.
     Joined joined = TakeCarry(s, e);
@@ -2350,7 +2367,7 @@ void Session::ResolveBoundary(const Item& item) {
         }
     }
     d.reasons |= item.reasons;
-    if (degraded) {
+    if (degraded || history_loss) {
         d.complete = false;
         d.reasons |= UnknownReason::LostSpans;
     }
@@ -2411,6 +2428,7 @@ void Session::ResolveBoundary(const Item& item) {
         }
         frame.present_result = item.result;
         frame.instrumentation_complete = d.complete;
+        frame.history_loss = history_loss;
     }
 
     {
@@ -2420,6 +2438,7 @@ void Session::ResolveBoundary(const Item& item) {
         const u64 since = e - anchor;
         if (since <= FirstWindowNs) {
             ++w.frames;
+            w.frames_with_history_loss += history_loss ? 1 : 0;
             if (is_long) {
                 ++w.frames_over_threshold;
             }
