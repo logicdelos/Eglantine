@@ -1632,7 +1632,9 @@ TEST_CASE("A wait for the guest is charged to the guest's translation", "[nx2][a
     CHECK(At(frame.cause_ns, Cause::Unknown) == 0);
     CHECK(Total(frame.cause_ns) == frame.duration_ns);
     CHECK(frame.primary_cause == Cause::CodeTranslation);
-    CHECK(frame.unknown_reasons == 0);
+    // The 30 ms the guest was not translating is Waiting with no known producer: the reason bit
+    // is the one that goes with producer_unknown_wait_ns, and no other reason applies.
+    CHECK(frame.unknown_reasons == UnknownReason::ProducerUnknownWait);
     CHECK(frame.instrumentation_complete);
     CHECK(snap.producer_unknown_wait_ns == 30 * Ms);
 }
