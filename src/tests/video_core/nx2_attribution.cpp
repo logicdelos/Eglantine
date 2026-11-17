@@ -1446,3 +1446,170 @@ TEST_CASE("Derived work ids never meet allocated ones", "[nx2][attribution]") {
     CHECK(derived != DerivedWorkId(WorkKind::GraphicsPipelineBuild, 77));
     CHECK(DerivedWorkId(WorkKind::Submission, 0) != 0);
 }
+
+TEST_CASE("A sustained burst of spans over many frames loses nothing and stays in the budget",
+          "[nx2][attribution]") {
+    const SessionConfig config = Config(100 * Ms); // the default budget: a history of about 14000
+    constexpr u64 Frames = 40;
+    constexpr u64 SpansPerFrame = 1000; // 40000 in all: nearly three histories
+    constexpr u64 Step = 20'000;        // ns between spans
+    constexpr u64 SpanNs = 10'000;
+    constexpr u64 FrameNs = 150 * Ms;
+    constexpr u64 RingChunk = 512; // an eighth of the ring, recorded between two drains
+    Run run{config};
+    const u64 origin = run.base;
+    Present(origin);
+    std::atomic<u64> go{0};
+    std::atomic<u64> done{0};
+    std::atomic<bool> failed{false};
+    std::thread burst{[&] {
+        RegisterThread("burst producer");
+        u64 recorded = 0;
+        for (u64 frame = 1; frame <= Frames; ++frame) {
+            while (go.load() < frame) {
+                std::this_thread::yield();
+            }
+            const u64 begin = origin + (frame - 1) * FrameNs + Ms;
+            for (u64 i = 0; i < SpansPerFrame; ++i) {
+                RecordSpan(Cause::Shader, begin + i * Step, begin + i * Step + SpanNs);
+                if (++recorded % RingChunk == 0 && !AwaitDrained(recorded)) {
+                    failed = true;
+                    return;
+                }
+            }
+            if (!AwaitDrained(recorded)) {
+                failed = true;
+                return;
+            }
+            done.store(frame);
+        }
+    }};
+    for (u64 frame = 1; frame <= Frames && !failed.load(); ++frame) {
+        const u64 start = origin + (frame - 1) * FrameNs;
+        go.store(frame);
+        while (done.load() < frame && !failed.load()) {
+            std::this_thread::yield();
+        }
+        // The root's own span in this frame, recorded in the same time as the burst.
+        RecordSpan(Cause::Texture, start, start + 60 * Ms);
+        REQUIRE(AwaitIdle());
+        Present(start + FrameNs);
+    }
+    burst.join();
+    REQUIRE_FALSE(failed.load());
+    AwaitFrames(Frames);
+    const AttributionSnapshot snap = run.Finish();
+    CHECK(snap.lost_events == 0);
+    CHECK(snap.complete);
+    CHECK(snap.frames == Frames);
+    REQUIRE(g_frames.size() == Frames);
+    for (u64 i = 0; i < Frames; ++i) {
+        const LongFrame& frame = g_frames[i];
+        CHECK(frame.id == i + 2);
+        CHECK(frame.duration_ns == FrameNs);
+        CHECK(frame.instrumentation_complete);
+        CHECK((frame.unknown_reasons & UnknownReason::LostSpans) == 0);
+        CHECK(At(frame.cause_ns, Cause::Texture) == 60 * Ms);
+        CHECK(At(frame.cause_ns, Cause::Unknown) == FrameNs - 60 * Ms);
+        CHECK(Total(frame.cause_ns) == FrameNs);
+        CHECK(At(frame.activity_ns, Cause::Shader) == SpansPerFrame * SpanNs);
+        CHECK(At(frame.activity_ns, Cause::Texture) == 60 * Ms);
+    }
+    // The spans of all the frames never sat in the history together.
+    CHECK(Detail::PeakRetainedHistoryBytes() <= config.buffer_bytes / 2);
+}
+
+TEST_CASE("One frame with more spans than the history holds is resolved in part, in full",
+          "[nx2][attribution]") {
+    Run run{Config(Ms)};
+    constexpr u64 Spans = 40000; // nearly three histories, inside one frame
+    constexpr u64 RingChunk = 256;
+    const u64 start = NowNs();
+    Present(start);
+    std::atomic<bool> failed{false};
+    u64 expected = 0;
+    OnThread([&] {
+        RegisterThread("burst producer");
+        for (u64 i = 0; i < Spans; ++i) {
+            // Real stamps, one after the other: each span lasts at least a microsecond and ends
+            // before the next begins, so none of them is cut by another.
+            const u64 begin = NowNs();
+            u64 end = NowNs();
+            while (end - begin < 1000) {
+                end = NowNs();
+            }
+            RecordSpan(Cause::Shader, begin, end);
+            expected += end - begin;
+            if ((i + 1) % RingChunk == 0 && !AwaitDrained(i + 1)) {
+                failed = true;
+                return;
+            }
+        }
+    });
+    REQUIRE_FALSE(failed.load());
+    const u64 end = NowNs();
+    Present(end);
+    AwaitFrames(1);
+    const AttributionSnapshot snap = run.Finish();
+    CHECK(snap.lost_events == 0);
+    CHECK(snap.complete);
+    REQUIRE(g_frames.size() == 1);
+    const LongFrame& frame = g_frames[0];
+    CHECK(frame.duration_ns == end - start);
+    CHECK(frame.instrumentation_complete);
+    CHECK((frame.unknown_reasons & UnknownReason::LostSpans) == 0);
+    CHECK(Total(frame.cause_ns) == end - start);
+    CHECK(At(frame.activity_ns, Cause::Shader) == expected);
+    CHECK(Detail::PeakRetainedHistoryBytes() <= Config(Ms).buffer_bytes / 2);
+}
+
+TEST_CASE("Losses mark only the frames they fall in, however many there are",
+          "[nx2][attribution]") {
+    SessionConfig config = Config(10 * Ms);
+    config.buffer_bytes = 16 * 1024; // rings of 4 events and a history of 64 spans
+    Run run{config};
+    constexpr u64 Spans = 1300; // refused for room one by one: more episodes than are kept
+    constexpr u64 Spacing = 2 * Ms;
+    Present(run.T(0));
+    Present(run.T(20 * Ms)); // the frame before: complete
+    std::atomic<bool> failed{false};
+    OnThread([&] {
+        RegisterThread("lossy producer");
+        u64 recorded = 0;
+        const auto record = [&](u64 at) {
+            RecordSpan(Cause::Shader, at, at + 1000);
+            ++recorded;
+            if (!AwaitDrained(recorded)) {
+                failed = true;
+            }
+        };
+        // In the second frame, further apart than a loss episode reaches.
+        for (u64 i = 0; i < Spans && !failed.load(); ++i) {
+            record(run.T(100 * Ms + i * Spacing));
+        }
+        // One more in the fifth, with the third and fourth frames between: they are not touched.
+        record(run.T(3050 * Ms));
+    });
+    REQUIRE_FALSE(failed.load());
+    Present(run.T(2800 * Ms));
+    Present(run.T(2900 * Ms));
+    Present(run.T(3000 * Ms));
+    Present(run.T(3100 * Ms));
+    AwaitFrames(5);
+    const AttributionSnapshot snap = run.Finish();
+    CHECK(snap.lost_events > 1024);
+    CHECK_FALSE(snap.complete);
+    REQUIRE(g_frames.size() == 5);
+    for (const LongFrame& frame : g_frames) {
+        CHECK(Total(frame.cause_ns) == frame.duration_ns);
+    }
+    CHECK(g_frames[0].instrumentation_complete);
+    CHECK_FALSE(g_frames[1].instrumentation_complete);
+    CHECK((g_frames[1].unknown_reasons & UnknownReason::LostSpans) != 0);
+    CHECK(g_frames[2].instrumentation_complete);
+    CHECK((g_frames[2].unknown_reasons & UnknownReason::LostSpans) == 0);
+    CHECK(g_frames[3].instrumentation_complete);
+    CHECK((g_frames[3].unknown_reasons & UnknownReason::LostSpans) == 0);
+    CHECK_FALSE(g_frames[4].instrumentation_complete);
+    CHECK((g_frames[4].unknown_reasons & UnknownReason::LostSpans) != 0);
+}
