@@ -6,7 +6,9 @@
 // never read as an option, whatever it looks like.
 
 #include <initializer_list>
+#include <set>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
@@ -155,4 +157,61 @@ TEST_CASE("The early scan records the mistakes with the fork options", "[launch_
     CHECK(Scan({"--", "--baseline=1"}).error.empty());
     // Older options keep their handling: a value on --version is not a mistake of this scan.
     CHECK(Scan({"--version=1", "--json"}).error.empty());
+}
+
+TEST_CASE("Every prefix of every long option resolves as getopt resolves it", "[launch_params]") {
+    // The table is the one getopt_long gets. Computed here from the table alone: an exact name
+    // wins; otherwise the options the prefix starts are one option, or several of the same kind
+    // (argument and id), or the prefix is ambiguous.
+    const std::vector<Core::LongOptionEntry> table = Core::LongOptionTable();
+    REQUIRE_FALSE(table.empty());
+    for (const Core::LongOptionEntry& option : table) {
+        for (std::size_t length = 1; length <= option.name.size(); ++length) {
+            const std::string_view prefix = option.name.substr(0, length);
+            std::string_view expected;
+            const Core::LongOptionEntry* first = nullptr;
+            bool ambiguous = false;
+            bool exact = false;
+            for (const Core::LongOptionEntry& candidate : table) {
+                if (candidate.name == prefix) {
+                    expected = candidate.name;
+                    exact = true;
+                    break;
+                }
+                if (candidate.name.starts_with(prefix)) {
+                    if (first == nullptr) {
+                        first = &candidate;
+                    } else if (first->takes_argument != candidate.takes_argument ||
+                               first->requires_argument != candidate.requires_argument ||
+                               first->id != candidate.id) {
+                        ambiguous = true;
+                    }
+                }
+            }
+            if (!exact) {
+                expected = (ambiguous || first == nullptr) ? std::string_view{} : first->name;
+            }
+            INFO("--" << std::string{prefix});
+            CHECK(Core::ResolveLongOption(prefix) == expected);
+        }
+    }
+}
+
+TEST_CASE("No two long options share an id", "[launch_params]") {
+    std::set<int> ids;
+    for (const Core::LongOptionEntry& option : Core::LongOptionTable()) {
+        INFO("--" << std::string{option.name});
+        CHECK(ids.insert(option.id).second);
+    }
+    // The options of 0.3, fork-cli3 and fork-baseline are all in the one table.
+    std::set<std::string_view> names;
+    for (const Core::LongOptionEntry& option : Core::LongOptionTable()) {
+        names.insert(option.name);
+    }
+    for (const char* name : {"report", "run-seconds", "run-frames", "json", "user-dir",
+                             "list-settings", "set", "control", "baseline", "baseline-allow",
+                             "print-baseline"}) {
+        INFO(name);
+        CHECK(names.contains(name));
+    }
 }
