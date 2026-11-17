@@ -38,6 +38,7 @@ add_executable(tests
     common/baseline_config.cpp
     core/launch_params_early.cpp
     common/speed_limit.cpp
+    core/conductor_pace.cpp
     common/bit_field.cpp
     common/cityhash.cpp
     common/container_hash.cpp

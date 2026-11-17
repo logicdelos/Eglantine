@@ -80,7 +80,8 @@ private:
     Result CloseLayerLocked(u64 layer_id);
 
 public:
-    bool ComposeOnDisplay(s32* out_swap_interval, f32* out_compose_speed_scale, u64 display_id);
+    bool ComposeOnDisplay(s32* out_swap_interval, f32* out_compose_speed_scale,
+                          s32* out_queued_swap_interval, u64 display_id);
 
 private:
     std::mutex m_lock{};

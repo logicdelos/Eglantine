@@ -215,9 +215,9 @@ struct Values {
     SwitchableSetting<bool> use_speed_limit{
                                             linkage, true, "use_speed_limit", Category::Core, Specialization::Paired, true, true};
 
-    // Off (the default): the game never runs faster than real time, also with the frame limit off
-    // or above 100 %. On: with the limit off or above 100 % frames are sent as fast as they can
-    // be produced. General, never per game.
+    // Off (the default): the user's speed limit cannot be switched off and cannot exceed 100 %
+    // (a game's own composition request is not touched). On: with the limit off or above 100 %
+    // frames are sent as fast as they can be produced. General, never per game.
     Setting<bool> allow_speed_up{linkage, false, "allow_speed_up", Category::Core,
                                  Specialization::Default, true, true};
 

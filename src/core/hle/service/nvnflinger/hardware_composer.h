@@ -24,7 +24,9 @@ public:
     explicit HardwareComposer();
     ~HardwareComposer();
 
-    u32 ComposeLocked(f32* out_speed_scale, Display& display,
+    /// `out_queued_swap_interval` is the swap interval the game queued (before it is normalised
+    /// into an interval and a speed multiplier), for the log.
+    u32 ComposeLocked(f32* out_speed_scale, s32* out_queued_swap_interval, Display& display,
                       Nvidia::Devices::nvdisp_disp0& nvdisp);
     void RemoveLayerLocked(Display& display, ConsumerId consumer_id);
 

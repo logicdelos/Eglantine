@@ -46,8 +46,8 @@ s32 NormalizeSwapInterval(f32* out_speed_scale, s32 swap_interval) {
 HardwareComposer::HardwareComposer() = default;
 HardwareComposer::~HardwareComposer() = default;
 
-u32 HardwareComposer::ComposeLocked(f32* out_speed_scale, Display& display,
-                                    Nvidia::Devices::nvdisp_disp0& nvdisp) {
+u32 HardwareComposer::ComposeLocked(f32* out_speed_scale, s32* out_queued_swap_interval,
+                                    Display& display, Nvidia::Devices::nvdisp_disp0& nvdisp) {
 #if BOOST_VERSION >= 108100 || __GNUC__ > 12
     boost::container::small_vector<HwcLayer, 2> composition_stack;
 #else //TODO: debian stable
@@ -56,6 +56,8 @@ u32 HardwareComposer::ComposeLocked(f32* out_speed_scale, Display& display,
 
     // Set default speed limit to 100%.
     *out_speed_scale = 1.0f;
+    *out_queued_swap_interval = 1;
+    bool queued_sets_speed = false;
 
     // If no layers are visible, skip the logic. Acquiring and holding buffers here would
     // consume the producer's queue without ever presenting.
@@ -141,6 +143,14 @@ u32 HardwareComposer::ComposeLocked(f32* out_speed_scale, Display& display,
         // We need to compose again either before this frame is supposed to
         // be released, or exactly on the vsync period it should be released.
         const s32 item_swap_interval = NormalizeSwapInterval(out_speed_scale, item.swap_interval);
+
+        // The swap interval the game queued, for the log of the speed multiplier: the one of the
+        // layer that sets the multiplier, else the last one. Pacing uses the normalised value.
+        const bool sets_speed = item.swap_interval <= 0 || item.swap_interval >= 5;
+        if (sets_speed || !queued_sets_speed) {
+            *out_queued_swap_interval = item.swap_interval;
+            queued_sets_speed = queued_sets_speed || sets_speed;
+        }
 
         // TODO: handle cases where swap intervals are relatively prime. So far,
         // only swap intervals of 0, 1 and 2 have been observed, but if 3 were

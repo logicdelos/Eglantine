@@ -47,9 +47,11 @@ There is one set of settings, the same for every game: the defaults. A game is t
 | Anti-aliasing | SMAA |
 | Scaling filter | BUF |
 | Vertical sync | FIFO |
-| Speed limit | on, 100 % |
+| Speed limit | on, 100 %; running faster than real time not allowed |
 | Asynchronous shader building | on |
 | Disk shader cache | on |
+
+With "Allow running faster than real time" off (the baseline) the frame limit setting cannot make a game run fast: your speed limit cannot be switched off or exceed 100 %. What a game asks for itself is left alone. Frames above a game's own rate are a matter for frame generation, which this fork has not tested. Android is untested and keeps its own defaults.
 
 Version 1 of the baseline made Docked, SMAA and BUF the defaults; the runs in the table above used them. Every game in the table is tested on the baseline, and a result on any other setting is labelled with the setting that differs: the 2x results above are the baseline with one declared variation, the resolution scale. Fire Emblem: Fortune's Weave and Xenoblade Chronicles 2 need no settings changes on the baseline. No promise is made for games that were not tested. The full list, its hash, its version history and the command-line options `--baseline`, `--baseline-allow`, `--print-baseline` and `--user-dir` are in [fork-notes/baseline.md](fork-notes/baseline.md).
 

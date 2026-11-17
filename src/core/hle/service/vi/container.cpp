@@ -272,10 +272,10 @@ Result Container::CloseLayerLocked(u64 layer_id) {
 }
 
 bool Container::ComposeOnDisplay(s32* out_swap_interval, f32* out_compose_speed_scale,
-                                 u64 display_id) {
+                                 s32* out_queued_swap_interval, u64 display_id) {
     std::scoped_lock lk{m_lock};
     return m_surface_flinger->ComposeDisplay(out_swap_interval, out_compose_speed_scale,
-                                             display_id);
+                                             out_queued_swap_interval, display_id);
 }
 
 } // namespace Service::VI

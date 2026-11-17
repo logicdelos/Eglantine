@@ -56,7 +56,9 @@ private:
 
 private:
     s32 m_swap_interval = 1;
+    s32 m_queued_swap_interval = 1; // what the game queued, before it was normalised
     f32 m_compose_speed_scale = 1.0f;
+    f32 m_logged_compose_scale = 1.0f;
 };
 
 } // namespace Service::VI
