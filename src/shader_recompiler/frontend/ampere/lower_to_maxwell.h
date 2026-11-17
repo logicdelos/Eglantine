@@ -2147,6 +2147,10 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 (unsigned_byte && (insn.Bits(24, 8) || (insn.words[3] & 0xc00001ffU))) ||
                 (opcode != 0xb05 && (insn.words[1] & ~(half ? 0x100000ffU :
                     0xffU | (absolute ? 0x40000000U : 0U) | (negate ? 0x80000000U : 0U)))) ||
+                // The constant-buffer form has no register source: Ra, bits 59-61 and the
+                // reserved word 3 bits must be clear.
+                (opcode == 0xb05 &&
+                 (insn.Bits(24, 8) || insn.Bits(59, 3) || (insn.words[3] & 0xc00001ffU))) ||
                 (opcode == 0xd05 && uniform_register(insn.Bits(32, 8)) == ~0U)) {
                 return fail(index, "native float-to-integer conversion mode");
             }
