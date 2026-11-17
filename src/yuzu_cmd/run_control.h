@@ -5,8 +5,6 @@
 
 #include <algorithm>
 #include <array>
-#include <cctype>
-#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
@@ -33,6 +31,7 @@
 #include "core/core.h"
 #include "core/file_sys/patch_manager.h"
 #include "core/file_sys/registered_cache.h"
+#include "core/loader/loose_directory_rules.h"
 #include "video_core/cache_envelope.h"
 #include "video_core/nx2_spikes.h"
 #include "video_core/rasterizer_interface.h"
@@ -588,42 +587,42 @@ inline constexpr std::array<std::string_view, 15> ShaderGenerationSwitches{
 
 namespace Detail {
 
-[[nodiscard]] inline bool IsRomFSDirectoryName(std::string_view name) {
-    return std::ranges::equal(name, std::string_view{"romfs"}, [](char a, char b) {
-        return std::tolower(static_cast<unsigned char>(a)) == b;
-    });
-}
+/// The subdirectories of a directory: their paths and names, in the order the host lists them and
+/// with the options the loader's own listing uses (src/common/fs/fs.cpp, IterateDirEntries),
+/// because the loader's choices among directories depend on that order.
+struct ListedDirectories {
+    std::vector<std::filesystem::path> paths;
+    std::vector<std::string> names;
+};
 
-/// The subdirectories of `parent`, in name order (the order the walk of a manifest uses).
-[[nodiscard]] inline std::vector<std::filesystem::path> SubdirectoriesByName(
-    const std::filesystem::path& parent) {
-    std::vector<std::filesystem::path> directories;
+[[nodiscard]] inline ListedDirectories ListSubdirectories(const std::filesystem::path& parent) {
+    ListedDirectories listed;
     std::error_code ec;
-    for (std::filesystem::directory_iterator it{parent, ec}, end; !ec && it != end;
-         it.increment(ec)) {
+    for (std::filesystem::directory_iterator it{
+             parent, std::filesystem::directory_options::skip_permission_denied, ec},
+         end;
+         !ec && it != end; it.increment(ec)) {
         std::error_code status_ec;
-        if (it->is_directory(status_ec)) {
-            directories.push_back(it->path());
+        if (it->status(status_ec).type() == std::filesystem::file_type::directory) {
+            listed.paths.push_back(it->path());
+            listed.names.push_back(PathText(it->path().filename()));
         }
     }
-    std::ranges::sort(directories, {}, [](const std::filesystem::path& directory) {
-        return PathText(directory.filename());
-    });
-    return directories;
+    return listed;
 }
 
-/// The loader's loose RomFS directory of `parent`: `romfs`, else a directory whose name is
-/// `romfs` in any letter case. Empty when there is none.
+/// The loader's loose RomFS directory of `parent`: `romfs`, else the first directory listed
+/// whose name is `romfs` in any letter case (Loader::FirstRomFSDirectoryIndex). Empty when there
+/// is none.
 [[nodiscard]] inline std::filesystem::path FindLooseRomFSDirectory(
     const std::filesystem::path& parent) {
     std::error_code ec;
     if (std::filesystem::path exact = parent / "romfs"; std::filesystem::is_directory(exact, ec)) {
         return exact;
     }
-    for (std::filesystem::path& directory : SubdirectoriesByName(parent)) {
-        if (IsRomFSDirectoryName(PathText(directory.filename()))) {
-            return std::move(directory);
-        }
+    ListedDirectories listed = ListSubdirectories(parent);
+    if (const auto index = Loader::FirstRomFSDirectoryIndex(listed.names)) {
+        return std::move(listed.paths[*index]);
     }
     return {};
 }
@@ -635,25 +634,15 @@ namespace Detail {
     return ec ? 0 : static_cast<u64>(size);
 }
 
-/// The directory of `updates` whose whole name is the greatest number (the later one in name
-/// order when two spell the same number); empty when there is none.
+/// The directory of `updates` the loader takes for an absent base RomFS
+/// (Loader::NewestUpdateDirectoryIndex, over the listing order); empty when there is none.
 [[nodiscard]] inline std::filesystem::path NewestUpdateDirectory(
     const std::filesystem::path& updates) {
-    std::filesystem::path newest;
-    u64 newest_version = 0;
-    for (std::filesystem::path& candidate : SubdirectoriesByName(updates)) {
-        const std::string name = PathText(candidate.filename());
-        u64 version = 0;
-        const auto parsed = std::from_chars(name.data(), name.data() + name.size(), version);
-        if (parsed.ec != std::errc{} || parsed.ptr != name.data() + name.size()) {
-            continue;
-        }
-        if (version >= newest_version) {
-            newest_version = version;
-            newest = std::move(candidate);
-        }
+    ListedDirectories listed = ListSubdirectories(updates);
+    if (const auto index = Loader::NewestUpdateDirectoryIndex(listed.names)) {
+        return std::move(listed.paths[*index]);
     }
-    return newest;
+    return {};
 }
 
 } // namespace Detail

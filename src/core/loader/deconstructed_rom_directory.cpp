@@ -30,6 +30,7 @@
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/service/filesystem/filesystem.h"
 #include "core/loader/deconstructed_rom_directory.h"
+#include "core/loader/loose_directory_rules.h"
 #include "core/loader/nso.h"
 
 #ifdef HAS_NCE
@@ -93,13 +94,14 @@ FileSys::VirtualDir FindLooseRomFSDirectory(const FileSys::VirtualDir& parent) {
     if (const auto dir = parent->GetSubdirectory("romfs")) {
         return dir;
     }
-    for (const auto& dir : parent->GetSubdirectories()) {
-        const auto name = dir->GetName();
-        if (name.size() == 5 && std::equal(name.begin(), name.end(), "romfs", [](char a, char b) {
-                return std::tolower(static_cast<unsigned char>(a)) == b;
-            })) {
-            return dir;
-        }
+    const auto subdirectories = parent->GetSubdirectories();
+    std::vector<std::string> names;
+    names.reserve(subdirectories.size());
+    for (const auto& dir : subdirectories) {
+        names.push_back(dir->GetName());
+    }
+    if (const auto index = FirstRomFSDirectoryIndex(names)) {
+        return subdirectories[*index];
     }
     return nullptr;
 }
@@ -152,22 +154,14 @@ FileSys::VirtualFile FindLooseRomFS(const FileSys::VirtualDir& exefs_dir) {
         if (const auto root = parent->GetParentDirectory()) {
             if (const auto updates = root->GetSubdirectory("updates")) {
                 FileSys::VirtualDir newest{};
-                u64 newest_version{0};
-                for (const auto& candidate : updates->GetSubdirectories()) {
-                    const std::string name = candidate->GetName();
-                    u64 version{0};
-                    const auto parsed =
-                        std::from_chars(name.data(), name.data() + name.size(), version);
-                    // from_chars stops at the first non digit and still reports success, so a
-                    // directory called "655360_old" or "999999.bak" would be accepted with its
-                    // leading digits. Require the whole name to be the number.
-                    if (parsed.ec != std::errc{} || parsed.ptr != name.data() + name.size()) {
-                        continue;
-                    }
-                    if (version >= newest_version) {
-                        newest_version = version;
-                        newest = candidate;
-                    }
+                const auto candidates = updates->GetSubdirectories();
+                std::vector<std::string> names;
+                names.reserve(candidates.size());
+                for (const auto& candidate : candidates) {
+                    names.push_back(candidate->GetName());
+                }
+                if (const auto index = NewestUpdateDirectoryIndex(names)) {
+                    newest = candidates[*index];
                 }
                 if (const auto romfs_dir = FindLooseRomFSDirectory(newest)) {
                     // Only safe when the executable is the same build as the update: running a 1.0
@@ -197,7 +191,7 @@ FileSys::VirtualFile FindLooseRomFS(const FileSys::VirtualDir& exefs_dir) {
                         return nullptr;
                     }
                     LOG_INFO(Loader, "Base RomFS is absent, using the update RomFS (version {})",
-                             newest_version);
+                             newest->GetName());
                     return build_from(romfs_dir);
                 }
             }

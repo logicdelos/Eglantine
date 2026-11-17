@@ -1129,6 +1129,67 @@ TEST_CASE("content stamp of an ExeFS main launch path follows the loader's RomFS
     }
 }
 
+TEST_CASE("the loose directory rules of the loader and the identity pick the same directory",
+          "[report][identity]") {
+    using Names = std::vector<std::string>;
+
+    SECTION("equal numbers spelled differently: the one listed last, in either listing order") {
+        CHECK(Loader::NewestUpdateDirectoryIndex(Names{"1", "01"}) == 1);
+        CHECK(Loader::NewestUpdateDirectoryIndex(Names{"01", "1"}) == 1);
+        CHECK(Loader::NewestUpdateDirectoryIndex(Names{"01", "1", "001"}) == 2);
+    }
+    SECTION("the greater number wins wherever it is listed") {
+        CHECK(Loader::NewestUpdateDirectoryIndex(Names{"10", "9", "010"}) == 2);
+        CHECK(Loader::NewestUpdateDirectoryIndex(Names{"655360", "100"}) == 0);
+        CHECK(Loader::NewestUpdateDirectoryIndex(Names{"100", "655360"}) == 1);
+    }
+    SECTION("names that are not whole numbers are skipped") {
+        CHECK(Loader::NewestUpdateDirectoryIndex(Names{"655360_old", "999999.bak", "7"}) == 2);
+        CHECK_FALSE(Loader::NewestUpdateDirectoryIndex(Names{"old", "", "1x"}).has_value());
+        CHECK_FALSE(Loader::NewestUpdateDirectoryIndex(Names{}).has_value());
+    }
+    SECTION("romfs spellings: the one listed first, in either listing order") {
+        CHECK(Loader::FirstRomFSDirectoryIndex(Names{"exefs", "RomFS", "ROMFS"}) == 1);
+        CHECK(Loader::FirstRomFSDirectoryIndex(Names{"ROMFS", "RomFS"}) == 0);
+        CHECK_FALSE(Loader::FirstRomFSDirectoryIndex(Names{"romfs2", "rom", "exefs"}).has_value());
+    }
+}
+
+TEST_CASE("content stamp follows the update directory the loader selects among equal numbers",
+          "[report][identity]") {
+    TempTree tree;
+    tree.Write("game/base/exefs/main", "MAIN");
+    tree.Write("game/base/exefs/main.npdm", "NPDM");
+    tree.Write("game/updates/1/romfs/a.bin", "aaaa");
+    tree.Write("game/updates/01/romfs/b.bin", "bbbb");
+
+    // The order the host lists the two directories in is the order the loader sees them in:
+    // whichever of them the shared rule selects over that listing is the one in use.
+    std::vector<std::string> listed;
+    for (const auto& entry : std::filesystem::directory_iterator{tree.root / "game" / "updates"}) {
+        listed.push_back(entry.path().filename().string());
+    }
+    REQUIRE(listed.size() == 2);
+    const std::optional<size_t> index = Loader::NewestUpdateDirectoryIndex(listed);
+    REQUIRE(index.has_value());
+    const std::string selected = listed[*index];
+    const std::string other = selected == "1" ? "01" : "1";
+    const auto relative = [](const std::string& directory) {
+        return fmt::format("game/updates/{}/romfs/{}.bin", directory,
+                           directory == "1" ? "a" : "b");
+    };
+
+    RunControl::HostIdentitySource source;
+    source.title_id = 0x0100000000001234ull;
+    source.game_path = tree.root / "game" / "base" / "exefs" / "main";
+    const u64 base = StampOf(source);
+
+    tree.Write(relative(other), "changed in the directory the loader does not use");
+    CHECK(StampOf(source) == base);
+    tree.Write(relative(selected), "changed in the directory the loader uses");
+    CHECK(StampOf(source) != base);
+}
+
 TEST_CASE("settings hash covers every switch that changes generated shaders",
           "[report][identity]") {
     const u64 base = RunControl::HostSettingsHash();

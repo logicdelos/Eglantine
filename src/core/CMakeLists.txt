@@ -1164,6 +1164,7 @@ add_library(core STATIC
     loader/kip.h
     loader/loader.cpp
     loader/loader.h
+    loader/loose_directory_rules.h
     loader/nax.cpp
     loader/nax.h
     loader/nca.cpp
