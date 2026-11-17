@@ -14,6 +14,7 @@
 
 namespace VideoCommon::Nx2Spikes::Detail {
 size_t PeakRetainedHistoryBytes();
+size_t PeakResolverScratchBytes();
 } // namespace VideoCommon::Nx2Spikes::Detail
 
 namespace {
@@ -843,6 +844,91 @@ TEST_CASE("Span storage held by many producers over pruning windows stays inside
     // ...and the storage of all producers together never exceeds the share of the budget that
     // is set aside for the history, although every producer filled its own vectors in turn.
     CHECK(peak <= config.buffer_bytes / 2);
+}
+
+TEST_CASE("Deeply nested spans with distinct work ids keep the resolver scratch linear",
+          "[nx2][attribution]") {
+    SessionConfig config = Config(10 * Ms);
+    config.buffer_bytes = size_t{32} << 20;
+    Run run{config};
+    constexpr u64 Spans = 4096;
+    constexpr u64 Unit = 1000; // ns
+    std::vector<WorkId> works;
+    for (u64 i = 0; i < Spans; ++i) {
+        works.push_back(NewWorkId());
+    }
+    Present(run.T(0));
+    // Span i runs from (i + 1) to (2 * Spans - i) units: each contains the next, the outermost
+    // owns all of them. The root waits 0-10 ms for the outermost work.
+    OnThread([&] {
+        RegisterThread("nested producer");
+        for (u64 i = 0; i < Spans; ++i) {
+            RecordSpan(Cause::Shader, run.T((i + 1) * Unit), run.T((2 * Spans - i) * Unit),
+                       works[i]);
+        }
+    });
+    const SpanToken wait = run.NextRootToken();
+    RecordSpan(Cause::Waiting, run.T(0), run.T(10 * Ms));
+    LinkWait(wait, works[0], DependencyKind::Job);
+    Present(run.T(20 * Ms));
+    const AttributionSnapshot snap = run.Finish();
+    REQUIRE(g_frames.size() == 1);
+    const LongFrame& frame = g_frames[0];
+    const u64 covered = (2 * Spans - 1) * Unit;
+    if (frame.instrumentation_complete) {
+        CHECK(At(frame.cause_ns, Cause::Shader) == covered);
+        CHECK(At(frame.cause_ns, Cause::Waiting) == 10 * Ms - covered);
+        CHECK(At(frame.cause_ns, Cause::Unknown) == 10 * Ms);
+        CHECK(Total(frame.cause_ns) == 20 * Ms);
+        CHECK(At(frame.activity_ns, Cause::Shader) == covered);
+    } else {
+        // Whatever did not fit is counted and the frame says so; no wrong answer is reported as
+        // complete.
+        CHECK((snap.lost_events > 0 ||
+               (frame.unknown_reasons & UnknownReason::AmbiguousDependency) != 0));
+    }
+    // The scratch is a few hundred bytes per span, not one entry per span and ancestor pair
+    // (which would be 4096 * 4096 entries here), and far inside the budget.
+    const size_t scratch = Detail::PeakResolverScratchBytes();
+    CHECK(scratch >= Spans * 64);
+    CHECK(scratch <= Spans * 512);
+    CHECK(scratch <= config.buffer_bytes / 2);
+}
+
+TEST_CASE("A wait chain whose candidates outnumber the leaves is reported, not resolved",
+          "[nx2][attribution]") {
+    Run run;
+    const WorkId first = NewWorkId();
+    const WorkId second = NewWorkId();
+    Present(run.T(0));
+    // The thread that runs `first` waits for `second`. Two workers run both works at once (a span
+    // of `first` around a span of `second`), so each of their leaves is a candidate at both
+    // levels of the chain: 3 + 2 candidate pieces against 4 leaves.
+    OnThread([&] {
+        const u32 id = RegisterThread("chain wait");
+        RecordSpan(Cause::Waiting, run.T(0), run.T(100 * Ms), first);
+        LinkWait(run.FirstSpanOf(id), second, DependencyKind::Job);
+    });
+    for (int worker = 0; worker < 2; ++worker) {
+        OnThread([&] {
+            RegisterThread("worker");
+            RecordSpan(Cause::Shader, run.T(0), run.T(90 * Ms), first);
+            RecordSpan(Cause::Shader, run.T(0), run.T(90 * Ms), second);
+        });
+    }
+    const SpanToken wait = run.NextRootToken();
+    RecordSpan(Cause::Waiting, run.T(0), run.T(100 * Ms));
+    LinkWait(wait, first, DependencyKind::Job);
+    Present(run.T(150 * Ms));
+    run.Finish();
+    REQUIRE(g_frames.size() == 1);
+    const LongFrame& frame = g_frames[0];
+    CHECK(At(frame.cause_ns, Cause::Waiting) == 100 * Ms);
+    CHECK(At(frame.cause_ns, Cause::Shader) == 0);
+    CHECK(At(frame.cause_ns, Cause::Unknown) == 50 * Ms);
+    CHECK(Total(frame.cause_ns) == 150 * Ms);
+    CHECK((frame.unknown_reasons & UnknownReason::AmbiguousDependency) != 0);
+    CHECK_FALSE(frame.instrumentation_complete);
 }
 
 TEST_CASE("The first 120 seconds roll over at the window end", "[nx2][attribution]") {

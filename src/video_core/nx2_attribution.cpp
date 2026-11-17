@@ -56,6 +56,7 @@ namespace Detail {
 void ReadEventCounts(std::array<u64, static_cast<size_t>(Event::Count)>& counts);
 void SetAttributionCounting(bool on);
 size_t PeakRetainedHistoryBytes();
+size_t PeakResolverScratchBytes();
 } // namespace Detail
 
 namespace {
@@ -187,16 +188,38 @@ struct Leaf {
     u64 span_end{};
 };
 
-/// Where a leaf is kept: the registration id of its thread and its position in that thread's list.
-struct LeafRef {
+/// One span that carries a work id, clipped to the window of a decomposition.
+struct WorkSpan {
+    WorkId work{};
     u32 thread{};
-    u32 index{};
+    u64 t0{};
+    u64 t1{};
 };
 
+/// One begin or end of a span in the sweep that builds the leaves of a thread.
+struct SweepEvent {
+    u64 t;
+    bool begin;
+    u32 idx;
+};
+
+/// What one node of an ordered or hashed map costs here, an estimate: key, value, links, allocator.
+constexpr size_t MapNodeBytes = 64;
+
+/// The scratch of a decomposition per span of the window, in the worst case. The leaves (at most
+/// two per span) and the work spans are held throughout; on top of them comes either the sweep that
+/// builds the leaves of a thread (span pointer, two events, two active-map nodes) or the wait
+/// expansions (candidate pieces, at most one per leaf, and their two sweep points each).
+constexpr size_t SweepBytesPerSpan =
+    sizeof(const SpanRec*) + 2 * sizeof(SweepEvent) + 2 * MapNodeBytes;
+constexpr size_t WaitBytesPerLeaf = sizeof(Leaf) + 2 * sizeof(u64);
+constexpr size_t ScratchBytesPerSpan = 2 * sizeof(Leaf) + sizeof(WorkSpan) +
+                                       std::max(SweepBytesPerSpan, 2 * WaitBytesPerLeaf);
+
 /// What one slot of retained span storage costs against SessionConfig::buffer_bytes: the record and
-/// the resolver's copies of it while a frame is decomposed (leaves and the sweep events), so rings
-/// plus history stay inside the one budget. Slots are counted by capacity, not by use.
-constexpr size_t HistoryBytesPerSpan = sizeof(SpanRec) + 2 * sizeof(Leaf) + 48;
+/// the worst-case scratch of decomposing it, so rings plus history stay inside the one budget.
+/// Slots are counted by capacity, not by use.
+constexpr size_t HistoryBytesPerSpan = sizeof(SpanRec) + ScratchBytesPerSpan;
 /// The first allocation of a span vector, in records.
 constexpr size_t MinSpanCapacity = 16;
 
@@ -231,12 +254,27 @@ public:
             }
         }
         leaves.resize(states.size());
+        size_t span_count{};
+        for (const ThreadState& state : states) {
+            span_count += state.open.size() + state.closed.size();
+        }
+        work_spans.reserve(span_count);
         for (size_t i = 0; i < states.size(); ++i) {
             BuildLeaves(static_cast<u32>(i + 1), states[i], leaves[i]);
+            leaf_total += leaves[i].size();
             for (const Leaf& leaf : leaves[i]) {
                 out.activity[CauseIdx(leaf.cause)] += leaf.t1 - leaf.t0;
             }
         }
+        std::sort(work_spans.begin(), work_spans.end(), [](const WorkSpan& a, const WorkSpan& b) {
+            if (a.work != b.work) {
+                return a.work < b.work;
+            }
+            if (a.thread != b.thread) {
+                return a.thread < b.thread;
+            }
+            return a.t0 < b.t0;
+        });
         ResolveRoots(roots);
         u64 total{};
         for (const u64 value : out.cause) {
@@ -247,7 +285,13 @@ public:
             out.reasons |= UnknownReason::LostSpans;
             out.complete = false;
         }
+        NoteScratch(out.work_ns.size() * MapNodeBytes + out.work_ns.bucket_count() * sizeof(void*));
         return std::move(out);
+    }
+
+    /// The most bytes of scratch (leaves, work spans, sweep and wait storage) held at once by Run.
+    [[nodiscard]] size_t PeakScratchBytes() const {
+        return peak_scratch;
     }
 
 private:
@@ -265,6 +309,10 @@ private:
                 out.complete = false;
             }
             spans.push_back(&rec);
+            if (rec.work != 0) {
+                work_spans.push_back(
+                    {rec.work, thread, std::max(rec.begin_ns, s), std::min(finish, e)});
+            }
         };
         for (const SpanRec& rec : state.open) {
             consider(rec);
@@ -275,11 +323,7 @@ private:
         if (spans.empty()) {
             return;
         }
-        struct Ev {
-            u64 t;
-            bool begin;
-            u32 idx;
-        };
+        using Ev = SweepEvent;
         std::vector<Ev> events;
         events.reserve(spans.size() * 2);
         for (size_t i = 0; i < spans.size(); ++i) {
@@ -303,43 +347,40 @@ private:
             return Key{rec.begin_ns, OpenEnd - (rec.open ? OpenEnd : rec.end_ns), rec.seq};
         };
         std::map<Key, u32> active;
-        std::vector<WorkId> chain;      // distinct work ids around the segment, innermost first
-        std::vector<WorkId> leaf_chain; // the same for the last leaf of `result`
+        std::map<Key, u32> active_work; // the same, only the spans that carry a work id
+        size_t most_active = 0;
+        result.reserve(events.size());
         u64 cur = s;
         for (size_t i = 0; i < events.size();) {
             const u64 t = events[i].t;
             if (t > cur && !active.empty()) {
                 const SpanRec* top = spans[active.rbegin()->second];
-                chain.clear();
-                for (auto it = active.rbegin(); it != active.rend(); ++it) {
-                    const WorkId id = spans[it->second]->work;
-                    if (id != 0 && std::find(chain.begin(), chain.end(), id) == chain.end()) {
-                        chain.push_back(id);
-                    }
-                }
-                const WorkId work = chain.empty() ? WorkId{0} : chain.front();
-                if (!result.empty() && result.back().span == top && result.back().t1 == cur &&
-                    chain == leaf_chain) {
+                const WorkId work =
+                    active_work.empty() ? WorkId{0} : spans[active_work.rbegin()->second]->work;
+                if (!result.empty() && result.back().span == top && result.back().t1 == cur) {
                     result.back().t1 = t;
                 } else {
                     result.push_back({cur, t, top->cause, work, top, thread,
                                       top->open ? OpenEnd : top->end_ns});
-                    leaf_chain = chain;
-                    for (const WorkId id : chain) {
-                        by_work[id].push_back({thread, static_cast<u32>(result.size() - 1)});
-                    }
                 }
             }
             for (; i < events.size() && events[i].t == t; ++i) {
                 const SpanRec& rec = *spans[events[i].idx];
                 if (events[i].begin) {
                     active.emplace(key_of(rec), events[i].idx);
+                    if (rec.work != 0) {
+                        active_work.emplace(key_of(rec), events[i].idx);
+                    }
                 } else {
                     active.erase(key_of(rec));
+                    active_work.erase(key_of(rec));
                 }
             }
+            most_active = std::max(most_active, active.size() + active_work.size());
             cur = t;
         }
+        NoteScratch(spans.capacity() * sizeof(const SpanRec*) + events.capacity() * sizeof(Ev) +
+                    most_active * MapNodeBytes);
     }
 
     void Charge(Cause cause, u64 from, u64 to, WorkId work) {
@@ -364,7 +405,14 @@ private:
             }
             return;
         }
-        std::vector<u64> points{s, e};
+        std::vector<u64> points;
+        size_t reserved = 2;
+        for (const auto* list : lists) {
+            reserved += 2 * list->size();
+        }
+        points.reserve(reserved);
+        points.push_back(s);
+        points.push_back(e);
         for (const auto* list : lists) {
             for (const Leaf& leaf : *list) {
                 points.push_back(leaf.t0);
@@ -420,40 +468,60 @@ private:
             out.reasons |= UnknownReason::AmbiguousDependency;
             return;
         }
-        const auto found = by_work.find(producer);
-        std::vector<Leaf> cands;
-        if (found != by_work.end()) {
-            for (const LeafRef ref : found->second) {
-                const Leaf& leaf = leaves[ref.thread - 1][ref.index];
-                if (leaf.thread == wait.thread || leaf.t1 <= x || leaf.t0 >= y) {
-                    continue;
-                }
-                Leaf clipped = leaf;
-                clipped.t0 = std::max(leaf.t0, x);
-                clipped.t1 = std::min(leaf.t1, y);
-                cands.push_back(clipped);
-            }
-        }
-        if (cands.empty()) {
+        size_t count{};
+        ForEachOwned(producer, wait.thread, x, y, [&count](const Leaf&) { ++count; });
+        if (count == 0) {
             Charge(Cause::Waiting, x, y, producer);
             return;
         }
-        std::vector<u64> points{x, y};
+        if (live_pieces + count > leaf_total) {
+            // The producers of the chain would hold more candidate pieces than there are leaves:
+            // not resolved, kept as waiting and reported.
+            Charge(Cause::Waiting, x, y, producer);
+            out.reasons |= UnknownReason::AmbiguousDependency;
+            out.complete = false;
+            return;
+        }
+        std::vector<Leaf> cands;
+        cands.reserve(count);
+        std::vector<size_t> group_first; // where the pieces of each thread begin
+        ForEachOwned(producer, wait.thread, x, y, [&](const Leaf& piece) {
+            if (cands.empty() || cands.back().thread != piece.thread) {
+                group_first.push_back(cands.size());
+            }
+            cands.push_back(piece);
+        });
+        std::vector<u64> points;
+        points.reserve(2 * count + 2);
+        points.push_back(x);
+        points.push_back(y);
         for (const Leaf& leaf : cands) {
             points.push_back(leaf.t0);
             points.push_back(leaf.t1);
         }
         std::sort(points.begin(), points.end());
         points.erase(std::unique(points.begin(), points.end()), points.end());
+        const size_t held = cands.capacity() * sizeof(Leaf) + points.capacity() * sizeof(u64);
+        live_pieces += count;
+        wait_bytes += held;
+        NoteScratch(wait_bytes);
+        // The pieces of one thread are sorted and do not overlap, so one cursor per thread finds
+        // the piece covering a segment.
+        std::vector<size_t> cursor = group_first;
         visited.push_back(producer);
         for (size_t p = 0; p + 1 < points.size(); ++p) {
             const u64 a = points[p];
             const u64 b = points[p + 1];
             const Leaf* best = nullptr;
-            for (const Leaf& leaf : cands) {
-                if (leaf.t0 > a || leaf.t1 < b) {
+            for (size_t g = 0; g < group_first.size(); ++g) {
+                const size_t last = g + 1 < group_first.size() ? group_first[g + 1] : cands.size();
+                while (cursor[g] < last && cands[cursor[g]].t1 <= a) {
+                    ++cursor[g];
+                }
+                if (cursor[g] >= last || cands[cursor[g]].t0 > a) {
                     continue;
                 }
+                const Leaf& leaf = cands[cursor[g]];
                 // The wait ends when the last producer span ends: that one is the critical one.
                 if (best == nullptr || leaf.span_end > best->span_end ||
                     (leaf.span_end == best->span_end &&
@@ -471,6 +539,65 @@ private:
             }
         }
         visited.pop_back();
+        live_pieces -= count;
+        wait_bytes -= held;
+    }
+
+    /// Calls `emit` with every piece of a leaf of another thread than `skip_thread` that lies inside
+    /// a span carrying `producer` and overlaps [x, y), clipped to the span and to [x, y). The spans of
+    /// one thread are merged first, so no stretch of a leaf is emitted twice. Pieces come thread by
+    /// thread, each thread's in time order.
+    template <typename F>
+    void ForEachOwned(WorkId producer, u32 skip_thread, u64 x, u64 y, F&& emit) const {
+        const auto first = std::lower_bound(
+            work_spans.begin(), work_spans.end(), producer,
+            [](const WorkSpan& item, WorkId id) { return item.work < id; });
+        u32 thread{};
+        u64 from{};
+        u64 to{};
+        const auto flush = [&] {
+            if (thread == 0) {
+                return;
+            }
+            const std::vector<Leaf>& list = leaves[thread - 1];
+            auto it = std::partition_point(list.begin(), list.end(),
+                                           [from](const Leaf& leaf) { return leaf.t1 <= from; });
+            for (; it != list.end() && it->t0 < to; ++it) {
+                Leaf piece = *it;
+                piece.t0 = std::max(it->t0, from);
+                piece.t1 = std::min(it->t1, to);
+                emit(piece);
+            }
+            thread = 0;
+        };
+        for (auto it = first; it != work_spans.end() && it->work == producer; ++it) {
+            if (it->thread == skip_thread) {
+                continue;
+            }
+            const u64 lo = std::max(it->t0, x);
+            const u64 hi = std::min(it->t1, y);
+            if (lo >= hi) {
+                continue;
+            }
+            if (thread == it->thread && lo <= to) {
+                to = std::max(to, hi);
+                continue;
+            }
+            flush();
+            thread = it->thread;
+            from = lo;
+            to = hi;
+        }
+        flush();
+    }
+
+    /// Notes the storage the resolver holds now: the leaves, the work spans and `transient`.
+    void NoteScratch(size_t transient) {
+        size_t bytes = work_spans.capacity() * sizeof(WorkSpan) + transient;
+        for (const std::vector<Leaf>& list : leaves) {
+            bytes += list.capacity() * sizeof(Leaf);
+        }
+        peak_scratch = std::max(peak_scratch, bytes);
     }
 
     std::span<const ThreadState> states;
@@ -478,9 +605,14 @@ private:
     u64 s;
     u64 e;
     std::vector<std::vector<Leaf>> leaves;
-    /// Every exclusive leaf under each distinct work id of the spans that enclose it (a producer's
-    /// work owns the time of the spans nested inside its own span).
-    std::unordered_map<WorkId, std::vector<LeafRef>> by_work;
+    /// The spans of the window that carry a work id, clipped to it, sorted by (work, thread, begin).
+    /// A leaf belongs to a work when it lies inside one of that work's spans on its thread, which is
+    /// how a producer owns the time of the spans nested in it that carry other work ids.
+    std::vector<WorkSpan> work_spans;
+    size_t leaf_total{};  ///< The number of leaves of all threads: the cap on live wait candidates
+    size_t live_pieces{}; ///< Candidate pieces held by the wait expansions that are running
+    size_t wait_bytes{};  ///< Their storage and that of their sweep points
+    size_t peak_scratch{};
     std::vector<WorkId> visited;
     Decomp out;
 };
@@ -546,6 +678,7 @@ struct Session {
     std::vector<std::pair<u64, u64>> losses;
     size_t history{}; ///< Slots of span storage owned: the capacities of every open/closed vector
     std::atomic<size_t> peak_retained_bytes{}; ///< Most bytes of span storage held at once
+    mutable std::atomic<size_t> peak_scratch_bytes{}; ///< Most resolver scratch held at once
     size_t history_cap{};
     u64 seen_lost{};
     u64 seen_unregistered{};
@@ -1021,7 +1154,11 @@ void Session::Prune() {
 Decomp Session::Decompose(u64 s, u64 e, std::span<const u32> roots) const {
     const u32 count = thread_count.load(std::memory_order_acquire);
     Resolver resolver{std::span<const ThreadState>{states.data(), count}, losses, s, e};
-    return resolver.Run(roots);
+    Decomp result = resolver.Run(roots);
+    if (resolver.PeakScratchBytes() > peak_scratch_bytes.load(std::memory_order_relaxed)) {
+        peak_scratch_bytes.store(resolver.PeakScratchBytes(), std::memory_order_relaxed);
+    }
+    return result;
 }
 
 u64 Session::TotalLost() const {
@@ -1343,6 +1480,13 @@ namespace Detail {
 size_t PeakRetainedHistoryBytes() {
     std::scoped_lock lock{g_lifecycle_mutex};
     return g_owned != nullptr ? g_owned->peak_retained_bytes.load(std::memory_order_relaxed) : 0;
+}
+
+/// The most bytes of resolver scratch (leaves, work spans, sweep and wait storage) one
+/// decomposition of the current (or last) session held at once, for the tests.
+size_t PeakResolverScratchBytes() {
+    std::scoped_lock lock{g_lifecycle_mutex};
+    return g_owned != nullptr ? g_owned->peak_scratch_bytes.load(std::memory_order_relaxed) : 0;
 }
 } // namespace Detail
 
