@@ -10,6 +10,7 @@
 #pragma once
 
 #include <span>
+#include <vector>
 
 #include "common/common_types.h"
 #include "video_core/textures/texture.h"
@@ -33,6 +34,36 @@ constexpr u32 SWIZZLE_Y_BITS = 0b011010000;
 void UnswizzleTexture(std::span<u8> output, std::span<const u8> input, u32 bytes_per_pixel,
                       u32 width, u32 height, u32 depth, u32 block_height, u32 block_depth,
                       u32 stride_alignment = 1, bool native_tiling = false);
+
+/// One run of whole block rows of a single-slice block linear image.
+struct UnswizzleBand {
+    std::size_t src_offset; ///< Into the block linear input
+    std::size_t dst_offset; ///< Into the linear output
+    u32 rows;               ///< Texel rows in the run
+};
+
+/// Splits the rows of a single-slice block linear image into at most `parts` runs of whole block
+/// rows (a block row is 8 << block_height rows). The runs hold the block rows in order, the first
+/// ones one block row longer when the count does not divide evenly, and between them they cover
+/// every row once. An image without rows gives no runs.
+[[nodiscard]] std::vector<UnswizzleBand> PlanUnswizzleBands(u32 bytes_per_pixel, u32 width,
+                                                            u32 height, u32 block_height,
+                                                            u32 block_depth, u32 stride_alignment,
+                                                            u32 parts);
+
+/// How many runs an image of `output_bytes` over `bands` block rows is worth splitting into on
+/// `threads` threads: no more than there are threads or block rows, and 1 MiB of output each.
+/// Never less than one.
+[[nodiscard]] u32 UnswizzleParts(u64 output_bytes, u32 bands, u32 threads);
+
+/// UnswizzleTexture with the block rows of a single-slice image split into `parts` runs. The
+/// texture unswizzle threads take runs and the caller takes its share, so it returns once every
+/// run is done. The bytes written are the bytes UnswizzleTexture writes; a 3D image, or one with
+/// fewer than two block rows, is unswizzled as one run.
+void UnswizzleTextureParallel(std::span<u8> output, std::span<const u8> input,
+                              u32 bytes_per_pixel, u32 width, u32 height, u32 depth,
+                              u32 block_height, u32 block_depth, u32 stride_alignment,
+                              bool native_tiling, u32 parts);
 
 /// Swizzles linear memory into a block linear texture.
 void SwizzleTexture(std::span<u8> output, std::span<const u8> input, u32 bytes_per_pixel, u32 width,
