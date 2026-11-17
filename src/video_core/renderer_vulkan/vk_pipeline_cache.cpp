@@ -618,6 +618,16 @@ void PublishSession(PipelineCacheSession& session) {
     CE::PublishCacheReport(std::move(report));
 }
 
+/// The committed size of the session: the sizes of its files as they are on disk, not the bytes
+/// this run has written. The checkpoint interval is scaled by it.
+void RefreshCommittedBytes(PipelineCacheSession& session) {
+    u64 total = 0;
+    for (const auto& file : session.files) {
+        total += file.committed_bytes;
+    }
+    session.committed_bytes.store(total, std::memory_order_relaxed);
+}
+
 /// Appends one record to the new generation of its file. Runs on the serialization thread, which
 /// owns the writers; a record that cannot be written is counted and compiled normally next time.
 void RecordPipeline(PipelineCacheSession& session, const CE::RecordMeta& meta,
@@ -706,11 +716,7 @@ bool CommitFile(PipelineCacheSession& session, size_t index, bool keep_reader) {
         }
     }
     file.writer.reset();
-    u64 total = 0;
-    for (const auto& other : session.files) {
-        total += other.committed_bytes;
-    }
-    session.committed_bytes.store(total, std::memory_order_relaxed);
+    RefreshCommittedBytes(session);
     if (keep_reader) {
         CE::CacheIdentity identity = session.identity;
         identity.kind = file.kind;
@@ -1578,6 +1584,11 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         if (!file.reader && file.load.reason != CE::RejectReason::Missing) {
             LOG_WARNING(Render_Vulkan, "{}", CE::CacheRejectLine(file.load));
         }
+        if (file.reader) {
+            // An accepted generation is the committed file from the start; the first checkpoint
+            // rewrites all of it, so its interval is scaled by this size.
+            file.committed_bytes = PP::CommittedFileBytes(path);
+        }
         session->files.push_back(std::move(file));
     };
     open_file(CE::PayloadKind::Transferable, pipeline_cache_filename,
@@ -1586,6 +1597,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         open_file(CE::PayloadKind::TransferableMesh, mesh_pipeline_cache_filename,
                   CE::MaxTransferableBytes / 4);
     }
+    RefreshCommittedBytes(*session);
 
     vulkan_pipeline_cache_filename.clear();
     if (use_vulkan_pipeline_cache) {

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <filesystem>
 #include <functional>
 #include <map>
 #include <memory>
@@ -265,6 +266,11 @@ inline constexpr u64 FirstWindowNs = u64{120} * 1'000'000'000;
     return first_window_ended ||
            since_last_commit_ns >= (std::max)(CheckpointMinIntervalNs, scaled);
 }
+
+/// The size of the committed cache file at `path`, the value `CheckpointDue` scales its interval
+/// by. A file accepted at load counts from the start, not only after this run commits. 0 when the
+/// file cannot be read.
+[[nodiscard]] u64 CommittedFileBytes(const std::filesystem::path& path);
 
 inline constexpr u32 NoRecord = ~u32{0};
 

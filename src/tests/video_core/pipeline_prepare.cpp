@@ -5,9 +5,11 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
 #include <future>
 #include <initializer_list>
 #include <memory>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -945,4 +947,103 @@ TEST_CASE("Records are found again in the committed generation by what they are"
     CHECK(RemapRecords(before, lookalikes) == std::vector<u32>{NoRecord, NoRecord, NoRecord});
     CHECK(RemapRecords({}, before).empty());
     CHECK(RemapRecords(before, {}) == std::vector<u32>{NoRecord, NoRecord, NoRecord});
+}
+
+namespace {
+
+namespace CE = VideoCommon::CacheEnvelope;
+namespace fs = std::filesystem;
+
+/// A directory of its own under the temporary one, removed with the object.
+struct ScratchDir {
+    ScratchDir() {
+        static std::atomic<u64> counter{0};
+        const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+        path = fs::temp_directory_path() / ("eglantine-pipeline-prepare-" + std::to_string(stamp) +
+                                            "-" + std::to_string(counter++));
+        fs::create_directories(path);
+    }
+    ~ScratchDir() {
+        std::error_code error;
+        fs::remove_all(path, error);
+    }
+    fs::path path;
+};
+
+CE::CacheIdentity TransferableIdentity() {
+    CE::CacheIdentity identity;
+    identity.kind = CE::PayloadKind::Transferable;
+    identity.shader_format_version = 35;
+    identity.host.build_id = 0x1111222233334444ULL;
+    identity.host.title_id = 0x0100000000001000ULL;
+    identity.host.game_version = 7;
+    identity.host.content_stamp = 0xabcdef0123456789ULL;
+    identity.host.settings_hash = 0x5555;
+    identity.device.vendor_id = 0x10de;
+    identity.device.device_id = 0x2206;
+    identity.device.driver_id = 4;
+    identity.device.driver_version = 0x00800123;
+    for (u8 i = 0; i < 16; ++i) {
+        identity.device.pipeline_cache_uuid[i] = static_cast<u8>(0xa0 + i);
+    }
+    return identity;
+}
+
+} // Anonymous namespace
+
+TEST_CASE("The first checkpoint of a loaded large generation waits for the size of that generation",
+          "[video_core][pipeline_prepare]") {
+    constexpr u64 RecordBytes = u64{512} << 10;
+    constexpr u32 RecordCount = 48; // 24 MiB: its interval is longer than the minimum one
+    const ScratchDir dir;
+    const fs::path path = dir.path / "transferable.bin";
+    const CE::CacheIdentity identity = TransferableIdentity();
+
+    // An earlier run committed a large generation.
+    {
+        auto writer = CE::EnvelopeWriter::Create(path, identity, CE::MaxBytes(identity.kind));
+        REQUIRE(writer);
+        for (u32 i = 0; i < RecordCount; ++i) {
+            const std::vector<u8> payload(RecordBytes, static_cast<u8>(i + 1));
+            REQUIRE(writer->Append({}, payload) == CE::AppendResult::Ok);
+        }
+        REQUIRE(writer->Commit());
+    }
+    const u64 on_disk = fs::file_size(path);
+
+    // This run accepts it. Before anything is committed, the size it reports is the file's.
+    CE::CacheLoadResult load;
+    auto reader = CE::EnvelopeReader::Open(path, identity, load);
+    REQUIRE(reader);
+    REQUIRE(load.accepted);
+    const u64 committed = CommittedFileBytes(path);
+    CHECK(committed == on_disk);
+    const u64 interval = committed * CheckpointNsPerByte;
+    REQUIRE(interval > CheckpointMinIntervalNs);
+
+    // The first new record of the run goes into the next generation, which starts as a copy.
+    auto writer = CE::EnvelopeWriter::Create(path, identity, CE::MaxBytes(identity.kind));
+    REQUIRE(writer);
+    REQUIRE(writer->Seed(*reader) == RecordCount);
+    const std::vector<u8> fresh(RecordBytes, static_cast<u8>(0xee));
+    REQUIRE(writer->Append({}, fresh) == CE::AppendResult::Ok);
+
+    // One uncommitted record: not due at the minimum interval, due when the whole file's worth
+    // of seconds has passed, and due at the end of the first window whatever the size.
+    CHECK_FALSE(CheckpointDue(1, CheckpointMinIntervalNs, committed, false));
+    CHECK_FALSE(CheckpointDue(1, interval - 1, committed, false));
+    CHECK(CheckpointDue(1, interval, committed, false));
+    CHECK(CheckpointDue(1, 0, committed, true));
+
+    // The commit replaces the file: its size is that of the new generation, not the two added.
+    const u64 new_generation = writer->Bytes();
+    REQUIRE(new_generation > committed);
+    reader.reset();
+    REQUIRE(writer->Commit());
+    CHECK(CommittedFileBytes(path) == new_generation);
+    CHECK(CommittedFileBytes(path) == fs::file_size(path));
+    CHECK(CommittedFileBytes(path) < committed + new_generation);
+
+    // A file that is not there has no size.
+    CHECK(CommittedFileBytes(dir.path / "missing.bin") == 0);
 }

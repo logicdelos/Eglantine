@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <map>
 #include <span>
 #include <string>
@@ -607,6 +608,12 @@ std::vector<u32> RemapRecords(std::span<const CacheEnvelope::IndexEntry> before,
         }
     }
     return mapped;
+}
+
+u64 CommittedFileBytes(const std::filesystem::path& path) {
+    std::error_code error;
+    const auto size = std::filesystem::file_size(path, error);
+    return error ? u64{0} : static_cast<u64>(size);
 }
 
 } // namespace VideoCommon::PipelinePrepare
