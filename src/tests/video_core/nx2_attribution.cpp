@@ -1887,4 +1887,25 @@ TEST_CASE("Time the presenting thread has no span for is charged by what the oth
         CHECK(At(g_frames[0].cause_ns, Cause::Unknown) == 150 * Ms);
         CHECK(g_frames[0].unknown_reasons == UnknownReason::UnlinkedGuest);
     }
+    SECTION("a decompression with a file read inside it shows as both, each time once") {
+        Run run{SessionConfig{}};
+        Present(run.T(0));
+        RecordSpan(Cause::Shader, run.T(0), run.T(30 * Ms));
+        OnThread([&] {
+            RegisterThread("guest core");
+            MarkGuestThread();
+            RecordSpan(Cause::Decompression, run.T(40 * Ms), run.T(100 * Ms), 0, 1 << 20);
+            RecordSpan(Cause::Disk, run.T(50 * Ms), run.T(60 * Ms), 0, 4096);
+        });
+        Present(run.T(150 * Ms));
+        run.Finish();
+        REQUIRE(g_frames.size() == 1);
+        const LongFrame& frame = g_frames[0];
+        CHECK(At(frame.cause_ns, Cause::Disk) == 10 * Ms);
+        CHECK(At(frame.cause_ns, Cause::Decompression) == 50 * Ms);
+        CHECK(At(frame.cause_ns, Cause::Waiting) == 60 * Ms);
+        CHECK(At(frame.cause_ns, Cause::Unknown) == 0);
+        CHECK(Total(frame.cause_ns) == 150 * Ms);
+        CHECK(At(frame.activity_ns, Cause::Decompression) == 50 * Ms);
+    }
 }
