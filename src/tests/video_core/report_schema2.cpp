@@ -210,6 +210,11 @@ TEST_CASE("schema 2 normal run: golden members", "[report][schema2]") {
     CHECK(attribution["inferred_ns"]["waiting"] == 11);
     CHECK(attribution["inferred_ns"]["shader"] == 0);
     REQUIRE(attribution["long_frames"].size() == 2);
+    // The waiting breakdown is optional: without an observed state none of its members exists.
+    CHECK_FALSE(attribution.contains("waiting_breakdown_ns"));
+    CHECK_FALSE(attribution.contains("waiting_service_top"));
+    CHECK_FALSE(attribution["long_frames"][0].contains("waiting_breakdown_ns"));
+    CHECK_FALSE(attribution["long_frames"][0].contains("waiting_service_top"));
     CHECK(attribution["long_frames"][0] == Json::parse(Schema2::LongFrameJson(frames[0])));
     CHECK(attribution["long_frames"][1]["id"] == 42);
     CHECK(attribution["long_frames"][1]["duration_ns"] == 100'000'001);
@@ -273,6 +278,66 @@ TEST_CASE("schema 2 normal run: golden members", "[report][schema2]") {
     REQUIRE(actual_cache["identity"]["envelope_version"].is_number_unsigned());
     actual_cache["identity"]["envelope_version"] = 1;
     CHECK(actual_cache == expected_cache);
+}
+
+TEST_CASE("schema 2 waiting breakdown: golden optional members", "[report][schema2]") {
+    const u32 service = Spikes::InternServiceName("report:service");
+    REQUIRE(service != 0);
+    Spikes::LongFrame frame = MakeFrame(41, 150'000'000);
+    frame.waiting_observed = true;
+    frame.waiting_ns = {10, 20, 30, 40};
+    frame.waiting_handlers[0] = {service, 5, 30};
+    frame.waiting_handlers[1] = {service, 0x80000002u, 3};
+    frame.waiting_handler_count = 2;
+    const std::vector<Spikes::LongFrame> frames{frame};
+    std::istringstream spool{SpoolOf(frames)};
+    Spikes::AttributionSnapshot snapshot = MakeSnapshot(1);
+    snapshot.waiting_observed = true;
+    snapshot.waiting_ns = {100, 200, 300, 400};
+    snapshot.waiting_handlers = {{service, 5, 300}};
+    snapshot.process_to_first_present.waiting_ns = {1, 2, 3, 4};
+    snapshot.first_present_to_interactive.waiting_ns = {5, 6, 7, 8};
+    bool ok = false;
+    const Json report =
+        WriteReport({snapshot, MakeAcceptedCache(), MakeSession(), &spool, true, false}, &ok);
+    REQUIRE(ok);
+
+    const Json attribution = report["attribution"];
+    CHECK(attribution["waiting_breakdown_ns"] ==
+          Json::parse(R"({"guest_running": 100, "guest_idle": 200, "service": 300,
+                          "host_other": 400})"));
+    CHECK(attribution["waiting_service_top"] ==
+          Json::parse(R"([{"service": "report:service", "command": 5, "ns": 300}])"));
+    // The seven causes and their members are unchanged.
+    CHECK(attribution["inferred_ns"].size() == Spikes::CauseCount);
+
+    const Json first = attribution["long_frames"][0];
+    CHECK(first["waiting_breakdown_ns"] ==
+          Json::parse(R"({"guest_running": 10, "guest_idle": 20, "service": 30,
+                          "host_other": 40})"));
+    CHECK(first["waiting_service_top"] ==
+          Json::parse(R"([{"service": "report:service", "command": 5, "ns": 30},
+                          {"service": "report:service", "command": 2147483650, "ns": 3}])"));
+
+    CHECK(report["startup"]["process_to_first_present"]["waiting_breakdown_ns"] ==
+          Json::parse(R"({"guest_running": 1, "guest_idle": 2, "service": 3, "host_other": 4})"));
+    CHECK(report["startup"]["first_present_to_interactive"]["waiting_breakdown_ns"] ==
+          Json::parse(R"({"guest_running": 5, "guest_idle": 6, "service": 7, "host_other": 8})"));
+    CHECK(report["startup"]["process_to_first_present"]["cause_ns"].size() ==
+          Spikes::CauseCount);
+}
+
+TEST_CASE("waiting breakdown json: clamps the handler count and names unknown services",
+          "[report][schema2]") {
+    Spikes::LongFrame frame = MakeFrame(7, 100'000'000);
+    frame.waiting_observed = true;
+    frame.waiting_handler_count = 1'000'000;
+    const Json json = Json::parse(Schema2::LongFrameJson(frame));
+    REQUIRE(json["waiting_service_top"].size() == Spikes::MaxWaitHandlers);
+    CHECK(json["waiting_service_top"][0]["service"] == "unknown");
+    CHECK(json["waiting_breakdown_ns"].size() == Spikes::WaitClassCount);
+    frame.waiting_observed = false;
+    CHECK_FALSE(Json::parse(Schema2::LongFrameJson(frame)).contains("waiting_breakdown_ns"));
 }
 
 TEST_CASE("schema 2 keeps every schema 1 member", "[report][schema2]") {

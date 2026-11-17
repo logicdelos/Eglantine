@@ -1987,3 +1987,207 @@ TEST_CASE("Time the presenting thread has no span for is charged by what the oth
         CHECK(At(frame.activity_ns, Cause::Decompression) == 50 * Ms);
     }
 }
+
+namespace {
+
+u64 Of(const WaitSplit& split, WaitClass wait_class) {
+    return split[static_cast<size_t>(wait_class)];
+}
+
+u64 Sum(const WaitSplit& split) {
+    u64 total{};
+    for (const u64 value : split) {
+        total += value;
+    }
+    return total;
+}
+
+} // Anonymous namespace
+
+TEST_CASE("Waiting splits by what the guest did meanwhile", "[nx2][attribution][waiting]") {
+    Run run;
+    const u32 service = InternServiceName("test:service");
+    REQUIRE(service != 0);
+    Present(run.T(0));
+    // A core thread: nothing known before 10 ms, guest code 10-40, its host side 40-60, idle after.
+    OnThread([&] {
+        RecordGuestState(GuestState::Running, run.T(10 * Ms));
+        RecordGuestState(GuestState::Other, run.T(40 * Ms));
+        RecordGuestState(GuestState::Idle, run.T(60 * Ms));
+    });
+    // A service thread inside one handler from 45 to 55 ms.
+    OnThread([&] {
+        RecordGuestState(GuestState::Service, run.T(45 * Ms), service, 7);
+        RecordGuestState(GuestState::Off, run.T(55 * Ms));
+    });
+    RecordSpan(Cause::Waiting, run.T(0), run.T(100 * Ms));
+    Present(run.T(150 * Ms));
+    const AttributionSnapshot snap = run.Finish();
+    REQUIRE(g_frames.size() == 1);
+    const LongFrame& frame = g_frames[0];
+    CHECK(At(frame.cause_ns, Cause::Waiting) == 100 * Ms);
+    CHECK(frame.waiting_observed);
+    CHECK(Of(frame.waiting_ns, WaitClass::GuestRunning) == 30 * Ms);
+    CHECK(Of(frame.waiting_ns, WaitClass::Service) == 10 * Ms);
+    // 0-10 (no thread knows), 40-45 and 55-60 (a core on its host side, no handler)
+    CHECK(Of(frame.waiting_ns, WaitClass::HostOther) == 20 * Ms);
+    CHECK(Of(frame.waiting_ns, WaitClass::GuestIdle) == 40 * Ms);
+    CHECK(Sum(frame.waiting_ns) == At(frame.cause_ns, Cause::Waiting));
+    REQUIRE(frame.waiting_handler_count == 1);
+    CHECK(frame.waiting_handlers[0].service == service);
+    CHECK(frame.waiting_handlers[0].command == 7);
+    CHECK(frame.waiting_handlers[0].ns == 10 * Ms);
+    CHECK(ServiceNameOf(frame.waiting_handlers[0].service) == "test:service");
+    // The totals are the sum over the long frames (and the start-up) and keep the invariant.
+    CHECK(snap.waiting_observed);
+    CHECK(snap.waiting_ns == frame.waiting_ns);
+    REQUIRE(snap.waiting_handlers.size() == 1);
+    CHECK(snap.waiting_handlers[0].ns == 10 * Ms);
+}
+
+TEST_CASE("A short host side stretch between guest runs reads as guest running",
+          "[nx2][attribution][waiting]") {
+    Run run;
+    Present(run.T(0));
+    OnThread([&] {
+        RecordGuestState(GuestState::Running, run.T(0));
+        RecordGuestState(GuestState::Other, run.T(40 * Ms));
+        RecordGuestState(GuestState::Running, run.T(40 * Ms) + 5'000); // a system call: 5 us
+        RecordGuestState(GuestState::Idle, run.T(80 * Ms));
+    });
+    RecordSpan(Cause::Waiting, run.T(0), run.T(100 * Ms));
+    Present(run.T(150 * Ms));
+    run.Finish();
+    REQUIRE(g_frames.size() == 1);
+    const WaitSplit& split = g_frames[0].waiting_ns;
+    CHECK(Of(split, WaitClass::GuestRunning) == 80 * Ms);
+    CHECK(Of(split, WaitClass::GuestIdle) == 20 * Ms);
+    CHECK(Of(split, WaitClass::HostOther) == 0);
+    CHECK(Sum(split) == 100 * Ms);
+}
+
+TEST_CASE("A host side stretch that lasts is its own class, and running wins over a handler",
+          "[nx2][attribution][waiting]") {
+    Run run;
+    const u32 service = InternServiceName("test:service");
+    Present(run.T(0));
+    OnThread([&] {
+        RecordGuestState(GuestState::Running, run.T(0));
+        RecordGuestState(GuestState::Other, run.T(20 * Ms));
+        RecordGuestState(GuestState::Idle, run.T(30 * Ms));
+    });
+    OnThread([&] {
+        RecordGuestState(GuestState::Service, run.T(10 * Ms), service, 3);
+        RecordGuestState(GuestState::Off, run.T(25 * Ms));
+    });
+    RecordSpan(Cause::Waiting, run.T(0), run.T(40 * Ms));
+    Present(run.T(150 * Ms));
+    run.Finish();
+    REQUIRE(g_frames.size() == 1);
+    const LongFrame& frame = g_frames[0];
+    CHECK(Of(frame.waiting_ns, WaitClass::GuestRunning) == 20 * Ms); // 0-20, handler or not
+    CHECK(Of(frame.waiting_ns, WaitClass::Service) == 5 * Ms);       // 20-25, no core running
+    CHECK(Of(frame.waiting_ns, WaitClass::HostOther) == 5 * Ms);     // 25-30, core on its host side
+    CHECK(Of(frame.waiting_ns, WaitClass::GuestIdle) == 10 * Ms);    // 30-40
+}
+
+TEST_CASE("The handler named is the one that ends last",
+          "[nx2][attribution][waiting]") {
+    Run run;
+    const u32 first = InternServiceName("test:first");
+    const u32 second = InternServiceName("test:second");
+    Present(run.T(0));
+    OnThread([&] {
+        RecordGuestState(GuestState::Service, run.T(10 * Ms), first, 1);
+        RecordGuestState(GuestState::Off, run.T(50 * Ms));
+    });
+    OnThread([&] {
+        RecordGuestState(GuestState::Service, run.T(20 * Ms), second, 2);
+        RecordGuestState(GuestState::Off, run.T(30 * Ms));
+    });
+    RecordSpan(Cause::Waiting, run.T(0), run.T(60 * Ms));
+    Present(run.T(150 * Ms));
+    run.Finish();
+    REQUIRE(g_frames.size() == 1);
+    const LongFrame& frame = g_frames[0];
+    CHECK(Of(frame.waiting_ns, WaitClass::Service) == 40 * Ms);
+    CHECK(Of(frame.waiting_ns, WaitClass::HostOther) == 20 * Ms);
+    REQUIRE(frame.waiting_handler_count == 1);
+    CHECK(frame.waiting_handlers[0].service == first);
+    CHECK(frame.waiting_handlers[0].ns == 40 * Ms);
+}
+
+TEST_CASE("Repeating a state does not move where it began, and the previous state is returned",
+          "[nx2][attribution][waiting]") {
+    Run run;
+    Present(run.T(0));
+    OnThread([&] {
+        CHECK(RecordGuestState(GuestState::Running, run.T(10 * Ms)).state == GuestState::Off);
+        CHECK(RecordGuestState(GuestState::Idle, run.T(30 * Ms)).state == GuestState::Running);
+        CHECK(RecordGuestState(GuestState::Idle, run.T(40 * Ms)).state == GuestState::Idle);
+    });
+    RecordSpan(Cause::Waiting, run.T(0), run.T(100 * Ms));
+    Present(run.T(150 * Ms));
+    run.Finish();
+    REQUIRE(g_frames.size() == 1);
+    const WaitSplit& split = g_frames[0].waiting_ns;
+    CHECK(Of(split, WaitClass::GuestRunning) == 20 * Ms);
+    CHECK(Of(split, WaitClass::GuestIdle) == 70 * Ms);
+    CHECK(Of(split, WaitClass::HostOther) == 10 * Ms);
+}
+
+TEST_CASE("Without a reported state the split says nothing and is not claimed",
+          "[nx2][attribution][waiting]") {
+    CHECK(RecordGuestState(GuestState::Running).state == GuestState::Off); // no session: ignored
+    Run run;
+    Present(run.T(0));
+    RecordSpan(Cause::Waiting, run.T(0), run.T(100 * Ms));
+    Present(run.T(150 * Ms));
+    const AttributionSnapshot snap = run.Finish();
+    REQUIRE(g_frames.size() == 1);
+    const LongFrame& frame = g_frames[0];
+    CHECK_FALSE(frame.waiting_observed);
+    CHECK(frame.waiting_handler_count == 0);
+    CHECK(Sum(frame.waiting_ns) == At(frame.cause_ns, Cause::Waiting)); // all host_other
+    CHECK(Of(frame.waiting_ns, WaitClass::HostOther) == 100 * Ms);
+    CHECK_FALSE(snap.waiting_observed);
+    CHECK(snap.waiting_handlers.empty());
+}
+
+TEST_CASE("The interval to the interactive marker carries the split of its waiting",
+          "[nx2][attribution][waiting]") {
+    Run run;
+    Present(run.T(0));
+    OnThread([&] {
+        RecordGuestState(GuestState::Running, run.T(0));
+        RecordGuestState(GuestState::Idle, run.T(4 * Ms));
+    });
+    RecordSpan(Cause::Waiting, run.T(1 * Ms), run.T(8 * Ms));
+    Present(run.T(10 * Ms));
+    Present(run.T(20 * Ms));
+    WaitUntil(run.T(25 * Ms));
+    InteractiveMarker marker;
+    marker.scene_id = "scene";
+    marker.origin = "lab";
+    marker.marker_ns = run.T(15 * Ms);
+    REQUIRE(MarkInteractive(marker) == MarkerResult::Accepted);
+    const AttributionSnapshot snap = run.Finish();
+    const IntervalAttribution& interval = snap.first_present_to_interactive;
+    REQUIRE(interval.status == IntervalStatus::Complete);
+    CHECK(snap.waiting_observed);
+    CHECK(At(interval.cause_ns, Cause::Waiting) == 7 * Ms);
+    CHECK(Of(interval.waiting_ns, WaitClass::GuestRunning) == 3 * Ms);
+    CHECK(Of(interval.waiting_ns, WaitClass::GuestIdle) == 4 * Ms);
+    CHECK(Sum(interval.waiting_ns) == At(interval.cause_ns, Cause::Waiting));
+}
+
+TEST_CASE("Service names are interned once and unknown ids read as unknown",
+          "[nx2][attribution][waiting]") {
+    const u32 id = InternServiceName("test:interned");
+    CHECK(id != 0);
+    CHECK(InternServiceName("test:interned") == id);
+    CHECK(InternServiceName("test:other") != id);
+    CHECK(ServiceNameOf(id) == "test:interned");
+    CHECK(ServiceNameOf(0) == "unknown");
+    CHECK(ServiceNameOf(0xFFFFFFFFu) == "unknown");
+}
