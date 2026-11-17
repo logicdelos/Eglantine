@@ -610,10 +610,33 @@ std::vector<u32> RemapRecords(std::span<const CacheEnvelope::IndexEntry> before,
     return mapped;
 }
 
-u64 CommittedFileBytes(const std::filesystem::path& path) {
-    std::error_code error;
-    const auto size = std::filesystem::file_size(path, error);
-    return error ? u64{0} : static_cast<u64>(size);
+size_t CommittedSizes::AddFile(const std::filesystem::path& path, bool accepted) {
+    u64 size = 0;
+    if (accepted) {
+        std::error_code error;
+        const auto on_disk = std::filesystem::file_size(path, error);
+        size = error ? u64{0} : static_cast<u64>(on_disk);
+    }
+    bytes.push_back(size);
+    return bytes.size() - 1;
+}
+
+void CommittedSizes::Committed(size_t index, bool succeeded, u64 generation_bytes) noexcept {
+    if (succeeded && index < bytes.size()) {
+        bytes[index] = generation_bytes;
+    }
+}
+
+u64 CommittedSizes::FileBytes(size_t index) const noexcept {
+    return index < bytes.size() ? bytes[index] : u64{0};
+}
+
+u64 CommittedSizes::Total() const noexcept {
+    u64 total = 0;
+    for (const u64 size : bytes) {
+        total += size;
+    }
+    return total;
 }
 
 } // namespace VideoCommon::PipelinePrepare

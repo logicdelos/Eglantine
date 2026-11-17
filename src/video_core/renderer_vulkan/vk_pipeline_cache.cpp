@@ -490,8 +490,7 @@ public:
         std::unique_ptr<CE::EnvelopeReader> reader;
         std::unique_ptr<CE::EnvelopeWriter> writer; ///< Serialization thread only
         bool writer_failed{};
-        u64 uncommitted{};     ///< Records appended to `writer` that are not committed yet
-        u64 committed_bytes{}; ///< Size of the file at its last commit
+        u64 uncommitted{}; ///< Records appended to `writer` that are not committed yet
     };
     /// Where candidate `i` of the scheduler lives: file and record index.
     struct Source {
@@ -520,7 +519,8 @@ public:
     std::shared_mutex reader_gate;
     std::atomic<u64> uncommitted{};      ///< Records of all writers not committed yet
     std::atomic<u64> last_commit_ns{};   ///< Spikes::NowNs() of the session start or last commit
-    std::atomic<u64> committed_bytes{};  ///< Size of the committed files
+    PP::CommittedSizes committed_sizes;  ///< Per file, parallel to `files`
+    std::atomic<u64> committed_bytes{};  ///< Total of `committed_sizes`, readable from any thread
     std::atomic<u64> checkpoints{};      ///< Commits made before the session ended
     std::atomic<bool> checkpoint_queued{};
     bool window_checkpoint_done{};       ///< GPU thread only
@@ -621,11 +621,7 @@ void PublishSession(PipelineCacheSession& session) {
 /// The committed size of the session: the sizes of its files as they are on disk, not the bytes
 /// this run has written. The checkpoint interval is scaled by it.
 void RefreshCommittedBytes(PipelineCacheSession& session) {
-    u64 total = 0;
-    for (const auto& file : session.files) {
-        total += file.committed_bytes;
-    }
-    session.committed_bytes.store(total, std::memory_order_relaxed);
+    session.committed_bytes.store(session.committed_sizes.Total(), std::memory_order_relaxed);
 }
 
 /// Appends one record to the new generation of its file. Runs on the serialization thread, which
@@ -709,9 +705,8 @@ bool CommitFile(PipelineCacheSession& session, size_t index, bool keep_reader) {
     if (pending != 0) {
         const u64 bytes = file.writer->Bytes();
         ok = file.writer->Commit();
-        if (ok) {
-            file.committed_bytes = bytes;
-        } else {
+        session.committed_sizes.Committed(index, ok, bytes);
+        if (!ok) {
             session.skipped.fetch_add(pending, std::memory_order_relaxed);
         }
     }
@@ -1584,11 +1579,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         if (!file.reader && file.load.reason != CE::RejectReason::Missing) {
             LOG_WARNING(Render_Vulkan, "{}", CE::CacheRejectLine(file.load));
         }
-        if (file.reader) {
-            // An accepted generation is the committed file from the start; the first checkpoint
-            // rewrites all of it, so its interval is scaled by this size.
-            file.committed_bytes = PP::CommittedFileBytes(path);
-        }
+        // An accepted generation is the committed file from the start; the first checkpoint
+        // rewrites all of it, so its interval is scaled by this size.
+        session->committed_sizes.AddFile(path, file.reader != nullptr);
         session->files.push_back(std::move(file));
     };
     open_file(CE::PayloadKind::Transferable, pipeline_cache_filename,

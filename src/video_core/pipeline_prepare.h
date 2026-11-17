@@ -267,10 +267,27 @@ inline constexpr u64 FirstWindowNs = u64{120} * 1'000'000'000;
            since_last_commit_ns >= (std::max)(CheckpointMinIntervalNs, scaled);
 }
 
-/// The size of the committed cache file at `path`, the value `CheckpointDue` scales its interval
-/// by. A file accepted at load counts from the start, not only after this run commits. 0 when the
-/// file cannot be read.
-[[nodiscard]] u64 CommittedFileBytes(const std::filesystem::path& path);
+/// The size of each committed cache file of a session and their total: the file sizes as they
+/// are on disk now, not the bytes this run has written. `CheckpointDue` scales its interval by
+/// the total. Files are added in the order the session keeps them.
+class CommittedSizes {
+public:
+    /// Adds a file. One accepted at load counts the size it has on disk from the start; one that
+    /// was rejected or is missing counts nothing (the next generation is not seeded from it).
+    /// Returns its index.
+    size_t AddFile(const std::filesystem::path& path, bool accepted);
+
+    /// A commit of file `index` that wrote `generation_bytes`. A commit that succeeded replaces
+    /// the count of the file (the generation holds the records of the previous one, so the sizes
+    /// are not summed); one that failed leaves the previous file and its count as they are.
+    void Committed(size_t index, bool succeeded, u64 generation_bytes) noexcept;
+
+    [[nodiscard]] u64 FileBytes(size_t index) const noexcept;
+    [[nodiscard]] u64 Total() const noexcept;
+
+private:
+    std::vector<u64> bytes;
+};
 
 inline constexpr u32 NoRecord = ~u32{0};
 

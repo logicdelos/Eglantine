@@ -970,9 +970,12 @@ struct ScratchDir {
     fs::path path;
 };
 
-CE::CacheIdentity TransferableIdentity() {
+constexpr u64 RecordBytes = u64{1} << 20;
+constexpr u32 LargeRecordCount = 24; // 24 MiB: its interval is longer than the minimum one
+
+CE::CacheIdentity CacheIdentityOf(CE::PayloadKind kind) {
     CE::CacheIdentity identity;
-    identity.kind = CE::PayloadKind::Transferable;
+    identity.kind = kind;
     identity.shader_format_version = 35;
     identity.host.build_id = 0x1111222233334444ULL;
     identity.host.title_id = 0x0100000000001000ULL;
@@ -989,61 +992,163 @@ CE::CacheIdentity TransferableIdentity() {
     return identity;
 }
 
+/// A committed generation of `count` records of RecordBytes each, as an earlier run left it.
+void WriteGeneration(const fs::path& path, const CE::CacheIdentity& identity, u32 count) {
+    auto writer = CE::EnvelopeWriter::Create(path, identity, CE::MaxBytes(identity.kind));
+    REQUIRE(writer);
+    for (u32 i = 0; i < count; ++i) {
+        const std::vector<u8> payload(RecordBytes, static_cast<u8>(i + 1));
+        REQUIRE(writer->Append({}, payload) == CE::AppendResult::Ok);
+    }
+    REQUIRE(writer->Commit());
+}
+
+/// Opens one file the way the pipeline cache does at load: the reader of an accepted file is
+/// kept, and the file is registered in `sizes` with whether it was accepted.
+std::unique_ptr<CE::EnvelopeReader> OpenFile(CommittedSizes& sizes, const fs::path& path,
+                                             const CE::CacheIdentity& expected) {
+    CE::CacheLoadResult load;
+    auto reader = CE::EnvelopeReader::Open(path, expected, load);
+    sizes.AddFile(path, reader != nullptr);
+    return reader;
+}
+
+/// What a file left by a build that is not this one looks like: rejected on opening.
+void WriteForeignGeneration(const fs::path& path, CE::PayloadKind kind, u32 count) {
+    CE::CacheIdentity foreign = CacheIdentityOf(kind);
+    foreign.host.build_id += 1;
+    WriteGeneration(path, foreign, count);
+}
+
 } // Anonymous namespace
 
 TEST_CASE("The first checkpoint of a loaded large generation waits for the size of that generation",
           "[video_core][pipeline_prepare]") {
-    constexpr u64 RecordBytes = u64{512} << 10;
-    constexpr u32 RecordCount = 48; // 24 MiB: its interval is longer than the minimum one
     const ScratchDir dir;
     const fs::path path = dir.path / "transferable.bin";
-    const CE::CacheIdentity identity = TransferableIdentity();
-
-    // An earlier run committed a large generation.
-    {
-        auto writer = CE::EnvelopeWriter::Create(path, identity, CE::MaxBytes(identity.kind));
-        REQUIRE(writer);
-        for (u32 i = 0; i < RecordCount; ++i) {
-            const std::vector<u8> payload(RecordBytes, static_cast<u8>(i + 1));
-            REQUIRE(writer->Append({}, payload) == CE::AppendResult::Ok);
-        }
-        REQUIRE(writer->Commit());
-    }
+    const CE::CacheIdentity identity = CacheIdentityOf(CE::PayloadKind::Transferable);
+    WriteGeneration(path, identity, LargeRecordCount);
     const u64 on_disk = fs::file_size(path);
 
-    // This run accepts it. Before anything is committed, the size it reports is the file's.
-    CE::CacheLoadResult load;
-    auto reader = CE::EnvelopeReader::Open(path, identity, load);
+    // This run accepts the file. Before anything is committed, the size it counts is the file's.
+    CommittedSizes sizes;
+    auto reader = OpenFile(sizes, path, identity);
     REQUIRE(reader);
-    REQUIRE(load.accepted);
-    const u64 committed = CommittedFileBytes(path);
-    CHECK(committed == on_disk);
-    const u64 interval = committed * CheckpointNsPerByte;
+    CHECK(sizes.FileBytes(0) == on_disk);
+    CHECK(sizes.Total() == on_disk);
+    const u64 interval = sizes.Total() * CheckpointNsPerByte;
     REQUIRE(interval > CheckpointMinIntervalNs);
 
     // The first new record of the run goes into the next generation, which starts as a copy.
     auto writer = CE::EnvelopeWriter::Create(path, identity, CE::MaxBytes(identity.kind));
     REQUIRE(writer);
-    REQUIRE(writer->Seed(*reader) == RecordCount);
+    REQUIRE(writer->Seed(*reader) == LargeRecordCount);
     const std::vector<u8> fresh(RecordBytes, static_cast<u8>(0xee));
     REQUIRE(writer->Append({}, fresh) == CE::AppendResult::Ok);
 
-    // One uncommitted record: not due at the minimum interval, due when the whole file's worth
-    // of seconds has passed, and due at the end of the first window whatever the size.
-    CHECK_FALSE(CheckpointDue(1, CheckpointMinIntervalNs, committed, false));
-    CHECK_FALSE(CheckpointDue(1, interval - 1, committed, false));
-    CHECK(CheckpointDue(1, interval, committed, false));
-    CHECK(CheckpointDue(1, 0, committed, true));
+    // One uncommitted record: not due at the minimum interval, due when one second per MiB of
+    // the accepted file has passed, and due at the end of the first window whatever the size.
+    CHECK_FALSE(CheckpointDue(1, CheckpointMinIntervalNs, sizes.Total(), false));
+    CHECK_FALSE(CheckpointDue(1, interval - 1, sizes.Total(), false));
+    CHECK(CheckpointDue(1, interval, sizes.Total(), false));
+    CHECK(CheckpointDue(1, 0, sizes.Total(), true));
+}
 
-    // The commit replaces the file: its size is that of the new generation, not the two added.
-    const u64 new_generation = writer->Bytes();
-    REQUIRE(new_generation > committed);
+TEST_CASE("Only an accepted file counts toward the committed size, main or mesh",
+          "[video_core][pipeline_prepare]") {
+    const ScratchDir dir;
+    const fs::path main_path = dir.path / "transferable.bin";
+    const fs::path mesh_path = dir.path / "transferable_mesh.bin";
+    const CE::CacheIdentity main_identity = CacheIdentityOf(CE::PayloadKind::Transferable);
+    const CE::CacheIdentity mesh_identity = CacheIdentityOf(CE::PayloadKind::TransferableMesh);
+
+    // Accepted main, rejected mesh: only the main file counts.
+    {
+        WriteGeneration(main_path, main_identity, LargeRecordCount);
+        WriteForeignGeneration(mesh_path, CE::PayloadKind::TransferableMesh, LargeRecordCount);
+        CommittedSizes sizes;
+        const auto main_reader = OpenFile(sizes, main_path, main_identity);
+        const auto mesh_reader = OpenFile(sizes, mesh_path, mesh_identity);
+        REQUIRE(main_reader);
+        REQUIRE_FALSE(mesh_reader);
+        CHECK(sizes.FileBytes(0) == fs::file_size(main_path));
+        CHECK(sizes.FileBytes(1) == 0);
+        CHECK(sizes.Total() == fs::file_size(main_path));
+    }
+    // Rejected main, accepted mesh: only the mesh file counts.
+    {
+        WriteForeignGeneration(main_path, CE::PayloadKind::Transferable, LargeRecordCount);
+        WriteGeneration(mesh_path, mesh_identity, LargeRecordCount);
+        CommittedSizes sizes;
+        const auto main_reader = OpenFile(sizes, main_path, main_identity);
+        const auto mesh_reader = OpenFile(sizes, mesh_path, mesh_identity);
+        REQUIRE_FALSE(main_reader);
+        REQUIRE(mesh_reader);
+        CHECK(sizes.FileBytes(0) == 0);
+        CHECK(sizes.FileBytes(1) == fs::file_size(mesh_path));
+        CHECK(sizes.Total() == fs::file_size(mesh_path));
+    }
+}
+
+TEST_CASE("A rejected or missing file does not delay the first checkpoint",
+          "[video_core][pipeline_prepare]") {
+    const ScratchDir dir;
+    const fs::path rejected_path = dir.path / "transferable.bin";
+    const fs::path missing_path = dir.path / "transferable_mesh.bin";
+    WriteForeignGeneration(rejected_path, CE::PayloadKind::Transferable, LargeRecordCount);
+    REQUIRE(fs::file_size(rejected_path) * CheckpointNsPerByte > CheckpointMinIntervalNs);
+
+    CommittedSizes sizes;
+    const auto rejected = OpenFile(sizes, rejected_path,
+                                   CacheIdentityOf(CE::PayloadKind::Transferable));
+    const auto missing = OpenFile(sizes, missing_path,
+                                  CacheIdentityOf(CE::PayloadKind::TransferableMesh));
+    REQUIRE_FALSE(rejected);
+    REQUIRE_FALSE(missing);
+    CHECK(sizes.Total() == 0);
+    // The next generation starts empty, so the minimum interval is the whole wait.
+    CHECK_FALSE(CheckpointDue(1, CheckpointMinIntervalNs - 1, sizes.Total(), false));
+    CHECK(CheckpointDue(1, CheckpointMinIntervalNs, sizes.Total(), false));
+}
+
+TEST_CASE("A commit replaces the committed size of its file and a failed one keeps it",
+          "[video_core][pipeline_prepare]") {
+    const ScratchDir dir;
+    const fs::path path = dir.path / "transferable.bin";
+    const CE::CacheIdentity identity = CacheIdentityOf(CE::PayloadKind::Transferable);
+    WriteGeneration(path, identity, LargeRecordCount);
+    const u64 first_generation = fs::file_size(path);
+
+    CommittedSizes sizes;
+    auto reader = OpenFile(sizes, path, identity);
+    REQUIRE(reader);
+    REQUIRE(sizes.Total() == first_generation);
+
+    // A generation that is dropped before it replaces the file leaves the file and its count.
+    {
+        auto writer = CE::EnvelopeWriter::Create(path, identity, CE::MaxBytes(identity.kind));
+        REQUIRE(writer);
+        REQUIRE(writer->Seed(*reader) == LargeRecordCount);
+        const std::vector<u8> fresh(RecordBytes, static_cast<u8>(0xee));
+        REQUIRE(writer->Append({}, fresh) == CE::AppendResult::Ok);
+        sizes.Committed(0, false, writer->Bytes());
+    }
+    CHECK(sizes.FileBytes(0) == first_generation);
+    CHECK(sizes.Total() == first_generation);
+    CHECK(fs::file_size(path) == first_generation);
+
+    // A commit that succeeds counts the size of the new file, not the two sizes added up.
+    auto writer = CE::EnvelopeWriter::Create(path, identity, CE::MaxBytes(identity.kind));
+    REQUIRE(writer);
+    REQUIRE(writer->Seed(*reader) == LargeRecordCount);
+    const std::vector<u8> fresh(RecordBytes, static_cast<u8>(0xee));
+    REQUIRE(writer->Append({}, fresh) == CE::AppendResult::Ok);
+    const u64 second_generation = writer->Bytes();
     reader.reset();
     REQUIRE(writer->Commit());
-    CHECK(CommittedFileBytes(path) == new_generation);
-    CHECK(CommittedFileBytes(path) == fs::file_size(path));
-    CHECK(CommittedFileBytes(path) < committed + new_generation);
-
-    // A file that is not there has no size.
-    CHECK(CommittedFileBytes(dir.path / "missing.bin") == 0);
+    sizes.Committed(0, true, second_generation);
+    CHECK(second_generation > first_generation);
+    CHECK(sizes.FileBytes(0) == fs::file_size(path));
+    CHECK(sizes.Total() == second_generation);
+    CHECK(sizes.Total() < first_generation + second_generation);
 }
