@@ -443,6 +443,13 @@ constexpr size_t HistoryBytesPerSpan = sizeof(SpanRec) + ScratchBytesPerSpan;
 /// The first allocation of a span vector, in records.
 constexpr size_t MinSpanCapacity = 16;
 
+constexpr size_t DefaultRingBudget = size_t{8} << 20;
+constexpr size_t DefaultHistoryBudget = size_t{64} << 20;
+// Two seconds at 4 * 6141.05 retained spans/s, doubled for vector growth, plus up to 15
+// initial spare slots per vector and one maximal drain round. A long open frame is chunked.
+static_assert((DefaultHistoryBudget - ScratchFixedBytes) / HistoryBytesPerSpan >=
+              2 * 49'129 + 2 * MaxThreads * (MinSpanCapacity - 1) + MaxThreads * 256);
+
 /// The most handler keys one decomposition names; the time of a key past it is added to the
 /// handler 0 (unknown), so the Service class stays whole.
 constexpr size_t MaxDecompHandlers = 32;
@@ -1372,7 +1379,7 @@ struct Session {
     void MarkOpenIncomplete();
     void Prune(bool force = false);
     bool Reserve(std::vector<SpanRec>& spans);
-    void Trim(std::vector<SpanRec>& spans);
+    void Trim(std::vector<SpanRec>& spans, bool force = false);
     void NoteRetained();
     void Process(const Item& item);
     void ResolveBoundary(const Item& item);
@@ -1661,6 +1668,13 @@ bool Session::CloseSpan(const PendingEnd& end) {
     rec.end_ns = std::max(end.end_ns, rec.begin_ns);
     rec.amount += end.amount;
     rec.flags |= end.flags;
+    if (owner.closed.capacity() == 0 && owner.open.empty()) {
+        // Move the empty allocation rather than charge two vectors for one span.
+        owner.open.swap(owner.closed);
+    } else if (owner.closed.size() == owner.closed.capacity() && history >= history_cap) {
+        // Another slot is already charged to the open vector: reclaim it before reserving.
+        Trim(owner.open, true);
+    }
     if (!Reserve(owner.closed)) {
         // The finished record does not fit: lost like a span refused at its Begin.
         lost_consumer.fetch_add(1, std::memory_order_relaxed);
@@ -1910,7 +1924,6 @@ void Session::DrainAll() {
     ApplyEnds();
     ApplyLinks();
     TakeLosses();
-    NoteRetained();
 }
 
 /// Frees history in the middle of a pass. `tails` are the pass's snapshots of the rings; what is
@@ -1977,13 +1990,13 @@ bool Session::Reserve(std::vector<SpanRec>& spans) {
     const size_t before = spans.capacity();
     spans.reserve(before + grow);
     history += spans.capacity() - before;
+    NoteRetained();
     return true;
 }
 
-/// Releases the capacity of `spans` once it holds less than half of it, and returns it to the
-/// allowance.
-void Session::Trim(std::vector<SpanRec>& spans) {
-    if (spans.capacity() <= 2 * spans.size()) {
+/// Returns unused storage to the allowance. Ordinarily wait until at least half can be freed.
+void Session::Trim(std::vector<SpanRec>& spans, bool force) {
+    if (spans.capacity() <= spans.size() || (!force && spans.capacity() <= 2 * spans.size())) {
         return;
     }
     const size_t before = spans.capacity();
@@ -1994,12 +2007,7 @@ void Session::Trim(std::vector<SpanRec>& spans) {
 
 /// Records the high-water mark of the span storage the session owns, from the real capacities.
 void Session::NoteRetained() {
-    const u32 count = thread_count.load(std::memory_order_acquire);
-    size_t slots{};
-    for (u32 i = 0; i < count; ++i) {
-        slots += states[i].open.capacity() + states[i].closed.capacity();
-    }
-    const size_t bytes = slots * sizeof(SpanRec);
+    const size_t bytes = history * sizeof(SpanRec);
     if (bytes > peak_retained_bytes.load(std::memory_order_relaxed)) {
         peak_retained_bytes.store(bytes, std::memory_order_relaxed);
     }
@@ -2672,14 +2680,13 @@ bool BeginSession(const SessionConfig& config) {
     s->generation = ++g_generation;
     s->config = config;
     s->start_ns = NowNs();
-    // One budget: half for the rings (allocated by the threads that register), half for the
-    // retained history and the resolver's working storage for it. A slot of span storage is
-    // charged the record and the worst-case scratch of resolving it (HistoryBytesPerSpan), slots
-    // are counted by the capacity the session owns, and the scratch that does not depend on the
-    // number of spans (ScratchFixedBytes) is taken off first. A ring never holds less than four
-    // events, and the history never fewer than 64 slots, whatever the budget.
-    const size_t ring_budget = config.buffer_bytes / 2;
-    const size_t history_budget = config.buffer_bytes - ring_budget;
+    // Keep the default producer rings unchanged. Charge the retained spans by capacity against
+    // their own budget, including ScratchFixedBytes and each slot's resolver scratch estimate.
+    const size_t ring_budget =
+        config.buffer_bytes != 0 ? config.buffer_bytes / 2 : DefaultRingBudget;
+    const size_t history_budget =
+        config.buffer_bytes != 0 ? config.buffer_bytes - ring_budget : DefaultHistoryBudget;
+    s->config.buffer_bytes = ring_budget + history_budget;
     const size_t per_thread = ring_budget / MaxThreads / sizeof(RingEvent);
     s->ring_capacity = std::bit_floor(std::max<size_t>(per_thread, 4));
     s->history_cap = std::max<size_t>(

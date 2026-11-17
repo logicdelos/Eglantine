@@ -511,14 +511,11 @@ inline std::atomic<bool> attribution_enabled{false}; ///< Set by BeginSession, c
 
 struct SessionConfig {
     u64 threshold_ns{100'000'000};
-    /// What the recorder may hold in total, shared by all threads; spans past it are counted as
-    /// lost. Half goes to the per-thread rings. The other half goes to the retained spans and the
-    /// storage used to resolve them: a retained span slot is charged its record and the most
-    /// working storage resolving it can need, about 584 bytes on a 64-bit host (an estimate, not an
-    /// allocator measurement), after a fixed 16 KiB for what does not grow with the spans. The
-    /// history never has fewer than 64 slots and a ring never fewer than four events, so budgets
-    /// below about 100 KiB are exceeded.
-    size_t buffer_bytes{size_t{16} << 20};
+    /// Ring and charged history/scratch budget. Zero selects 8 MiB of rings and 64 MiB of
+    /// history/scratch; explicit budgets are split evenly. The respective floors are four events
+    /// per ring and 64 history slots. A history slot costs its record plus estimated worst-case
+    /// resolver scratch (584 bytes on x64), after 16 KiB of fixed scratch.
+    size_t buffer_bytes{};
     /// Charge the time the presenting thread has no span for by what the other threads were doing
     /// (UnknownReason::PresenterGap) instead of leaving it Unknown. Off: the strict decomposition.
     bool charge_presenter_gaps{true};

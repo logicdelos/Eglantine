@@ -63,6 +63,7 @@ u64 Total(const Times& times) {
 /// Unknown. The tests of the gap rule use a SessionConfig of their own (charging on, the default).
 SessionConfig Strict() {
     SessionConfig config;
+    config.buffer_bytes = size_t{16} << 20; // keep the pressure and small-ring fixtures unchanged
     config.charge_presenter_gaps = false;
     return config;
 }
@@ -993,17 +994,15 @@ TEST_CASE("A span that ends while the history has room is kept and its frame is 
     CHECK((outcome.frame.unknown_reasons & UnknownReason::LostSpans) == 0);
 }
 
-TEST_CASE("A span whose end finds no room in the history is counted as lost and marks its frame",
-          "[nx2][attribution]") {
-    // The same fill twice, once with the end and once without it: the records the filler loses
-    // are the same, so the difference is the end alone, and exactly one.
+TEST_CASE("A span closing at capacity reuses its open history slot",
+          "[nx2][attribution][history]") {
     const CloseOutcome not_ended = RunCloseScenario(CloseCase::FullNotEnded);
     const CloseOutcome ended = RunCloseScenario(CloseCase::FullEnded);
-    REQUIRE(not_ended.lost_events > 0); // the history really was full
-    CHECK(ended.lost_events == not_ended.lost_events + 1);
-    // The filler's refused records lie after the frame, so only the refused close can touch it.
-    CHECK_FALSE(ended.frame.instrumentation_complete);
-    CHECK((ended.frame.unknown_reasons & UnknownReason::LostSpans) != 0);
+    REQUIRE(not_ended.lost_events > 0); // the filler really exhausted history
+    CHECK(ended.lost_events == not_ended.lost_events);
+    // The filler loses events in a later interval, not in the finished span's long frame.
+    CHECK(ended.frame.instrumentation_complete);
+    CHECK((ended.frame.unknown_reasons & UnknownReason::LostSpans) == 0);
 }
 
 TEST_CASE("Deeply nested spans with distinct work ids keep the resolver scratch linear",
