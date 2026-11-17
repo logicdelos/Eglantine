@@ -1144,6 +1144,12 @@ public:
         has_unbound_instructions = true;
     }
 
+    /// The recorded instruction at `address`. ReadInstruction answers the last recorded word
+    /// (the one at the highest cached address) from guest memory, which a test has none of.
+    u64 RecordedInstruction(u32 address) const {
+        return code[(address - cached_lowest) / sizeof(u64)];
+    }
+
     u32 ReadCbufValue(u32, u32) override {
         return 0;
     }
@@ -1195,7 +1201,7 @@ void RequireSameEnvironment(RecordedEnv& source, VideoCommon::FileEnvironment& d
     REQUIRE(decoded.TextureBoundBuffer() == source.TextureBoundBuffer());
     REQUIRE(decoded.ReadViewportTransformState() == source.ReadViewportTransformState());
     for (u32 i = 0; i < source.CachedSizeWords(); ++i) {
-        REQUIRE(decoded.ReadInstruction(0x30 + i * 8) == source.ReadInstruction(0x30 + i * 8));
+        REQUIRE(decoded.ReadInstruction(0x30 + i * 8) == source.RecordedInstruction(0x30 + i * 8));
     }
     REQUIRE_THROWS_AS(decoded.ReadInstruction(0x30 + static_cast<u32>(source.CachedSizeWords()) * 8),
                       Shader::LogicError);
