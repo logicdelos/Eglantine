@@ -6,13 +6,16 @@
 
 #include "common/assert.h"
 #include "common/common_types.h"
+#include "common/nx2_dependency_wait.h"
 #include "common/scratch_buffer.h"
 #include "core/hle/kernel/k_scheduler.h"
 #include "core/hle/kernel/k_scoped_scheduler_lock_and_sleep.h"
+#include "core/hle/kernel/k_readable_event.h"
 #include "core/hle/kernel/k_synchronization_object.h"
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/k_thread_queue.h"
 #include "core/hle/kernel/kernel.h"
+#include "core/hle/service/kernel_helpers.h"
 #include "core/hle/kernel/svc_results.h"
 
 namespace Kernel {
@@ -85,6 +88,7 @@ Result KSynchronizationObject::Wait(KernelCore& kernel, s32* out_index,
     ThreadQueueImplForKSynchronizationObjectWait wait_queue(kernel, objects, thread_nodes.data(),
                                                             num_objects);
 
+    Nx2Sampler::DependencyWait dependency_wait;
     {
         // Setup the scheduling lock and sleep.
         KScopedSchedulerLockAndSleep slp(kernel, std::addressof(timer), thread, timeout);
@@ -133,6 +137,23 @@ Result KSynchronizationObject::Wait(KernelCore& kernel, s32* out_index,
         // Clear the thread's synced index.
         thread->SetSyncedIndex(-1);
 
+        if (Nx2Sampler::DependencyTraceEnabled()) {
+            std::string description = fmt::format("sync objects timeout={} [", timeout);
+            for (auto i = 0; i < num_objects; ++i) {
+                auto* object = objects[i];
+                fmt::format_to(std::back_inserter(description), "{}{}", i == 0 ? "" : ", ",
+                               fmt::ptr(object));
+                if (const auto* event = object->DynamicCast<KReadableEvent*>()) {
+                    fmt::format_to(std::back_inserter(description), "({})",
+                                   Service::KernelHelpers::DebugEventName(event));
+                } else if (const auto* target = object->DynamicCast<KThread*>()) {
+                    fmt::format_to(std::back_inserter(description), "(thread t{})",
+                                   target->GetThreadId());
+                }
+            }
+            description += ']';
+            dependency_wait.Begin(thread->GetThreadId(), std::move(description));
+        }
         // Wait for an object to be signaled.
         wait_queue.SetHardwareTimer(timer);
         thread->BeginWait(kernel, std::addressof(wait_queue));

@@ -29,6 +29,7 @@
 
 #include <fmt/format.h>
 
+#include "common/nx2_dependency_wait.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/thread.h"
@@ -1041,6 +1042,7 @@ void WatchStalls(unsigned limit_seconds) {
             "{}/stall_{}.txt", Common::FS::GetEdenPathString(Common::FS::EdenPath::LogDir), stamp);
         const std::string text =
             fmt::format("No guest frame for {} s (after {} frames).\n", limit_seconds, frames) +
+            (DependencyTraceEnabled() ? DependencyWait::Snapshot() : std::string{}) +
             Stacks();
         if (std::FILE* const file = std::fopen(path.c_str(), "w")) {
             std::fwrite(text.data(), 1, text.size(), file);

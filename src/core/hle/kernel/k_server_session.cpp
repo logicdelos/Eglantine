@@ -17,6 +17,7 @@
 #include "common/assert.h"
 #include "common/common_types.h"
 #include "common/logging.h"
+#include "common/nx2_sampler.h"
 #include "common/scope_exit.h"
 #include "common/scratch_buffer.h"
 #include "core/core.h"
@@ -1375,6 +1376,10 @@ Result KServerSession::SendReply(KernelCore& kernel, uintptr_t server_message, u
             KScopedSchedulerLock sl{kernel};
 
             if (!client_thread->IsTerminationRequested()) {
+                if (is_hle && Nx2Sampler::DependencyTraceEnabled()) {
+                    LOG_INFO(Kernel, "dep ipc-reply tid={} result={:#x}",
+                             client_thread->GetThreadId(), client_result.raw);
+                }
                 client_thread->EndWait(kernel, client_result);
             }
         }

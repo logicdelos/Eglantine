@@ -35,6 +35,7 @@
 #include "common/div_ceil.h"
 #include "common/game_presets.h"
 #include "common/nx2_bottleneck.h"
+#include "common/nx2_dependency_wait.h"
 #include "common/nx2_sampler.h"
 #include "common/settings.h"
 #include "common/thread.h"
@@ -317,6 +318,11 @@ private:
         request.syncpoint = syncpoint;
         request.pending = true;
         auto& manager = system.Host1x().GetSyncpointManager();
+        if (Nx2Sampler::DependencyTraceEnabled()) {
+            LOG_INFO(Service, "dep event-fence object={} tid={} slot={:#x} id={} target={} guest={}",
+                     fmt::ptr(&event->GetReadableEvent()), ctx.GetThread().GetThreadId(), slot,
+                     syncpoint, value, manager.GetGuestSyncpointValue(syncpoint));
+        }
         // The action runs on the GPU thread under the manager's lock, or inline if the value is
         // already reached.
         request.handle = manager.RegisterGuestAction(
@@ -2427,6 +2433,18 @@ private:
         // other channels acquire. Extend the deadline whenever the syncpoint makes progress.
         auto deadline = start + std::chrono::milliseconds{unless_gpu_waits ? 4000 : 15000};
         if (!syncpoints.IsReadyGuest(fence_id, fence_value)) {
+            Nx2Sampler::DependencyWait dependency_wait;
+            const bool trace = Nx2Sampler::DependencyTraceEnabled();
+            const u64 tid = trace ? Nx2Sampler::dependency_ipc_thread : 0;
+            if (trace) {
+                auto description = fmt::format("VI fence id={} target={} initial_guest={}",
+                                               fence_id, fence_value,
+                                               syncpoints.GetGuestSyncpointValue(fence_id));
+                LOG_INFO(Service, "dep fence-wait tid={} {}", tid, description);
+                if (tid != 0) {
+                    dependency_wait.Begin(tid, std::move(description));
+                }
+            }
             // The game is blocked on the GPU, so it isn't writing what queued lists read.
             VideoCommon::Nx2GpuLatency::NoteGuestWait();
             // Title 1's channels resume and suspend again while they wait on this thread, so any
@@ -2483,6 +2501,11 @@ private:
                 while (!wake->done && !abort() && std::chrono::steady_clock::now() < deadline) {
                     wake->cv.wait_for(lk, poll);
                 }
+            }
+            if (trace) {
+                LOG_INFO(Service, "dep fence-wait-return tid={} id={} target={} guest={} aborted={}",
+                         tid, fence_id, fence_value, syncpoints.GetGuestSyncpointValue(fence_id),
+                         gave_up);
             }
             if (gave_up) {
                 return false;

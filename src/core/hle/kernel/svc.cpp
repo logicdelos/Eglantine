@@ -16,6 +16,7 @@
 #include <type_traits>
 
 #include "common/nx2_bottleneck.h"
+#include "common/nx2_dependency_wait.h"
 #include "core/arm/arm_interface.h"
 #include "core/core.h"
 #include "core/debugger/trace_hooks.h"
@@ -2536,12 +2537,38 @@ static bool Nx2SvcLegacy() {
     return legacy;
 }
 
+static const char* DependencySvcName(SvcId id) {
+    switch (id) {
+    case SvcId::SleepThread: return "SleepThread";
+    case SvcId::WaitSynchronization: return "WaitSynchronization";
+    case SvcId::ArbitrateLock: return "ArbitrateLock";
+    case SvcId::WaitProcessWideKeyAtomic: return "WaitProcessWideKeyAtomic";
+    case SvcId::SendSyncRequestLight: return "SendSyncRequestLight";
+    case SvcId::SendSyncRequest: return "SendSyncRequest";
+    case SvcId::SendSyncRequestWithUserBuffer: return "SendSyncRequestWithUserBuffer";
+    case SvcId::WaitForAddress: return "WaitForAddress";
+    case SvcId::ReplyAndReceiveLight: return "ReplyAndReceiveLight";
+    case SvcId::ReplyAndReceive: return "ReplyAndReceive";
+    case SvcId::ReplyAndReceiveWithUserBuffer: return "ReplyAndReceiveWithUserBuffer";
+    default: return nullptr;
+    }
+}
+
 /// Dispatches SVC `imm` for the current thread, with optional tracing and trace-hook reporting.
 void Call(Core::System& system, u32 imm) {
     auto& kernel = system.Kernel();
     auto& process = GetCurrentProcess(kernel);
     std::array<uint64_t, 8> args;
     kernel.CurrentPhysicalCore().SaveSvcArguments(process, args);
+    Nx2Sampler::DependencyWait dependency_wait;
+    if (Nx2Sampler::DependencyTraceEnabled()) {
+        if (const auto* svc = DependencySvcName(SvcId(imm))) {
+            dependency_wait.Begin(
+                GetCurrentThread(kernel).GetThreadId(),
+                fmt::format("SVC {} r0={:#x} r1={:#x} r2={:#x} r3={:#x} r4={:#x}", svc,
+                            args[0], args[1], args[2], args[3], args[4]));
+        }
+    }
     Nx2Bottleneck::NoteSvc(kernel.CurrentPhysicalCore().CoreIndex(), imm);
     if (SvcId(imm) != SvcId::SleepThread && YieldIdleEnabled) {
         GetCurrentThread(kernel).ResetYieldStreak();

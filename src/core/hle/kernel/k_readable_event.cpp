@@ -5,6 +5,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/assert.h"
+#include "common/logging.h"
+#include "common/nx2_sampler.h"
 #include "core/hle/kernel/k_event.h"
 #include "core/hle/kernel/k_readable_event.h"
 #include "core/hle/kernel/k_scheduler.h"
@@ -45,6 +47,10 @@ Result KReadableEvent::Signal(KernelCore& kernel) {
     KScopedSchedulerLock lk{kernel};
     if (!m_is_signaled) {
         m_is_signaled = true;
+        if (Nx2Sampler::DependencyTraceEnabled()) {
+            LOG_INFO(Kernel, "dep event-signal object={} tid={}", fmt::ptr(this),
+                     Nx2Sampler::dependency_ipc_thread);
+        }
         this->NotifyAvailable(kernel);
     }
     R_SUCCEED();
@@ -61,6 +67,10 @@ Result KReadableEvent::Reset(KernelCore& kernel) {
     R_UNLESS(m_is_signaled, ResultInvalidState);
 
     m_is_signaled = false;
+    if (Nx2Sampler::DependencyTraceEnabled()) {
+        LOG_INFO(Kernel, "dep event-reset object={} tid={}", fmt::ptr(this),
+                 Nx2Sampler::dependency_ipc_thread);
+    }
     R_SUCCEED();
 }
 

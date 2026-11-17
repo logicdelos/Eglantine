@@ -24,6 +24,7 @@
 #include <fmt/ranges.h>
 #include "common/assert.h"
 #include "common/logging.h"
+#include "common/nx2_dependency_wait.h"
 #include "common/settings.h"
 #include "core/arm/debug.h"
 #include "core/core.h"
@@ -327,9 +328,40 @@ void ServiceFrameworkBase::ReportUnimplementedFunction(HLERequestContext& ctx,
     PushStubZeroes(rb);
 }
 
+namespace {
+class DependencyRequest {
+public:
+    DependencyRequest(HLERequestContext& ctx, std::string_view service, const char* method) {
+        if (!Nx2Sampler::DependencyTraceEnabled()) {
+            return;
+        }
+        previous = Nx2Sampler::dependency_ipc_thread;
+        tid = ctx.GetThread().GetThreadId();
+        Nx2Sampler::dependency_ipc_thread = tid;
+        label = fmt::format("{}::{} ({})", service, ctx.GetCommand(), method);
+        wait.Begin(tid, fmt::format("IPC {}", label));
+        LOG_INFO(Service, "dep ipc-enter tid={} {}", tid, label);
+    }
+
+    ~DependencyRequest() {
+        if (tid != 0) {
+            LOG_INFO(Service, "dep ipc-handler-return tid={} {}", tid, label);
+            Nx2Sampler::dependency_ipc_thread = previous;
+        }
+    }
+
+private:
+    Nx2Sampler::DependencyWait wait;
+    std::string label;
+    u64 previous{};
+    u64 tid{};
+};
+} // Anonymous namespace
+
 void ServiceFrameworkBase::InvokeRequest(HLERequestContext& ctx) {
     auto it = handlers.find(ctx.GetCommand());
     FunctionInfoBase const* info = it == handlers.end() ? nullptr : &it->second;
+    const DependencyRequest dependency{ctx, service_name, info ? info->name : "unimplemented"};
     if (info == nullptr || info->handler_callback == nullptr)
         return ReportUnimplementedFunction(ctx, info);
 
@@ -358,6 +390,7 @@ void ServiceFrameworkBase::InvokeRequest(HLERequestContext& ctx) {
 void ServiceFrameworkBase::InvokeRequestTipc(HLERequestContext& ctx) {
     auto it = handlers_tipc.find(ctx.GetCommand());
     FunctionInfoBase const* info = it == handlers_tipc.end() ? nullptr : &it->second;
+    const DependencyRequest dependency{ctx, service_name, info ? info->name : "unimplemented"};
     if (info == nullptr || info->handler_callback == nullptr)
         return ReportUnimplementedFunction(ctx, info);
 

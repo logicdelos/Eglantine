@@ -6,6 +6,7 @@
 
 #include "core/arm/exclusive_monitor.h"
 #include "core/core.h"
+#include "common/nx2_dependency_wait.h"
 #include "core/hle/kernel/k_condition_variable.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_scheduler.h"
@@ -156,6 +157,7 @@ Result KConditionVariable::SignalToAddress(KernelCore& kernel, KProcessAddress a
 Result KConditionVariable::WaitForAddress(KernelCore& kernel, Handle handle, KProcessAddress addr, u32 value) {
     KThread* cur_thread = GetCurrentThreadPointer(kernel);
     ThreadQueueImplForKConditionVariableWaitForAddress wait_queue(kernel);
+    Nx2Sampler::DependencyWait dependency_wait;
 
     // Wait for the address.
     KThread* owner_thread{};
@@ -182,6 +184,11 @@ Result KConditionVariable::WaitForAddress(KernelCore& kernel, Handle handle, KPr
         // Update the lock.
         cur_thread->SetUserAddressKey(addr, value);
         owner_thread->AddWaiter(kernel, cur_thread);
+        if (Nx2Sampler::DependencyTraceEnabled()) {
+            dependency_wait.Begin(cur_thread->GetThreadId(),
+                                  fmt::format("lock address={:#x} owner=t{}",
+                                              GetInteger(addr), owner_thread->GetThreadId()));
+        }
 
         // Begin waiting.
         cur_thread->BeginWait(kernel, std::addressof(wait_queue));
