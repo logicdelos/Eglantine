@@ -135,6 +135,10 @@ if (ENABLE_UPDATE_CHECKER)
 endif()
 
 target_link_libraries(tests PRIVATE common core input_common video_core)
+if (MSVC)
+    # tests/core/launch_params.cpp includes <getopt.h>: the bundled getopt that core links.
+    target_link_libraries(tests PRIVATE getopt)
+endif()
 
 if (ENABLE_MCP_SERVER)
     target_sources(tests PRIVATE mcp/protocol.cpp)
