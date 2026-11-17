@@ -12,6 +12,10 @@
 
 #include "video_core/nx2_spikes.h"
 
+namespace VideoCommon::Nx2Spikes::Detail {
+size_t PeakRetainedHistoryBytes();
+} // namespace VideoCommon::Nx2Spikes::Detail
+
 namespace {
 
 using namespace VideoCommon::Nx2Spikes;
@@ -803,6 +807,42 @@ TEST_CASE("Rings and retained history share one fixed budget", "[nx2][attributio
     CHECK(snap.lost_events > 0);
     CHECK(snap.lost_events < Presents * PerPresent);
     CHECK_FALSE(snap.complete);
+}
+
+TEST_CASE("Span storage held by many producers over pruning windows stays inside the budget",
+          "[nx2][attribution]") {
+    SessionConfig config = Config(100 * Ms);
+    config.buffer_bytes = 512 * 1024;
+    Run run{config};
+    constexpr u64 Producers = 8;
+    constexpr u64 SpansPerBurst = 800;
+    constexpr u64 RingChunk = 64; // fewer than a ring holds, so a burst never overflows its ring
+    REQUIRE(run.base > 4'000 * Ms);
+    // Spans and presents far enough in the past that each present prunes the burst before it.
+    const u64 origin = run.base - 4'000 * Ms;
+    Present(origin);
+    for (u64 round = 0; round < Producers; ++round) {
+        const u64 begin = origin + (round + 1) * 20 * Ms;
+        // One thread per burst: every producer keeps its own span vectors for the whole session.
+        OnThread([&] {
+            RegisterThread("burst producer");
+            for (u64 done = 0; done < SpansPerBurst; done += RingChunk) {
+                for (u64 i = 0; i < RingChunk; ++i) {
+                    RecordSpan(Cause::Shader, begin, begin + 5 * Ms);
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds{5});
+            }
+        });
+        Present(begin + 15 * Ms);
+        AwaitFrames(round + 1);
+    }
+    run.Finish();
+    const size_t peak = Detail::PeakRetainedHistoryBytes();
+    // Each burst alone is stored, so the storage was exercised...
+    CHECK(peak >= SpansPerBurst / 2 * 40);
+    // ...and the storage of all producers together never exceeds the share of the budget that
+    // is set aside for the history, although every producer filled its own vectors in turn.
+    CHECK(peak <= config.buffer_bytes / 2);
 }
 
 TEST_CASE("The first 120 seconds roll over at the window end", "[nx2][attribution]") {

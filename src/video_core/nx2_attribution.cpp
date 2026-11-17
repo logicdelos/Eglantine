@@ -55,6 +55,7 @@ namespace VideoCommon::Nx2Spikes {
 namespace Detail {
 void ReadEventCounts(std::array<u64, static_cast<size_t>(Event::Count)>& counts);
 void SetAttributionCounting(bool on);
+size_t PeakRetainedHistoryBytes();
 } // namespace Detail
 
 namespace {
@@ -192,10 +193,12 @@ struct LeafRef {
     u32 index{};
 };
 
-/// What one retained span costs against SessionConfig::buffer_bytes: its record (a vector may hold
-/// twice what it uses) and the resolver's copies of it while a frame is decomposed (leaves and the
-/// sweep events), so rings plus history stay inside the one budget.
-constexpr size_t HistoryBytesPerSpan = 2 * sizeof(SpanRec) + 2 * sizeof(Leaf) + 48;
+/// What one slot of retained span storage costs against SessionConfig::buffer_bytes: the record and
+/// the resolver's copies of it while a frame is decomposed (leaves and the sweep events), so rings
+/// plus history stay inside the one budget. Slots are counted by capacity, not by use.
+constexpr size_t HistoryBytesPerSpan = sizeof(SpanRec) + 2 * sizeof(Leaf) + 48;
+/// The first allocation of a span vector, in records.
+constexpr size_t MinSpanCapacity = 16;
 
 struct Decomp {
     CauseTimes cause{};
@@ -541,7 +544,8 @@ struct Session {
     std::vector<PendingLink> pending_links;
     std::vector<PendingEnd> pending_ends;
     std::vector<std::pair<u64, u64>> losses;
-    size_t history{};
+    size_t history{}; ///< Slots of span storage owned: the capacities of every open/closed vector
+    std::atomic<size_t> peak_retained_bytes{}; ///< Most bytes of span storage held at once
     size_t history_cap{};
     u64 seen_lost{};
     u64 seen_unregistered{};
@@ -575,6 +579,9 @@ struct Session {
     void Quiesce();
     void MarkOpenIncomplete();
     void Prune();
+    bool Reserve(std::vector<SpanRec>& spans);
+    void Trim(std::vector<SpanRec>& spans);
+    void NoteRetained();
     void Process(const Item& item);
     void ResolveBoundary(const Item& item);
     void ResolveStartup(u64 first_present);
@@ -814,6 +821,12 @@ bool Session::CloseSpan(const PendingEnd& end) {
     rec.end_ns = std::max(end.end_ns, rec.begin_ns);
     rec.amount += end.amount;
     rec.flags |= end.flags;
+    if (!Reserve(owner.closed)) {
+        // The finished record does not fit: lost like a span refused at its Begin.
+        lost_consumer.fetch_add(1, std::memory_order_relaxed);
+        AddLoss(rec.begin_ns, rec.end_ns);
+        return true;
+    }
     if (last_resolved_ts != 0 && rec.end_ns <= last_resolved_ts) {
         lost_consumer.fetch_add(1, std::memory_order_relaxed); // charged to its frame as open
     }
@@ -839,12 +852,11 @@ void Session::DrainThread(u32 id, ThreadBuf& buf) {
         const RingEvent& event = buf.events[i & buf.mask];
         switch (event.type) {
         case EventType::Begin: {
-            if (history >= history_cap) {
+            if (!Reserve(state.open)) {
                 lost_consumer.fetch_add(1, std::memory_order_relaxed);
                 AddLoss(event.begin_ns, event.begin_ns);
                 break;
             }
-            ++history;
             SpanRec rec;
             rec.thread = id;
             rec.seq = event.seq;
@@ -873,7 +885,7 @@ void Session::DrainThread(u32 id, ThreadBuf& buf) {
             break;
         }
         case EventType::Closed: {
-            if (history >= history_cap) {
+            if (!Reserve(state.closed)) {
                 lost_consumer.fetch_add(1, std::memory_order_relaxed);
                 AddLoss(event.begin_ns, event.end_ns);
                 break;
@@ -884,7 +896,6 @@ void Session::DrainThread(u32 id, ThreadBuf& buf) {
                 AddLoss(event.begin_ns, event.end_ns);
                 break;
             }
-            ++history;
             SpanRec rec;
             rec.thread = id;
             rec.seq = event.seq;
@@ -935,6 +946,7 @@ void Session::DrainAll() {
     ApplyEnds();
     ApplyLinks();
     TakeLosses();
+    NoteRetained();
 }
 
 void Session::MarkOpenIncomplete() {
@@ -942,6 +954,50 @@ void Session::MarkOpenIncomplete() {
         for (SpanRec& rec : state.open) {
             rec.flags |= SpanFlags::Incomplete;
         }
+    }
+}
+
+/// Makes room for one more record in `spans`. The capacity of a vector is storage the session
+/// owns whether or not it is in use, so growth is charged to `history` (in records) and refused
+/// when it does not fit in `history_cap`; the charge is returned only by Trim, when the storage is
+/// actually released.
+bool Session::Reserve(std::vector<SpanRec>& spans) {
+    if (spans.size() < spans.capacity()) {
+        return true;
+    }
+    const size_t room = history < history_cap ? history_cap - history : 0;
+    const size_t grow = std::min(std::max(spans.capacity(), MinSpanCapacity), room);
+    if (grow == 0) {
+        return false;
+    }
+    const size_t before = spans.capacity();
+    spans.reserve(before + grow);
+    history += spans.capacity() - before;
+    return true;
+}
+
+/// Releases the capacity of `spans` once it holds less than half of it, and returns it to the
+/// allowance.
+void Session::Trim(std::vector<SpanRec>& spans) {
+    if (spans.capacity() <= 2 * spans.size()) {
+        return;
+    }
+    const size_t before = spans.capacity();
+    std::vector<SpanRec> fit(spans.begin(), spans.end());
+    spans.swap(fit);
+    history -= before - spans.capacity();
+}
+
+/// Records the high-water mark of the span storage the session owns, from the real capacities.
+void Session::NoteRetained() {
+    const u32 count = thread_count.load(std::memory_order_acquire);
+    size_t slots{};
+    for (u32 i = 0; i < count; ++i) {
+        slots += states[i].open.capacity() + states[i].closed.capacity();
+    }
+    const size_t bytes = slots * sizeof(SpanRec);
+    if (bytes > peak_retained_bytes.load(std::memory_order_relaxed)) {
+        peak_retained_bytes.store(bytes, std::memory_order_relaxed);
     }
 }
 
@@ -954,10 +1010,10 @@ void Session::Prune() {
     pruned_through = floor;
     const u32 count = thread_count.load(std::memory_order_acquire);
     for (u32 i = 0; i < count; ++i) {
-        std::vector<SpanRec>& closed = states[i].closed;
-        const size_t before = closed.size();
-        std::erase_if(closed, [floor](const SpanRec& r) { return r.end_ns <= floor; });
-        history -= before - closed.size();
+        ThreadState& state = states[i];
+        std::erase_if(state.closed, [floor](const SpanRec& r) { return r.end_ns <= floor; });
+        Trim(state.closed);
+        Trim(state.open);
     }
     std::erase_if(losses, [floor](const std::pair<u64, u64>& l) { return l.second <= floor; });
 }
@@ -1282,6 +1338,14 @@ WorkId NewWorkId() {
     return g_next_work.fetch_add(1, std::memory_order_relaxed);
 }
 
+namespace Detail {
+/// The most bytes of span storage the current (or last) session held at once, for the tests.
+size_t PeakRetainedHistoryBytes() {
+    std::scoped_lock lock{g_lifecycle_mutex};
+    return g_owned != nullptr ? g_owned->peak_retained_bytes.load(std::memory_order_relaxed) : 0;
+}
+} // namespace Detail
+
 bool BeginSession(const SessionConfig& config) {
     std::scoped_lock lock{g_lifecycle_mutex};
     if (Detail::attribution_enabled.load(std::memory_order_acquire)) {
@@ -1292,7 +1356,8 @@ bool BeginSession(const SessionConfig& config) {
     s->config = config;
     s->start_ns = NowNs();
     // One budget: half for the rings (allocated by the threads that register), half for the
-    // retained history and the resolver's copies of it. A ring never holds less than four events.
+    // retained history and the resolver's copies of it, counted in slots of span storage by the
+    // capacity the session owns. A ring never holds less than four events.
     const size_t ring_budget = config.buffer_bytes / 2;
     const size_t per_thread = ring_budget / MaxThreads / sizeof(RingEvent);
     s->ring_capacity = std::bit_floor(std::max<size_t>(per_thread, 4));
