@@ -18,9 +18,9 @@
 # 0 releases one fence at a time.
 #EDEN_NX2_FENCE_BATCH=0
 
-# Leave buffer downloads disabled on Switch 2 (default): forcing downloads (=1) copies back
-# buffers the CPU never touches, which adds mutex contention and lowers FPS (upstream reported a
-# large drop; not measured in this fork).
+# Leave buffer downloads disabled on Switch 2 (default): forcing downloads (=1) also copies back
+# buffers the CPU never touches, which adds mutex contention. Its effect on speed is not measured
+# in this fork.
 #EDEN_NX2_BUFFER_DOWNLOADS=1
 
 # Paces frame submission 2 frames ahead. Reduces frametime spikes, but adds ~1-2 frames of input latency.
@@ -76,8 +76,8 @@
 # Terrain/indirect drawing fix for Donkey Kong Bananza: enabled by default. Set to 0 only to leave to GPU.
 #EDEN_NX2_RESETFIX=0
 
-# Drop reactive-flushing read traps on Switch 2 programs (opt-in; can lower FPS: upstream reported a
-# drop in Mario Kart World; not measured in this fork).
+# Drop reactive-flushing read traps on Switch 2 programs (opt-in). Its effect on speed is not
+# measured in this fork.
 #EDEN_NX2_NO_REACTIVE=1
 
 # EDEN_NX2_PBFLUSH is kept from upstream's file; this fork's source does not read it.

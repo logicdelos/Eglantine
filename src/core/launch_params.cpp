@@ -722,7 +722,7 @@ void ApplyLaunchParams(LaunchParams const& lp) noexcept {
             "-p, --program         Pass following string as arguments to executable\n"
             "-u, --user            Select a specific user profile from 0 to 7\n"
             "--user-dir <path>     Use this directory as the user directory (configuration, saves,\n"
-            "                      shader cache, logs) for this run; created when missing. Spell it out in full\n"
+            "                      shader cache, logs) for this run; created when missing\n"
             "-d, --debug           Run the GDB stub on a port from 1 to 65535\n"
             "-v, --version         Output version information and exit\n"
             "--version --json      Print the build identity (version, revision, compiler, options) as one\n"
