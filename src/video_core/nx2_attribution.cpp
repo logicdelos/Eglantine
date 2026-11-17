@@ -110,24 +110,49 @@ u64 Sub(u64 a, u64 b) noexcept {
 // Producer side
 // ---------------------------------------------------------------------------------------------
 
-enum class EventType : u8 { Begin, End, Closed, Link, State };
-constexpr size_t EventTypeCount = 5;
+enum class EventType : u8 { Begin, End, Closed, Link };
+constexpr size_t EventTypeCount = 4;
 
 struct RingEvent {
     u64 seq{};      ///< The span's sequence number (on the thread that began it)
-    u64 begin_ns{}; ///< Begin, Closed: when it began. Link: when the wait was released. State: when
-                    ///< the thread entered the state
+    u64 begin_ns{}; ///< Begin, Closed: when it began. Link: when the wait was released
     u64 end_ns{};   ///< End, Closed
-    u64 work{};     ///< Begin, Closed: the span's work. Link: the producer. State: the handler
-                    ///< (service id << 32 | command)
+    u64 work{};     ///< Begin, Closed: the span's work. Link: the producer
     u64 amount{};
     u32 owner{}; ///< End, Link: registration id of the thread that began the span
-    u32 flags{};    ///< State: the GuestState
+    u32 flags{};
     EventType type{EventType::Begin};
     Cause cause{Cause::Unknown};
     DependencyKind kind{DependencyKind::Job};
 };
 static_assert(sizeof(RingEvent) <= 64);
+
+constexpr size_t GuestStateCount = 5; ///< GuestState values, Off included
+/// Slots of one thread's handler table: the first seven hold one handler each, the last takes the
+/// ones past them (read as the handler 0, "unknown").
+constexpr size_t HandlerSlots = 8;
+constexpr size_t HandlerOverflowSlot = HandlerSlots - 1;
+
+/// The time a Service stretch spent in one handler. `key_plus1` is HandlerKey + 1 (0: unused).
+struct HandlerSlot {
+    std::atomic<u64> key_plus1{};
+    std::atomic<u64> ns{};
+};
+
+/// What a thread keeps of its reported state: the nanoseconds it spent in each GuestState (and in
+/// each handler while Service) up to the last change, and the state it is in since then. Only the
+/// owning thread writes it, inside a sequence lock (`seq` odd while it writes); the consumer reads
+/// a consistent copy and adds the stretch still open. A change costs one clock read and plain
+/// stores, no ring event, so a flood of changes cannot lose attribution events.
+struct StateClock {
+    std::atomic<u32> seq{};
+    std::atomic<u64> since{};      ///< When the thread entered `cur`
+    std::atomic<u32> cur{};        ///< GuestState
+    std::atomic<u64> cur_handler{}; ///< HandlerKey while Service
+    std::atomic<u64> transitions{}; ///< Changes recorded (0: the thread never reported)
+    std::array<std::atomic<u64>, GuestStateCount> ns{};
+    std::array<HandlerSlot, HandlerSlots> handlers{};
+};
 
 struct ThreadBuf {
     u32 id{};
@@ -144,10 +169,14 @@ struct ThreadBuf {
     std::atomic<u64> lost{};
     /// Events published per EventType (producer only; the consumer reads them for diagnostics).
     std::array<std::atomic<u64>, EventTypeCount> kinds{};
-    // Producer only: the last state RecordGuestState published (a repeat is not published again).
+    // Producer only: the last state RecordGuestState recorded (a repeat is not recorded again),
+    // the handlers it has given a slot to, and the slot of the Service stretch that is open.
     GuestState last_state{GuestState::Off};
     u32 last_service{};
     u32 last_command{};
+    u32 handler_used{};
+    u32 cur_slot{};
+    alignas(64) StateClock clock;
     /// Set by MarkGuestThread: this thread runs guest code (set by the producer, read at drain).
     std::atomic<bool> guest{};
     // Overflow range [min, max] of the events this thread could not record. Only the owning thread
@@ -190,27 +219,34 @@ constexpr u64 HandlerKey(u32 service, u32 command) noexcept {
     return (u64{service} << 32) | command;
 }
 
-/// A stretch of time shorter than this is not worth its own record: a core thread leaves the guest
-/// code for the host side of every system call, so the stretches of Other between two stretches of
-/// Running are merged into them when they are this short, and a repeat of the same state within
-/// this distance is one stretch. The time of a merged stretch reads as the state around it.
-constexpr u64 StateMergeNs = 20'000;
+/// The most samples of a thread's state clock kept, and the least time between two (a sample is
+/// taken by the consumer on its pass, about every 2 ms).
+constexpr size_t MaxStateSamples = 4096;
+constexpr u64 MinStateSampleNs = 2'000'000;
+
+/// Nanoseconds in one handler slot of a sample.
+struct HandlerAcc {
+    u64 key_plus1{};
+    u64 ns{};
+};
+
+/// A thread's state clock read at `t`: the time spent in each state up to `t` (the stretch open at
+/// `t` included) and the state it is in then, so a time after the sample can be extrapolated.
+struct StateSample {
+    u64 t{};
+    std::array<u64, GuestStateCount> ns{};
+    std::array<HandlerAcc, HandlerSlots> h{};
+    GuestState cur{GuestState::Off};
+    u64 cur_handler{};
+};
 
 struct ThreadState {
     std::vector<SpanRec> open;
     std::vector<SpanRec> closed;
     bool guest{}; ///< Copied from the ring at each drain
-    // What the thread reported with RecordGuestState. `states` holds the finished stretches in time
-    // order (begin_ns, end_ns, work = handler key, amount = GuestState; Off is never stored). The
-    // stretch open now is cur_*, and a short Other that follows a Running is held back in
-    // `pending` until the next stretch says whether it merges.
-    std::vector<SpanRec> states;
-    bool state_open{};
-    GuestState cur_state{GuestState::Off};
-    u64 cur_begin{};
-    u64 cur_handler{};
-    bool has_pending{};
-    SpanRec pending;
+    /// The samples of the state clock, in time order (the consumer's, under Session::states_mutex).
+    /// Not span history: capped by MaxStateSamples and pruned with the history.
+    std::vector<StateSample> samples;
 };
 
 struct PendingLink {
@@ -240,15 +276,80 @@ struct Leaf {
     u64 span_end{};
 };
 
-/// One stretch of a thread's reported state, clipped to the window of a decomposition. `finish` is
-/// where the stretch really ends (OpenEnd while it lasts), for choosing the handler to name.
-struct StateLeaf {
-    u64 t0{};
-    u64 t1{};
-    u64 finish{};
-    u64 handler{};
-    GuestState state{GuestState::Off};
+/// The state time of one thread over the Waiting windows of a decomposition, summed.
+struct WaitAgg {
+    std::array<u64, GuestStateCount> ns{};
+    std::array<HandlerAcc, HandlerSlots> h{};
 };
+
+/// a + (b - a) * num / den for b >= a, num <= den.
+inline u64 Lerp(u64 a, u64 b, u64 num, u64 den) {
+    if (b <= a || den == 0) {
+        return a;
+    }
+    const u64 d = b - a;
+    if (d <= 0xFFFFFFFFULL && num <= 0xFFFFFFFFULL) {
+        return a + d * num / den;
+    }
+    return a + static_cast<u64>(static_cast<long double>(d) * static_cast<long double>(num) /
+                                static_cast<long double>(den));
+}
+
+/// The slot of `h` that holds the handler `key` (the overflow slot when it has none).
+inline size_t HandlerSlotOf(const std::array<HandlerAcc, HandlerSlots>& h, u64 key) {
+    for (size_t i = 0; i < HandlerSlots; ++i) {
+        if (h[i].key_plus1 == key + 1) {
+            return i;
+        }
+    }
+    return HandlerOverflowSlot;
+}
+
+/// The cumulative state times of a thread at `t`: linear between the two samples around it, the
+/// first sample's before the series, and after it the last sample's with its state running on. The
+/// state times are exact at every sample and proportional between two, which is what the waiting
+/// breakdown means by "proportional within a frame".
+inline StateSample CumulativeAt(const std::vector<StateSample>& v, u64 t) {
+    StateSample r;
+    if (v.empty()) {
+        r.t = t;
+        return r;
+    }
+    if (t <= v.front().t) {
+        r = v.front();
+        r.t = t;
+        return r;
+    }
+    if (t >= v.back().t) {
+        r = v.back();
+        const u64 dt = t - r.t;
+        r.t = t;
+        if (r.cur != GuestState::Off) {
+            r.ns[static_cast<size_t>(r.cur)] += dt;
+            if (r.cur == GuestState::Service) {
+                r.h[HandlerSlotOf(r.h, r.cur_handler)].ns += dt;
+            }
+        }
+        return r;
+    }
+    const auto it = std::upper_bound(v.begin(), v.end(), t,
+                                     [](u64 value, const StateSample& s) { return value < s.t; });
+    const StateSample& b = *it;
+    const StateSample& a = *(it - 1);
+    const u64 num = t - a.t;
+    const u64 den = b.t - a.t;
+    r.t = t;
+    r.cur = a.cur;
+    r.cur_handler = a.cur_handler;
+    for (size_t i = 0; i < GuestStateCount; ++i) {
+        r.ns[i] = Lerp(a.ns[i], b.ns[i], num, den);
+    }
+    for (size_t i = 0; i < HandlerSlots; ++i) {
+        r.h[i].key_plus1 = b.h[i].key_plus1 != 0 ? b.h[i].key_plus1 : a.h[i].key_plus1;
+        r.h[i].ns = Lerp(a.h[i].ns, b.h[i].ns, num, den);
+    }
+    return r;
+}
 
 /// One span that carries a work id, clipped to the window of a decomposition.
 struct WorkSpan {
@@ -342,6 +443,20 @@ constexpr size_t HistoryBytesPerSpan = sizeof(SpanRec) + ScratchBytesPerSpan;
 /// The first allocation of a span vector, in records.
 constexpr size_t MinSpanCapacity = 16;
 
+/// The most handler keys one decomposition names; the time of a key past it is added to the
+/// handler 0 (unknown), so the Service class stays whole.
+constexpr size_t MaxDecompHandlers = 32;
+
+inline void AddHandlerNs(std::unordered_map<u64, u64>& map, u64 key, u64 ns) {
+    if (ns == 0) {
+        return;
+    }
+    if (map.size() >= MaxDecompHandlers && !map.contains(key)) {
+        key = 0;
+    }
+    map[key] += ns;
+}
+
 struct Decomp {
     CauseTimes cause{};
     CauseTimes activity{};
@@ -370,7 +485,7 @@ struct Decomp {
             wait[i] += part.wait[i];
         }
         for (const auto& [key, ns] : part.handler_ns) {
-            handler_ns[key] += ns;
+            AddHandlerNs(handler_ns, key, ns);
         }
     }
 };
@@ -443,7 +558,6 @@ public:
                 out.activity[CauseIdx(leaf.cause)] += leaf.t1 - leaf.t0;
             }
         }
-        BuildStateLeaves();
         std::sort(work_spans.begin(), work_spans.end(), [](const WorkSpan& a, const WorkSpan& b) {
             if (a.work != b.work) {
                 return a.work < b.work;
@@ -454,6 +568,7 @@ public:
             return a.t0 < b.t0;
         });
         ResolveRoots(roots);
+        FinishWaiting();
         u64 total{};
         for (const u64 value : out.cause) {
             total += value;
@@ -473,103 +588,174 @@ public:
     }
 
 private:
-    /// The stretches the threads reported with RecordGuestState, clipped to the window, per thread
-    /// in time order (the merged stretches, the one held back, the one open now).
-    void BuildStateLeaves() {
-        state_leaves.resize(states.size());
+    /// The most Waiting windows held before they are folded into the per-thread totals.
+    static constexpr size_t MaxWaitWindows = 32;
+
+    /// Notes that [from, to) was charged to Waiting; adjacent windows join.
+    void NoteWaiting(u64 from, u64 to) {
+        wait_total += to - from;
+        if (!wait_windows.empty() && wait_windows.back().second == from) {
+            wait_windows.back().second = to;
+            return;
+        }
+        if (wait_windows.size() >= MaxWaitWindows) {
+            FoldWaitWindows();
+        }
+        wait_windows.emplace_back(from, to);
+    }
+
+    /// Adds, for every thread that reported states, the time it spent in each state (and handler)
+    /// inside the held windows to its total, and drops the windows.
+    void FoldWaitWindows() {
+        if (wait_windows.empty()) {
+            return;
+        }
+        if (wait_agg.size() < states.size()) {
+            wait_agg.resize(states.size());
+        }
         for (size_t i = 0; i < states.size(); ++i) {
-            const ThreadState& st = states[i];
-            std::vector<StateLeaf>& list = state_leaves[i];
-            const auto add = [&](u64 begin, u64 finish, u64 handler, GuestState state) {
-                const u64 t0 = std::max(begin, s);
-                const u64 t1 = std::min(finish, e);
-                if (t0 < t1) {
-                    list.push_back({t0, t1, finish, handler, state});
+            const std::vector<StateSample>& samples = states[i].samples;
+            if (samples.empty()) {
+                continue;
+            }
+            WaitAgg& agg = wait_agg[i];
+            for (const auto& [from, to] : wait_windows) {
+                const StateSample a = CumulativeAt(samples, from);
+                const StateSample b = CumulativeAt(samples, to);
+                for (size_t k = 0; k < GuestStateCount; ++k) {
+                    agg.ns[k] += b.ns[k] > a.ns[k] ? b.ns[k] - a.ns[k] : 0;
                 }
-            };
-            for (const SpanRec& rec : st.states) {
-                add(rec.begin_ns, rec.end_ns, rec.work, static_cast<GuestState>(rec.amount));
+                for (size_t j = 0; j < HandlerSlots; ++j) {
+                    const u64 key = b.h[j].key_plus1 != 0 ? b.h[j].key_plus1 : a.h[j].key_plus1;
+                    if (key != 0) {
+                        agg.h[j].key_plus1 = key;
+                    }
+                    agg.h[j].ns += b.h[j].ns > a.h[j].ns ? b.h[j].ns - a.h[j].ns : 0;
+                }
             }
-            if (st.has_pending) {
-                add(st.pending.begin_ns, st.pending.end_ns, st.pending.work,
-                    static_cast<GuestState>(st.pending.amount));
+        }
+        wait_windows.clear();
+    }
+
+    /// An estimate of the time at least one of the parts is on, out of `total`, given the longest
+    /// part (`lo`), the sum of the parts and the product of the shares not on (`none`): as if the
+    /// parts were independent, kept between the longest part and the sum (or `total`).
+    static u64 UnionEstimate(u64 total, u64 lo, u64 sum, long double none) {
+        const u64 hi = std::min(total, sum);
+        const long double est = static_cast<long double>(total) * (1.0L - none);
+        const u64 v = est <= 0.0L ? 0 : static_cast<u64>(est + 0.5L);
+        return std::clamp(v, std::min(lo, hi), hi);
+    }
+
+    /// Splits the Waiting time of the decomposition by the state times of the threads over its
+    /// windows. Each class is an integer taken out of what the classes before it left, so the four
+    /// sum to the Waiting time; the figures are proportional estimates (see WaitSplit), exact when
+    /// one thread tells the story.
+    void FinishWaiting() {
+        FoldWaitWindows();
+        const u64 total = wait_total;
+        if (total == 0) {
+            return;
+        }
+        const auto ld = static_cast<long double>(total);
+        u64 r_max = 0;
+        u64 r_sum = 0;
+        u64 s_max = 0;
+        u64 s_sum = 0;
+        u64 i_min = total;
+        u64 i_sum = 0;
+        size_t core_n = 0;
+        long double run_none = 1.0L;
+        long double svc_none = 1.0L;
+        long double idle_all = 1.0L;
+        for (const WaitAgg& a : wait_agg) {
+            const u64 r = std::min(a.ns[static_cast<size_t>(GuestState::Running)], total);
+            const u64 o = std::min(a.ns[static_cast<size_t>(GuestState::Other)], total);
+            const u64 id = std::min(a.ns[static_cast<size_t>(GuestState::Idle)], total);
+            const u64 sv = std::min(a.ns[static_cast<size_t>(GuestState::Service)], total);
+            r_max = std::max(r_max, r);
+            r_sum += r;
+            run_none *= 1.0L - static_cast<long double>(r) / ld;
+            s_max = std::max(s_max, sv);
+            s_sum += sv;
+            svc_none *= 1.0L - static_cast<long double>(sv) / ld;
+            if (r + o + id > 0) {
+                ++core_n;
+                i_min = std::min(i_min, id);
+                i_sum += id;
+                idle_all *= static_cast<long double>(id) / ld;
             }
-            if (st.state_open) {
-                add(st.cur_begin, OpenEnd, st.cur_handler, st.cur_state);
-            }
-            std::sort(list.begin(), list.end(),
-                      [](const StateLeaf& a, const StateLeaf& b) { return a.t0 < b.t0; });
+        }
+        const u64 running = UnionEstimate(total, r_max, r_sum, run_none);
+        u64 rem = total - running;
+        const u64 svc_union = UnionEstimate(total, s_max, s_sum, svc_none);
+        u64 service = running == 0 ? svc_union
+                                   : static_cast<u64>(static_cast<long double>(svc_union) *
+                                                          static_cast<long double>(rem) / ld +
+                                                      0.5L);
+        service = std::min(service, rem);
+        rem -= service;
+        u64 idle = 0;
+        if (core_n > 0) {
+            const u64 shortfall = static_cast<u64>(core_n - 1) * total;
+            const u64 lo = i_sum > shortfall ? i_sum - shortfall : 0;
+            const long double est = ld * idle_all;
+            const u64 v = static_cast<u64>(est + 0.5L);
+            idle = std::min(std::clamp(v, std::min(lo, i_min), i_min), rem);
+        }
+        out.wait[static_cast<size_t>(WaitClass::GuestRunning)] += running;
+        out.wait[static_cast<size_t>(WaitClass::Service)] += service;
+        out.wait[static_cast<size_t>(WaitClass::GuestIdle)] += idle;
+        out.wait[static_cast<size_t>(WaitClass::HostOther)] += rem - idle;
+        if (service > 0) {
+            SplitHandlers(service);
         }
     }
 
-    /// Splits [from, to) of Waiting by what the guest did meanwhile (WaitClass), piece by piece
-    /// between the points where a reported state changes. At an instant a core running guest code
-    /// makes it GuestRunning; else a handler executing makes it Service (the one that ends last
-    /// is the one named, the lower thread on a tie); else a core thread on its host side makes it
-    /// HostOther; else, with every reporting thread idle, GuestIdle. An instant no thread reported
-    /// a state for is HostOther.
-    void SplitWaiting(u64 from, u64 to) {
-        if (to <= from) {
-            return;
-        }
-        split_points.clear();
-        split_points.push_back(from);
-        split_points.push_back(to);
-        for (const std::vector<StateLeaf>& list : state_leaves) {
-            auto it = std::partition_point(list.begin(), list.end(),
-                                           [from](const StateLeaf& l) { return l.t1 <= from; });
-            for (; it != list.end() && it->t0 < to; ++it) {
-                split_points.push_back(std::max(it->t0, from));
-                split_points.push_back(std::min(it->t1, to));
-            }
-        }
-        std::sort(split_points.begin(), split_points.end());
-        split_points.erase(std::unique(split_points.begin(), split_points.end()),
-                           split_points.end());
-        for (size_t p = 0; p + 1 < split_points.size(); ++p) {
-            const u64 a = split_points[p];
-            const u64 b = split_points[p + 1];
-            bool running = false;
-            bool other = false;
-            bool idle = false;
-            const StateLeaf* service = nullptr;
-            for (const std::vector<StateLeaf>& list : state_leaves) {
-                const auto it = std::partition_point(
-                    list.begin(), list.end(), [a](const StateLeaf& l) { return l.t1 <= a; });
-                if (it == list.end() || it->t0 > a) {
+    /// Shares `service` ns among the handlers, by the time the threads spent in each over the
+    /// windows. Whatever the floors leave goes to the largest, so the shares sum to `service`.
+    void SplitHandlers(u64 service) {
+        std::vector<std::pair<u64, u64>> weights;
+        for (const WaitAgg& a : wait_agg) {
+            for (const HandlerAcc& h : a.h) {
+                if (h.ns == 0) {
                     continue;
                 }
-                switch (it->state) {
-                case GuestState::Running:
-                    running = true;
-                    break;
-                case GuestState::Idle:
-                    idle = true;
-                    break;
-                case GuestState::Other:
-                    other = true;
-                    break;
-                case GuestState::Service:
-                    if (service == nullptr || it->finish > service->finish) {
-                        service = &*it;
-                    }
-                    break;
-                case GuestState::Off:
-                    break;
+                const u64 key = h.key_plus1 != 0 ? h.key_plus1 - 1 : 0;
+                const auto it = std::find_if(weights.begin(), weights.end(),
+                                             [key](const auto& w) { return w.first == key; });
+                if (it != weights.end()) {
+                    it->second += h.ns;
+                } else {
+                    weights.emplace_back(key, h.ns);
                 }
             }
-            WaitClass cls = WaitClass::HostOther;
-            if (running) {
-                cls = WaitClass::GuestRunning;
-            } else if (service != nullptr) {
-                cls = WaitClass::Service;
-            } else if (!other && idle) {
-                cls = WaitClass::GuestIdle;
+        }
+        u64 sum = 0;
+        size_t best = 0;
+        for (size_t i = 0; i < weights.size(); ++i) {
+            sum += weights[i].second;
+            if (weights[i].second > weights[best].second) {
+                best = i;
             }
-            out.wait[static_cast<size_t>(cls)] += b - a;
-            if (cls == WaitClass::Service) {
-                out.handler_ns[service->handler] += b - a;
-            }
+        }
+        if (sum == 0) {
+            AddHandlerNs(out.handler_ns, 0, service);
+            return;
+        }
+        std::vector<u64> shares(weights.size());
+        u64 given = 0;
+        for (size_t i = 0; i < weights.size(); ++i) {
+            shares[i] = service == sum
+                            ? weights[i].second
+                            : static_cast<u64>(static_cast<long double>(service) *
+                                               static_cast<long double>(weights[i].second) /
+                                               static_cast<long double>(sum));
+            given += shares[i];
+        }
+        shares[best] += service > given ? service - given : 0;
+        for (size_t i = 0; i < weights.size(); ++i) {
+            AddHandlerNs(out.handler_ns, weights[i].first, shares[i]);
         }
     }
 
@@ -668,8 +854,8 @@ private:
 
     void Charge(Cause cause, u64 from, u64 to, WorkId work) {
         out.cause[CauseIdx(cause)] += to - from;
-        if (cause == Cause::Waiting) {
-            SplitWaiting(from, to);
+        if (cause == Cause::Waiting && to > from) {
+            NoteWaiting(from, to);
         }
         if (inferring) {
             out.inferred[CauseIdx(cause)] += to - from;
@@ -1026,12 +1212,10 @@ private:
         for (const std::vector<Leaf>& list : leaves) {
             c.leaves += list.capacity();
         }
-        for (const std::vector<StateLeaf>& list : state_leaves) {
-            c.leaves += list.capacity();
-        }
         c.root_points = root_points;
         c.pieces = wait_pieces;
-        c.wait_points = wait_points + split_points.capacity();
+        c.wait_points = wait_points + 2 * wait_windows.capacity() +
+                        wait_agg.capacity() * (sizeof(WaitAgg) / sizeof(u64));
         c.work_nodes = out.work_ns.size() + out.handler_ns.size();
         c.work_buckets = out.work_ns.bucket_count() + out.handler_ns.bucket_count();
         peak_scratch = std::max(peak_scratch, ScratchBytes(c) + ScratchFixedBytes);
@@ -1045,8 +1229,9 @@ private:
     bool charge_gaps; ///< SessionConfig::charge_presenter_gaps
     bool inferring{}; ///< Charges are inferences (ExpandRootGap is running)
     std::vector<std::vector<Leaf>> leaves;
-    std::vector<std::vector<StateLeaf>> state_leaves;
-    std::vector<u64> split_points; ///< Scratch of SplitWaiting
+    std::vector<std::pair<u64, u64>> wait_windows; ///< Waiting charges not yet folded
+    std::vector<WaitAgg> wait_agg;                 ///< Per thread: its state time over the Waiting
+    u64 wait_total{};                              ///< Waiting time charged so far
     /// The spans of the window that carry a work id, clipped to it, sorted by (work, thread, begin).
     /// A leaf belongs to a work when it lies inside one of that work's spans on its thread, which is
     /// how a producer owns the time of the spans nested in it that carry other work ids.
@@ -1126,7 +1311,8 @@ struct Session {
     AttributionSnapshot final_snap;
     /// Under stats_mutex: the Service time of the long frames and the start-up, per handler key.
     std::unordered_map<u64, u64> wait_handler_total;
-    std::atomic<bool> states_seen{}; ///< A State event was taken from a ring
+    std::atomic<bool> states_seen{}; ///< A thread has reported a state
+    mutable std::mutex states_mutex; ///< Guards ThreadState::samples (the consumer and the test hook)
 
     // Consumer-owned
     std::array<ThreadState, MaxThreads> states;
@@ -1171,9 +1357,7 @@ struct Session {
     void ConsumerMain();
     void DrainAll();
     bool DrainThread(u32 id, ThreadBuf& buf, u64 tail, u64 limit);
-    void IngestState(u32 id, ThreadState& st, const RingEvent& event);
-    void StoreState(ThreadState& st, const SpanRec& rec);
-    void AppendState(ThreadState& st, const SpanRec& rec);
+    void SampleStates(u64 now, bool force);
     void RelieveHistory(u64 stamp, const std::array<u64, MaxThreads>& tails, u32 count);
     bool ResolveInPart(u64 through);
     void HoldForTest();
@@ -1333,6 +1517,7 @@ void Session::ConsumerMain() {
         if (abandon.load(std::memory_order_relaxed)) {
             return;
         }
+        SampleStates(NowNs(), false);
         const bool had_items = !work.empty();
         if (stopping && !finalized) {
             finalized = true;
@@ -1580,76 +1765,97 @@ bool Session::DrainThread(u32 id, ThreadBuf& buf, u64 tail, u64 limit) {
             pending_links.push_back({event.owner, event.seq, event.work, event.kind, 0});
             break;
         }
-        case EventType::State:
-            IngestState(id, state, event);
-            break;
         }
     }
     buf.head.store(stop_at, std::memory_order_release);
     return stop_at < tail;
 }
 
-/// Takes one State event of a thread: the stretch that was open ends where the new one begins.
-void Session::IngestState(u32 id, ThreadState& st, const RingEvent& event) {
-    states_seen.store(true, std::memory_order_relaxed);
-    const u64 at = event.begin_ns;
-    if (st.state_open) {
-        SpanRec rec;
-        rec.thread = id;
-        rec.begin_ns = st.cur_begin;
-        rec.end_ns = std::max(at, st.cur_begin);
-        rec.work = st.cur_handler;
-        rec.amount = static_cast<u64>(st.cur_state);
-        rec.open = false;
-        StoreState(st, rec);
+/// A consistent copy of a thread's state clock at `now` (see StateClock): false when the thread has
+/// not reported, or the thread kept changing it for the whole try (the next pass samples it).
+static bool ReadStateClock(const StateClock& c, u64 now, StateSample& out) {
+    for (int attempt = 0; attempt < 64; ++attempt) {
+        const u32 s1 = c.seq.load(std::memory_order_acquire);
+        if ((s1 & 1U) != 0) {
+            continue;
+        }
+        const u64 since = c.since.load(std::memory_order_relaxed);
+        const u32 cur = c.cur.load(std::memory_order_relaxed);
+        const u64 handler = c.cur_handler.load(std::memory_order_relaxed);
+        const u64 transitions = c.transitions.load(std::memory_order_relaxed);
+        for (size_t i = 0; i < GuestStateCount; ++i) {
+            out.ns[i] = c.ns[i].load(std::memory_order_relaxed);
+        }
+        for (size_t i = 0; i < HandlerSlots; ++i) {
+            out.h[i].key_plus1 = c.handlers[i].key_plus1.load(std::memory_order_relaxed);
+            out.h[i].ns = c.handlers[i].ns.load(std::memory_order_relaxed);
+        }
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (c.seq.load(std::memory_order_relaxed) != s1) {
+            continue;
+        }
+        if (transitions == 0 || cur >= GuestStateCount) {
+            return false;
+        }
+        out.cur = static_cast<GuestState>(cur);
+        out.cur_handler = handler;
+        out.t = std::max(now, since);
+        if (out.cur != GuestState::Off && out.t > since) {
+            const u64 dt = out.t - since;
+            out.ns[cur] += dt;
+            if (out.cur == GuestState::Service) {
+                out.h[HandlerSlotOf(out.h, handler)].ns += dt;
+            }
+        }
+        return true;
     }
-    const auto next = static_cast<GuestState>(event.flags);
-    st.state_open = next != GuestState::Off;
-    st.cur_state = next;
-    st.cur_begin = at;
-    st.cur_handler = event.work;
+    return false;
 }
 
-/// Keeps a finished stretch. A short Other right after a Running is held back; when the stretch
-/// that follows is Running again, the two merge and the Other reads as Running (the host side of a
-/// system call, which a busy core thread enters and leaves thousands of times a second).
-void Session::StoreState(ThreadState& st, const SpanRec& rec) {
-    const auto running = static_cast<u64>(GuestState::Running);
-    const auto other = static_cast<u64>(GuestState::Other);
-    if (rec.amount == other && rec.end_ns - rec.begin_ns < StateMergeNs && !st.has_pending &&
-        !st.states.empty() && st.states.back().amount == running) {
-        st.pending = rec;
-        st.has_pending = true;
-        return;
-    }
-    if (st.has_pending) {
-        st.has_pending = false;
-        const bool joins = !st.states.empty() && st.states.back().amount == rec.amount &&
-                           st.states.back().work == rec.work &&
-                           rec.begin_ns - st.states.back().end_ns <= StateMergeNs;
-        if (!joins) {
-            AppendState(st, st.pending);
+/// Reads the state clock of every thread at `now` and appends it to the thread's samples (the
+/// consumer's pass, and the test hook with `force`, which skips the least time between samples).
+/// A sample earlier than the last is dropped; one at the same time replaces it; a thread that is
+/// not in a state and has not changed since extends its last sample instead of adding one.
+void Session::SampleStates(u64 now, bool force) {
+    const std::scoped_lock lock{states_mutex};
+    const u32 count = thread_count.load(std::memory_order_acquire);
+    for (u32 i = 0; i < count; ++i) {
+        StateSample sample;
+        if (!ReadStateClock(threads[i]->clock, now, sample)) {
+            continue;
         }
-    }
-    AppendState(st, rec);
-}
-
-void Session::AppendState(ThreadState& st, const SpanRec& rec) {
-    if (!st.states.empty()) {
-        SpanRec& back = st.states.back();
-        if (back.amount == rec.amount && back.work == rec.work && rec.begin_ns >= back.end_ns &&
-            rec.begin_ns - back.end_ns <= StateMergeNs) {
-            back.end_ns = std::max(back.end_ns, rec.end_ns);
-            return;
+        states_seen.store(true, std::memory_order_relaxed);
+        std::vector<StateSample>& v = states[i].samples;
+        if (!v.empty()) {
+            StateSample& back = v.back();
+            if (sample.t < back.t) {
+                continue;
+            }
+            if (sample.t == back.t) {
+                back = sample;
+                continue;
+            }
+            if (!force && sample.t - back.t < MinStateSampleNs) {
+                continue;
+            }
+            if (sample.cur == GuestState::Off && back.cur == GuestState::Off &&
+                back.ns == sample.ns) {
+                bool same = true;
+                for (size_t k = 0; k < HandlerSlots; ++k) {
+                    same = same && back.h[k].ns == sample.h[k].ns &&
+                           back.h[k].key_plus1 == sample.h[k].key_plus1;
+                }
+                if (same) {
+                    back.t = sample.t;
+                    continue;
+                }
+            }
         }
+        if (v.size() >= MaxStateSamples) {
+            v.erase(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(MaxStateSamples / 4));
+        }
+        v.push_back(sample);
     }
-    if (!Reserve(st.states)) {
-        lost_consumer.fetch_add(1, std::memory_order_relaxed);
-        ++lost_history;
-        AddLoss(rec.begin_ns, rec.end_ns);
-        return;
-    }
-    st.states.push_back(rec);
 }
 
 /// Attaches the links whose span is in the history. A link whose span is not there yet is kept; it
@@ -1791,8 +1997,7 @@ void Session::NoteRetained() {
     const u32 count = thread_count.load(std::memory_order_acquire);
     size_t slots{};
     for (u32 i = 0; i < count; ++i) {
-        slots += states[i].open.capacity() + states[i].closed.capacity() +
-                 states[i].states.capacity();
+        slots += states[i].open.capacity() + states[i].closed.capacity();
     }
     const size_t bytes = slots * sizeof(SpanRec);
     if (bytes > peak_retained_bytes.load(std::memory_order_relaxed)) {
@@ -1811,12 +2016,20 @@ void Session::Prune(bool force) {
     }
     pruned_through = floor;
     const u32 count = thread_count.load(std::memory_order_acquire);
+    const std::scoped_lock samples_lock{states_mutex};
     for (u32 i = 0; i < count; ++i) {
         ThreadState& state = states[i];
         std::erase_if(state.closed, [floor](const SpanRec& r) { return r.end_ns <= floor; });
-        std::erase_if(state.states, [floor](const SpanRec& r) { return r.end_ns <= floor; });
+        // The state samples before the floor go, except the last of them (the one a time after
+        // the floor is interpolated from).
+        std::vector<StateSample>& samples = state.samples;
+        const auto keep = std::lower_bound(
+            samples.begin(), samples.end(), floor,
+            [](const StateSample& sample, u64 at) { return sample.t < at; });
+        if (keep != samples.begin()) {
+            samples.erase(samples.begin(), keep - 1);
+        }
         Trim(state.closed);
-        Trim(state.states);
         Trim(state.open);
     }
     // The losses of an interval resolved in part stay until its present has joined the parts.
@@ -1943,6 +2156,7 @@ bool Session::LostBetween(u64 s, u64 e) const {
 /// Names what was recorded and what was lost, by kind and by thread, when the session ends.
 void Session::LogDiagnostics() const {
     std::array<u64, EventTypeCount> total{};
+    u64 state_changes = 0;
     u64 ring_lost = 0;
     const u32 count = thread_count.load(std::memory_order_acquire);
     for (u32 i = 0; i < count; ++i) {
@@ -1956,24 +2170,27 @@ void Session::LogDiagnostics() const {
         }
         const u64 dropped = buf.lost.load(std::memory_order_relaxed);
         ring_lost += dropped;
+        const u64 changes = buf.clock.transitions.load(std::memory_order_relaxed);
+        state_changes += changes;
         if (dropped != 0 || sum >= 10000) {
             LOG_INFO(HW_GPU,
-                     "Nx2Attribution thread {}: {} begin, {} end, {} closed, {} link, {} state "
-                     "events, {} lost in the ring",
-                     buf.name.data(), own[0], own[1], own[2], own[3], own[4], dropped);
+                     "Nx2Attribution thread {}: {} begin, {} end, {} closed, {} link events, {} "
+                     "lost in the ring, {} state changes (no ring event)",
+                     buf.name.data(), own[0], own[1], own[2], own[3], dropped, changes);
         }
     }
     const u64 all = TotalLost();
     const u64 known = ring_lost + lost_history + lost_late;
     LOG_INFO(HW_GPU,
-             "Nx2Attribution events: {} begin, {} end, {} closed, {} link, {} state; lost: {} "
-             "ring, {} history, {} late, {} other",
-             total[0], total[1], total[2], total[3], total[4], ring_lost, lost_history, lost_late,
-             all > known ? all - known : u64{0});
+             "Nx2Attribution events: {} begin, {} end, {} closed, {} link; {} state changes; "
+             "lost: {} ring, {} history, {} late, {} other",
+             total[0], total[1], total[2], total[3], state_changes, ring_lost, lost_history,
+             lost_late, all > known ? all - known : u64{0});
 }
 
 Decomp Session::Decompose(u64 s, u64 e, std::span<const u32> roots) const {
     const u32 count = thread_count.load(std::memory_order_acquire);
+    const std::scoped_lock samples_lock{states_mutex};
     Resolver resolver{std::span<const ThreadState>{states.data(), count}, losses, s, e,
                       config.charge_presenter_gaps};
     Decomp result = resolver.Run(roots);
@@ -2396,6 +2613,15 @@ u64 DrainedRingEvents() {
     return t != nullptr ? t->head.load(std::memory_order_acquire) : 0;
 }
 
+/// Test hook: reads the state clock of every thread as of `at_ns` into its samples, as the consumer
+/// does on every pass (but at a time the test chooses, and whatever the time since the last one).
+/// A no-op without a session.
+void SampleGuestStates(u64 at_ns) {
+    if (Session* s = ActiveSession()) {
+        s->SampleStates(at_ns, true);
+    }
+}
+
 /// The number of events in the calling thread's ring that the consumer has not taken yet (0
 /// without a session), for the tests. It reads two existing counters and is on no recording path.
 u64 UndrainedRingEvents() {
@@ -2566,22 +2792,51 @@ GuestMark RecordGuestState(GuestState state, u64 ns, u32 service, u32 command) {
     if (previous.state == state && previous.service == service && previous.command == command) {
         return previous;
     }
-    t->busy.exchange(1, std::memory_order_seq_cst);
-    RingEvent event;
-    event.type = EventType::State;
-    event.flags = static_cast<u32>(state);
-    event.work = HandlerKey(service, command);
-    event.begin_ns = ns != 0 ? ns : NowNs();
-    const bool ok = Push(*t, event, t->open_count.load(std::memory_order_relaxed));
-    if (ok) {
-        t->last_state = state;
-        t->last_service = service;
-        t->last_command = command;
+    const u64 now = ns != 0 ? ns : NowNs();
+    const u64 key = HandlerKey(service, command);
+    StateClock& c = t->clock;
+    const u32 seq = c.seq.load(std::memory_order_relaxed);
+    c.seq.store(seq + 1, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+    const u64 since = c.since.load(std::memory_order_relaxed);
+    if (previous.state != GuestState::Off) {
+        const u64 delta = now > since ? now - since : 0;
+        const size_t prev = static_cast<size_t>(previous.state);
+        c.ns[prev].store(c.ns[prev].load(std::memory_order_relaxed) + delta,
+                         std::memory_order_relaxed);
+        if (previous.state == GuestState::Service) {
+            HandlerSlot& slot = c.handlers[t->cur_slot];
+            slot.ns.store(slot.ns.load(std::memory_order_relaxed) + delta,
+                          std::memory_order_relaxed);
+        }
     }
-    t->busy.store(0, std::memory_order_release);
-    if (!ok) {
-        NoteLoss(*t, event.begin_ns, event.begin_ns);
+    if (state == GuestState::Service) {
+        // The slot of this handler: an earlier one of the seven, a new one, or the overflow slot.
+        u32 slot = HandlerOverflowSlot;
+        bool found = false;
+        for (u32 i = 0; i < t->handler_used && !found; ++i) {
+            if (c.handlers[i].key_plus1.load(std::memory_order_relaxed) == key + 1) {
+                slot = i;
+                found = true;
+            }
+        }
+        if (!found && t->handler_used < HandlerOverflowSlot) {
+            slot = t->handler_used++;
+            c.handlers[slot].key_plus1.store(key + 1, std::memory_order_relaxed);
+        } else if (!found) {
+            c.handlers[HandlerOverflowSlot].key_plus1.store(1, std::memory_order_relaxed);
+        }
+        t->cur_slot = slot;
     }
+    c.since.store(std::max(now, since), std::memory_order_relaxed);
+    c.cur.store(static_cast<u32>(state), std::memory_order_relaxed);
+    c.cur_handler.store(key, std::memory_order_relaxed);
+    c.transitions.store(c.transitions.load(std::memory_order_relaxed) + 1,
+                        std::memory_order_relaxed);
+    t->last_state = state;
+    t->last_service = service;
+    t->last_command = command;
+    c.seq.store(seq + 2, std::memory_order_release);
     return previous;
 }
 

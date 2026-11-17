@@ -427,16 +427,21 @@ inline constexpr std::array<std::string_view, 9> UnknownReasonNames{
 inline constexpr size_t MaxCriticalWork = 8;
 
 /// Where the Waiting time of a frame went, by what the guest was doing while the waiting thread
-/// waited (the order of WaitClassNames, the index into a WaitSplit). Each stretch of Waiting is
-/// in exactly one class, so a WaitSplit sums to the Waiting it splits.
-///  * GuestRunning: a guest CPU core thread was executing translated guest code.
+/// waited (the order of WaitClassNames, the index into a WaitSplit). The four classes are integer
+/// nanoseconds that sum to the Waiting they split.
+///  * GuestRunning: guest CPU core threads were executing translated guest code.
 ///  * GuestIdle: every guest core thread that reported was idle (sleep, timer, vsync wait).
 ///  * Service: no core was running, and a host-side service request handler was executing (the
 ///    guest thread that sent it is blocked until it returns).
-///  * HostOther: host scheduling, locks and system call handling on a core thread that none of
-///    the above covers, and time before any state was reported.
-/// Where several apply at an instant: GuestRunning first, then Service, then HostOther; GuestIdle
-/// only when every thread that reported is idle.
+///  * HostOther: whatever is left: host scheduling, locks and system call handling on a core
+///    thread, and time before any state was reported.
+/// The split is PROPORTIONAL, not instant by instant: threads keep a clock of the time spent in
+/// each state (no event per change), the recorder samples it about every 2 ms and reads the time
+/// of each state inside the Waiting windows of a frame by interpolating between samples. The
+/// classes are then taken in order out of what is left: GuestRunning is the time one or more core
+/// threads ran (as if independent, between the busiest core and the sum of them), Service is the
+/// service threads' time on what is left, GuestIdle the time every core was idle on what is left,
+/// HostOther the rest. With one thread telling the story the figures are exact at the samples.
 enum class WaitClass : u8 { GuestRunning, GuestIdle, Service, HostOther, Count };
 inline constexpr size_t WaitClassCount = static_cast<size_t>(WaitClass::Count);
 inline constexpr std::array<std::string_view, WaitClassCount> WaitClassNames{
@@ -637,10 +642,10 @@ struct GuestMark {
     u32 command{};
 };
 
-/// Records that the calling thread is in `state` from `ns` (0: now, read inside the publication, as
-/// BeginSpan does) and returns the state it was in. A change to the state it is in already, with
-/// the same handler, records nothing. Call only when AttributionEnabled(). Cost: one clock read
-/// and one 64-byte ring store, no lock and no allocation.
+/// Records that the calling thread is in `state` from `ns` (0: now) and returns the state it was
+/// in. A change to the state it is in already, with the same handler, records nothing. Call only
+/// when AttributionEnabled(). Cost: at most one clock read and a handful of relaxed stores into
+/// the thread's own state clock; no ring event, no lock, no allocation, however many changes.
 GuestMark RecordGuestState(GuestState state, u64 ns = 0, u32 service = 0, u32 command = 0);
 
 /// Interns a service name for the handler of a Service state and returns its id (stable for the
