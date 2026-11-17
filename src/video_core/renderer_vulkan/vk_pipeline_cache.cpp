@@ -1673,7 +1673,8 @@ void PipelineCache::RunPreparation(u64 generation) {
         }
         PP::Scheduler::Task task =
             prepare.Next(generation, PP::AvailablePhysicalMemoryBytes(), hold);
-        // Released to make room under the ready cap: destroyed here, outside the scheduler.
+        // Released unused because the game left the recorded order: destroyed here, outside the
+        // scheduler.
         task.evicted.reset();
         switch (task.kind) {
         case PP::Scheduler::TaskKind::Done:
