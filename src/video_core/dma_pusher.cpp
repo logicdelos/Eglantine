@@ -1088,21 +1088,35 @@ void DmaPusher::TraceSemaphore(const char* action, GPUVAddr address, u32 payload
              memory_manager.GpuToCpuAddress(address).value_or(0), payload, operation);
 }
 
-void DmaPusher::TraceBlockedQueue() const {
+void DmaPusher::TraceBlockedQueue() {
     // Existing GPFIFO copies only, never another guest read or GPU flush. A stale or missing
     // copy is not evidence that a command was absent from the stream.
-    size_t remaining_words = 65536;
+    if (dma_pushbuffer.empty()) {
+        return;
+    }
     const u64 generation = suspensions.load(std::memory_order_relaxed);
+    if (generation != dependency_blocked_generation) {
+        dependency_blocked_generation = generation;
+        dependency_last_blocked_list = 0;
+        dependency_snapshot_budget = 65536;
+    }
+    if (dma_pushbuffer.back().dependency_queue_position <= dependency_last_blocked_list) {
+        return;
+    }
     bool head = true;
     for (const auto& list : dma_pushbuffer) {
         const size_t first = head ? dma_pushbuffer_subindex : 0;
         const size_t resume = head ? command_resume_offset : 0;
+        head = false;
+        if (list.dependency_queue_position <= dependency_last_blocked_list) {
+            continue;
+        }
+        dependency_last_blocked_list = list.dependency_queue_position;
         LOG_INFO(HW_GPU,
                  "dep fifo-blocked ch={} q={} i={} offset={} entries={} snapshots={} generation={}/{}",
                  channel_state.bind_id, list.dependency_queue_position, first, resume,
                  list.command_lists.size(), list.submitted_offsets.size(),
                  list.snapshot_suspensions, generation);
-        head = false;
         for (size_t i = first; i < list.submitted_offsets.size(); ++i) {
             if (std::ranges::binary_search(list.deferred_entries, static_cast<u32>(i))) {
                 LOG_INFO(HW_GPU, "dep fifo-snapshot-unavailable ch={} q={} i={} reason=deferred",
@@ -1112,13 +1126,14 @@ void DmaPusher::TraceBlockedQueue() const {
             const auto words = std::span{list.submitted_words}.subspan(
                 list.submitted_offsets[i], list.command_lists[i].size.Value());
             for (size_t offset = i == first ? resume : 0; offset < words.size();) {
-                if (remaining_words == 0) {
+                if (dependency_snapshot_budget == 0) {
                     LOG_INFO(HW_GPU, "dep fifo-snapshot-truncated ch={} q={} i={} offset={}",
                              channel_state.bind_id, list.dependency_queue_position, i, offset);
-                    return;
+                    break;
                 }
                 std::array<u32, 32> raw{};
-                const size_t count = std::min({raw.size(), words.size() - offset, remaining_words});
+                const size_t count =
+                    std::min({raw.size(), words.size() - offset, dependency_snapshot_budget});
                 for (size_t j = 0; j < count; ++j) {
                     raw[j] = words[offset + j].argument;
                 }
@@ -1126,7 +1141,7 @@ void DmaPusher::TraceBlockedQueue() const {
                          channel_state.bind_id, list.dependency_queue_position, i, offset,
                          fmt::join(std::span{raw}.first(count), " "));
                 offset += count;
-                remaining_words -= count;
+                dependency_snapshot_budget -= count;
             }
         }
     }

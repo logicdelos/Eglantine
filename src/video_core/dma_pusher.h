@@ -201,7 +201,7 @@ public:
     }
 
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
-    void TraceBlockedQueue() const;
+    void TraceBlockedQueue();
     void TraceSemaphore(const char* action, GPUVAddr address, u32 payload, u32 operation) const;
 
 private:
@@ -303,6 +303,9 @@ public:
     size_t parsed_entry_count{};
     std::vector<ParkedMethod> parked_methods;
     GPUVAddr split_method_end{}; ///< End of the last entry that ended inside a method
+    u64 dependency_blocked_generation{};
+    u64 dependency_last_blocked_list{};
+    size_t dependency_snapshot_budget{};
 
     std::array<Engines::EngineInterface*, max_subchannels> subchannels{};
     std::array<Engines::EngineTypes, max_subchannels> subchannel_type;

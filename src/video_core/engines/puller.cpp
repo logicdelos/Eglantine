@@ -305,17 +305,14 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
 
 bool Puller::PollAcquire(DmaPusher& dma_pusher) {
     auto& pending = *pending_acquire;
+    if (Nx2Sampler::DependencyTraceEnabled() &&
+        std::chrono::steady_clock::now() - pending.since > std::chrono::seconds{2}) {
+        dma_pusher.TraceBlockedQueue();
+    }
     if (pending.fence_lean) {
         // The fence completion is an event, not a guest-memory poll. It owns all earlier
         // report writes and cache downloads, including reports overwritten before we resume.
         if (!acquire_fence_ready->load(std::memory_order_acquire)) {
-            if (Nx2Sampler::DependencyTraceEnabled() && !pending.reported &&
-                std::chrono::steady_clock::now() - pending.since > std::chrono::seconds{2}) {
-                pending.reported = true;
-                dma_pusher.TraceSemaphore("fence-blocked", pending.address, pending.value,
-                                          pending.operation);
-                dma_pusher.TraceBlockedQueue();
-            }
             return false;
         }
         const u32 current = dma_pusher.memory_manager.Read<u32>(pending.address);
@@ -379,10 +376,6 @@ bool Puller::PollAcquire(DmaPusher& dma_pusher) {
                     dma_pusher.memory_manager.Read<u32>((pending_acquire->address & ~GPUVAddr{0xf}) + 4),
                     dma_pusher.memory_manager.Read<u32>((pending_acquire->address & ~GPUVAddr{0xf}) + 8),
                     dma_pusher.memory_manager.Read<u32>((pending_acquire->address & ~GPUVAddr{0xf}) + 12));
-        if (Nx2Sampler::DependencyTraceEnabled()) {
-            dma_pusher.TraceSemaphore("blocked", pending.address, pending.value, pending.operation);
-            dma_pusher.TraceBlockedQueue();
-        }
     }
     return false;
 }
