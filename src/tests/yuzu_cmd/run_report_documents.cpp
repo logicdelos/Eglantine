@@ -14,6 +14,7 @@
 
 #include "common/baseline_settings.h"
 #include "common/run_outcome.h"
+#include "common/settings.h"
 #include "yuzu_cmd/run_report.h"
 
 // The two documents of --report, whole: the normal report and the crash report. Both read the
@@ -128,6 +129,16 @@ bool ListsAblation(const std::string& text) {
     return false;
 }
 
+/// The source the document's baseline object names for `key`; empty when it lists no deviation.
+std::string DeviationSource(const Json& document, std::string_view key) {
+    for (const auto& deviation : document["baseline"]["deviations"]) {
+        if (deviation["key"].get<std::string>() == key) {
+            return deviation["source"].get<std::string>();
+        }
+    }
+    return {};
+}
+
 /// Makes shader ablation active from another thread, in the window between the snapshot having
 /// evaluated the baseline and having published its text. The other thread cannot take the report's
 /// lock then: the request must not be lost.
@@ -180,6 +191,41 @@ TEST_CASE("Shader ablation that begins while nothing is rebuilding reaches the c
     REQUIRE_FALSE(ListsAblation(RunReport::CrashDocumentText("test")));
     Settings::Baseline::NoteShaderAblation();
     CHECK(ListsAblation(RunReport::CrashDocumentText("test")));
+    Settings::Baseline::ClearNotedSources();
+    RunReport::RefreshCrashSnapshot();
+}
+
+TEST_CASE("Settings changed through the control channel reach both reports", "[run_report]") {
+    REQUIRE(GetFixture().prepared);
+    Settings::Baseline::ClearNotedSources();
+    RunReport::RefreshCrashSnapshot();
+    REQUIRE(DeviationSource(Json::parse(RunReport::CrashDocumentText("test")), "allow_speed_up")
+                .empty());
+
+    // What a control channel `set` does after the value is loaded and applied.
+    Settings::values.allow_speed_up.LoadString("true");
+    RunReport::NoteSettingChange("allow_speed_up", Settings::Baseline::kControlChannel);
+    Settings::values.speed_limit.LoadString("200");
+    RunReport::NoteSettingChange("speed_limit", Settings::Baseline::kControlChannel);
+
+    const Json crash = Json::parse(RunReport::CrashDocumentText("test"));
+    const Json normal = Json::parse(
+        RunReport::NormalDocumentText(Common::RunOutcome::Reason::GuestExit, 0, true, ""));
+    for (const Json* document : {&crash, &normal}) {
+        CHECK((*document)["baseline"]["on_baseline"] == false);
+        CHECK(DeviationSource(*document, "allow_speed_up") == "control channel");
+        CHECK(DeviationSource(*document, "speed_limit") == "control channel");
+        // The initial settings stay what they were at the start (the crash report may leave
+        // them out when they do not fit its fixed buffer).
+        const Json& initial = (*document)["settings"]["initial"];
+        if (document == &normal || initial.contains("speed_limit")) {
+            REQUIRE(initial.contains("speed_limit"));
+            CHECK(initial["speed_limit"] == 100);
+        }
+    }
+
+    Settings::values.allow_speed_up.LoadString("false");
+    Settings::values.speed_limit.LoadString("100");
     Settings::Baseline::ClearNotedSources();
     RunReport::RefreshCrashSnapshot();
 }

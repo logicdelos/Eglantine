@@ -938,6 +938,11 @@ void RefreshCrashSnapshot() {
     RebuildCrashDocument(state);
 }
 
+void NoteSettingChange(std::string_view key, std::string_view source) {
+    Settings::Baseline::NoteSource(key, source);
+    RefreshCrashSnapshot();
+}
+
 void SetTitleId(u64 program_id) {
     State& state = GetState();
     StateLock lock{state};

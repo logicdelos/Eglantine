@@ -11,6 +11,7 @@
 
 #include <SDL3/SDL_keyboard.h>
 
+#include "common/baseline_settings.h"
 #include "common/key_script.h"
 #include "common/logging.h"
 #include "common/settings.h"
@@ -26,6 +27,7 @@
 #include "yuzu_cmd/control_commands.h"
 #include "yuzu_cmd/control_file.h"
 #include "yuzu_cmd/frame_capture.h"
+#include "yuzu_cmd/run_report.h"
 
 namespace Control {
 
@@ -314,6 +316,9 @@ Response Commands::Setting(const Request& request, bool change) {
         if (system.IsPoweredOn()) {
             system.ApplySettings();
         }
+        // A change of a setting from outside the run: named as such in the baseline object, and
+        // the crash report's snapshot of it is taken again.
+        RunReport::NoteSettingChange(name, Settings::Baseline::kControlChannel);
         // The value itself is not logged.
         LOG_INFO(Frontend, "Control: set {}", name);
     }

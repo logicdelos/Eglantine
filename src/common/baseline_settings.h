@@ -41,7 +41,7 @@ struct Deviation {
     std::string baseline;
     std::string effective;
     /// "global config", "per-game config", "command line", "environment switch",
-    /// "hardware fallback" or "program requirement".
+    /// "hardware fallback", "program requirement", "live control file" or "control channel".
     std::string source;
 };
 
@@ -49,6 +49,10 @@ struct Deviation {
 /// of a Switch 2 program). It is listed as a deviation but does not take a run off the baseline:
 /// no one chose it, and it is the same on every run of that program.
 inline constexpr std::string_view kProgramRequirement = "program requirement";
+
+/// The source of a setting changed by a `set` request on the control channel (--control) while
+/// the run goes on. It takes a run off the baseline unless the setting is declared.
+inline constexpr std::string_view kControlChannel = "control channel";
 
 /// An EDEN_NX2_* environment switch that is set. Every one is a deviation from the baseline.
 struct EnvironmentSwitch {
@@ -75,7 +79,8 @@ inline constexpr std::string_view kSwitchPrefix = "EDEN_NX2_";
 [[nodiscard]] std::string Hash();
 
 /// Records where the current value of a setting came from when it is not the configuration file:
-/// "command line", "hardware fallback" or "program requirement". Used by Deviations.
+/// "command line", "hardware fallback", "program requirement", "live control file" or
+/// kControlChannel. Used by Deviations.
 void NoteSource(std::string_view key, std::string_view source);
 void ClearNotedSources();
 

@@ -41,6 +41,11 @@ void CaptureStart(const std::vector<std::string>& overridden_settings);
 /// setting or switched a diagnostics feature on while the game runs.
 void RefreshCrashSnapshot();
 
+/// After a setting was changed from outside the run while it goes on (the live control file, a
+/// control channel `set`): names `source` as where its value came from in the baseline object and
+/// takes the crash report's snapshot again. `settings.initial` keeps the state at the start.
+void NoteSettingChange(std::string_view key, std::string_view source);
+
 /// Records whether --baseline was given and the keys --baseline-allow declared, for the report's
 /// baseline object (version, hash, on_baseline, deviations). Call it before CaptureStart.
 void SetBaselineRequest(bool requested, std::vector<std::string> declared);

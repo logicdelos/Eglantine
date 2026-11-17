@@ -1055,8 +1055,7 @@ static void RunLiveKeys(InputCommon::InputSubsystem& input_subsystem, Core::Syst
             system.ApplySettings();
             // A change of a setting from outside the run: named as such in the baseline object,
             // which the crash report keeps as a snapshot, so the snapshot is taken again.
-            Settings::Baseline::NoteSource("gpu_accuracy", "live control file");
-            RunReport::RefreshCrashSnapshot();
+            RunReport::NoteSettingChange("gpu_accuracy", "live control file");
             LOG_INFO(Frontend, "Live keys: GPU accuracy {}", high ? "high" : "low");
             continue;
         }
