@@ -45,8 +45,35 @@ bool IsBaselineCategory(Category category) {
     }
 }
 
+/// Settings of the debugging categories that change what a run does or draws: the macro engine
+/// (compiled or interpreted, high-level replacements), the debug knob mask, the console identity
+/// bit the guest reads, key loading, service stubbing, the web applet, the controller applet and
+/// the Vulkan start-up check. The rest of those categories only write logs and dumps, open
+/// servers, or hold a path, a secret or a per-install serial number, and stays out of the baseline.
+constexpr std::array<std::string_view, 9> kDebugBaselineKeys{
+    "debug_knobs",
+    "disable_macro_hle",
+    "disable_macro_jit",
+    "disable_web_applet",
+    "enable_all_controllers",
+    "perform_vulkan_check",
+    "quest_flag",
+    "use_auto_stub",
+    "use_dev_keys",
+};
+
+bool IsDebugBaselineKey(std::string_view key) {
+    return std::find(kDebugBaselineKeys.begin(), kDebugBaselineKeys.end(), key) !=
+           kDebugBaselineKeys.end();
+}
+
 bool IsBaselineSetting(const std::string& key, const BasicSetting& setting) {
-    return IsBaselineCategory(setting.GetCategory()) && setting.Save() && !IsExcludedKey(key);
+    const Category category = setting.GetCategory();
+    const bool included = IsBaselineCategory(category) ||
+                          ((category == Category::Debugging ||
+                            category == Category::DebuggingGraphics) &&
+                           IsDebugBaselineKey(key));
+    return included && setting.Save() && !IsExcludedKey(key);
 }
 
 std::mutex source_mutex;

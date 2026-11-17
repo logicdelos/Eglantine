@@ -5,6 +5,7 @@
 // settings: a new install and an old config both land on the baseline, and a stored choice is
 // kept and reported as a deviation.
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -165,5 +166,63 @@ TEST_CASE("A stored choice is kept and reported", "[baseline_config]") {
     CHECK(deviations[0].source == "global config");
     CHECK_FALSE(Settings::Baseline::OnBaseline(deviations, {}));
     CHECK(Settings::Baseline::OnBaseline(deviations, {"use_docked_mode"}));
+    Settings::Baseline::ResetToBaseline();
+}
+
+TEST_CASE("Debug settings that change a run are in the baseline and are reset",
+          "[baseline_config]") {
+    const ScratchDirectory scratch{"eglantine_baseline_config_debug"};
+    Settings::Baseline::ResetToBaseline();
+    Settings::Baseline::ClearNotedSources();
+
+    const std::vector<std::string> keys{
+        "debug_knobs",          "disable_macro_hle", "disable_macro_jit",
+        "disable_web_applet",   "enable_all_controllers", "perform_vulkan_check",
+        "quest_flag",           "use_auto_stub",     "use_dev_keys",
+    };
+    // Settings of the same categories that only write logs, open servers or hold secrets.
+    const std::vector<std::string> left_out{"use_gdbstub", "mcp_token", "dump_nso", "extended_logging",
+                                            "gpu_log_level", "serial_unit"};
+
+    const auto entries = Settings::Baseline::Entries();
+    const auto listed = [&entries](const std::string& key) {
+        return std::any_of(entries.begin(), entries.end(),
+                           [&key](const Settings::Baseline::Entry& entry) {
+                               return entry.key == key;
+                           });
+    };
+    for (const auto& key : keys) {
+        CHECK(listed(key));
+    }
+    for (const auto& key : left_out) {
+        CHECK_FALSE(listed(key));
+    }
+
+    // A stored value that is not the default, marked as a choice (default=false).
+    std::string text;
+    for (const auto& key : keys) {
+        const auto found = Settings::values.linkage.by_key.find(key);
+        REQUIRE(found != Settings::values.linkage.by_key.end());
+        const std::string standard = found->second->DefaultToString();
+        text += Stored(*found->second, false,
+                       standard == "true" ? "false" : (standard == "false" ? "true" : "1"));
+    }
+    WriteFile(scratch.File("debug-config.ini"), text);
+
+    {
+        const TestConfig config{Common::FS::PathToUTF8String(scratch.File("debug-config.ini"))};
+        const auto deviations = Settings::Baseline::Deviations(Settings::values, kNoSwitches);
+        CHECK(deviations.size() == keys.size());
+        for (const auto& deviation : deviations) {
+            CHECK(deviation.source == "global config");
+        }
+        CHECK_FALSE(Settings::Baseline::OnBaseline(deviations, {}));
+
+        // The reset that --baseline does after the config loads covers each of them.
+        Settings::Baseline::ResetToBaseline();
+        const auto after = Settings::Baseline::Deviations(Settings::values, kNoSwitches);
+        CHECK(after.empty());
+        CHECK(Settings::Baseline::OnBaseline(after, {}));
+    }
     Settings::Baseline::ResetToBaseline();
 }

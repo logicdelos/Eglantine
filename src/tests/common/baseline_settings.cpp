@@ -65,11 +65,16 @@ constexpr std::string_view kPinnedCommon[] = {
     "custom_rtc_enabled=false",
     "custom_rtc_offset=0",
     "debug=false",
+    "debug_knobs=0",
     "disable_buffer_reorder=false",
+    "disable_macro_hle=false",
+    "disable_macro_jit=false",
     "disable_shader_loop_safety_checks=false",
+    "disable_web_applet=true",
     "dma_accuracy=0",
     "driver_shader_cache_size=10",
     "emulate_bgr565=false",
+    "enable_all_controllers=false",
     "enable_buffer_history=false",
     "enable_compute_pipelines=false",
     "fast_cpu_time=0",
@@ -106,11 +111,13 @@ constexpr std::string_view kPinnedCommon[] = {
     "nvidia_dlss_quality=2",
     "output_device=auto",
     "output_engine=0",
+    "perform_vulkan_check=true",
     "post_shader_chain=",
     "post_shader_enabled=true",
     "post_shader_preset=",
     "prefer_3d_vcache=true",
     "private_driver_shader_cache=true",
+    "quest_flag=false",
     "region_index=1",
     "renderdoc_hotkey=false",
     "resolution_setup=3",
@@ -129,7 +136,9 @@ constexpr std::string_view kPinnedCommon[] = {
     "turbo_speed_limit=200",
     "use_asynchronous_gpu_emulation=true",
     "use_asynchronous_shaders=true",
+    "use_auto_stub=false",
     "use_custom_cpu_ticks=false",
+    "use_dev_keys=false",
     "use_disk_shader_cache=true",
     "use_docked_mode=1",
     "use_mesh_shaders=true",
@@ -159,10 +168,10 @@ constexpr std::string_view kPinnedPlatform[] = {
 
 #ifdef _WIN32
 constexpr std::string_view kPinnedHash =
-    "23977f27b2859cb0013f008fedaa07c2590d4a52706bcd3085cbcb2750463557";
+    "79af37a9cf061121162b4d3e6ddc2e6505e93eeb19c496a604b3645f212af0a6";
 #else
 constexpr std::string_view kPinnedHash =
-    "8e074e3912f682100c5a9eb64dd71c29755f054a154f16b2debc8520dbb8d3eb";
+    "f102d7004e0da8189c21d3f874ef370dde83fc5017899612f43de84da19c5169";
 #endif
 
 bool IsPlatformKey(std::string_view key) {
