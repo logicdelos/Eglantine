@@ -441,7 +441,7 @@ TEST_CASE("long frame json: exact integers, clamps and names", "[report][schema2
         frame.end_ns = frame.start_ns + 1'000'000'000;
         const Json json = Json::parse(Schema2::LongFrameJson(frame));
         CHECK(json["start_ns"].get<u64>() == 9'007'199'254'740'993ull);
-        CHECK(json["end_ns"].get<u64>() == 9'007'199'255'740'993ull);
+        CHECK(json["end_ns"].get<u64>() == 9'007'200'254'740'993ull);
     }
     SECTION("critical work: only what is counted, never more than the array holds") {
         for (size_t i = 0; i < frame.critical_work_ids.size(); ++i) {
