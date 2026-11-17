@@ -85,7 +85,9 @@ void SetTitleId(u64 program_id);
 //       "unknown_primary_frame_fraction", "producer_unknown_wait_ns",
 //       "inferred_ns": {<cause>: ns...} (sum over long frames and start-up),
 //       "waiting_breakdown_ns": {<wait_class>: ns...} (optional: the part of the waiting cause, over
-//       the same frames and start-up, by what the guest did meanwhile; sums to cause "waiting"),
+//       the same frames and start-up, by what the guest did meanwhile; sums to cause "waiting".
+//       The split is proportional: thread state clocks are sampled about every 2 ms and read
+//       between samples, and guest_running is an estimate over the core threads),
 //       "waiting_service_top": [{"service", "command", "ns"}...] (optional: the commands that took
 //       most of the "service" class, at most 8, longest first),
 //       "long_frames": [LongFrame...] }
