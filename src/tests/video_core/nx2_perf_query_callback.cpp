@@ -99,6 +99,9 @@ public:
     void Free(size_t) override {
         ++freed;
     }
+    void SetAmend(u64 value) {
+        amend_value = value;
+    }
     u64 Accumulation() const {
         return accumulation_value;
     }
@@ -265,4 +268,293 @@ TEST_CASE("Nx2Perf compute: query callbacks preserve immediate and deferred writ
             }
         }
     }
+}
+
+namespace {
+
+// A few queue words in one device page (device 0x1000, one every 16 bytes) and the cache that
+// writes them. The streamer adds nothing to a payload, so a word holds exactly what was released.
+struct QueueWords {
+    u8* page;
+    Tegra::MaxwellDeviceMemoryManager& device_memory;
+    QueryRasterizer& rasterizer;
+    Runtime& runtime;
+    QueryCache& cache;
+};
+
+class FenceMode {
+public:
+    explicit FenceMode(Settings::GpuAccuracy accuracy)
+        : old_behavior{Settings::values.gpu_fence_behavior.GetValue()},
+          old_accuracy{Settings::values.current_gpu_accuracy} {
+        Settings::values.gpu_fence_behavior.SetValue(Settings::GpuFenceBehavior::Default);
+        Settings::values.current_gpu_accuracy = accuracy;
+    }
+    ~FenceMode() {
+        Settings::values.gpu_fence_behavior.SetValue(old_behavior);
+        Settings::values.current_gpu_accuracy = old_accuracy;
+    }
+    FenceMode(const FenceMode&) = delete;
+    FenceMode& operator=(const FenceMode&) = delete;
+
+private:
+    Settings::GpuFenceBehavior old_behavior;
+    Settings::GpuAccuracy old_accuracy;
+};
+
+template <typename Body>
+void WithQueueWords(Settings::GpuAccuracy accuracy, Body&& body) {
+    ScopedSystemTestContext context;
+    Core::System system;
+    system.Initialize();
+    Kernel::KProcess process{system.Kernel()};
+    SCOPE_EXIT { system.Kernel().UnregisterKernelObject(&process); };
+    auto& table = process.GetPageTable().GetImpl();
+    table.Resize(20, 12);
+    u8* page = system.DeviceMemory().buffer.BackingBasePointer() + 0x10000;
+    table.entries.GetAndFault(4).Store(false, Common::PageType::Memory, 1,
+                                     reinterpret_cast<uintptr_t>(page) - 0x4000);
+    process.GetMemory().SetCurrentPageTable(process);
+    Tegra::MaxwellDeviceMemoryManager device_memory{system.DeviceMemory()};
+    const auto asid = device_memory.RegisterProcess(&process.GetMemory());
+    device_memory.Map(0x1000, 0x4000, 0x1000, asid);
+    QueryRasterizer rasterizer;
+    device_memory.BindInterface(&rasterizer);
+    Tegra::MemoryManager memory{system, device_memory, 32, 1ULL << 31};
+    memory.BindRasterizer(&rasterizer);
+    memory.Map(0x10000, 0x1000, 0x1000, Tegra::PTEKind::PITCH, false);
+    Tegra::GPU gpu{system, false, false};
+    Runtime runtime;
+    runtime.streamer.SetAmend(0);
+    QueryCache cache{gpu, rasterizer, device_memory, runtime};
+    cache.UseMemory(memory);
+    const FenceMode mode{accuracy};
+    rasterizer.defer = true;
+    QueueWords words{page, device_memory, rasterizer, runtime, cache};
+    body(words);
+}
+
+GPUVAddr WordAddress(u32 index) {
+    return 0x10000 + index * 16;
+}
+
+u32 ReadWord(QueueWords& words, u32 index = 0) {
+    return words.device_memory.Read<u32>(0x1000 + index * 16);
+}
+
+void StoreWord(QueueWords& words, u32 value, u32 index = 0) {
+    std::memcpy(words.page + index * 16, &value, sizeof(value));
+}
+
+void IssueReport(QueueWords& words, u32 index, VideoCommon::QueryPropertiesFlags flags,
+                 u32 payload) {
+    words.cache.CounterReport(WordAddress(index), VideoCommon::QueryType::Payload, flags, payload,
+                              0);
+    REQUIRE(words.rasterizer.pending.size() == 1);
+}
+
+void LandReports(QueueWords& words) {
+    const auto operations = std::move(words.rasterizer.pending);
+    words.rasterizer.pending.clear();
+    for (const auto& operation : operations) {
+        operation();
+    }
+}
+
+// A report whose fence operation runs, and whose cache entry is then released.
+void Report(QueueWords& words, u32 index, VideoCommon::QueryPropertiesFlags flags, u32 payload) {
+    const u32 freed = words.runtime.streamer.freed;
+    IssueReport(words, index, flags, payload);
+    LandReports(words);
+    words.cache.UnregisterPending();
+    REQUIRE(words.runtime.streamer.freed == freed + 1);
+}
+
+constexpr auto Publication =
+    VideoCommon::QueryPropertiesFlags::IsAFence | VideoCommon::QueryPropertiesFlags::AdvanceOnly;
+constexpr auto GuestReport = VideoCommon::QueryPropertiesFlags::IsAFence;
+constexpr u32 AcquireEqual = Tegra::Nx2SemaphoreWaiters::AcquireEqual;
+constexpr u32 AcquireGequal = Tegra::Nx2SemaphoreWaiters::AcquireGequal;
+
+} // namespace
+
+TEST_CASE("Nx2 queue word: a syncpoint publication never lowers a word the guest ran ahead",
+          "[video_core][nx2_queue_word]") {
+    WithQueueWords(Settings::GpuAccuracy::High, [](QueueWords& words) {
+        auto& waiters = Tegra::Nx2SemaphoreWaiters::Get();
+        int owner{};
+        SCOPE_EXIT { waiters.Remove(&owner); };
+        // The order of the trace: compute completions had counted the word up to 0x72, then the
+        // syncpoint (counting slower) was published into it, once per list.
+        for (u32 publication = 0x50; publication <= 0x71; ++publication) {
+            CAPTURE(publication);
+            StoreWord(words, 0x72);
+            waiters.Add(&owner, 0x1000, publication, AcquireEqual);
+            Report(words, 0, Publication, publication);
+            REQUIRE(ReadWord(words) == 0x72U);
+            // The acquire that the lowered word had stalled (>= 0x64) is met.
+            REQUIRE(Tegra::Nx2SemaphoreWaiters::Satisfies(AcquireGequal, 0x64, ReadWord(words)));
+            // A write that changed nothing wakes nobody.
+            REQUIRE_FALSE(waiters.Latched(&owner));
+        }
+    });
+}
+
+TEST_CASE("Nx2 queue word: a syncpoint publication still advances a word that is behind or equal",
+          "[video_core][nx2_queue_word]") {
+    WithQueueWords(Settings::GpuAccuracy::High, [](QueueWords& words) {
+        auto& waiters = Tegra::Nx2SemaphoreWaiters::Get();
+        int owner{};
+        SCOPE_EXIT { waiters.Remove(&owner); };
+        for (const u32 before : {0x00U, 0x10U, 0x5bU, 0x5cU, 0xffffffffU}) {
+            CAPTURE(before);
+            StoreWord(words, before);
+            waiters.Add(&owner, 0x1000, 0x5c, AcquireEqual);
+            Report(words, 0, Publication, 0x5c);
+            REQUIRE(ReadWord(words) == 0x5cU);
+            REQUIRE(waiters.Latched(&owner));
+        }
+    });
+}
+
+TEST_CASE("Nx2 queue word: the advance test is a signed distance",
+          "[video_core][nx2_queue_word]") {
+    struct Case {
+        u32 word;
+        u32 publication;
+        u32 expected;
+    };
+    const Case cases[] = {
+        {0xfffffff0U, 0x00000005U, 0x00000005U}, // the counter wrapped: newer
+        {0x00000005U, 0xfffffff0U, 0x00000005U}, // an old value from before the wrap: older
+        {0xffffffffU, 0x0000005cU, 0x0000005cU}, // a word reset to all ones takes any value
+        {0x00000000U, 0x7fffffffU, 0x7fffffffU}, // largest step forward
+        {0x00000000U, 0x80000000U, 0x00000000U}, // smallest step back
+        {0x00000072U, 0x0000005cU, 0x00000072U},
+        {0x00000072U, 0x00000072U, 0x00000072U},
+    };
+    WithQueueWords(Settings::GpuAccuracy::High, [&cases](QueueWords& words) {
+        for (const Case& test : cases) {
+            CAPTURE(test.word, test.publication);
+            StoreWord(words, test.word);
+            Report(words, 0, Publication, test.publication);
+            REQUIRE(ReadWord(words) == test.expected);
+        }
+    });
+}
+
+TEST_CASE("Nx2 queue word: a guest release writes what it carries, a lower value included",
+          "[video_core][nx2_queue_word]") {
+    WithQueueWords(Settings::GpuAccuracy::High, [](QueueWords& words) {
+        for (const u32 payload : {0x00U, 0x10U, 0x5cU, 0x71U, 0x73U, 0xffffffffU}) {
+            CAPTURE(payload);
+            StoreWord(words, 0x72);
+            Report(words, 0, GuestReport, payload);
+            REQUIRE(ReadWord(words) == payload);
+        }
+    });
+}
+
+TEST_CASE("Nx2 queue word: a flush of the cached publication keeps a word that moved ahead",
+          "[video_core][nx2_queue_word]") {
+    WithQueueWords(Settings::GpuAccuracy::High, [](QueueWords& words) {
+        StoreWord(words, 0x10);
+        IssueReport(words, 0, Publication, 0x5c);
+        LandReports(words);
+        REQUIRE(ReadWord(words) == 0x5cU);
+        // The report stays cached until a later fence frees it. A compute completion counts the
+        // word on in the meantime, and a flush of the address writes the cached value again.
+        StoreWord(words, 0x72);
+        REQUIRE_FALSE(words.cache.SemiFlushRegion(0x1000, 4));
+        REQUIRE(ReadWord(words) == 0x72U);
+        // A word that fell behind the cached value (a reset) is written forward.
+        StoreWord(words, 0x10);
+        REQUIRE_FALSE(words.cache.SemiFlushRegion(0x1000, 4));
+        REQUIRE(ReadWord(words) == 0x5cU);
+        words.cache.UnregisterPending();
+    });
+}
+
+TEST_CASE("Nx2 queue word: a publication outside a fence keeps the newer word too",
+          "[video_core][nx2_queue_word]") {
+    WithQueueWords(Settings::GpuAccuracy::Low, [](QueueWords& words) {
+        auto& waiters = Tegra::Nx2SemaphoreWaiters::Get();
+        int owner{};
+        SCOPE_EXIT { waiters.Remove(&owner); };
+        StoreWord(words, 0x72);
+        waiters.Add(&owner, 0x1000, 0x5c, AcquireEqual);
+        words.cache.CounterReport(WordAddress(0), VideoCommon::QueryType::Payload,
+                                  VideoCommon::QueryPropertiesFlags::AdvanceOnly, 0x5c, 0);
+        REQUIRE(words.rasterizer.pending.empty());
+        REQUIRE(ReadWord(words) == 0x72U);
+        REQUIRE_FALSE(waiters.Latched(&owner));
+        words.cache.CounterReport(WordAddress(0), VideoCommon::QueryType::Payload,
+                                  VideoCommon::QueryPropertiesFlags::AdvanceOnly, 0x80, 0);
+        REQUIRE(ReadWord(words) == 0x80U);
+        // A plain report of a lower value lands.
+        words.cache.CounterReport(WordAddress(0), VideoCommon::QueryType::Payload,
+                                  VideoCommon::QueryPropertiesFlags{}, 0x10, 0);
+        REQUIRE(ReadWord(words) == 0x10U);
+    });
+}
+
+TEST_CASE("Nx2 queue word: each word is judged on its own value",
+          "[video_core][nx2_queue_word]") {
+    WithQueueWords(Settings::GpuAccuracy::High, [](QueueWords& words) {
+        StoreWord(words, 0x72, 0);
+        StoreWord(words, 0x10, 1);
+        StoreWord(words, 0x90, 2);
+        Report(words, 0, Publication, 0x5c);
+        Report(words, 1, Publication, 0x5c);
+        Report(words, 2, Publication, 0x5c);
+        REQUIRE(ReadWord(words, 0) == 0x72U);
+        REQUIRE(ReadWord(words, 1) == 0x5cU);
+        REQUIRE(ReadWord(words, 2) == 0x90U);
+        REQUIRE(ReadWord(words, 3) == 0U);
+    });
+}
+
+TEST_CASE("Nx2 queue word: issued releases predict an advance-only report as a keep-newer store",
+          "[video_core][nx2_queue_word]") {
+    auto& issued = Tegra::Nx2IssuedReleases::Get();
+    issued.Clear();
+    SCOPE_EXIT { issued.Clear(); };
+    constexpr u64 address = 0x1000;
+    issued.IssueAdvance(address, 0x5c);
+    REQUIRE(issued.HasPendingReport(address));
+    REQUIRE_FALSE(issued.HasReductionIn(address, 4));
+    // The word is ahead: it stays, so the acquire is met and an equal wait for the report is not.
+    REQUIRE(issued.Meets(address, 0x64, AcquireGequal, [] { return 0x72U; }));
+    REQUIRE(issued.Meets(address, 0x72, AcquireEqual, [] { return 0x72U; }));
+    REQUIRE_FALSE(issued.Meets(address, 0x5c, AcquireEqual, [] { return 0x72U; }));
+    // The word is behind: the report advances it.
+    REQUIRE(issued.Meets(address, 0x5c, AcquireEqual, [] { return 0x10U; }));
+    REQUIRE_FALSE(issued.Meets(address, 0x64, AcquireGequal, [] { return 0x10U; }));
+    // The word wrapped.
+    REQUIRE(issued.Meets(address, 0x05, AcquireEqual, [] { return 0xfffffff0U; }));
+    issued.Settle(address);
+    REQUIRE_FALSE(issued.Any());
+}
+
+TEST_CASE("Nx2 queue word: issued releases apply a publication after a max release in order",
+          "[video_core][nx2_queue_word]") {
+    auto& issued = Tegra::Nx2IssuedReleases::Get();
+    issued.Clear();
+    SCOPE_EXIT { issued.Clear(); };
+    constexpr u64 address = 0x1000;
+    constexpr u32 reduce_max = 2;
+    issued.IssueReduction(address, reduce_max, false, 0x72);
+    issued.IssueAdvance(address, 0x5c);
+    REQUIRE(issued.HasReductionIn(address, 4));
+    REQUIRE(issued.HasPendingReport(address));
+    // The word reaches 0x72 and stays there: it never reads 0x5c at any step.
+    REQUIRE(issued.Meets(address, 0x64, AcquireGequal, [] { return 0x10U; }));
+    REQUIRE(issued.Meets(address, 0x72, AcquireEqual, [] { return 0x10U; }));
+    REQUIRE_FALSE(issued.Meets(address, 0x5c, AcquireEqual, [] { return 0x10U; }));
+    // After the reduction settled only the publication is pending.
+    issued.Settle(address);
+    REQUIRE_FALSE(issued.HasReductionIn(address, 4));
+    REQUIRE(issued.HasPendingReport(address));
+    REQUIRE(issued.Meets(address, 0x72, AcquireEqual, [] { return 0x72U; }));
+    REQUIRE_FALSE(issued.Meets(address, 0x5c, AcquireEqual, [] { return 0x72U; }));
 }
