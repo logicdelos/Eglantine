@@ -77,6 +77,9 @@ struct State {
     bool baseline_requested = false; // --baseline was given
     std::vector<std::string> baseline_declared; // keys of --baseline-allow
     std::optional<u64> title_id;
+    /// A change that the crash snapshot must show (shader ablation) happened while the mutex was
+    /// taken. Whoever holds the mutex rebuilds the snapshot after it unlocks (StateLock).
+    std::atomic<bool> refresh_pending{false};
 };
 
 State& GetState() {
@@ -190,8 +193,9 @@ Json SetTunables() {
             continue;
         }
         Json tunable = Json::object();
-        // A value is only reported when it is a plain number or word: a path or a script stays out.
-        tunable["raw"] = Settings::Baseline::PublicSwitchValue(text.substr(equals + 1));
+        // A value is only reported when its variable is not a path variable and it is a plain
+        // number or word: a path or a script stays out, also when it looks like a number.
+        tunable["raw"] = Settings::Baseline::PublicSwitchValue(name, text.substr(equals + 1));
         tunable["source"] = "environment";
         tunable["effective"] = Json::object();
         result[std::string{name}] = std::move(tunable);
@@ -612,21 +616,10 @@ void RemoveCrashFile(const CrashChar* path) noexcept {
 #endif
 }
 
-/// Writes the crash report. False when a report was meant and could not be written; true when it
-/// was written, was not armed, or the normal report is already at the destination.
-bool WriteCrashReport(std::string_view detail) noexcept {
-    const int index = crash_document.load(std::memory_order_acquire);
-    if (index < 0) {
-        return true;
-    }
-    int expected = CrashArmed;
-    if (!crash_phase.compare_exchange_strong(expected, CrashWriting, std::memory_order_acq_rel)) {
-        return true;
-    }
-    const CrashDocument& document = crash_documents[index];
-
-    char middle[CrashMiddleCapacity];
-    CrashText text{middle, sizeof(middle)};
+/// The part of the crash report that changes at the moment of the crash: elapsed time, the
+/// counters and the exit object. Returns its length.
+size_t FormatCrashMiddle(char* buffer, size_t capacity, std::string_view detail) noexcept {
+    CrashText text{buffer, capacity};
     const double elapsed =
         Common::RunOutcome::Active() ? Common::RunOutcome::ElapsedSeconds() : 0.0;
     const auto milliseconds = static_cast<unsigned long long>(elapsed > 0.0 ? elapsed * 1000.0 : 0.0);
@@ -648,10 +641,28 @@ bool WriteCrashReport(std::string_view detail) noexcept {
     text.Add(",\"shutdown_complete\":false,\"metrics_complete\":false,\"detail\":\"");
     text.AddEscaped(detail, 64);
     text.Add("\"}");
+    return text.size;
+}
+
+/// Writes the crash report. False when a report was meant and could not be written; true when it
+/// was written, was not armed, or the normal report is already at the destination.
+bool WriteCrashReport(std::string_view detail) noexcept {
+    const int index = crash_document.load(std::memory_order_acquire);
+    if (index < 0) {
+        return true;
+    }
+    int expected = CrashArmed;
+    if (!crash_phase.compare_exchange_strong(expected, CrashWriting, std::memory_order_acq_rel)) {
+        return true;
+    }
+    const CrashDocument& document = crash_documents[index];
+
+    char middle[CrashMiddleCapacity];
+    const size_t middle_size = FormatCrashMiddle(middle, sizeof(middle), detail);
 
     // Seeking is not needed: the file was empty when it was created.
     const bool written = WriteCrashPart(document.head, document.head_size) &&
-                         WriteCrashPart(middle, text.size) &&
+                         WriteCrashPart(middle, middle_size) &&
                          WriteCrashPart(document.tail, document.tail_size) && FlushCrashFile();
     const bool closed = CloseCrashFile();
     const bool published = written && closed && PublishCrashFile();
@@ -668,6 +679,10 @@ bool WriteCrashReport(std::string_view detail) noexcept {
     // The normal report can have been put in place in the meantime, which is as good.
     return CrashDestinationExists();
 }
+
+/// Runs on the thread that holds the state mutex, after a snapshot's text was formatted and
+/// before it is published. Only a test sets it.
+void (*snapshot_test_hook)() = nullptr;
 
 /// Formats the fixed parts of the crash report from what is known now. Called with the state
 /// mutex held, before the run and again when the title and the settings are known.
@@ -708,6 +723,9 @@ void RebuildCrashDocument(State& state) {
     std::string tail = make_tail(true);
     if (tail.size() > CrashTailCapacity) {
         tail = make_tail(false);
+    }
+    if (snapshot_test_hook != nullptr) {
+        snapshot_test_hook();
     }
     if (head.size() > CrashHeadCapacity || tail.size() > CrashTailCapacity) {
         return;
@@ -796,21 +814,56 @@ bool FinishCrashReport(State& state) {
     return expected != CrashWriting;
 }
 
-/// Called by the renderer when shader ablation becomes active. If the report is being written at
-/// that moment, the report is current anyway and the snapshot is left alone.
-void RefreshCrashBaselineIfIdle() {
-    State& state = GetState();
-    std::unique_lock lock{state.mutex, std::try_to_lock};
-    if (lock.owns_lock()) {
+/// Rebuilds the crash snapshot when a refresh is pending, unless another thread holds the mutex:
+/// that thread looks again after it unlocks (StateLock), so a request is never dropped.
+void DrainPendingRefresh(State& state) {
+    while (state.refresh_pending.load(std::memory_order_seq_cst)) {
+        std::unique_lock lock{state.mutex, std::try_to_lock};
+        if (!lock.owns_lock()) {
+            return;
+        }
+        // Cleared with the mutex held and before the snapshot is evaluated: a request that
+        // arrives later sets it again.
+        state.refresh_pending.store(false, std::memory_order_seq_cst);
         RebuildCrashDocument(state);
     }
+}
+
+/// The state mutex, and the duty that comes with it: after unlocking, a refresh that was requested
+/// while the mutex was held (and that its holder may have evaluated before) is carried out.
+class StateLock {
+public:
+    explicit StateLock(State& state_) : state{state_}, lock{state_.mutex} {}
+    StateLock(const StateLock&) = delete;
+    StateLock& operator=(const StateLock&) = delete;
+    ~StateLock() {
+        lock.unlock();
+        try {
+            DrainPendingRefresh(state);
+        } catch (...) {
+            // The snapshot keeps its previous text; the report itself is not affected.
+        }
+    }
+
+private:
+    State& state;
+    std::unique_lock<std::mutex> lock;
+};
+
+/// Called by the renderer when shader ablation becomes active. The flag that makes the baseline
+/// object show it is already set; this makes the crash snapshot show it as well. Never dropped:
+/// when the mutex is busy its holder rebuilds the snapshot after it unlocks.
+void RequestCrashBaselineRefresh() {
+    State& state = GetState();
+    state.refresh_pending.store(true, std::memory_order_seq_cst);
+    DrainPendingRefresh(state);
 }
 
 } // Anonymous namespace
 
 PrepareResult Prepare(const std::string& destination, std::string& message) {
     State& state = GetState();
-    std::scoped_lock lock{state.mutex};
+    StateLock lock{state};
     std::error_code ec;
     const fs::path path{Common::FS::ToU8String(destination)};
     if (!path.has_filename()) {
@@ -854,7 +907,7 @@ PrepareResult Prepare(const std::string& destination, std::string& message) {
 
 void CaptureStart(const std::vector<std::string>& overridden_settings) {
     State& state = GetState();
-    std::scoped_lock lock{state.mutex};
+    StateLock lock{state};
     state.tunables = SetTunables();
     state.initial_settings = ReportedSettings();
     state.overridden_settings = Json::object();
@@ -872,22 +925,22 @@ void CaptureStart(const std::vector<std::string>& overridden_settings) {
 
 void SetBaselineRequest(bool requested, std::vector<std::string> declared) {
     State& state = GetState();
-    std::scoped_lock lock{state.mutex};
+    StateLock lock{state};
     state.baseline_requested = requested;
     state.baseline_declared = std::move(declared);
     RebuildCrashDocument(state);
-    Settings::Baseline::SetChangeHook(&RefreshCrashBaselineIfIdle);
+    Settings::Baseline::SetChangeHook(&RequestCrashBaselineRefresh);
 }
 
 void RefreshCrashSnapshot() {
     State& state = GetState();
-    std::scoped_lock lock{state.mutex};
+    StateLock lock{state};
     RebuildCrashDocument(state);
 }
 
 void SetTitleId(u64 program_id) {
     State& state = GetState();
-    std::scoped_lock lock{state.mutex};
+    StateLock lock{state};
     state.title_id = program_id;
     RebuildCrashDocument(state);
 }
@@ -895,7 +948,7 @@ void SetTitleId(u64 program_id) {
 bool Publish(Common::RunOutcome::Reason reason, int code, bool shutdown_complete,
              std::string_view detail) {
     State& state = GetState();
-    std::scoped_lock lock{state.mutex};
+    StateLock lock{state};
     if (!state.prepared) {
         return true;
     }
@@ -933,6 +986,31 @@ void ExitWithFailure(std::string_view detail) {
         }
     }
     std::exit(code);
+}
+
+std::string NormalDocumentText(Common::RunOutcome::Reason reason, int code, bool shutdown_complete,
+                               std::string_view detail) {
+    State& state = GetState();
+    StateLock lock{state};
+    return Document(state, reason, code, shutdown_complete, detail);
+}
+
+std::string CrashDocumentText(std::string_view detail) {
+    const int index = crash_document.load(std::memory_order_acquire);
+    if (index < 0) {
+        return {};
+    }
+    const CrashDocument& document = crash_documents[index];
+    char middle[CrashMiddleCapacity];
+    const size_t middle_size = FormatCrashMiddle(middle, sizeof(middle), detail);
+    std::string text{document.head, document.head_size};
+    text.append(middle, middle_size);
+    text.append(document.tail, document.tail_size);
+    return text;
+}
+
+void SetSnapshotTestHook(void (*hook)()) {
+    snapshot_test_hook = hook;
 }
 
 } // namespace RunReport

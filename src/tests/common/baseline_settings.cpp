@@ -546,11 +546,52 @@ TEST_CASE("The harness variables are instrumentation: named, never valued, not d
 TEST_CASE("A report carries a value only when it is a plain number or word", "[baseline_settings]") {
     using Settings::Baseline::PublicSwitchValue;
     for (const char* plain : {"0", "1", "250", "-3", "0.75", "on", "off", "true", "false", "yes", "no"}) {
-        CHECK(PublicSwitchValue(plain) == plain);
+        CHECK(PublicSwitchValue("EDEN_NX2_SPLIT", plain) == plain);
     }
     for (const char* hidden : {"", "C:/dir/file", "/tmp/x", "a.txt", "1.", ".5", "-", "1e3", "12 34",
                                "on,off", "123456789012345678901234567890"}) {
-        CHECK(PublicSwitchValue(hidden) == "set");
+        CHECK(PublicSwitchValue("EDEN_NX2_SPLIT", hidden) == "set");
+    }
+}
+
+TEST_CASE("A path variable is never reported by value, whatever the value looks like",
+          "[baseline_settings]") {
+    using Settings::Baseline::IsPathSwitch;
+    using Settings::Baseline::PublicSwitchValue;
+    // A relative path can be a number or a word.
+    for (const char* name :
+         {"EDEN_NX2_ABLATE_FILE", "EDEN_NX2_CRASH_DUMP", "EDEN_NX2_DEBUG_DIR", "EDEN_NX2_DIAG_DIR",
+          "EDEN_NX2_FRAME_CAPTURE", "EDEN_NX2_FRAME_DUMP", "EDEN_NX2_KEY_RECORD",
+          "EDEN_NX2_KEY_SCRIPT", "EDEN_NX2_LAB_PYTHON", "EDEN_NX2_LAB_SCRIPT",
+          "EDEN_NX2_MESH_EMULATION_DUMP", "EDEN_NX2_MME_RECORD", "EDEN_NX2_NO_MESH_FILE",
+          "EDEN_NX2_PB_DUMP", "EDEN_NX2_SAMPLE_OUT", "EDEN_NX2_SHADER_DUMP",
+          "EDEN_NX2_TEXTURE_DUMP", "EDEN_NX2_VDEC_DUMP", "EGLANTINE_SOME_DIR"}) {
+        CHECK(IsPathSwitch(name));
+        for (const char* value : {"123", "on", "0", "true", "-1", "2.5"}) {
+            CHECK(PublicSwitchValue(name, value) == "set");
+        }
+    }
+    // The flags and numbers stay readable.
+    for (const char* name : {"EDEN_NX2_DIAG", "EDEN_NX2_HIDE_WINDOW", "EDEN_NX2_SEM_WATCH",
+                             "EDEN_NX2_FRAME_DUMP_AT", "EDEN_NX2_NO_MESH", "EDIR", "_DIR"}) {
+        CHECK_FALSE(IsPathSwitch(name));
+    }
+}
+
+TEST_CASE("A deviation of a path variable carries no value", "[baseline_settings]") {
+    Settings::Baseline::ClearNotedSources();
+    const auto values = std::make_unique<Settings::Values>();
+    Settings::Baseline::ResetToBaseline(*values);
+    const std::vector<Settings::Baseline::EnvironmentSwitch> switches{
+        {"EDEN_NX2_SHADER_DUMP", "123"}, {"EDEN_NX2_ABLATE_FILE", "on"}, {"EDEN_NX2_SPLIT", "2"}};
+    const auto deviations = Settings::Baseline::Deviations(*values, switches);
+    REQUIRE(deviations.size() == 3);
+    for (const auto& deviation : deviations) {
+        if (deviation.key == "EDEN_NX2_SPLIT") {
+            CHECK(deviation.effective == "2");
+        } else {
+            CHECK(deviation.effective == "set");
+        }
     }
 }
 

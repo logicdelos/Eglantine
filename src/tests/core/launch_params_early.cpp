@@ -122,3 +122,37 @@ TEST_CASE("A fork option without its argument is a mistake with or without --rep
     CHECK(Core::MisusedBranchOption("-g").empty());
     CHECK(Core::MisusedBranchOption("").empty());
 }
+
+TEST_CASE("The early scan records the mistakes with the fork options", "[launch_params]") {
+    // The caller prints the build identity only when error is empty, so each of these ends in
+    // exit code 64 and not in a version line.
+    const auto missing = Scan({"--version", "--json", "--baseline-allow"});
+    CHECK(missing.version_json);
+    CHECK(missing.error == "--baseline-allow needs an argument");
+    const auto attached = Scan({"--version", "--json", "--baseline=1"});
+    CHECK(attached.version_json);
+    CHECK(attached.error == "--baseline does not take an argument");
+    CHECK(Scan({"--version", "--json", "--print-baseline=x"}).error ==
+          "--print-baseline does not take an argument");
+    CHECK(Scan({"--version", "--json", "--json=x"}).error == "--json does not take an argument");
+    CHECK(Scan({"--version", "--json", "--report"}).error == "--report needs an argument");
+    CHECK(Scan({"--version", "--json", "--run-seconds"}).error == "--run-seconds needs an argument");
+    CHECK(Scan({"--version", "--json", "--run-frames"}).error == "--run-frames needs an argument");
+    CHECK(Scan({"--version", "--json", "--run-f"}).error == "--run-frames needs an argument");
+    // The first mistake is the one that is kept.
+    CHECK(Scan({"--baseline=1", "--report"}).error == "--baseline does not take an argument");
+
+    // An argument that an option takes is not a missing one, and an option is not misused when
+    // it is spelled right.
+    CHECK(Scan({"--version", "--json", "--baseline-allow", "key=1"}).error.empty());
+    CHECK(Scan({"--version", "--json", "--baseline-allow=key=1"}).error.empty());
+    CHECK(Scan({"--version", "--json", "--report", "out.json"}).error.empty());
+    CHECK(Scan({"--version", "--json", "--baseline"}).error.empty());
+    CHECK(Scan({"--version", "--json", "--print-baseline"}).error.empty());
+    // The word after an option that takes an argument is that argument, whatever it looks like.
+    CHECK(Scan({"--report", "--baseline=1", "--version", "--json"}).error.empty());
+    // After "--" nothing is an option.
+    CHECK(Scan({"--", "--baseline=1"}).error.empty());
+    // Older options keep their handling: a value on --version is not a mistake of this scan.
+    CHECK(Scan({"--version=1", "--json"}).error.empty());
+}

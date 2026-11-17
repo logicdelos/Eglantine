@@ -62,4 +62,18 @@ void SetTitleId(u64 program_id);
 /// otherwise the code is 1.
 [[noreturn]] void ExitWithFailure(std::string_view detail);
 
+// The three functions below exist for tests of the report text; the emulator never calls them.
+
+/// The normal report's text as Publish would write it now (the metrics recording is consumed).
+[[nodiscard]] std::string NormalDocumentText(Common::RunOutcome::Reason reason, int code,
+                                             bool shutdown_complete, std::string_view detail);
+
+/// The crash report's text as a crash would write it now: the snapshot taken before the run, with
+/// the counters of the moment. Empty when the crash report is not armed (Prepare was not called).
+[[nodiscard]] std::string CrashDocumentText(std::string_view detail);
+
+/// A function that runs on the thread that holds the report's lock after a crash snapshot was
+/// formatted and before it is published; nullptr removes it.
+void SetSnapshotTestHook(void (*hook)());
+
 } // namespace RunReport

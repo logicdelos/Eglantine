@@ -39,6 +39,8 @@ add_executable(tests
     core/launch_params_early.cpp
     common/speed_limit.cpp
     core/conductor_pace.cpp
+    yuzu_cmd/run_report_documents.cpp
+    ../yuzu_cmd/run_report.cpp
     common/bit_field.cpp
     common/cityhash.cpp
     common/container_hash.cpp

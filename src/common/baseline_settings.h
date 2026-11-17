@@ -91,10 +91,16 @@ void ClearNotedSources();
 /// The names of the harness variables in `switches`, sorted. Never the values.
 [[nodiscard]] std::vector<std::string> HarnessSwitches(const std::vector<EnvironmentSwitch>& switches);
 
-/// The text of an environment variable's value that a report may carry: the value itself when it
-/// is a plain number or one of on, off, true, false, yes, no; "set" otherwise (a path, a script, a
-/// free text). Reports never carry the value of a variable that can hold a path.
-[[nodiscard]] std::string PublicSwitchValue(std::string_view value);
+/// True for a variable whose reader takes a path, a file name or a script as its value
+/// (EDEN_NX2_DIAG_DIR, EDEN_NX2_FRAME_CAPTURE, EDEN_NX2_SHADER_DUMP and the like, and any name
+/// ending in _DIR, _FILE, _PATH, _SCRIPT, _PYTHON, _DUMP, _RECORD, _OUT or _CAPTURE).
+[[nodiscard]] bool IsPathSwitch(std::string_view name);
+
+/// The text of an environment variable's value that a report may carry. A path variable (by name,
+/// before the shape of the value is looked at: a relative path can be "123" or "on") is always
+/// "set". Any other variable carries its value when it is a plain number or one of on, off, true,
+/// false, yes, no, and "set" otherwise (a free text).
+[[nodiscard]] std::string PublicSwitchValue(std::string_view name, std::string_view value);
 
 /// Shader ablation (a diagnostics file that makes the renderer skip programs) is not a setting.
 /// The renderer calls NoteShaderAblation when it has read at least one active entry; from then on

@@ -213,8 +213,15 @@ EarlyOptions ScanEarlyOptions(int argc, char* argv[]) noexcept {
             const size_t equals = body.find('=');
             const struct option* const found = FindLongOption(body.substr(0, equals));
             // An unknown option is left to ParseLaunchParams. A value given to an option that
-            // takes none makes getopt return an error and the option is not parsed.
-            if (found == nullptr || (equals != std::string_view::npos && found->has_arg == no_argument)) {
+            // takes none makes getopt return an error and the option is not parsed: for the
+            // options this fork added that is a bad command line, here as there.
+            if (found == nullptr) {
+                continue;
+            }
+            if (equals != std::string_view::npos && found->has_arg == no_argument) {
+                if (std::string misuse = MisusedBranchOption(arg); !misuse.empty()) {
+                    fail(std::move(misuse));
+                }
                 continue;
             }
             std::optional<std::string> value;
@@ -222,6 +229,11 @@ EarlyOptions ScanEarlyOptions(int argc, char* argv[]) noexcept {
                 value = std::string{body.substr(equals + 1)};
             } else if (found->has_arg == required_argument && i + 1 < argc) {
                 value = argv[++i];
+            } else if (found->has_arg == required_argument && found->val != 0x10C) {
+                // The last word, and the option needs an argument (--user-dir says it itself).
+                if (std::string misuse = MisusedBranchOption(arg); !misuse.empty()) {
+                    fail(std::move(misuse));
+                }
             }
             switch (found->val) {
             case 'v':

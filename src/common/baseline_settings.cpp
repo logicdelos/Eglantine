@@ -315,7 +315,34 @@ std::vector<std::string> HarnessSwitches(const std::vector<EnvironmentSwitch>& s
     return names;
 }
 
-std::string PublicSwitchValue(std::string_view value) {
+bool IsPathSwitch(std::string_view name) {
+    // Variables whose reader uses the value as a path, a file name or a script. Found by reading
+    // every reader of an EDEN_NX2_ variable; the suffix rule below catches a variable that is
+    // added later under the usual naming.
+    static constexpr std::array<std::string_view, 18> paths{
+        "EDEN_NX2_ABLATE_FILE",   "EDEN_NX2_CRASH_DUMP",         "EDEN_NX2_DEBUG_DIR",
+        "EDEN_NX2_DIAG_DIR",      "EDEN_NX2_FRAME_CAPTURE",      "EDEN_NX2_FRAME_DUMP",
+        "EDEN_NX2_KEY_RECORD",    "EDEN_NX2_KEY_SCRIPT",         "EDEN_NX2_LAB_PYTHON",
+        "EDEN_NX2_LAB_SCRIPT",    "EDEN_NX2_MESH_EMULATION_DUMP", "EDEN_NX2_MME_RECORD",
+        "EDEN_NX2_NO_MESH_FILE",  "EDEN_NX2_PB_DUMP",            "EDEN_NX2_SAMPLE_OUT",
+        "EDEN_NX2_SHADER_DUMP",   "EDEN_NX2_TEXTURE_DUMP",       "EDEN_NX2_VDEC_DUMP",
+    };
+    if (std::find(paths.begin(), paths.end(), name) != paths.end()) {
+        return true;
+    }
+    static constexpr std::array<std::string_view, 9> suffixes{
+        "_DIR", "_FILE", "_PATH", "_SCRIPT", "_PYTHON", "_DUMP", "_RECORD", "_OUT", "_CAPTURE",
+    };
+    return std::any_of(suffixes.begin(), suffixes.end(), [&](std::string_view suffix) {
+        return name.size() > suffix.size() && name.ends_with(suffix);
+    });
+}
+
+std::string PublicSwitchValue(std::string_view name, std::string_view value) {
+    if (IsPathSwitch(name)) {
+        // A relative path can look like a number or a word, so the name decides first.
+        return "set";
+    }
     static constexpr std::array<std::string_view, 6> words{"on", "off", "true", "false", "yes", "no"};
     if (std::find(words.begin(), words.end(), value) != words.end()) {
         return std::string{value};
@@ -381,7 +408,8 @@ std::vector<Deviation> Deviations(const Values& current,
         // The harness variables are instrumentation, not a choice of the run.
         if (!IsHarnessSwitch(entry.name)) {
             deviations.push_back(
-                {entry.name, "unset", PublicSwitchValue(entry.value), "environment switch"});
+                {entry.name, "unset", PublicSwitchValue(entry.name, entry.value),
+                 "environment switch"});
         }
     }
     if (ShaderAblationActive()) {
