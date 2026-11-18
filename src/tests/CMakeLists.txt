@@ -16,6 +16,7 @@ add_executable(tests
     video_core/unbacked_image_policy.cpp
     core/builtin_patches.cpp
     core/launch_params.cpp
+    core/jit_prewarm.cpp
     core/gpu_dirty_memory_manager.cpp
     video_core/macro_dma_forward.cpp
     video_core/gpu_timestamp.cpp
