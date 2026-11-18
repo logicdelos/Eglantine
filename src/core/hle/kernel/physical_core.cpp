@@ -283,7 +283,26 @@ void PhysicalCore::Idle(KernelCore& kernel) {
             std::this_thread::yield();
         }
     }
+    // The rest of the idle time goes to translating blocks the guest is expected to need (the list
+    // of an earlier launch, see core/arm/dynarmic/jit_prewarm.h). It runs unlocked and looks at the
+    // interrupt flag between blocks, so an interrupt waits for at most one block.
+    KProcess* const application = kernel.ApplicationProcess();
+    Core::ArmInterface* const arm =
+        application != nullptr ? application->GetArmInterface(m_core_index) : nullptr;
+    constexpr auto PrewarmPollInterval = std::chrono::milliseconds{10};
     std::unique_lock lk{m_guard};
+    while (arm != nullptr) {
+        lk.unlock();
+        const Core::PrewarmState state = arm->PrewarmIdle(m_is_interrupted);
+        lk.lock();
+        if (state == Core::PrewarmState::Finished) {
+            break;
+        }
+        if (m_on_interrupt.wait_for(lk, PrewarmPollInterval,
+                                    [this] { return m_is_interrupted.load(); })) {
+            return;
+        }
+    }
     m_on_interrupt.wait(lk, [this] { return m_is_interrupted.load(); });
 }
 

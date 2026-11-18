@@ -23,6 +23,13 @@
 # 0 turns it off and the report then says so. New in 0.5 (not released).
 #EDEN_NX2_ATTRIBUTION=0
 
+# Translate code ahead of the game on the second and later launches (x86-64 only). The first
+# launch writes a hint list in the shader cache folder of the title (jit_blocks.mythos.bin: guest
+# addresses and checksums of translated blocks, no game bytes); a later launch of the same build,
+# game and content translates those blocks while a core has nothing to run. On by default; 0 turns
+# it off (nothing is read, recorded or written). New in 0.5 (not released).
+#EDEN_NX2_JIT_PREWARM=0
+
 # Leave buffer downloads disabled on Switch 2 (default): forcing downloads (=1) also copies back
 # buffers the CPU never touches, which adds mutex contention. Its effect on speed is not measured
 # in this fork.

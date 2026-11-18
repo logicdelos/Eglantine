@@ -19,6 +19,7 @@
 #include "common/hash.h"
 #include "core/arm/arm_interface.h"
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
+#include "core/arm/dynarmic/jit_prewarm.h"
 #include "dynarmic/interface/A64/config.h"
 
 namespace Core::Memory {
@@ -102,6 +103,7 @@ public:
     void SignalInterrupt(Kernel::KThread* thread) override;
     void ClearInstructionCache() override;
     void InvalidateCacheRange(u64 addr, std::size_t size) override;
+    PrewarmState PrewarmIdle(const std::atomic<bool>& stop) override;
 
 protected:
     const Kernel::DebugWatchpoint* HaltedWatchpoint() const override;
@@ -115,6 +117,10 @@ private:
     friend class DynarmicCallbacks64;
 
     void MakeJit(Common::PageTable* page_table, std::size_t address_space_bits);
+    static void OnBlockCompiled(void* user, u64 location, u64 guest_hash);
+
+    // Before m_jit: the JIT's callback points into it.
+    std::optional<JitPrewarm::Handle> m_prewarm{};
     std::optional<DynarmicCallbacks64> m_cb{};
     std::size_t m_core_index{};
 

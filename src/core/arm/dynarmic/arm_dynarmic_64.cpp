@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <iterator>
 #include <mutex>
@@ -506,6 +507,44 @@ void SyncJitPhaseHook() {
 
 } // namespace
 
+void ArmDynarmic64::OnBlockCompiled(void* user, u64 location, u64 guest_hash) {
+    static_cast<JitPrewarm::CoreState*>(user)->Record(location, guest_hash);
+}
+
+PrewarmState ArmDynarmic64::PrewarmIdle(const std::atomic<bool>& stop) {
+    if (!m_prewarm) {
+        return PrewarmState::Finished;
+    }
+    // The page of guest code the callbacks keep serves the translations of the guest: none of ours
+    // may read from it, and none of theirs may find a page of ours in it.
+    m_cb->last_code_addr = u64(-1);
+    const auto now_ms = [] {
+        return static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count());
+    };
+    const auto translate = [this](const JitPrewarm::Entry& entry) -> JitPrewarm::Outcome {
+        switch (m_jit->PrecompileBlock(entry.location, entry.guest_hash)) {
+        case Dynarmic::A64::PrecompileResult::Compiled:
+            return JitPrewarm::Outcome::Compiled;
+        case Dynarmic::A64::PrecompileResult::AlreadyCompiled:
+            return JitPrewarm::Outcome::Present;
+        case Dynarmic::A64::PrecompileResult::CodeMismatch:
+            return JitPrewarm::Outcome::Mismatch;
+        case Dynarmic::A64::PrecompileResult::NoSpace:
+            return JitPrewarm::Outcome::NoSpace;
+        case Dynarmic::A64::PrecompileResult::Busy:
+            return JitPrewarm::Outcome::Busy;
+        case Dynarmic::A64::PrecompileResult::Unsupported:
+            break;
+        }
+        return JitPrewarm::Outcome::Unsupported;
+    };
+    const JitPrewarm::RunResult result = m_prewarm->State().Run(stop, now_ms, translate);
+    m_cb->last_code_addr = u64(-1);
+    return result == JitPrewarm::RunResult::Finished ? PrewarmState::Finished : PrewarmState::Poll;
+}
+
 HaltReason ArmDynarmic64::RunThread(Kernel::KThread* thread) {
     SyncJitPhaseHook();
     if (VideoCommon::Nx2Spikes::AttributionEnabled()) {
@@ -556,6 +595,15 @@ ArmDynarmic64::ArmDynarmic64(System& system, bool uses_wall_clock, Kernel::KProc
     auto& page_table_impl = page_table.GetImpl();
     MakeJit(&page_table_impl, page_table.GetAddressSpaceWidth());
     SyncJitPhaseHook();
+#ifdef ARCHITECTURE_x86_64
+    // Only the x86-64 JIT translates ahead and reports the blocks it translates.
+    if (process->IsApplication()) {
+        m_prewarm = JitPrewarm::Attach(process->GetProgramId(), process, core_index);
+        if (m_prewarm) {
+            m_jit->SetBlockCompiledCallback(&OnBlockCompiled, &m_prewarm->State());
+        }
+    }
+#endif
     static std::once_flag polled;
     static std::once_flag bottleneck_source;
     std::call_once(polled, [] {

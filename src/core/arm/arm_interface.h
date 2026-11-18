@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <span>
 #include <string>
 #include <vector>
@@ -44,6 +45,12 @@ enum class Architecture {
     AArch32,
 };
 
+/// What a core's interface wants of its idle time (ArmInterface::PrewarmIdle).
+enum class PrewarmState : u8 {
+    Finished, ///< Nothing, now or later: the core just waits
+    Poll,     ///< Something may come up: ask again after a short wait
+};
+
 /// Generic ARMv8 CPU interface
 class ArmInterface {
 public:
@@ -55,6 +62,13 @@ public:
 
     // Perform any backend-specific initialization.
     virtual void Initialize() {}
+
+    // The core this interface belongs to has nothing to run (PhysicalCore::Idle, on the core's
+    // host thread, no guest code executing): translate code ahead of the guest until `stop` is set
+    // or nothing can be done now. Returns at once when the backend has nothing to do.
+    virtual PrewarmState PrewarmIdle(const std::atomic<bool>& stop) {
+        return PrewarmState::Finished;
+    }
 
     // Runs the CPU until an event happens.
     virtual HaltReason RunThread(Kernel::KThread* thread) = 0;
