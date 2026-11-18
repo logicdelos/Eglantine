@@ -13,6 +13,7 @@
 // The sections using code from Ryujinx are marked with a link to the original version
 
 #include <algorithm>
+#include <chrono>
 #include <array>
 #include <cstring>
 #include <numeric>
@@ -860,6 +861,46 @@ bool IsValidEntry(const Tegra::MemoryManager& gpu_memory, const TICEntry& config
     return gpu_memory.GpuToCpuAddress(address, guest_size_bytes).has_value();
 }
 
+namespace {
+// With attribution recording on, names a CPU texture conversion that took SlowTextureNs or more,
+// so a long Texture span can be tied to its image. One predictable branch when recording is off.
+constexpr s64 SlowTextureNs = 8'000'000;
+
+class SlowTextureLog {
+public:
+    SlowTextureLog(const char* what_, bool recording_, const ImageInfo& info_, u64 amount_)
+        : what{what_}, recording{recording_}, info{info_}, amount{amount_} {
+        if (recording) {
+            begin = std::chrono::steady_clock::now();
+        }
+    }
+    ~SlowTextureLog() {
+        if (!recording) {
+            return;
+        }
+        const s64 ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now() - begin)
+                           .count();
+        if (ns >= SlowTextureNs) {
+            LOG_INFO(HW_GPU,
+                     "Slow texture {}: {:.1f} ms, {} {} {}, {} levels, {} layers, block height {}, "
+                     "amount {}",
+                     what, static_cast<double>(ns) / 1e6, info.type, info.format, info.size,
+                     info.resources.levels, info.resources.layers, info.block.height, amount);
+        }
+    }
+    SlowTextureLog(const SlowTextureLog&) = delete;
+    SlowTextureLog& operator=(const SlowTextureLog&) = delete;
+
+private:
+    const char* what;
+    bool recording;
+    const ImageInfo& info;
+    u64 amount;
+    std::chrono::steady_clock::time_point begin{};
+};
+} // Anonymous namespace
+
 boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(Tegra::MemoryManager& gpu_memory,
                                                                    GPUVAddr gpu_addr,
                                                                    const ImageInfo& info,
@@ -869,6 +910,8 @@ boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(Tegra::Memory
     // CPU untiling (or the linear copy) of the guest texture into the upload buffer.
     const VideoCommon::Nx2Spikes::SpanScope unswizzle_span{VideoCommon::Nx2Spikes::Cause::Texture,
                                                            0, guest_size_bytes};
+    const SlowTextureLog slow_log{"unswizzle", unswizzle_span.Token().Valid(), info,
+                                  guest_size_bytes};
     const u32 bpp_log2 = BytesPerBlockLog2(info.format);
     const Extent2D tile_size = DefaultBlockSize(info.format);
     const Extent3D size = info.size;
@@ -1373,6 +1416,10 @@ void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8
             level_span.AddAmount(u64{copy.image_extent.width} * copy.image_extent.height *
                                  copy.image_extent.depth * copy.image_subresource.num_layers);
         }
+        const SlowTextureLog slow_level_log{"convert", level_span.Token().Valid(), info,
+                                            u64{copy.image_extent.width} * copy.image_extent.height *
+                                                copy.image_extent.depth *
+                                                copy.image_subresource.num_layers};
 
         if (astc && recompression_setting == Settings::AstcRecompression::Uncompressed) {
             Tegra::Texture::ASTC::Decompress(
