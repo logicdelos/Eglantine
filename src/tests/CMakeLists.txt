@@ -11,6 +11,7 @@ add_executable(tests
     core/nx2_frame_interval.cpp
     video_core/upload_batch.cpp
     video_core/texture_swizzle.cpp
+    video_core/texture_unswizzle_bands.cpp
     core/nx2_oot_time.cpp
     video_core/unbacked_image_policy.cpp
     core/builtin_patches.cpp
