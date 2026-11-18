@@ -180,6 +180,13 @@ private:
 Jit::Jit(UserConfig conf) : impl(std::make_unique<Jit::Impl>(this, conf)) {}
 Jit::~Jit() = default;
 
+// This backend does not compile ahead: PrecompileBlock reports it and the callback is never called.
+PrecompileResult Jit::PrecompileBlock(std::uint64_t, std::uint64_t) {
+    return PrecompileResult::Unsupported;
+}
+
+void Jit::SetBlockCompiledCallback(BlockCompiledCallback, void*) {}
+
 HaltReason Jit::Run() {
     return impl->Run();
 }

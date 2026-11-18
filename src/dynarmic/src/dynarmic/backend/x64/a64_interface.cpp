@@ -13,6 +13,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <optional>
 
 #include <boost/icl/interval_set.hpp>
 #include "common/assert.h"
@@ -62,6 +63,38 @@ static Optimization::PolyfillOptions GenPolyfillOptions(const BlockOfCode& code)
         .vector_multiply_widen = true,
     };
 }
+
+namespace {
+
+/// Hash of the instruction words one translation reads: a block compiled ahead of the guest is only
+/// kept when the guest code is still the code the block was recorded from. A word that cannot be
+/// read is folded as a value no word can have a reason to share and flagged: such a block is
+/// neither recorded nor accepted.
+struct CodeFold {
+    static constexpr u64 Seed = 0xcbf29ce484222325ULL;
+    static constexpr u64 Unreadable = 0x9e3779b97f4a7c15ULL;
+
+    u64 hash = Seed;
+    bool unreadable = false;
+
+    void Add(u64 word) {
+        hash = (hash ^ word) * 0x100000001b3ULL;
+        hash ^= hash >> 29;
+    }
+
+    std::optional<u32> Read(A64::UserCallbacks* callbacks, u64 vaddr) {
+        const std::optional<u32> word = callbacks->MemoryReadCode(vaddr);
+        if (word) {
+            Add(*word);
+        } else {
+            unreadable = true;
+            Add(Unreadable);
+        }
+        return word;
+    }
+};
+
+} // namespace
 
 struct Jit::Impl final {
 public:
@@ -274,7 +307,8 @@ private:
         if (phase_hook) {
             phase_hook(JitPhase::MemoryCommit, to_ns(commit_start), to_ns(compile_start));
         }
-        const auto get_code = [this](u64 vaddr) { return conf.callbacks->MemoryReadCode(vaddr); };
+        CodeFold fold;
+        const auto get_code = [this, &fold](u64 vaddr) { return fold.Read(conf.callbacks, vaddr); };
         // LocationDescriptor ctor() does important ops (like tflags) do not skip
         auto const arch_descriptor = A64::LocationDescriptor{descriptor};
         ir_block.Reset(arch_descriptor);
@@ -291,8 +325,52 @@ private:
         if (phase_hook) {
             phase_hook(JitPhase::Compile, to_ns(compile_start), to_ns(compile_end));
         }
+        if (block_compiled_callback && !fold.unreadable && !arch_descriptor.SingleStepping()) {
+            block_compiled_callback(block_compiled_user, descriptor.Value(), fold.hash);
+        }
         return entrypoint;
     }
+
+public:
+    PrecompileResult PrecompileBlock(u64 location, u64 expected_guest_hash) {
+        if (is_executing) {
+            return PrecompileResult::Busy;
+        }
+        // Pending invalidations first, so that a range another thread just invalidated is not
+        // compiled from, and later skipped by, a block that predates it.
+        PerformRequestedCacheInvalidation(static_cast<HaltReason>(Atomic::Load(&jit_state.halt_reason)));
+
+        const IR::LocationDescriptor descriptor{location};
+        if (emitter.GetBasicBlock(descriptor)) {
+            return PrecompileResult::AlreadyCompiled;
+        }
+        // Compiling ahead never evacuates the cache (GetBlock does when under 1 MiB is left): it
+        // would throw away blocks the guest is using, to keep ones it may not use.
+        constexpr size_t MINIMUM_REMAINING_PRECOMPILE_CODESIZE = 64 * 1024 * 1024;
+        if (block_of_code.SpaceRemaining() < MINIMUM_REMAINING_PRECOMPILE_CODESIZE) {
+            return PrecompileResult::NoSpace;
+        }
+        block_of_code.EnsureMemoryCommitted(1 * 1024 * 1024);
+
+        CodeFold fold;
+        const auto get_code = [this, &fold](u64 vaddr) { return fold.Read(conf.callbacks, vaddr); };
+        auto const arch_descriptor = A64::LocationDescriptor{descriptor};
+        ir_block.Reset(arch_descriptor);
+        A64::Translate(ir_block, arch_descriptor, get_code, {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
+        if (fold.unreadable || fold.hash != expected_guest_hash) {
+            return PrecompileResult::CodeMismatch;
+        }
+        Optimization::Optimize(ir_block, conf, polyfill_options);
+        emitter.Emit(ir_block);
+        return PrecompileResult::Compiled;
+    }
+
+    void SetBlockCompiledCallback(BlockCompiledCallback callback, void* user) {
+        block_compiled_callback = callback;
+        block_compiled_user = user;
+    }
+
+private:
 
     void PerformRequestedCacheInvalidation(HaltReason hr) {
         if (Has(hr, HaltReason::CacheInvalidation)) {
@@ -326,12 +404,22 @@ private:
     bool invalidate_entire_cache = false;
     boost::icl::interval_set<u64> invalid_cache_ranges;
     std::mutex invalidation_mutex;
+    BlockCompiledCallback block_compiled_callback = nullptr;
+    void* block_compiled_user = nullptr;
 };
 
 Jit::Jit(UserConfig conf)
         : impl(std::make_unique<Jit::Impl>(this, conf)) {}
 
 Jit::~Jit() = default;
+
+PrecompileResult Jit::PrecompileBlock(u64 location, u64 expected_guest_hash) {
+    return impl->PrecompileBlock(location, expected_guest_hash);
+}
+
+void Jit::SetBlockCompiledCallback(BlockCompiledCallback callback, void* user) {
+    impl->SetBlockCompiledCallback(callback, user);
+}
 
 HaltReason Jit::Run() {
     return impl->Run();

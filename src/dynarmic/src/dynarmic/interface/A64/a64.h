@@ -21,6 +21,22 @@
 namespace Dynarmic {
 namespace A64 {
 
+/// What Jit::PrecompileBlock did.
+enum class PrecompileResult : std::uint8_t {
+    Compiled,        ///< The block was translated and is now in the code cache.
+    AlreadyCompiled, ///< The block was in the code cache; nothing was done.
+    CodeMismatch,    ///< The guest code is not what the caller expected (or unreadable); nothing was compiled.
+    NoSpace,         ///< The code cache is too full to compile ahead without evicting; nothing was done.
+    Busy,            ///< The Jit is executing; nothing was done.
+    Unsupported,     ///< This backend cannot compile ahead.
+};
+
+/// Called once for every block the Jit compiled because the guest reached it (not for blocks made by
+/// PrecompileBlock), on the compiling thread, after the block is in the code cache. location is the
+/// value PrecompileBlock takes; guest_hash is the hash of the instruction words the translator read
+/// (see PrecompileBlock). Must not throw, block or call back into the Jit.
+using BlockCompiledCallback = void (*)(void* user, std::uint64_t location, std::uint64_t guest_hash);
+
 class Jit final {
 public:
     explicit Jit(UserConfig conf);
@@ -121,6 +137,24 @@ public:
      * i.e.: We're in a callback.
      */
     bool IsExecuting() const;
+
+    /**
+     * Compiles the block at `location` (the unique value of an A64 location descriptor: pc, FPCR
+     * bits and the single-step flag) before the guest reaches it. Must be called on the thread that
+     * calls Run, while Run is not executing; returns Busy otherwise. The block is translated from
+     * the guest memory as it is now, by the same path a block the guest reaches takes, and is only
+     * kept when the hash of the instruction words the translator read equals `expected_guest_hash`
+     * (the value BlockCompiledCallback was given for it): a changed or unreadable word gives
+     * CodeMismatch. Pending cache invalidations are applied first and invalidate a precompiled block
+     * like any other. Never clears the code cache to make room (NoSpace), and does not count in
+     * g_jit_stats or call g_jit_phase_hook: it is not time the guest waited for.
+     */
+    PrecompileResult PrecompileBlock(std::uint64_t location, std::uint64_t expected_guest_hash);
+
+    /// Sets the callback described at BlockCompiledCallback (null: none). Call it before Run, from
+    /// the thread that calls Run. Only the x86-64 backend compiles ahead and reports blocks; the
+    /// others return Unsupported from PrecompileBlock and never call the callback.
+    void SetBlockCompiledCallback(BlockCompiledCallback callback, void* user);
 
     /// @brief Disassemble the instructions following the current pc and return
     /// the resulting instructions as a vector of their string representations.
