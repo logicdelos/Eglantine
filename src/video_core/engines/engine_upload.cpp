@@ -37,37 +37,39 @@ void State::ProcessExec(const bool is_linear_) {
 }
 
 void State::ProcessData(const u32 data, const bool is_last_call) {
-    const u32 sub_copy_size = (std::min)(4U, copy_size - write_offset);
-    std::memcpy(&inner_buffer[write_offset], &data, sub_copy_size);
-    write_offset += sub_copy_size;
-    if (!is_last_call) {
-        return;
-    }
-    if (native_partial && is_linear && regs.line_count == 1) {
-        const u32 count = write_offset - flushed_offset;
-        if (count) {
-            rasterizer->AccelerateInlineToMemory(regs.dest.Address() + flushed_offset, count,
-                std::span<const u8>{inner_buffer.data() + flushed_offset, count});
-            flushed_offset = write_offset;
-        }
-        return;
-    }
-    ProcessData(inner_buffer);
+    Receive({reinterpret_cast<const u8*>(&data), sizeof(data)}, is_last_call);
 }
 
 void State::ProcessData(const u32* data, size_t num_data) {
-    if (native_partial && is_linear && regs.line_count == 1) {
-        const auto count = std::min<size_t>(num_data * sizeof(u32), copy_size - write_offset);
-        if (count) {
-            rasterizer->AccelerateInlineToMemory(regs.dest.Address() + write_offset, count,
-                std::span<const u8>{reinterpret_cast<const u8*>(data), count});
-            write_offset += static_cast<u32>(count);
-            flushed_offset = write_offset;
-        }
+    Receive({reinterpret_cast<const u8*>(data), num_data * sizeof(u32)}, true);
+}
+
+void State::Receive(std::span<const u8> data, bool is_last_call) {
+    if (!HasPendingData()) {
         return;
     }
-    std::span<const u8> read_buffer(reinterpret_cast<const u8*>(data), num_data * sizeof(u32));
-    ProcessData(read_buffer);
+    data = data.first(std::min<size_t>(data.size(), copy_size - write_offset));
+    const bool partial = native_partial && is_linear && regs.line_count == 1;
+    const u32 end = write_offset + static_cast<u32>(data.size());
+    const bool flush = is_last_call && (partial || end == copy_size);
+    // A complete bulk packet (or a native linear prefix) needs no staging copy.
+    if (!flush || write_offset != flushed_offset) {
+        if (!data.empty()) {
+            std::memcpy(inner_buffer.data() + write_offset, data.data(), data.size());
+        }
+        data = std::span<const u8>{inner_buffer}.subspan(flushed_offset, end - flushed_offset);
+    }
+    write_offset = end;
+    if (!flush || data.empty()) {
+        return;
+    }
+    if (partial) {
+        rasterizer->AccelerateInlineToMemory(regs.dest.Address() + flushed_offset,
+                                             static_cast<u32>(data.size()), data);
+    } else {
+        ProcessData(data);
+    }
+    flushed_offset = end;
 }
 
 void State::ProcessData(std::span<const u8> read_buffer) {

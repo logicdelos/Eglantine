@@ -136,6 +136,7 @@ add_executable(tests
     video_core/shader_attributes.cpp
     video_core/indirect_reset.cpp
     video_core/ocarina_upscale.cpp
+    video_core/compute_clean_cut.cpp
     input_common/calibration_configuration_job.cpp
 )
 
@@ -162,6 +163,15 @@ endif()
 target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain Threads::Threads)
 
 add_test(NAME tests COMMAND tests)
+
+find_package(Python3 3.8 QUIET COMPONENTS Interpreter)
+if (Python3_Interpreter_FOUND)
+    set(replay_tool "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/replay_qualify")
+    add_test(NAME replay_qualify_controls COMMAND Python3::Interpreter -I -S -B
+             "${replay_tool}/replay_qualify.py" --selftest)
+    add_test(NAME replay_qualify_fixture COMMAND Python3::Interpreter -I -S -B
+             "${replay_tool}/replay_qualify.py" --verify "${replay_tool}/fixtures/synthetic_scene")
+endif()
 
 # needed for vma
 if(NOT MSVC)

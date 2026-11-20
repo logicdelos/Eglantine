@@ -1,0 +1,2 @@
+{"frame_id": 1, "height": 32, "identical": true, "live_checksum": "3bd127a8070fb5ac", "live_png": "live_00000001.png", "replay_checksum": "3bd127a8070fb5ac", "replay_ns": 0, "replay_png": "replay_00000001.png", "schema": 1, "semantic_mismatches": 0, "width": 32}
+{"frame_id": 2, "height": 32, "identical": true, "live_checksum": "78041f93c51e754c", "live_png": "live_00000002.png", "replay_checksum": "78041f93c51e754c", "replay_ns": 0, "replay_png": "replay_00000002.png", "schema": 1, "semantic_mismatches": 0, "width": 32}

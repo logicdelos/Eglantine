@@ -81,7 +81,12 @@ public:
         return copy_size;
     }
 
+    [[nodiscard]] bool HasPendingData() const noexcept {
+        return flushed_offset < copy_size;
+    }
+
 private:
+    void Receive(std::span<const u8> data, bool is_last_call);
     void ProcessData(std::span<const u8> read_buffer);
 
     bool native_partial{};

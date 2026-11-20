@@ -1,0 +1,116 @@
+{
+  "accounting": {
+    "closed_frame_calls": 10,
+    "exact": true,
+    "executed_total": 12,
+    "late_calls": 0,
+    "mismatched_functions": 0,
+    "open_tail_calls": 0,
+    "startup_calls": 2
+  },
+  "audit": {
+    "enabled": true,
+    "known_entries": 12,
+    "mismatched_calls": 0,
+    "region_known": true,
+    "unknown_calls": 0,
+    "unknown_overflow": 0,
+    "unknown_targets": 0
+  },
+  "bootstrap": {
+    "bootstrap_calls": 4,
+    "sites": 1
+  },
+  "coverage": {
+    "failed": [],
+    "instrumented_target_share": 1.0,
+    "resolved_target_share": 1.0
+  },
+  "coverage_complete": true,
+  "errors": {
+    "ambiguous_pending": 0,
+    "code_changes": 0,
+    "epoch_reservation_timeouts": 0,
+    "guest_thread_overflow": 0,
+    "id_duplicates": 0,
+    "id_gaps": 0,
+    "late_calls": 0,
+    "late_modules": 0,
+    "name_read_failures": 0,
+    "pending_overflow": 0,
+    "probe_table_full": 0,
+    "rendezvous_timeouts": 0,
+    "returns_not_observed": 0,
+    "role_conflicts": 0,
+    "stream_overflow": 0,
+    "target_table_full": 0,
+    "unaudited_entries": 0,
+    "unknown_overflow": 0,
+    "unmatched_returns": 0
+  },
+  "final": true,
+  "frames": {
+    "closed": 2,
+    "presents": 3,
+    "presents_by_path": {
+      "buffer_queue": 0,
+      "nx2_vi2": 3
+    },
+    "streams": [
+      {
+        "ambiguous": false,
+        "path": "nx2_vi2",
+        "presents": 3,
+        "stream": "0x1",
+        "token": "0x1",
+        "tokens": 1
+      }
+    ]
+  },
+  "functions": [
+    {
+      "acked": true,
+      "audited_entries": 6,
+      "calls": 6,
+      "frame_calls": 5,
+      "late_calls": 0,
+      "open_tail_calls": 0,
+      "provenance": [
+        "resolver"
+      ],
+      "startup_calls": 1
+    },
+    {
+      "acked": true,
+      "audited_entries": 6,
+      "calls": 6,
+      "frame_calls": 5,
+      "late_calls": 0,
+      "open_tail_calls": 0,
+      "provenance": [
+        "audit"
+      ],
+      "startup_calls": 1
+    }
+  ],
+  "guest_threads": [
+    {
+      "calls": 12,
+      "id": 1
+    }
+  ],
+  "kind": "nvn_call_census",
+  "provenance": {
+    "min_frames": 2
+  },
+  "replay_capture": {
+    "detail": "",
+    "failed": false
+  },
+  "run_complete": true,
+  "schema": 2,
+  "stop": {
+    "clean": true,
+    "reason": "frame_limit"
+  }
+}

@@ -1,0 +1,18 @@
+{"classification": "supported", "detail": "pushbuffer list queued on channel 1", "fence_id": 100, "frame_id": 1, "kind": "submit", "reconciled": true, "seq": 1, "syncpoint_value": 10}
+{"classification": "supported", "detail": "DmaPusher consumed 128 pushbuffer words", "fence_id": 100, "frame_id": 1, "kind": "consume", "reconciled": true, "seq": 2, "syncpoint_value": 10}
+{"classification": "supported", "detail": "Maxwell3D indexed draw 64 vertices", "fence_id": 100, "frame_id": 1, "kind": "draw", "reconciled": true, "seq": 3, "syncpoint_value": 10}
+{"classification": "fallback", "detail": "native compute dispatch routed via fallback", "fence_id": 100, "frame_id": 1, "kind": "compute_dispatch", "reconciled": true, "seq": 4, "syncpoint_value": 10}
+{"classification": "supported", "detail": "syncpoint incremented to 10", "fence_id": 100, "frame_id": 1, "kind": "syncpoint_increment", "reconciled": true, "seq": 5, "syncpoint_value": 10}
+{"classification": "supported", "detail": "host fence 100 signaled", "fence_id": 100, "frame_id": 1, "kind": "fence_signal", "reconciled": true, "seq": 6, "syncpoint_value": 10}
+{"classification": "unobservable", "detail": "transient scratch unmapped before read", "fence_id": 100, "frame_id": 1, "kind": "readback_visibility", "reconciled": true, "seq": 7, "syncpoint_value": 10}
+{"classification": "unsupported", "detail": "debug marker method retired as no-op", "fence_id": 100, "frame_id": 1, "kind": "draw", "reconciled": true, "seq": 8, "syncpoint_value": 10}
+{"classification": "supported", "detail": "offscreen composite emitted RGBA8 frame", "fence_id": 100, "frame_id": 1, "kind": "present_compose", "reconciled": true, "seq": 9, "syncpoint_value": 10}
+{"classification": "supported", "detail": "pushbuffer list queued on channel 1", "fence_id": 200, "frame_id": 2, "kind": "submit", "reconciled": true, "seq": 1, "syncpoint_value": 20}
+{"classification": "supported", "detail": "DmaPusher consumed 128 pushbuffer words", "fence_id": 200, "frame_id": 2, "kind": "consume", "reconciled": true, "seq": 2, "syncpoint_value": 20}
+{"classification": "supported", "detail": "Maxwell3D indexed draw 64 vertices", "fence_id": 200, "frame_id": 2, "kind": "draw", "reconciled": true, "seq": 3, "syncpoint_value": 20}
+{"classification": "fallback", "detail": "native compute dispatch routed via fallback", "fence_id": 200, "frame_id": 2, "kind": "compute_dispatch", "reconciled": true, "seq": 4, "syncpoint_value": 20}
+{"classification": "supported", "detail": "syncpoint incremented to 20", "fence_id": 200, "frame_id": 2, "kind": "syncpoint_increment", "reconciled": true, "seq": 5, "syncpoint_value": 20}
+{"classification": "supported", "detail": "host fence 200 signaled", "fence_id": 200, "frame_id": 2, "kind": "fence_signal", "reconciled": true, "seq": 6, "syncpoint_value": 20}
+{"classification": "unobservable", "detail": "transient scratch unmapped before read", "fence_id": 200, "frame_id": 2, "kind": "readback_visibility", "reconciled": true, "seq": 7, "syncpoint_value": 20}
+{"classification": "unsupported", "detail": "debug marker method retired as no-op", "fence_id": 200, "frame_id": 2, "kind": "draw", "reconciled": true, "seq": 8, "syncpoint_value": 20}
+{"classification": "supported", "detail": "offscreen composite emitted RGBA8 frame", "fence_id": 200, "frame_id": 2, "kind": "present_compose", "reconciled": true, "seq": 9, "syncpoint_value": 20}
