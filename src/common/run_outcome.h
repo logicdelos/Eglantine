@@ -35,6 +35,7 @@ enum class Reason : u32 {
     HostCrash,     // the emulator itself crashed (written by the crash handler, never requested)
     BadArguments,  // set by the frontend, never requested
     ReportIoError, // set by the frontend, never requested
+    CaptureFailed, // --capture-frames ended without a complete capture; replaces a clean exit only
 };
 
 /// The bounds of a run; a missing member is unbounded.
@@ -89,6 +90,17 @@ void NoteFrame() noexcept;
 [[nodiscard]] Reason CurrentReason() noexcept;
 /// The detail given with the reason on record.
 [[nodiscard]] std::string Detail();
+
+/// The reason on record together with the one a failed capture replaced.
+struct Recorded {
+    Reason reason = Reason::None;
+    /// What CaptureFailed replaced: a clean exit, or None when no stop was on record yet. None for
+    /// every other reason on record.
+    Reason displaced = Reason::None;
+};
+/// Both, read together. A consumer that judges how the run itself ended (not the capture) reads
+/// `displaced` when `reason` is CaptureFailed.
+[[nodiscard]] Recorded CurrentRecord() noexcept;
 
 /// Makes SIGINT and SIGTERM (and Ctrl+Break on Windows) request a stop. The handlers only set a
 /// flag, which StopRequested converts. Call after anything that installs handlers of its own.

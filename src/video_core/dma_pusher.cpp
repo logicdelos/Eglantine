@@ -33,6 +33,8 @@
 #include "video_core/nx2_method_census.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/rasterizer_interface.h"
+#include "video_core/replay/memory_capture.h"
+#include "video_core/replay/run_state.h"
 
 namespace Tegra {
 
@@ -70,7 +72,7 @@ DmaPusher::~DmaPusher() = default;
 void DmaPusher::DispatchCalls() {
     // The sub-index is kept: a channel suspended on a semaphore resumes inside its command list.
     dma_state.is_last_call = true;
-    while (system.IsPoweredOn()) {
+    while (VideoCore::Replay::GpuWorkRunning(system.IsPoweredOn())) {
         if (!Step()) {
             break;
         }
@@ -105,7 +107,8 @@ bool DmaPusher::Step() {
     // as this frame's commands (methods on unbound subchannels, garbage QMDs, then a channel
     // waiting forever on a release it never got). The acquire is released now, so the commands
     // are written and the memory not yet reused: copy them here. EDEN_NX2_RESNAPSHOT=0: off.
-    if (ResnapshotEnabled() && suspensions.load(std::memory_order_relaxed) != suspensions_before) {
+    if (ResnapshotEnabled() && !VideoCore::Replay::ReplayGpuRunning() &&
+        suspensions.load(std::memory_order_relaxed) != suspensions_before) {
         const u64 now = suspensions.load(std::memory_order_acquire);
         for (CommandList& list : dma_pushbuffer) {
             if (!list.submitted_offsets.empty()) {
@@ -269,17 +272,22 @@ bool DmaPusher::Step() {
         // safe read below would flush (with the split, the front can't tell: it reads memory
         // unflushed anyway). Entries on pages the GPU writes (culling) always take the flushing
         // read: their words at submit time are an older frame's.
-        const bool submitted = command_resume_offset < header.size &&
+        // Replay: the recorded words are the submitted data, whatever happened to the channel. A
+        // piece the pusher already consumed whole (it stopped on an acquire after its last word)
+        // has nothing left to run and is not read from memory either.
+        const bool replaying = VideoCore::Replay::ReplayGpuRunning();
+        const bool submitted = (replaying || command_resume_offset < header.size) &&
                                dma_pushbuffer_subindex < command_list.submitted_offsets.size() &&
-                               (command_list.snapshot_suspensions & 1) == 0 &&
-                               command_list.snapshot_suspensions ==
-                                   suspensions.load(std::memory_order_acquire) &&
-                               !std::ranges::binary_search(
-                                   command_list.deferred_entries,
-                                   static_cast<u32>(dma_pushbuffer_subindex)) &&
-                               !gpu_written &&
-                               !(use_safe && memory_manager.IsMemoryDirty(dma_state.dma_get,
-                                                                          header.size * sizeof(u32)));
+                               (replaying ||
+                                ((command_list.snapshot_suspensions & 1) == 0 &&
+                                 command_list.snapshot_suspensions ==
+                                     suspensions.load(std::memory_order_acquire) &&
+                                 !std::ranges::binary_search(
+                                     command_list.deferred_entries,
+                                     static_cast<u32>(dma_pushbuffer_subindex)) &&
+                                 !gpu_written &&
+                                 !(use_safe && memory_manager.IsMemoryDirty(
+                                                   dma_state.dma_get, header.size * sizeof(u32)))));
         // Off by default: the check below reads memory and allocates for each entry it checks.
         // EDEN_NX2_PERF_VERIFY=1 turns it on.
         static const bool check_parsed_entries = VideoCommon::Nx2Perf::Verify();
@@ -447,6 +455,27 @@ const u8* DmaPusher::CensusSlotsFor(Engines::EngineTypes type) {
 }
 
 size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset) {
+    const size_t consumed = ProcessCommandsImpl(commands, word_offset);
+    if (consumed != 0 && VideoCore::Replay::ReplayGpuRunning()) {
+        VideoCore::Replay::ObserveReplayEffect({VideoCore::Replay::EffectKind::Consume,
+            static_cast<u32>(channel_state.bind_id), consumed, true});
+    }
+    if (VideoCore::Replay::CaptureActive() && !dma_pushbuffer.empty()) {
+        // Prefetch lists have no guest address; an entry is named by its index and address.
+        const CommandList& list = dma_pushbuffer.front();
+        const bool prefetch = !list.prefetch_command_list.empty();
+        static_assert(sizeof(CommandHeader) == sizeof(u32));
+        VideoCore::Replay::NoteConsume(
+            channel_state.bind_id, prefetch ? 0U : static_cast<u32>(dma_pushbuffer_subindex),
+            prefetch ? u64{0} : u64{dma_state.dma_get}, static_cast<u32>(word_offset),
+            consumed == commands.size() ? VideoCore::Replay::ConsumeEntryEnd : 0U,
+            static_cast<u32>(suspensions.load(std::memory_order_relaxed)),
+            std::span<const u32>{reinterpret_cast<const u32*>(commands.data()), consumed});
+    }
+    return consumed;
+}
+
+size_t DmaPusher::ProcessCommandsImpl(std::span<const CommandHeader> commands, size_t word_offset) {
     for (size_t index = 0; index < commands.size();) {
         // Data word of methods command
         if (dma_state.method_count && dma_state.non_incrementing) {
@@ -1068,7 +1097,10 @@ void DmaPusher::DumpCurrentEntry(const char* reason) {
             for (u64 j = word; j < std::min<u64>(header.size, word + 8); ++j) {
                 const GPUVAddr address = header.addr + j * sizeof(u32);
                 const u32 gpu_value = memory_manager.Read<u32>(address);
-                const u32 cpu_value = system.ApplicationMemory().Read32(address);
+                // A replay has no guest process to read; the column then matches by definition.
+                const u32 cpu_value = VideoCore::Replay::ReplayGpuRunning()
+                                          ? gpu_value
+                                          : system.ApplicationMemory().Read32(address);
                 gpu_line += fmt::format(" {:08x}", gpu_value);
                 cpu_line += gpu_value == cpu_value ? std::string(" ........")
                                                    : fmt::format(" {:08x}", cpu_value);

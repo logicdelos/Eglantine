@@ -48,6 +48,7 @@
 #include "core/file_sys/vfs/vfs_concat.h"
 #include "core/file_sys/vfs/vfs_real.h"
 #include "core/gpu_dirty_memory_manager.h"
+#include "core/hle/guest_call/nvn_census.h"
 #include "core/hle/kernel/k_memory_manager.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_resource_limit.h"
@@ -434,6 +435,47 @@ struct System::Impl {
         return SystemResultStatus::Success;
     }
 
+    // The kernel without a process: its memory layout (and the slab heaps and page table heap in
+    // the bottom of the device memory) must exist before the replay allocates GPU backing above
+    // it. System::Initialize only configures the kernel; the game path initializes it in Load.
+    void InitializeReplayKernel(System& system) {
+        InitializeKernel(system);
+    }
+
+    // The same order as ShutdownMainProcess for what the kernel leaves outside itself: the sleep
+    // counters are linked into a registry that points into the kernel threads' slab storage (the
+    // host thread's own counter sits behind them), and the preemption event is scheduled in the
+    // core timing. Both have to go before the kernel and its slab heaps do.
+    void ShutdownReplayKernel() {
+        kernel.CloseServices();
+        kernel.ShutdownCores();
+        Nx2Bottleneck::ClearSleepThreadCounters();
+        core_timing.ClearPendingEvents();
+        kernel.Shutdown();
+    }
+
+    bool SetupForReplay(System& system, Frontend::EmuWindow& emu_window, std::string& error) {
+        InitializeReplayKernel(system);
+        host1x_core.emplace(system);
+        VideoCore::CreateReplayGPU(gpu_core, emu_window, system);
+        if (!gpu_core) {
+            host1x_core.reset();
+            ShutdownReplayKernel();
+            error = "the replay GPU could not be created (the Vulkan renderer is required)";
+            return false;
+        }
+        return true;
+    }
+
+    void TeardownReplay() {
+        if (gpu_core) {
+            gpu_core->NotifyShutdown();
+        }
+        gpu_core.reset();
+        host1x_core.reset();
+        ShutdownReplayKernel();
+    }
+
     SystemResultStatus Load(System& system, Frontend::EmuWindow& emu_window, const std::string& filepath, Service::AM::FrontendAppletParameters& params) {
         if (params.launch_type == Service::AM::LaunchType::FrontendInitiated) {
             fs_controller.InitTempStorage();
@@ -536,6 +578,9 @@ struct System::Impl {
             cheat_engine->Initialize();
         }
 
+        // Probes go in before the first guest instruction runs (EDEN_NX2_NVN_CENSUS; a no-op when unset).
+        NvnCensus::Start(*process->GetHandle(), params.program_id);
+
         // Register with applet manager
         // All threads are started, begin main process execution, now that we're in the clear
         applet_manager.CreateAndInsertByFrontendAppletParameters(std::move(process), params);
@@ -607,6 +652,7 @@ struct System::Impl {
         kernel.SuspendEmulation(true);
         kernel.CloseServices();
         kernel.ShutdownCores();
+        NvnCensus::Stop();
         Nx2Bottleneck::ClearSleepThreadCounters();
         Service::LogUnimplementedCommandCounts();
         services.reset();
@@ -815,6 +861,22 @@ void System::InitializeDebugger() {
 SystemResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::string& filepath,
                                 Service::AM::FrontendAppletParameters& params) {
     return impl->Load(*this, emu_window, filepath, params);
+}
+
+bool System::SetupForReplay(Frontend::EmuWindow& emu_window, std::string& error) {
+    return impl->SetupForReplay(*this, emu_window, error);
+}
+
+void System::TeardownReplay() {
+    impl->TeardownReplay();
+}
+
+void System::InitializeReplayKernel() {
+    impl->InitializeReplayKernel(*this);
+}
+
+void System::ShutdownReplayKernel() {
+    impl->ShutdownReplayKernel();
 }
 
 bool System::IsPoweredOn() const {

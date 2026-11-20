@@ -24,6 +24,8 @@
 #include <optional>
 #include <regex>
 #include <string>
+#include <thread>
+#include "common/frame_timing_log.h"
 #include "common/fs/fs_util.h"
 #include "common/settings_enums.h"
 #include "core/launch_params.h"
@@ -57,6 +59,7 @@
 #include "core/file_sys/vfs/vfs_real.h"
 #include "core/hle/service/am/applet_manager.h"
 #include "core/hle/service/filesystem/filesystem.h"
+#include "core/hle/guest_call/nvn_census.h"
 #include "core/loader/loader.h"
 #include "frontend_common/config.h"
 #include "input_common/drivers/keyboard.h"
@@ -64,13 +67,17 @@
 #include "network/network.h"
 #include "sdl_config.h"
 #include "video_core/gpu.h"
+#include "video_core/replay/options.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
 #include "video_core/shader_warm/shader_warm_builder.h"
+#include "video_core/replay/capture.h"
 #include "yuzu_cmd/cli_settings.h"
 #include "yuzu_cmd/control_commands.h"
 #include "yuzu_cmd/run_control.h"
+#include "yuzu_cmd/replay_runner.h"
+#include "yuzu_cmd/replay_seams.h"
 #include "yuzu_cmd/run_report.h"
 #include "yuzu_cmd/user_dir.h"
 #include "yuzu_cmd/version_info.h"
@@ -229,6 +236,40 @@ static std::string startup_detail;
 static bool attribution_session_started = false;
 namespace Spikes = VideoCommon::Nx2Spikes;
 
+// Frames a capture records before its first selected frame; a replay runs them without comparing.
+static constexpr u64 CapturePrerollFrames = 2;
+// --capture was begun; SDL_AppIterate ends the run once the capture has finished by itself.
+static bool capture_begun = false;
+// --frame-times was started; it is stopped before the report is published.
+static bool frame_timing_started = false;
+
+// True when the run ended on its own terms (a limit, the game or the user leaving).
+static bool RunEndedNormally() {
+    using Common::RunOutcome::Reason;
+    switch (Common::RunOutcome::CurrentReason()) {
+    case Reason::None:
+    case Reason::GuestExit:
+    case Reason::WindowClosed:
+    case Reason::Requested:
+    case Reason::FrameLimit:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void StopFrameTiming(bool run_ended_normally) {
+    if (!frame_timing_started) {
+        return;
+    }
+    frame_timing_started = false;
+    std::string error;
+    void(Common::FrameTiming::Stop(run_ended_normally, error));
+    if (!error.empty()) {
+        LOG_WARNING(Frontend, "Frame timing log: {}", error);
+    }
+}
+
 // Called by the run clock's thread when a stop was requested and the shutdown has not finished
 // within Common::RunOutcome::StopGraceSeconds: writes the report with what is known and ends the
 // process without waiting for the rest.
@@ -237,6 +278,13 @@ static void ForceFinish() noexcept {
     Reason reason = Common::RunOutcome::CurrentReason();
     if (reason == Reason::None) {
         reason = Reason::StartupError;
+    }
+    // The log is written before the report so the report's frame_timing summary matches the file;
+    // a log another thread is already writing, or one that was never started, is left alone.
+    try {
+        std::string log_error;
+        void(Common::FrameTiming::StopIncomplete(log_error));
+    } catch (...) {
     }
     int code = Common::RunOutcome::ExitCode(reason);
     const std::string detail =
@@ -649,6 +697,14 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     if (argument_error.empty() && unattended && !lp.unknown_option.empty()) {
         argument_error = "unknown option, or an option without its argument: " + lp.unknown_option;
     }
+    if (argument_error.empty()) {
+        const VideoCore::Replay::RunContext context{.has_game_path = !lp.filepath.empty(),
+                                                    .unattended = unattended};
+        std::string options_error;
+        if (!VideoCore::Replay::ValidateOptions(lp.replay, context, options_error)) {
+            argument_error = std::move(options_error);
+        }
+    }
     // --set: every name and value is checked before anything starts; the settings change below.
     std::vector<CliSettings::Resolved> setting_overrides;
     if (argument_error.empty()) {
@@ -692,6 +748,7 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         fmt::print("{}", Settings::Baseline::PrintableText());
         return SDL_APP_SUCCESS;
     }
+    VideoCore::Replay::SetActiveOptions(lp.replay);
     if (unattended) {
         // SDL turns SIGINT and SIGTERM into a closed window; this run tells them apart.
         SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
@@ -853,10 +910,71 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         Common::RunOutcome::InstallSignalHandlers();
     }
 
+    // --frame-times: the raw per-frame log of this run (a replay's frames or a game's presents).
+    if (!lp.replay.frame_times_path.empty()) {
+        std::string timing_error;
+        const Common::FrameTiming::Config timing{
+            .path = lp.replay.frame_times_path,
+            .source = lp.replay.ReplayRequested() ? Common::FrameTiming::Source::ReplayFrame
+                                                  : Common::FrameTiming::Source::HostPresent,
+        };
+        if (!VideoCore::Replay::CheckPrivateOutput(timing.path, VideoCore::Replay::OutputKind::File,
+                                                   timing_error) ||
+            !Common::FrameTiming::Start(timing, timing_error)) {
+            fmt::print(stderr, "--frame-times: {}\n", timing_error);
+            startup_reason = Common::RunOutcome::Reason::BadArguments;
+            startup_detail = "--frame-times: " + timing_error;
+            return SDL_APP_FAILURE;
+        }
+        frame_timing_started = true;
+    }
+    // --nvn-census: the census of this run replaces the environment's (it starts with the guest).
+    if (lp.replay.CensusRequested()) {
+        std::string census_error;
+        if (!VideoCore::Replay::CheckPrivateOutput(lp.replay.census_path,
+                                                   VideoCore::Replay::OutputKind::File, census_error)) {
+            fmt::print(stderr, "--nvn-census: {}\n", census_error);
+            startup_reason = Common::RunOutcome::Reason::BadArguments;
+            startup_detail = "--nvn-census: " + census_error;
+            return SDL_APP_FAILURE;
+        }
+        Core::NvnCensus::Configure({.out = lp.replay.census_path, .audit = lp.replay.census_audit});
+    }
+
 #ifdef _WIN32
     Common::Windows::SetCurrentTimerResolutionToMaximum();
     state->system.CoreTiming().SetTimerResolutionNs(Common::Windows::GetCurrentTimerResolution());
 #endif
+
+    // --replay: the capture stands in for the game. Nothing below loads content or starts a guest
+    // process; the run ends here and the usual unattended end (report, exit code) follows.
+    if (lp.replay.ReplayRequested()) {
+        ReplayRunner::RegisterHost();
+        std::atomic<bool> replay_stop{false};
+        std::jthread stop_watcher{[&replay_stop](std::stop_token token) {
+            while (!token.stop_requested() && !Common::RunOutcome::StopRequested()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+            if (Common::RunOutcome::StopRequested()) {
+                replay_stop.store(true);
+            }
+        }};
+        const ReplayRunner::Outcome outcome =
+            ReplayRunner::Run(state->system, *state->emu_window, lp.replay,
+                              lp.run_frames.value_or(0), replay_stop);
+        stop_watcher.request_stop();
+        stop_watcher.join();
+        using Common::RunOutcome::Reason;
+        StopFrameTiming(outcome.reason == Reason::FrameLimit);
+        if (outcome.reason == Reason::BadArguments || outcome.reason == Reason::ReportIoError) {
+            // Set by the frontend, never requested (Common::RunOutcome::Request).
+            startup_reason = outcome.reason;
+            startup_detail = outcome.detail;
+        } else {
+            Common::RunOutcome::Request(outcome.reason, outcome.detail);
+        }
+        return outcome.reason == Reason::FrameLimit ? SDL_APP_SUCCESS : SDL_APP_FAILURE;
+    }
 
     state->system.SetContentProvider(std::make_unique<FileSys::ContentProviderUnion>());
     state->system.SetFilesystem(std::make_shared<FileSys::RealVfsFilesystem>());
@@ -939,6 +1057,27 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
             LOG_ERROR(Network, "Could not access RoomMember");
             return SDL_APP_FAILURE;
         }
+    }
+
+    // --capture: begins before the GPU starts, so the selected frames cannot present before it
+    // is armed. SDL_AppIterate ends the run when the capture finishes by itself.
+    if (lp.replay.CaptureRequested()) {
+        const VideoCore::Replay::Options& replay = lp.replay;
+        VideoCore::Replay::CaptureConfig capture{
+            .path = replay.capture_path,
+            .first_frame = replay.capture_first_frame,
+            .frame_count = replay.capture_frame_count,
+            .preroll_frames = static_cast<u32>(std::min<u64>(replay.capture_first_frame - 1, CapturePrerollFrames)),
+            .title_id = state->system.GetApplicationProcessProgramID(),
+            .limits = {},
+        };
+        std::string capture_error;
+        if (!VideoCore::Replay::BeginCapture(state->system, capture, capture_error)) {
+            fmt::print(stderr, "--capture: {}\n", capture_error);
+            Common::RunOutcome::Request(Common::RunOutcome::Reason::CaptureFailed, capture_error);
+            return SDL_APP_FAILURE;
+        }
+        capture_begun = true;
     }
 
     // Core is loaded, start the GPU (makes the GPU contexts current to this thread)
@@ -1231,6 +1370,11 @@ extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
     if (Common::RunOutcome::StopRequested()) {
         return SDL_APP_SUCCESS;
     }
+    if (capture_begun && !VideoCore::Replay::CaptureActive()) {
+        // The capture finished or stopped by itself; its report says which.
+        Common::RunOutcome::Request(Common::RunOutcome::Reason::FrameLimit, "the capture ended");
+        return SDL_APP_SUCCESS;
+    }
     RunKeyScript(state->input_subsystem, state->system);
     if (state->control) {
         state->control->Poll();
@@ -1309,6 +1453,10 @@ extern "C" void SDL_AppQuit(void *appstate, SDL_AppResult result) {
     state->mcp_server.reset(); // stops serving before the system goes away
     state->mcp_host.reset();
 #endif
+    if (capture_begun) {
+        capture_begun = false;
+        VideoCore::Replay::EndCapture(RunEndedNormally());
+    }
     state->system.DetachDebugger();
     // SDL calls this even when SDL_AppInit never powered the system on (no ROM given, --help or
     // --version): the kernel is uninitialised then, and Pause()/ShutdownMainProcess() would
@@ -1327,6 +1475,7 @@ extern "C" void SDL_AppQuit(void *appstate, SDL_AppResult result) {
         // final snapshot. Not in Publish: a stuck shutdown publishes without it, incomplete.
         Spikes::EndSession();
     }
+    StopFrameTiming(RunEndedNormally());
     if (Common::RunOutcome::Active() || startup_reason != Common::RunOutcome::Reason::None) {
         const int code = EndUnattendedRun();
         if (code != (result == SDL_APP_FAILURE ? 1 : 0)) {

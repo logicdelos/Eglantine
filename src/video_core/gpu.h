@@ -180,6 +180,13 @@ public:
 
     void WaitForIdle();
 
+    /// Visits every channel in ascending channel id order (the replay capture's checkpoint cut:
+    /// its file must not depend on container order). Caller contract: the caller runs inside a
+    /// RunQuiesced function, so the GPU thread is between two command lists and no engine is in
+    /// use, and no guest thread allocates or releases a channel during the walk (channels are
+    /// created and destroyed only by the guest's nvdrv ioctls).
+    void ForEachChannel(const std::function<void(Control::ChannelState&)>& visit);
+
     /// Tick pending requests within the GPU.
     void TickWork();
 
@@ -230,7 +237,9 @@ public:
 
     void RendererFrameEndNotify();
 
-    void RequestComposite(std::vector<Tegra::FramebufferConfig>&& layers,
+    /// `present_id` is the logical id the accepted present was given
+    /// (VideoCore::Replay::NoteAcceptedPresent / CountAcceptedPresent).
+    void RequestComposite(u64 present_id, std::vector<Tegra::FramebufferConfig>&& layers,
                           std::vector<Service::Nvidia::NvFence>&& fences);
 
     void WaitForComposite();
@@ -262,6 +271,13 @@ public:
 
     /// Runs func on the GPU thread after the command lists submitted so far.
     void RunInOrder(std::function<void()>&& func);
+
+    /// RunInOrder for work that needs the GPU at rest: with the GPU split, the front waits for the
+    /// back to finish every deferred function, this one included, before it parses another list.
+    /// func therefore sees every list submitted before the call run to its end (or suspended on a
+    /// semaphore) and none submitted after it started, and no other GPU work runs until it returns.
+    /// Not waited for: the caller waits on what func signals.
+    void RunQuiesced(std::function<void()>&& func);
 
     /// RunInOrder for GPU memory maps: also done before the GPU thread reads the command lists
     /// submitted later (with the GPU split, on its front rather than its back).

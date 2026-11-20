@@ -8,14 +8,18 @@
 
 #include "common/adpf.h"
 #include "common/assert.h"
+#include "common/frame_timing_log.h"
 #include "common/logging.h"
+#include "common/test_frame_delay.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/hle/service/nvdrv/core/container.h"
 #include "core/hle/service/nvdrv/core/nvmap.h"
+#include "core/hle/guest_call/nvn_census.h"
 #include "core/hle/service/nvdrv/devices/nvdisp_disp0.h"
 #include "core/perf_stats.h"
 #include "video_core/gpu.h"
+#include "video_core/replay/capture.h"
 
 namespace Service::Nvidia::Devices {
 
@@ -87,7 +91,12 @@ void nvdisp_disp0::Composite(std::span<const Nvnflinger::HwcLayer> sorted_layers
         }
     }
 
-    system.GPU().RequestComposite(std::move(output_layers), std::move(output_fences));
+    const u64 present_id = VideoCore::Replay::NoteAcceptedPresent(
+        VideoCore::Replay::PresentPath::LegacyBufferQueue, output_layers, output_fences);
+    Core::NvnCensus::NoteAcceptedPresent(present_id); // same id closes the census frame
+    system.GPU().RequestComposite(present_id, std::move(output_layers), std::move(output_fences));
+    Common::TestHooks::FrameDelay::ForProcess().Apply();
+    Common::FrameTiming::Record(present_id);
     Common::ADPF::ReportFrameInterval();
     system.SpeedLimiter().DoSpeedLimiting(system.CoreTiming().GetGlobalTimeUs());
     system.GetPerfStats().EndSystemFrame();

@@ -44,6 +44,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/rasterizer_download_area.h"
+#include "video_core/replay/capture.h"
 
 namespace Core::Memory {
 
@@ -72,6 +73,18 @@ struct Memory::Impl {
             current_page_table->fastmem_arena = nullptr;
         }
 
+#ifdef __ANDROID__
+        heap_tracker.emplace(system.DeviceMemory().buffer);
+        host_buffer = std::addressof(*heap_tracker);
+#else
+        host_buffer = std::addressof(system.DeviceMemory().buffer);
+#endif
+    }
+
+    // A replay has no guest process: its own page table, never with the fastmem arena.
+    void SetCurrentPageTable(Common::PageTable& page_table) {
+        current_page_table = &page_table;
+        current_page_table->fastmem_arena = nullptr;
 #ifdef __ANDROID__
         heap_tracker.emplace(system.DeviceMemory().buffer);
         host_buffer = std::addressof(*heap_tracker);
@@ -959,6 +972,7 @@ struct Memory::Impl {
             }
         };
         gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
+            VideoCore::Replay::NoteGuestWrite(address, size);
             auto& current_area = rasterizer_write_areas[core];
             PAddr subaddress = address >> YUZU_PAGEBITS;
             // Performance note:
@@ -1044,6 +1058,10 @@ void Memory::Reset() {
 
 void Memory::SetCurrentPageTable(Kernel::KProcess& process) {
     impl->SetCurrentPageTable(process);
+}
+
+void Memory::SetCurrentPageTable(Common::PageTable& page_table) {
+    impl->SetCurrentPageTable(page_table);
 }
 
 void Memory::MapMemoryRegion(Common::PageTable& page_table, Common::ProcessAddress base, u64 size,

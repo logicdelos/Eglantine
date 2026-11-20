@@ -220,6 +220,10 @@ add_library(core STATIC
     frontend/framebuffer_layout.h
     frontend/graphics_context.h
     hle/api_version.h
+    hle/guest_call/nvn_census.cpp
+    hle/guest_call/nvn_census.h
+    hle/guest_call/nvn_census_verdict.h
+    hle/guest_call/nvn_epoch_slot.h
     hle/ipc.h
     hle/kernel/board/nintendo/nx/k_memory_layout.cpp
     hle/kernel/board/nintendo/nx/k_memory_layout.h

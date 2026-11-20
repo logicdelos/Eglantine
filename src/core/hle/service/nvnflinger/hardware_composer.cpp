@@ -14,6 +14,7 @@
 #include "core/hle/service/nvnflinger/hardware_composer.h"
 #include "core/hle/service/nvnflinger/hwc_layer.h"
 #include "core/hle/service/nvnflinger/ui/graphic_buffer.h"
+#include "core/hle/service/present_admission.h"
 
 namespace Service::Nvnflinger {
 
@@ -163,7 +164,7 @@ u32 HardwareComposer::ComposeLocked(f32* out_speed_scale, s32* out_queued_swap_i
     }
 
     // If any new buffers were acquired, we can present.
-    if (has_acquired_buffer && !composition_stack.empty()) {
+    if (PresentAdmission::HasNewLegacyComposition(has_acquired_buffer, composition_stack.empty())) {
         // Sort back-to-front: lower z first, higher z last so top-most draws last (on top).
         std::stable_sort(composition_stack.begin(), composition_stack.end(),
                          [&](const HwcLayer& l, const HwcLayer& r) { return l.z_index < r.z_index; });

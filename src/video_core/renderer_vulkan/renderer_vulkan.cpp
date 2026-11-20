@@ -13,6 +13,7 @@
 #include <array>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -25,11 +26,15 @@
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/core_timing.h"
+#include "core/core.h"
 #include "core/frontend/graphics_context.h"
 #include "video_core/capture.h"
 #include "video_core/nx2_spikes.h"
 #include "video_core/gpu.h"
 #include "video_core/present.h"
+#include "video_core/replay/capture.h"
+#include "video_core/replay/memory_capture.h"
+#include "video_core/replay/run_state.h"
 #include "video_core/renderer_vulkan/present/util.h"
 #ifdef HAS_RESHADE
 #include "video_core/post_processing/fx_chain.h"
@@ -61,6 +66,40 @@ constexpr VkExtent2D CaptureImageSize{
     .width = VideoCore::Capture::LinearWidth,
     .height = VideoCore::Capture::LinearHeight,
 };
+
+// Replay composition (RendererVulkan::SetReplayReadback). One replay owns the process, so the
+// state is process-wide; the picture is written by the GPU thread and read by the replay thread.
+std::atomic<bool> replay_readback{false};
+std::mutex replay_picture_mutex;
+std::vector<u8> replay_picture;
+u32 replay_picture_width = 0;
+u32 replay_picture_height = 0;
+
+// The picture of the last live composite while a capture runs (read right after the composite,
+// on the same thread, by the capture's host hook).
+std::mutex capture_picture_mutex;
+std::vector<u8> capture_picture;
+u32 capture_picture_width = 0;
+u32 capture_picture_height = 0;
+
+bool ReadCapturePicture([[maybe_unused]] Core::System& system, [[maybe_unused]] u64 present_id,
+                        VideoCore::Replay::EndPicture& out) {
+    std::scoped_lock lock{capture_picture_mutex};
+    if (capture_picture.empty()) {
+        return false;
+    }
+    out.width = capture_picture_width;
+    out.height = capture_picture_height;
+    out.stride_bytes = capture_picture_width * 4;
+    out.pixels = std::move(capture_picture);
+    capture_picture.clear();
+    return true;
+}
+
+// Registered by the RendererVulkan constructor, so the renderer of the system is one.
+bool ReadDeviceIdentity(Core::System& system, VideoCore::Replay::DeviceIdentity& out) {
+    return static_cast<const RendererVulkan&>(system.Renderer()).FillDeviceIdentity(out);
+}
 
 #ifdef HAS_LSFG
 [[nodiscard]] VkExtent2D GuestExtent(std::span<const Tegra::FramebufferConfig> framebuffers) {
@@ -246,6 +285,10 @@ try
 #endif
 
     Report();
+    VideoCore::Replay::SetCaptureHostHooks(VideoCore::Replay::CaptureHostHooks{
+        .read_composed_picture = ReadCapturePicture,
+        .device_identity = ReadDeviceIdentity,
+    });
 } catch (const vk::Exception& exception) {
     LOG_ERROR(Render_Vulkan, "Vulkan initialization failed with error: {}", exception.what());
     throw std::runtime_error{fmt::format("Vulkan initialization error {}", exception.what())};
@@ -256,13 +299,53 @@ RendererVulkan::~RendererVulkan() {
     void(device.GetLogical().WaitIdle());
 }
 
+void RendererVulkan::ComposeForCapture(std::span<const Tegra::FramebufferConfig> framebuffers) {
+    const auto layers = Tegra::FilterLayerStack(
+        framebuffers, Service::Nvnflinger::LayerStackId::Default, screenshot_layer_scratch);
+    std::scoped_lock lock{capture_picture_mutex};
+    capture_picture.clear();
+    u32 width = 0;
+    u32 height = 0;
+    if (!Tegra::PictureExtent(layers, width, height)) {
+        return;
+    }
+    const vk::Buffer buffer =
+        RenderToBuffer(layers, Layout::DefaultFrameLayout(width, height), VK_FORMAT_B8G8R8A8_UNORM,
+                       VkDeviceSize{width} * height * 4);
+    const auto mapped = buffer.Mapped();
+    capture_picture.assign(mapped.begin(), mapped.end());
+    capture_picture_width = width;
+    capture_picture_height = height;
+}
+
+bool RendererVulkan::FillDeviceIdentity(VideoCore::Replay::DeviceIdentity& out) const {
+    const VkPhysicalDeviceProperties properties = device.GetPhysical().GetProperties();
+    out.vendor_id = properties.vendorID;
+    out.device_id = properties.deviceID;
+    out.driver_id = static_cast<u32>(device.GetDriverID());
+    out.driver_version = properties.driverVersion;
+    std::copy(std::begin(properties.pipelineCacheUUID), std::end(properties.pipelineCacheUUID),
+              out.pipeline_cache_uuid.begin());
+    return true;
+}
+
 void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebuffers) {
     SCOPE_EXIT {
         render_window.OnFrameDisplayed();
     };
 
-    RenderAppletCaptureLayer(framebuffers);
+    // A replay never reaches the window, the swapchain, the applet capture or frame generation.
+    if (VideoCore::Replay::ReplayGpuRunning()) {
+        ComposeForReplay(framebuffers);
+        return;
+    }
 
+    RenderAppletCaptureLayer(framebuffers);
+    // A live capture keeps the picture the way a replay composes it: at the guest size, layer
+    // stack default, no overlay. Only while a capture runs.
+    if (VideoCore::Replay::CaptureActive()) {
+        ComposeForCapture(framebuffers);
+    }
     if (!render_window.IsShown()) {
         // Nothing is presented, but the frame still ends for the per-frame resources: without the
         // tick the descriptor payload of the frame never resets while the guest keeps drawing.
@@ -324,6 +407,69 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
 #ifdef HAS_LSFG
     scheduler.DispatchWork();
 #endif
+
+    gpu.RendererFrameEndNotify();
+    rasterizer.TickFrame();
+}
+
+void RendererVulkan::SetReplayReadback(bool readback) {
+    replay_readback.store(readback, std::memory_order_release);
+    std::scoped_lock lock{replay_picture_mutex};
+    replay_picture.clear();
+}
+
+bool RendererVulkan::ReadReplayPicture(u32& width, u32& height, std::vector<u8>& bgra,
+                                       std::string& error) {
+    std::scoped_lock lock{replay_picture_mutex};
+    if (replay_picture.empty()) {
+        error = "no replay picture was composed for this frame";
+        return false;
+    }
+    // Taken, not copied: a present that composes nothing must fail the next read, not repeat
+    // the previous picture.
+    width = replay_picture_width;
+    height = replay_picture_height;
+    bgra = std::move(replay_picture);
+    replay_picture.clear();
+    return true;
+}
+
+void RendererVulkan::ComposeForReplay(std::span<const Tegra::FramebufferConfig> framebuffers) {
+    constexpr VkFormat format = VK_FORMAT_B8G8R8A8_UNORM;
+    // The same layer stack the screenshot path shows: what a viewer sees, without overlays.
+    const auto layers = Tegra::FilterLayerStack(
+        framebuffers, Service::Nvnflinger::LayerStackId::Default, screenshot_layer_scratch);
+    // The extent of this present, from the same calculation the capture used: a frame that
+    // composed nothing live composes nothing here, and the readback then fails by name.
+    u32 width = 0;
+    u32 height = 0;
+    if (!Tegra::PictureExtent(layers, width, height)) {
+        LOG_ERROR(Render_Vulkan, "Replay present has no picture extent");
+    } else if (replay_readback.load(std::memory_order_acquire)) {
+        const Layout::FramebufferLayout layout = Layout::DefaultFrameLayout(width, height);
+        const vk::Buffer buffer =
+            RenderToBuffer(layers, layout, format, VkDeviceSize{width} * height * 4);
+        const auto mapped = buffer.Mapped();
+        std::scoped_lock lock{replay_picture_mutex};
+        replay_picture.assign(mapped.begin(), mapped.end());
+        replay_picture_width = width;
+        replay_picture_height = height;
+    } else {
+        // Timing only: draw into a cached target and wait for the GPU, with no download. The
+        // target follows the present's extent: a size change makes a new one.
+        const Layout::FramebufferLayout layout = Layout::DefaultFrameLayout(width, height);
+        if (!replay_frame.image || replay_frame_extent.width != layout.width ||
+            replay_frame_extent.height != layout.height) {
+            scheduler.Finish();
+            replay_frame_extent = VkExtent2D{layout.width, layout.height};
+            replay_frame.image = CreateWrappedImage(memory_allocator, replay_frame_extent, format);
+            replay_frame.image_view = CreateWrappedImageView(device, replay_frame.image, format);
+            replay_frame.framebuffer =
+                blit_capture.CreateFramebuffer(device, layout, *replay_frame.image_view, format);
+        }
+        blit_capture.DrawToFrame(device, rasterizer, &replay_frame, layers, layout, 1, format);
+        scheduler.Finish();
+    }
 
     gpu.RendererFrameEndNotify();
     rasterizer.TickFrame();

@@ -111,6 +111,22 @@ TEST_CASE("Old options keep the unknown option policy", "[core][launch_params]")
     REQUIRE_FALSE(config.unknown_option.empty());
 }
 
+TEST_CASE("--control is refused together with --replay", "[core][launch_params][control]") {
+    ScopedSystemTestContext context;
+    Core::System system;
+    // A replay never serves the control queue, so the combination is a bad argument (exit 64).
+    const std::string refusal =
+        "--control cannot be combined with --replay: a replay does not serve the control channel";
+    REQUIRE(Parse(system, {"--replay", "frame.egcap", "--control", "ctl.1"}).parse_error ==
+            refusal);
+    REQUIRE(Parse(system, {"--control", "ctl.1", "--replay", "frame.egcap"}).parse_error ==
+            refusal);
+    // A run of the game keeps the channel, with or without the other replay-slice options.
+    REQUIRE(Parse(system, {"-g", "game.nsp", "--control", "ctl.1"}).parse_error.empty());
+    REQUIRE(Parse(system, {"-g", "game.nsp", "--frame-times", "times.jsonl", "--control", "ctl.1"})
+                .parse_error.empty());
+}
+
 TEST_CASE("--baseline refuses a --set of a baseline setting unless it is declared",
           "[core][launch_params]") {
     ScopedSystemTestContext context;

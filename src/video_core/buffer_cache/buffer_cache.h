@@ -34,6 +34,7 @@
 #include "video_core/nx2_knobs.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/replay/memory_capture.h"
 #include "video_core/texture_cache/util.h"
 
 namespace VideoCommon {
@@ -399,6 +400,7 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
 
 template <class P>
 void BufferCache<P>::DownloadMemory(DAddr device_addr, u64 size) {
+    VideoCore::Replay::NoteHostReadback(device_addr, size);
     if constexpr (USE_MEMORY_MAPS) {
         if (download_cpu_read_ranges) {
             download_cpu_read_ranges = false;

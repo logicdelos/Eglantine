@@ -88,6 +88,8 @@ add_library(
     fiber.cpp
     fiber.h
     fixed_point.h
+    frame_timing_log.cpp
+    frame_timing_log.h
     free_region_manager.h
     fs/file.cpp
     fs/file.h
@@ -168,6 +170,8 @@ add_library(
     string_util.cpp
     string_util.h
     swap.h
+    test_frame_delay.cpp
+    test_frame_delay.h
     thread.cpp
     thread.h
     driver_shader_cache.cpp

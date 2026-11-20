@@ -154,8 +154,10 @@ Result MapNro(u64* out_base_address, Kernel::KProcess* process, u64 nro_heap_add
         regions.data(), nro_heap_address, nro_heap_size, bss_heap_address, bss_heap_size);
 
     // Re-map the nro/bss as code memory in the destination process.
-    R_RETURN(MapProcessCodeMemory(out_base_address, process, regions.data(), num_regions,
-                                  generate_random));
+    R_TRY(MapProcessCodeMemory(out_base_address, process, regions.data(), num_regions,
+                               generate_random));
+    process->NoteCodeChange();
+    R_SUCCEED();
 }
 
 Result SetNroPerms(Kernel::KProcess* process, u64 base_address, u64 rx_size, u64 ro_size,
@@ -171,6 +173,7 @@ Result SetNroPerms(Kernel::KProcess* process, u64 base_address, u64 rx_size, u64
     R_TRY(SetProcessMemoryPermission(process, base_address + rw_offset, rw_size,
                                      Kernel::Svc::MemoryPermission::ReadWrite));
 
+    process->NoteCodeChange();
     R_SUCCEED();
 }
 
@@ -182,7 +185,9 @@ Result UnmapNro(Kernel::KProcess* process, u64 base_address, u64 nro_heap_addres
         regions.data(), nro_heap_address, nro_heap_size, bss_heap_address, bss_heap_size);
 
     // Unmap the nro/bss.
-    R_RETURN(UnmapProcessCodeMemory(process, base_address, regions.data(), num_regions));
+    R_TRY(UnmapProcessCodeMemory(process, base_address, regions.data(), num_regions));
+    process->NoteCodeChange();
+    R_SUCCEED();
 }
 
 } // namespace Service::RO

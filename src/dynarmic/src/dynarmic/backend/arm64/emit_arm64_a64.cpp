@@ -43,7 +43,7 @@ void EmitA64Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::Re
 void EmitA64Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::LinkBlock terminal, IR::LocationDescriptor, bool is_single_step) {
     oaknut::Label fail;
 
-    if (ctx.conf.HasOptimization(OptimizationFlag::BlockLinking) && !is_single_step) {
+    if (ctx.conf.HasOptimization(OptimizationFlag::BlockLinking) && !is_single_step && !terminal.force_dispatch) {
         if (ctx.conf.enable_cycle_counting) {
             code.CMP(Xticks, 0);
             code.B(LE, fail);

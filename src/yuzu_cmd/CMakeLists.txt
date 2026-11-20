@@ -52,6 +52,10 @@ add_executable(yuzu-cmd
     run_control.h
     run_report.cpp
     run_report.h
+    replay_runner.cpp
+    replay_runner.h
+    replay_seams.cpp
+    replay_seams.h
     sdl_config.cpp
     sdl_config.h
     user_dir.cpp

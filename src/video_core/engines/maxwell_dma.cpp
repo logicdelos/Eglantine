@@ -20,6 +20,7 @@
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
 #include "video_core/renderer_base.h"
+#include "video_core/replay/memory_capture.h"
 #include "video_core/textures/decoders.h"
 
 namespace Tegra::Engines {
@@ -441,6 +442,10 @@ void MaxwellDMA::ReleaseSemaphore() {
     if (type == LaunchDMA::SemaphoreType::RELEASE_FOUR_WORD_SEMAPHORE) {
         flags = flags | VideoCommon::QueryPropertiesFlags::HasTimeout;
     }
+    VideoCore::Replay::NoteFenceProduced(
+        VideoCore::Replay::FenceKind::SemaphoreWrite, -1, static_cast<u32>(memory_manager.GetID()),
+        address, payload,
+        type == LaunchDMA::SemaphoreType::RELEASE_FOUR_WORD_SEMAPHORE ? 8 : 4, false);
     rasterizer->Query(address, VideoCommon::QueryType::Payload, flags, payload, 0);
 }
 

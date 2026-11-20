@@ -15,6 +15,7 @@
 
 #include "core/arm/arm_interface.h"
 #include "core/file_sys/program_metadata.h"
+#include "core/hle/guest_call/nvn_census.h"
 #include "core/hle/kernel/code_set.h"
 #include "core/hle/kernel/k_address_arbiter.h"
 #include "core/hle/kernel/k_capabilities.h"
@@ -147,6 +148,7 @@ private:
     std::atomic<s64> m_num_ipc_messages{};
     std::atomic<s64> m_num_ipc_replies{};
     std::atomic<s64> m_num_ipc_receives{};
+    std::atomic<u64> m_code_generation{};
 
     s32 m_ideal_core_id{};
     u32 m_version{};
@@ -201,6 +203,19 @@ public:
 
     u64 GetProgramId() const {
         return m_program_id;
+    }
+
+    /// Bumped when executable code is mapped or unmapped, or a permission change grants, removes or rewrites execute on a code region.
+    /// That includes a code memory object mapped into, or unmapped from, its owner (the owner is notified, whichever process made the call).
+    /// Only the census reads the counter, so nothing is counted while no census is armed.
+    void NoteCodeChange() noexcept {
+        if (Core::NvnCensus::IsActive()) {
+            m_code_generation.fetch_add(1, std::memory_order_release);
+        }
+    }
+
+    u64 CodeGeneration() const noexcept {
+        return m_code_generation.load(std::memory_order_acquire);
     }
 
     bool IsMkwDynamicFpsPatchApplied() const {

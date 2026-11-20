@@ -13,6 +13,8 @@ add_executable(tests
     video_core/texture_swizzle.cpp
     video_core/texture_unswizzle_bands.cpp
     core/nx2_oot_time.cpp
+    core/nvn_epoch_slot.cpp
+    core/nvn_census_verdict.cpp
     video_core/unbacked_image_policy.cpp
     core/builtin_patches.cpp
     core/launch_params.cpp
@@ -42,6 +44,8 @@ add_executable(tests
     common/fresh_profile.cpp
     core/launch_params_early.cpp
     common/speed_limit.cpp
+    common/test_frame_delay.cpp
+    common/frame_timing_log.cpp
     core/conductor_pace.cpp
     yuzu_cmd/run_report_documents.cpp
     ../yuzu_cmd/run_report.cpp
@@ -64,6 +68,7 @@ add_executable(tests
     common/slot_vector.cpp
     common/unique_function.cpp
     common/zstd_compression.cpp
+    video_core/replay_session.cpp
     core/core_timing.cpp
     core/ldn.cpp
     core/internal_network/socket_proxy.cpp
@@ -73,6 +78,7 @@ add_executable(tests
     core/nx2_movie_pacing.cpp
     core/nx2_gpu_memory_registry.cpp
     core/priority_queue.cpp
+    core/replay_kernel.cpp
     core/internal_network/network.cpp
     video_core/frame_dump_schedule.cpp
     video_core/framebuffer_limits.cpp
@@ -97,7 +103,14 @@ add_executable(tests
     video_core/cache_envelope.cpp
     video_core/nx2_attribution.cpp
     video_core/pipeline_prepare.cpp
+    video_core/replay_capture.cpp
     video_core/report_schema2.cpp
+    video_core/replay_checkpoint.cpp
+    video_core/replay_codec.cpp
+    video_core/replay_format.cpp
+    video_core/replay_memory.cpp
+    video_core/replay_options.cpp
+    video_core/replay_report.cpp
     ../yuzu_cmd/report_schema2.cpp
     video_core/h264_packet.cpp
     video_core/vertex_repack.cpp

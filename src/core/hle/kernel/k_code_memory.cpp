@@ -134,6 +134,12 @@ Result KCodeMemory::MapToOwner(KernelCore& kernel, KProcessAddress address, size
     // Mark ourselves as mapped.
     m_is_owner_mapped = true;
 
+    // New executable pages in the owner are code the generation counter must see. The owner is the
+    // process that gains the mapping, which is not necessarily the one making this call.
+    if (k_perm == KMemoryPermission::UserReadExecute) {
+        m_owner->NoteCodeChange();
+    }
+
     R_SUCCEED();
 }
 
@@ -150,6 +156,9 @@ Result KCodeMemory::UnmapFromOwner(KernelCore& kernel, KProcessAddress address, 
 
     // Mark ourselves as unmapped.
     m_is_owner_mapped = false;
+
+    // The mapping may have held executable code: latch it, as the generation contract requires.
+    m_owner->NoteCodeChange();
 
     R_SUCCEED();
 }
