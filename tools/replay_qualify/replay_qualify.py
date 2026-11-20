@@ -682,8 +682,13 @@ def verify_fixture_dir(fixture_dir: Path) -> tuple[int, dict[str, Any]]:
             cls_name = eff.get("classification")
             if cls_name not in VALID_CLASSIFICATIONS:
                 raise InvalidInputError(f"effects.jsonl:{line_no} invalid classification")
+            eff_fid = eff.get("frame_id")
+            if not isinstance(eff_fid, int) or eff_fid not in seen_ids:
+                raise InvalidInputError(
+                    f"effects.jsonl:{line_no} references unknown frame_id {eff_fid!r}"
+                )
             counts_by_class[cls_name] += 1
-            effects_by_frame.setdefault(int(eff["frame_id"]), []).append(eff)
+            effects_by_frame.setdefault(eff_fid, []).append(eff)
 
         fail_reasons: list[str] = []
         frame_results: list[dict[str, Any]] = []
@@ -868,6 +873,23 @@ def run_selftest() -> int:
         (inc_dir / "census.json").write_text(json.dumps(census, indent=2) + "\n", encoding="utf-8")
         code, _ = verify_fixture_dir(inc_dir)
         checks.append(("incomplete_census_reject", EXIT_INCOMPLETE, code))
+
+        # 9. Orphan effect row referencing an unlisted frame_id -> INVALID (2)
+        orphan_dir = write_synthetic_fixture(root / "case_orphan_effect")
+        orphan_eff = {
+            "frame_id": 999,
+            "seq": 1,
+            "kind": "draw",
+            "classification": "supported",
+            "reconciled": True,
+            "syncpoint_value": 9990,
+            "fence_id": 99900,
+            "detail": "orphan frame entry",
+        }
+        with (orphan_dir / "effects.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(orphan_eff, sort_keys=True) + "\n")
+        code, _ = verify_fixture_dir(orphan_dir)
+        checks.append(("orphan_effect_frame_reject", EXIT_INVALID, code))
 
     failed = [(name, exp, got) for name, exp, got in checks if exp != got]
     for name, exp, got in checks:
