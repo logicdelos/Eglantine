@@ -850,7 +850,8 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         return EditNup(lp) ? SDL_APP_SUCCESS : SDL_APP_FAILURE;
     }
 
-    if (lp.filepath.empty()) {
+    // A replay's capture stands in for the game: there is no ROM to load.
+    if (lp.filepath.empty() && !lp.replay.ReplayRequested()) {
         LOG_CRITICAL(Frontend, "Failed to load ROM: No ROM specified");
         return SDL_APP_FAILURE;
     }
