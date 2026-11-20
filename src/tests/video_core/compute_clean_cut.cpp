@@ -53,6 +53,7 @@ struct Fixture {
     KeplerCompute compute{memory};
 
     explicit Fixture(bool native) {
+        compute.current_dma_segment = 0;
         compute.BindRasterizer(&rasterizer);
         if (native) {
             compute.SetNativeMacroMode(&macros.engine, macros.positions, &macros);
@@ -122,5 +123,32 @@ TEST_CASE("compute clean cut: a legacy engine refuses until the launch that read
     CHECK(Blocker(f.compute) == WaitsForLaunch);
     // The launch reads the recorded uploads and empties the list.
     f.compute.CallMethod(f.system, Launch, 0, true);
+    CHECK(Blocker(f.compute).empty());
+}
+
+TEST_CASE("compute clean cut: a legacy bulk upload drains after launch",
+          "[video_core][replay][compute_clean_cut]") {
+    Fixture f{false};
+    f.BeginUpload(14); // last data word includes padding
+    constexpr u32 words[] = {1, 2, 3, 4};
+    SECTION("one packet") {
+        f.compute.CallMultiMethod(f.system, DataUpload, words, 4, 4);
+    }
+    SECTION("split packet") {
+        f.compute.CallMultiMethod(f.system, DataUpload, words, 2, 4);
+        f.compute.CallMultiMethod(f.system, DataUpload, words + 2, 2, 2);
+    }
+    CHECK(Blocker(f.compute) == WaitsForLaunch);
+    f.compute.CallMethod(f.system, Launch, 0, true);
+    CHECK(Blocker(f.compute).empty());
+}
+
+TEST_CASE("compute clean cut: a buffered native word blocks until the method run flushes",
+          "[video_core][replay][compute_clean_cut]") {
+    Fixture f{true};
+    f.BeginUpload(4);
+    f.SendWords(1, false);
+    CHECK(Blocker(f.compute) == Unfinished);
+    f.SendWords(1, true);
     CHECK(Blocker(f.compute).empty());
 }

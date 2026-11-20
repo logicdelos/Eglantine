@@ -467,7 +467,7 @@ private:
     MemoryManager& memory_manager;
     VideoCore::RasterizerInterface* rasterizer = nullptr;
     Upload::State upload_state;
-    GPUVAddr upload_address;
+    GPUVAddr upload_address{};
     bool upload_dirty{};
 
     struct UploadInfo {

@@ -156,6 +156,15 @@ target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain
 
 add_test(NAME tests COMMAND tests)
 
+find_package(Python3 3.8 QUIET COMPONENTS Interpreter)
+if (Python3_Interpreter_FOUND)
+    set(replay_tool "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/replay_qualify")
+    add_test(NAME replay_qualify_controls COMMAND Python3::Interpreter -I -S -B
+             "${replay_tool}/replay_qualify.py" --selftest)
+    add_test(NAME replay_qualify_fixture COMMAND Python3::Interpreter -I -S -B
+             "${replay_tool}/replay_qualify.py" --verify "${replay_tool}/fixtures/synthetic_scene")
+endif()
+
 # needed for vma
 if(NOT MSVC)
     target_compile_options(tests PRIVATE
