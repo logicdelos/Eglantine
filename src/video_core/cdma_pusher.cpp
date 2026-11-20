@@ -19,6 +19,7 @@
 #include "video_core/host1x/nvdec_common.h"
 #include "video_core/host1x/vic.h"
 #include "video_core/memory_manager.h"
+#include "video_core/replay/memory_capture.h"
 
 namespace Tegra {
 
@@ -118,6 +119,11 @@ void CDmaPusher::ExecuteCommand(u32 method, u32 arg) {
             auto& syncpoint_manager = host1x.GetSyncpointManager();
             syncpoint_manager.IncrementGuest(syncpoint_id);
             syncpoint_manager.IncrementHost(syncpoint_id);
+            if (VideoCore::Replay::CaptureActive()) {
+                VideoCore::Replay::NoteFenceProduced(
+                    VideoCore::Replay::FenceKind::SyncpointRaised, 0, 0, syncpoint_id,
+                    syncpoint_manager.GetGuestSyncpointValue(syncpoint_id), 0, true);
+            }
             break;
         }
         case ThiMethod::SetMethod1:

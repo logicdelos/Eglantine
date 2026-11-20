@@ -35,6 +35,7 @@
 #include "video_core/nx2_profile.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/textures/texture.h"
+#include "video_core/replay/memory_capture.h"
 #include "video_core/macro_dma_forward.h"
 #ifdef ARCHITECTURE_x86_64
 #include "video_core/macro_turing_jit.h"
@@ -915,6 +916,15 @@ void Maxwell3D::ProcessQueryGet() {
         if (regs.report_semaphore.query.short_query != 0) {
             flags |= VideoCommon::QueryPropertiesFlags::IsAFence;
         }
+        if (query_type == VideoCommon::QueryType::Payload) {
+            VideoCore::Replay::NoteFenceProduced(
+                VideoCore::Replay::FenceKind::SemaphoreWrite, -1,
+                static_cast<u32>(memory_manager.GetID()), sequence_address, payload,
+                regs.report_semaphore.query.short_query != 0 ? 4 : 8, false);
+        } else {
+            // A counter result: the replay recomputes it, the capture has no value to compare.
+            VideoCore::Replay::NoteOutputNotComparable();
+        }
         rasterizer->Query(sequence_address, query_type, flags, payload, subreport);
         break;
     case Regs::ReportSemaphore::Operation::Acquire:
@@ -923,6 +933,7 @@ void Maxwell3D::ProcessQueryGet() {
         UNIMPLEMENTED_MSG("Unimplemented query operation ACQUIRE");
         break;
     case Regs::ReportSemaphore::Operation::ReportOnly:
+        VideoCore::Replay::NoteOutputNotComparable();
         rasterizer->Query(sequence_address, query_type, flags, payload, subreport);
         break;
     case Regs::ReportSemaphore::Operation::Trap:

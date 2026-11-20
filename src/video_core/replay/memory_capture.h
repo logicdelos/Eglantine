@@ -55,6 +55,7 @@
 
 #include "common/common_types.h"
 #include "video_core/replay/capture.h"
+#include "video_core/replay/effect.h"
 #include "video_core/replay/events.h"
 #include "video_core/replay/format.h"
 #include "video_core/replay/format_io.h"
@@ -494,10 +495,25 @@ void NoteFenceProducedSlow(FenceKind kind, s32 channel, u32 address_space, u64 i
 // unknown (it lets a guest CPU write count as the producer).
 void NoteFenceWaitSlow(FenceKind kind, s32 channel, u32 address_space, u64 id, u64 value,
                        u64 device, bool blocked);
+inline LiveEffect ProducedEffect(FenceKind kind, u64 id, u64 value) {
+    return kind == FenceKind::SyncpointRaised ? LiveEffect{EffectKind::SyncpointIncrement, id, 1, true}
+           : LiveEffect{EffectKind::FenceSignal, id, value, kind != FenceKind::Timestamp};
+}
+void NoteEngineEffectSlow(const LiveEffect& effect);
+inline void NoteEngineEffect(EffectKind kind) {
+    const LiveEffect effect{kind, 0, 0, true};
+    if (CaptureActive()) {
+        NoteEngineEffectSlow(effect);
+    } else {
+        ObserveReplayEffect(effect);
+    }
+}
 inline void NoteFenceProduced(FenceKind kind, s32 channel, u32 address_space, u64 id, u64 value,
                               u64 aux, bool external) {
     if (CaptureActive()) {
         NoteFenceProducedSlow(kind, channel, address_space, id, value, aux, external);
+    } else if (!external) {
+        ObserveReplayEffect(ProducedEffect(kind, id, value));
     }
 }
 inline void NoteFenceWait(FenceKind kind, s32 channel, u32 address_space, u64 id, u64 value,
@@ -525,6 +541,8 @@ void NoteHostReadbackSlow(u64 device, u64 size);
 inline void NoteHostReadback(u64 device, u64 size) {
     if (CaptureActive()) {
         NoteHostReadbackSlow(device, size);
+    } else {
+        ObserveReplayEffect({EffectKind::ReadbackVisibility, 0, 0, false});
     }
 }
 
@@ -536,6 +554,8 @@ void NoteOutputNotComparableSlow();
 inline void NoteOutputNotComparable() {
     if (CaptureActive()) {
         NoteOutputNotComparableSlow();
+    } else {
+        ObserveReplayEffect({EffectKind::FenceSignal, 0, 0, false});
     }
 }
 

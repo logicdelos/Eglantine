@@ -71,6 +71,13 @@ CaptureReport EndCapture(bool run_ended_normally);
 
 // ---- hooks ------------------------------------------------------------------------------------------
 
+void NoteGraphicsCallSlow();
+inline void NoteGraphicsCall() {
+    if (CaptureActive()) {
+        NoteGraphicsCallSlow();
+    }
+}
+
 void NoteSubmitSlow(s32 channel, const Tegra::CommandList& list);
 void NoteGuestWriteSlow(u64 device_address, u64 size);
 void NoteAcceptedPresentSlow(u64 present_id, PresentPath path,

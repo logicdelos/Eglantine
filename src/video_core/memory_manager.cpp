@@ -28,6 +28,7 @@
 #include "video_core/memory_manager.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
+#include "video_core/replay/memory_capture.h"
 #include "video_core/texture_cache/util.h"
 
 namespace Tegra {
@@ -286,16 +287,23 @@ GPUVAddr MemoryManager::Map(GPUVAddr gpu_addr, DAddr dev_addr, std::size_t size,
         rasterizer->FlushRegion(dev_addr, size, VideoCommon::CacheType::All);
         rasterizer->InvalidateRegion(dev_addr, size, VideoCommon::CacheType::TextureCache);
     }
-    if (is_big_pages)
-        return BigPageTableOp(gpu_addr, dev_addr, size, kind, EntryType::Mapped);
-    return PageTableOp(gpu_addr, dev_addr, size, kind, EntryType::Mapped);
+    const GPUVAddr result = is_big_pages
+        ? BigPageTableOp(gpu_addr, dev_addr, size, kind, EntryType::Mapped)
+        : PageTableOp(gpu_addr, dev_addr, size, kind, EntryType::Mapped);
+    VideoCore::Replay::NoteGpuMap(static_cast<u32>(GetID()), gpu_addr, size, dev_addr,
+                                  is_big_pages ? VideoCore::Replay::MapBigPages : 0U,
+                                  static_cast<u32>(kind));
+    return result;
 }
 
 GPUVAddr MemoryManager::MapSparse(GPUVAddr gpu_addr, std::size_t size, bool is_big_pages) {
     PreserveMapping(gpu_addr, size);
-    if (is_big_pages)
-        return BigPageTableOp(gpu_addr, 0, size, PTEKind::INVALID, EntryType::Reserved);
-    return PageTableOp(gpu_addr, 0, size, PTEKind::INVALID, EntryType::Reserved);
+    const GPUVAddr result = is_big_pages
+        ? BigPageTableOp(gpu_addr, 0, size, PTEKind::INVALID, EntryType::Reserved)
+        : PageTableOp(gpu_addr, 0, size, PTEKind::INVALID, EntryType::Reserved);
+    VideoCore::Replay::NoteGpuMapSparse(
+        static_cast<u32>(GetID()), gpu_addr, size, VideoCore::Replay::NativeSparseFlags(is_big_pages));
+    return result;
 }
 
 void MemoryManager::Unmap(GPUVAddr gpu_addr, std::size_t size) {
@@ -312,6 +320,56 @@ void MemoryManager::Unmap(GPUVAddr gpu_addr, std::size_t size) {
 
     BigPageTableOp(gpu_addr, 0, size, PTEKind::INVALID, EntryType::Free);
     PageTableOp(gpu_addr, 0, size, PTEKind::INVALID, EntryType::Free);
+    VideoCore::Replay::NoteGpuUnmap(static_cast<u32>(GetID()), gpu_addr, size);
+}
+
+void MemoryManager::ForEachMapping(const std::function<void(const MappingRun&)>& visit) const {
+    const auto walk = [&](const bool big) {
+        const u64 count = (big ? big_page_table_mask : page_table_mask) + 1;
+        const u64 bytes = big ? big_page_size : page_size;
+        const std::vector<u64>& words = big ? big_entries : entries;
+        MappingRun run{};
+        bool open = false;
+        const auto flush = [&] {
+            if (open) {
+                visit(run);
+                open = false;
+            }
+        };
+        for (u64 index = 0; index < count; ++index) {
+            const u64 word = words[index / 32];
+            if (word == 0 && index % 32 == 0) {
+                flush();
+                index += 31;
+                continue;
+            }
+            const GPUVAddr gpu = index * bytes;
+            const auto type = static_cast<EntryType>((word >> (2 * (index % 32))) & 0x03ULL);
+            if (type == EntryType::Free || (!big && GetEntry(gpu, true) == EntryType::Mapped)) {
+                flush();
+                continue;
+            }
+            const bool sparse = type == EntryType::Reserved;
+            DAddr device = 0;
+            PTEKind kind = PTEKind::INVALID;
+            if (!sparse) {
+                device = DAddr(big ? big_page_table_dev[index] : page_table[index]) << cpu_page_bits;
+                std::unique_lock<std::mutex> lock(guard);
+                kind = kind_map.GetValueAt(gpu);
+            }
+            if (open && run.sparse == sparse && run.kind == kind &&
+                run.gpu_addr + run.size == gpu && (sparse || run.device + run.size == device)) {
+                run.size += bytes;
+                continue;
+            }
+            flush();
+            run = MappingRun{gpu, bytes, device, kind, big, sparse};
+            open = true;
+        }
+        flush();
+    };
+    walk(true);
+    walk(false);
 }
 
 std::optional<DAddr> MemoryManager::GpuToCpuAddress(GPUVAddr gpu_addr) const {
@@ -425,16 +483,23 @@ u32 MemoryManager::ReadU32(GPUVAddr addr, ReadPageCache& cache) const {
 
 template <typename T>
 void MemoryManager::Write(GPUVAddr addr, T data) {
-    if (auto page_pointer{GetPointer(addr)}; page_pointer) {
-        // NOTE: Avoid adding any extra logic to this fast-path block
-        std::memcpy(page_pointer, &data, sizeof(T));
-        return;
+    // The same translation GetPointer does, kept so the replay capture can name the device bytes.
+    if (const auto address{GpuToCpuAddress(addr)}; address) {
+        if (u8* page_pointer = memory.GetPointer<u8>(*address)) {
+            // NOTE: Avoid adding any extra logic to this fast-path block
+            std::memcpy(page_pointer, &data, sizeof(T));
+            VideoCore::Replay::NoteGpuWrite(*address, sizeof(T));  // one relaxed load when off
+            return;
+        }
     }
     // A Switch 2 sparse block nobody wrote yet gets its memory now.
     Tegra::Nx2BackSparseWrite(addr, sizeof(T), &data);
-    if (auto page_pointer{GetPointer(addr)}; page_pointer) {
-        std::memcpy(page_pointer, &data, sizeof(T));
-        return;
+    if (const auto address{GpuToCpuAddress(addr)}; address) {
+        if (u8* page_pointer = memory.GetPointer<u8>(*address)) {
+            std::memcpy(page_pointer, &data, sizeof(T));
+            VideoCore::Replay::NoteGpuWrite(*address, sizeof(T));
+            return;
+        }
     }
 
     static std::atomic<u32> reported{};
@@ -563,6 +628,7 @@ void MemoryManager::ReadBlockImpl(GPUVAddr gpu_src_addr, void* dest_buffer, std:
         } else {
             std::memset(dest_buffer, 0, copy_amount);
         }
+        VideoCore::Replay::NoteGpuRead(dev_addr_base, copy_amount);
         dest_buffer = static_cast<u8*>(dest_buffer) + copy_amount;
     };
     auto mapped_big = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
@@ -579,6 +645,7 @@ void MemoryManager::ReadBlockImpl(GPUVAddr gpu_src_addr, void* dest_buffer, std:
         } else {
             memory.ReadBlockUnsafe(dev_addr_base, dest_buffer, copy_amount);
         }
+        VideoCore::Replay::NoteGpuRead(dev_addr_base, copy_amount);
         dest_buffer = static_cast<u8*>(dest_buffer) + copy_amount;
     };
     auto read_short_pages = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
@@ -632,6 +699,7 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
         if (u8* physical = memory.GetPointer<u8>(dev_addr_base)) [[likely]] {
             std::memcpy(physical, src_buffer, copy_amount);
         }
+        VideoCore::Replay::NoteGpuWrite(dev_addr_base, copy_amount);
         // After the copy: the buffer cache may upload the written bytes from guest memory.
         if (!unsafe) {
             rasterizer->InvalidateRegion(dev_addr_base, copy_amount, which);
@@ -650,6 +718,7 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
         } else {
             memory.WriteBlockUnsafe(dev_addr_base, src_buffer, copy_amount);
         }
+        VideoCore::Replay::NoteGpuWrite(dev_addr_base, copy_amount);
         if (!unsafe) {
             rasterizer->InvalidateRegion(dev_addr_base, copy_amount, which);
         }

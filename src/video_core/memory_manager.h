@@ -10,6 +10,7 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -168,6 +169,24 @@ public:
      */
     boost::container::small_vector<std::pair<GPUVAddr, std::size_t>, 32> GetSubmappedRange(
         GPUVAddr gpu_addr, std::size_t size) const;
+
+    /// One run of the address space's page tables: consecutive GPU pages of one kind of entry
+    /// that map consecutive device addresses (`device` is 0 and `sparse` true for reserved pages).
+    struct MappingRun {
+        GPUVAddr gpu_addr;
+        u64 size;
+        DAddr device;
+        PTEKind kind;
+        bool big_pages;
+        bool sparse;
+    };
+    /// Calls `visit` for every mapped or reserved run: first the big-page runs, then the small-page
+    /// runs not covered by a big page (the order GpuToCpuAddress resolves them), each ascending.
+    /// Reports runs, not pages. Page table changes are made by the thread that processes the
+    /// channel's map operations (the GPU thread, or the guest thread before the GPU starts): call
+    /// this only on that thread or while it is idle (the replay capture calls it at its
+    /// checkpoint cut after the GPU drained). Takes `guard` only for the kind lookups.
+    void ForEachMapping(const std::function<void(const MappingRun&)>& visit) const;
 
     GPUVAddr Map(GPUVAddr gpu_addr, DAddr dev_addr, std::size_t size,
                  PTEKind kind = PTEKind::INVALID, bool is_big_pages = true);

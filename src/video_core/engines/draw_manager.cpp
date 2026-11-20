@@ -13,6 +13,7 @@
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/rasterizer_interface.h"
+#include "video_core/replay/memory_capture.h"
 
 namespace Tegra::Engines {
 
@@ -295,6 +296,7 @@ void Maxwell3D::DrawManager::DrawTexture(Maxwell3D& maxwell3d) {
     draw_texture_state.src_sampler = maxwell3d.regs.draw_texture.src_sampler;
     draw_texture_state.src_texture = maxwell3d.regs.draw_texture.src_texture;
     maxwell3d.rasterizer->DrawTexture();
+    VideoCore::Replay::NoteEngineEffect(VideoCore::Replay::EffectKind::Draw);
 }
 
 void Maxwell3D::DrawManager::UpdateTopology(Maxwell3D& maxwell3d) {
@@ -352,6 +354,7 @@ void Maxwell3D::DrawManager::ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed
     }
     if (execute) {
         maxwell3d.rasterizer->Draw(draw_indexed, instance_count);
+        VideoCore::Replay::NoteEngineEffect(VideoCore::Replay::EffectKind::Draw);
     }
 }
 
@@ -361,6 +364,7 @@ void Maxwell3D::DrawManager::ProcessDrawIndirect(Maxwell3D& maxwell3d) {
     UpdateTopology(maxwell3d);
     if (maxwell3d.ShouldExecute()) {
         maxwell3d.rasterizer->DrawIndirect();
+        VideoCore::Replay::NoteEngineEffect(VideoCore::Replay::EffectKind::Draw);
     }
 }
 } // namespace Tegra::Engines
