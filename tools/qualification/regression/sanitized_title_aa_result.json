@@ -1,0 +1,133 @@
+{
+  "schema": 1,
+  "verdict": "PASS",
+  "family_k": 2,
+  "alpha": 0.01,
+  "delta": 0.05129329438755058,
+  "calibration": null,
+  "metrics": {
+    "sanitized_title_scene:median_fps": {
+      "scene": "sanitized_title_scene",
+      "metric": "median_fps",
+      "gating": true,
+      "pairs": 4,
+      "d_bar": -0.0009796377150443902,
+      "s_obs": 0.0013097151967808264,
+      "s_cal": null,
+      "s": 0.0013097151967808264,
+      "df": 3,
+      "spread_source": "own pairs",
+      "c": 11.45316480189934,
+      "h": 0.007500191996141415,
+      "alpha_test": 0.0007142857142857143,
+      "loss_lower": -0.008479829711185806,
+      "loss_upper": 0.006520554281097025,
+      "loss_pct": -0.09801177168005104,
+      "loss_lower_pct": -0.8515885310205196,
+      "loss_upper_pct": 0.6499341598222963,
+      "min_detectable": 0.008577432745493644,
+      "min_detectable_pct": 0.8540751521075363,
+      "sensitive": true,
+      "noninferior": true,
+      "pairs_needed": null,
+      "verdict": "PASS"
+    },
+    "sanitized_title_scene:inverse_p99": {
+      "scene": "sanitized_title_scene",
+      "metric": "inverse_p99",
+      "gating": false,
+      "pairs": 4,
+      "d_bar": -0.1290022237792604,
+      "s_obs": 0.46061425516328636,
+      "s_cal": null,
+      "s": 0.46061425516328636,
+      "df": 3,
+      "spread_source": "own pairs",
+      "c": 11.45316480189934,
+      "h": 2.6377454872446164,
+      "alpha_test": 0.0007142857142857143,
+      "loss_lower": -2.7667477110238767,
+      "loss_upper": 2.508743263465356,
+      "loss_pct": -13.769265414024744,
+      "loss_lower_pct": -1490.6816229202984,
+      "loss_upper_pct": 91.86295637898662,
+      "min_detectable": 3.0166007121164196,
+      "min_detectable_pct": 95.10326099750566,
+      "sensitive": false,
+      "noninferior": false,
+      "pairs_needed": null,
+      "verdict": "INCONCLUSIVE"
+    }
+  },
+  "pictures": null,
+  "census": null,
+  "reasons": [],
+  "tool": "regress_stats.py",
+  "mode": "check",
+  "scenes": [
+    "sanitized_title_scene"
+  ],
+  "baseline_build": "b5aef6b73b-acc/h-int54",
+  "candidate_build": "b5aef6b73b-acc/h-int54",
+  "evidence": "measured",
+  "beta": 0.05,
+  "min_pairs": 4,
+  "injection": null,
+  "design": {
+    "kind": "sequential",
+    "min_pairs": 4,
+    "max_pairs": 10,
+    "looks": [
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10
+    ],
+    "k": 2,
+    "alpha_family": 0.01,
+    "alpha_per_test": 0.0007142857142857143,
+    "rule": "Bonferroni alpha spending: the family alpha is split equally over the K scene-metric tests and over every look (one per pair count from min_pairs to max_pairs). Each test at each look uses the one-sided t critical value of alpha / (K * looks). By the union bound the chance that any test at any look declares a false loss is at most alpha, whatever the stopping rule and whatever the dependence between the tests."
+  },
+  "accounting": {
+    "runs": 8,
+    "discarded_runs": {},
+    "cache_state": "warm",
+    "paired_ordering": {
+      "sanitized_title_scene": [
+        "baseline:p1",
+        "candidate:p1",
+        "candidate:p2",
+        "baseline:p2",
+        "baseline:p3",
+        "candidate:p3",
+        "candidate:p4",
+        "baseline:p4"
+      ]
+    },
+    "probe_runs": {
+      "sanitized_title_scene": 0
+    }
+  },
+  "stops": null,
+  "low_end": {
+    "sanitized_title_scene": {
+      "sensitivity_pct": 95.10326099750566,
+      "loss_pct": -13.769265414024744,
+      "loss_upper_pct": 91.86295637898662,
+      "reaches_5_percent": false,
+      "statement": "sanitized_title_scene: low-end drops beyond 95.1 % would have been detected (4 pairs)"
+    }
+  },
+  "progress": {
+    "sanitized_title_scene": {
+      "check": {
+        "pairs": 4,
+        "verdict": "PASS",
+        "failed": false
+      }
+    }
+  }
+}
