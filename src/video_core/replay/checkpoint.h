@@ -62,6 +62,7 @@
 
 #pragma once
 
+#include <memory>
 #include <span>
 #include <string>
 #include <vector>
@@ -217,12 +218,13 @@ void Encode(const GpuCheckpoint& value, std::vector<u8>& out);
 // by channel with the channel bound. The next method applies them first anyway, so the running
 // game cannot tell. Call it only with the GPU thread between two command lists (see
 // CaptureHost::RunQuiescent); CaptureGpuCheckpoint refuses an engine that still holds some.
-void SettleEngineSinks(Tegra::GPU& gpu);
+using CutChannels = std::span<const std::shared_ptr<Tegra::Control::ChannelState>>;
+void SettleEngineSinks(Tegra::GPU& gpu, CutChannels channels);
 // Reads the live state of the GPU at a clean cut. False with a message when there is no clean cut
 // or a part of the state cannot be written down; nothing is skipped silently. `retry_later` (when
 // given) tells a refusal that a later cut may not have (a list still waiting on a semaphore, an
 // operation half way) from one that holds at any time.
-[[nodiscard]] bool CaptureGpuCheckpoint(Tegra::GPU& gpu, GpuCheckpoint& out, std::string& error,
+[[nodiscard]] bool CaptureGpuCheckpoint(CutChannels channels, GpuCheckpoint& out, std::string& error,
                                         bool* retry_later = nullptr);
 // Checks what can be checked without a GPU: channel ids sequential from 1 in recorded order,
 // every address space and channel referenced exists once, every sub-record names a known channel,
@@ -243,8 +245,8 @@ void SettleEngineSinks(Tegra::GPU& gpu);
 // The objects the last successful restore made, by recorded id; nullptr when there is none. These
 // are the replay host's `channel` and `address_space` seams.
 [[nodiscard]] Tegra::Control::ChannelState* RestoredChannel(Core::System& system, u32 channel_id);
-[[nodiscard]] Tegra::MemoryManager* RestoredAddressSpace(Core::System& system,
-                                                         u32 address_space_id);
+[[nodiscard]] std::shared_ptr<Tegra::MemoryManager> RestoredAddressSpace(Core::System& system,
+                                                                        u32 address_space_id);
 // Drops the registry of restored objects (the GPU keeps its channels: it cannot release them).
 void ReleaseRestoredGpuState();
 

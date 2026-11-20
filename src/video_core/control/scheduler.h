@@ -13,7 +13,6 @@
 #include <memory>
 #include <mutex>
 #include <vector>
-#include "common/container/unordered_map.h"
 
 #include "video_core/dma_pusher.h"
 
@@ -43,13 +42,14 @@ public:
         return any_cpu_pending.load(std::memory_order_acquire);
     }
 
-    void DeclareChannel(std::shared_ptr<ChannelState> new_channel);
+    [[nodiscard]] std::shared_ptr<ChannelState> AllocateChannel();
+    [[nodiscard]] std::vector<std::shared_ptr<ChannelState>> SnapshotChannels();
 
 private:
-    void BindChannel(GPU& gpu, s32 bind_id);
+    void BindChannel(GPU& gpu, const std::shared_ptr<ChannelState>& channel);
     void PublishPendingState();
 
-    ::Common::unordered_map<s32, std::shared_ptr<ChannelState>> channels;
+    std::vector<std::shared_ptr<ChannelState>> channels; // bind_id is the 1-based index
     std::mutex scheduling_guard;
     std::vector<std::shared_ptr<ChannelState>> pending_channels; ///< Suspended on an acquire
     std::atomic<bool> any_pending{};

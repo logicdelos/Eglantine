@@ -64,8 +64,10 @@ struct ChannelState {
         Engines::Nv01Timer nv01_timer;
         DmaPusher dma_pusher;
     };
+    std::shared_ptr<MemoryManager> memory_manager;
+    // Engines hold references to the address space used to construct them even if nvdrv rebinds.
+    std::shared_ptr<MemoryManager> engine_memory;
     std::optional<Payload> payload;
-    MemoryManager* memory_manager = nullptr;
 
     s32 bind_id = -1;
     u64 program_id = 0;

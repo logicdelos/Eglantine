@@ -18,6 +18,7 @@
 #include "video_core/cdma_pusher.h"
 #include "video_core/framebuffer_config.h"
 #include "video_core/rasterizer_download_area.h"
+#include "video_core/replay/cut_publication.h"
 
 namespace Core {
 class System;
@@ -161,7 +162,8 @@ public:
 
     void InitChannel(Control::ChannelState& to_init, u64 program_id);
 
-    void BindChannel(s32 channel_id);
+    void BindChannel(Control::ChannelState& channel);
+    void BindAddressSpace(Control::ChannelState& channel, std::shared_ptr<MemoryManager> memory);
 
     void ReleaseChannel(Control::ChannelState& to_release);
 
@@ -180,12 +182,10 @@ public:
 
     void WaitForIdle();
 
-    /// Visits every channel in ascending channel id order (the replay capture's checkpoint cut:
-    /// its file must not depend on container order). Caller contract: the caller runs inside a
-    /// RunQuiesced function, so the GPU thread is between two command lists and no engine is in
-    /// use, and no guest thread allocates or releases a channel during the walk (channels are
-    /// created and destroyed only by the guest's nvdrv ioctls).
-    void ForEachChannel(const std::function<void(Control::ChannelState&)>& visit);
+    /// Stable, owning registry in ascending channel-id order. A capture holds Publication().Lock()
+    /// and GPU quiescence from before this snapshot until checkpoint and mapping publication ends.
+    [[nodiscard]] std::vector<std::shared_ptr<Control::ChannelState>> SnapshotChannels();
+    [[nodiscard]] VideoCore::Replay::CutPublication& Publication();
 
     /// Tick pending requests within the GPU.
     void TickWork();

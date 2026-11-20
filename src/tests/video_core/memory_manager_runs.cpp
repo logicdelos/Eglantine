@@ -4,7 +4,10 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <chrono>
 #include <exception>
+#include <future>
+#include <latch>
 #include <limits>
 #include <random>
 #include <catch2/catch_test_macros.hpp>
@@ -13,7 +16,10 @@
 #include "core/core.h"
 #include "core/device_memory.h"
 #include "tests/core/system_test_context.h"
+#include "video_core/control/channel_state.h"
+#include "video_core/gpu.h"
 #include "video_core/memory_manager.h"
+#include "video_core/replay/checkpoint.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/rasterizer_interface.h"
 
@@ -221,4 +227,64 @@ TEST_CASE("ReadU32 with a page cache reads what Read<u32> reads", "[memory_manag
         CAPTURE(offset);
         CHECK(memory.ReadU32(window + offset, cache) == memory.Read<u32>(window + offset));
     }
+}
+
+TEST_CASE("A cut owns one channel generation while nvdrv publishes a channel and remap",
+          "[video_core][replay][memory][cut_publication]") {
+    using namespace std::chrono_literals;
+    ScopedSystemTestContext context;
+    Core::System system;
+    Core::DeviceMemory physical;
+    Tegra::MaxwellDeviceMemoryManager device_memory{physical};
+    NullRasterizer rasterizer;
+    Tegra::GPU gpu{system, false, false};
+    REQUIRE(gpu.Publication().ArmBeforeRun());
+    gpu.Publication().BeforeGpuStart();
+    CHECK_FALSE(gpu.Publication().ArmBeforeRun());
+    auto manager = std::make_shared<Tegra::MemoryManager>(system, device_memory, 32, 1ULL << 31);
+    manager->SetCutPublication(gpu.Publication());
+    manager->BindRasterizer(&rasterizer);
+    auto first = gpu.AllocateChannel();
+    gpu.BindAddressSpace(*first, manager);
+    first->Init(system, 0);
+    constexpr GPUVAddr page = 0x400000;
+    constexpr DAddr old_backing = 0x20000, new_backing = 0x30000;
+    manager->Map(page, old_backing, 4096, Tegra::PTEKind::PITCH, false);
+    manager.reset(); // Closing the address-space handle does not invalidate the channel's backing.
+    auto cut = gpu.Publication().Lock();
+    auto channels = gpu.SnapshotChannels();
+    std::latch starting{2};
+    auto opening = std::async(std::launch::async, [&] {
+        starting.count_down();
+        return gpu.AllocateChannel();
+    });
+    auto remapping = std::async(std::launch::async, [&] {
+        starting.count_down();
+        first->memory_manager->Map(page, new_backing, 4096, Tegra::PTEKind::PITCH, false);
+    });
+    starting.wait();
+    const bool open_blocked = opening.wait_for(20ms) == std::future_status::timeout;
+    const bool map_blocked = remapping.wait_for(20ms) == std::future_status::timeout;
+    VideoCore::Replay::GpuCheckpoint checkpoint;
+    std::string error;
+    const bool captured = VideoCore::Replay::CaptureGpuCheckpoint(channels, checkpoint, error);
+    std::vector<DAddr> cut_backings;
+    for (const auto& channel : channels) {
+        channel->memory_manager->ForEachMapping([&](const auto& run) { cut_backings.push_back(run.device); });
+    }
+    cut.unlock();
+    auto second = opening.get();
+    remapping.get();
+    CHECK(open_blocked);
+    CHECK(map_blocked);
+    INFO(error);
+    REQUIRE(captured);
+    REQUIRE(checkpoint.channels.size() == 1);
+    REQUIRE(checkpoint.address_spaces.size() == 1);
+    CHECK(checkpoint.channels.front().address_space_id == first->memory_manager->GetID());
+    CHECK(cut_backings == std::vector<DAddr>{old_backing});
+    CHECK(channels.size() == 1);
+    CHECK(gpu.SnapshotChannels().size() == 2);
+    CHECK(second->bind_id == first->bind_id + 1);
+    CHECK(first->memory_manager->GpuToCpuAddress(page) == new_backing);
 }

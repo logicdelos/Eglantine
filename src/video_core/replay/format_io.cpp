@@ -23,6 +23,7 @@
 #include "video_core/replay/format_io.h"
 #include "video_core/replay/library_call.h"
 #include "video_core/replay/memory_restore.h"
+#include "video_core/replay/present_extent.h"
 
 // Platform headers last, so their macros cannot reach the replay headers above.
 #ifdef _WIN32
@@ -3003,9 +3004,13 @@ private:
                                                       " that no earlier blob defines");
             }
             const u64 offset = layer.framebuffer_offset;
-            const u64 length = u64{layer.stride} * layer.height * 4;
+            const auto length = PresentBackingBytes(layer.width, layer.height, layer.stride,
+                                                    layer.pixel_format);
+            if (!length) {
+                return Bad(ReadError::UnsupportedState, "invalid PRESENT extent or pixel format");
+            }
             if (layer.alloc_offset > found->second || offset > found->second - layer.alloc_offset ||
-                !backing_.at(found->first).UnchangedSince(layer.alloc_offset + offset, length, seq_)) {
+                !backing_.at(found->first).UnchangedSince(layer.alloc_offset + offset, *length, seq_)) {
                 return Bad(ReadError::BadMapping, "PRESENT layer lacks captured backing in allocation " +
                                                       Number(layer.alloc_id));
             }
