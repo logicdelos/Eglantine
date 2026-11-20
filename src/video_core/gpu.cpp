@@ -67,25 +67,12 @@ struct GPU::Impl {
 
     ~Impl() = default;
 
-    std::shared_ptr<Control::ChannelState> CreateChannel(s32 channel_id) {
-        auto channel_state = std::make_shared<Tegra::Control::ChannelState>(channel_id);
-        channels.emplace(channel_id, channel_state);
-        scheduler.DeclareChannel(channel_state);
-        return channel_state;
-    }
-
-    void BindChannel(s32 channel_id) {
-        if (bound_channel != channel_id) {
-            auto it = channels.find(channel_id);
-            ASSERT(it != channels.end());
-            bound_channel = channel_id;
-            current_channel = it->second.get();
-            renderer->ReadRasterizer()->BindChannel(*current_channel);
+    void BindChannel(Control::ChannelState& channel) {
+        if (bound_channel != channel.bind_id) {
+            bound_channel = channel.bind_id;
+            current_channel = &channel;
+            renderer->ReadRasterizer()->BindChannel(channel);
         }
-    }
-
-    std::shared_ptr<Control::ChannelState> AllocateChannel() {
-        return CreateChannel(new_channel_id++);
     }
 
     void InitChannel(Control::ChannelState& to_init, u64 program_id) {
@@ -451,7 +438,7 @@ struct GPU::Impl {
     std::unique_ptr<VideoCore::RendererBase> renderer;
     const bool use_nvdec;
 
-    s32 new_channel_id{1};
+    VideoCore::Replay::CutPublication publication;
     /// Shader build notifier
     VideoCore::ShaderNotify shader_notify;
     /// When true, we are about to shut down emulation session, so terminate outstanding tasks
@@ -491,7 +478,6 @@ struct GPU::Impl {
     std::unique_ptr<Core::Frontend::GraphicsContext> cpu_context;
 
     Tegra::Control::Scheduler scheduler;
-    ::Common::unordered_map<s32, std::shared_ptr<Tegra::Control::ChannelState>> channels;
     Tegra::Control::ChannelState* current_channel;
     s32 bound_channel{-1};
 
@@ -509,22 +495,31 @@ GPU::GPU(Core::System& system, bool is_async, bool use_nvdec)
 GPU::~GPU() = default;
 
 std::shared_ptr<Control::ChannelState> GPU::AllocateChannel() {
-    return impl->AllocateChannel();
+    auto lock = Publication().Lock();
+    return impl->scheduler.AllocateChannel();
 }
 
 void GPU::InitChannel(Control::ChannelState& to_init, u64 program_id) {
+    auto lock = Publication().Lock();
     impl->InitChannel(to_init, program_id);
 }
 
-void GPU::BindChannel(s32 channel_id) {
-    impl->BindChannel(channel_id);
+void GPU::BindChannel(Control::ChannelState& channel) {
+    impl->BindChannel(channel);
+}
+
+void GPU::BindAddressSpace(Control::ChannelState& channel, std::shared_ptr<MemoryManager> memory) {
+    auto lock = Publication().Lock();
+    channel.memory_manager = std::move(memory);
 }
 
 void GPU::ReleaseChannel(Control::ChannelState& to_release) {
+    auto lock = Publication().Lock();
     impl->ReleaseChannel(to_release);
 }
 
 void GPU::InitAddressSpace(Tegra::MemoryManager& memory_manager) {
+    memory_manager.SetCutPublication(Publication());
     impl->InitAddressSpace(memory_manager);
 }
 
@@ -654,6 +649,7 @@ void GPU::RendererFrameEndNotify() {
 }
 
 void GPU::Start() {
+    Publication().BeforeGpuStart();
     impl->Start();
 }
 
@@ -713,18 +709,12 @@ void GPU::FlushAndInvalidateRegion(DAddr addr, u64 size) {
     impl->FlushAndInvalidateRegion(addr, size);
 }
 
-void GPU::ForEachChannel(const std::function<void(Control::ChannelState&)>& visit) {
-    std::vector<Control::ChannelState*> ordered;
-    ordered.reserve(impl->channels.size());
-    for (auto& [id, channel] : impl->channels) {
-        ordered.push_back(channel.get());
-    }
-    std::ranges::sort(ordered, [](const Control::ChannelState* a, const Control::ChannelState* b) {
-        return a->bind_id < b->bind_id;
-    });
-    for (Control::ChannelState* channel : ordered) {
-        visit(*channel);
-    }
+std::vector<std::shared_ptr<Control::ChannelState>> GPU::SnapshotChannels() {
+    return impl->scheduler.SnapshotChannels();
+}
+
+VideoCore::Replay::CutPublication& GPU::Publication() {
+    return impl->publication;
 }
 
 

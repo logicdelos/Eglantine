@@ -546,30 +546,32 @@ bool ValidateCheckpointForRestore(const GpuCheckpoint& checkpoint, std::string& 
     return true;
 }
 
-void SettleEngineSinks(Tegra::GPU& gpu) {
-    gpu.ForEachChannel([&gpu](Tegra::Control::ChannelState& channel) {
-        if (!channel.initialized || !channel.payload.has_value() || channel.memory_manager == nullptr) {
-            return;
+void SettleEngineSinks(Tegra::GPU& gpu, CutChannels channels) {
+    for (const auto& owner : channels) {
+        auto& channel = *owner;
+        if (!channel.initialized || !channel.payload.has_value() || !channel.memory_manager ||
+            channel.engine_memory != channel.memory_manager) {
+            continue;
         }
         auto& payload = *channel.payload;
         if (payload.maxwell_3d.method_sink.empty() && payload.kepler_compute.method_sink.empty() &&
             payload.fermi_2d.method_sink.empty() && payload.maxwell_dma.method_sink.empty() &&
             payload.kepler_memory.method_sink.empty()) {
-            return;
+            continue;
         }
         // The writes go through the channel's engines with the channel bound, as the scheduler
         // binds it before it runs one of its command lists.
-        gpu.BindChannel(channel.bind_id);
+        gpu.BindChannel(channel);
         Core::System& system = payload.dma_pusher.system;
         payload.maxwell_3d.ConsumeSink(system);
         payload.kepler_compute.ConsumeSink(system);
         payload.fermi_2d.ConsumeSink(system);
         payload.maxwell_dma.ConsumeSink(system);
         payload.kepler_memory.ConsumeSink(system);
-    });
+    }
 }
 
-bool CaptureGpuCheckpoint(Tegra::GPU& gpu, GpuCheckpoint& out, std::string& error,
+bool CaptureGpuCheckpoint(CutChannels channels, GpuCheckpoint& out, std::string& error,
                           bool* retry_later) {
     out = GpuCheckpoint{};
     error.clear();
@@ -584,12 +586,13 @@ bool CaptureGpuCheckpoint(Tegra::GPU& gpu, GpuCheckpoint& out, std::string& erro
     std::map<u32, AddressSpaceEntry> spaces;
     bool shared_macros_done = false;
 
-    gpu.ForEachChannel([&](Tegra::Control::ChannelState& channel) {
+    std::ranges::for_each(channels, [&](const auto& owner) {
+        auto& channel = *owner;
         if (!failure.empty() || !channel.initialized || !channel.payload.has_value()) {
             return;
         }
-        if (channel.memory_manager == nullptr) {
-            failure = ChannelName(channel) + " has no address space";
+        if (!channel.memory_manager || channel.memory_manager != channel.engine_memory) {
+            failure = ChannelName(channel) + " has no address space or was rebound after initialization";
             return;
         }
         auto& payload = *channel.payload;
@@ -768,15 +771,14 @@ bool CaptureGpuCheckpoint(Tegra::GPU& gpu, GpuCheckpoint& out, std::string& erro
 namespace {
 
 struct RestoredObjects {
-    std::map<u32, std::unique_ptr<Tegra::MemoryManager>> spaces;
+    std::map<u32, std::shared_ptr<Tegra::MemoryManager>> spaces;
     std::map<u32, std::shared_ptr<Tegra::Control::ChannelState>> channels;
 };
 
-// Lives as long as the process: the GPU keeps pointers into these objects and cannot release a
-// channel, so there is nothing to destroy them against.
+// Published after a complete restore. ReleaseRestoredGpuState drops these replay lookup handles.
 RestoredObjects& Registry() {
-    static RestoredObjects* const objects = new RestoredObjects;
-    return *objects;
+    static RestoredObjects objects;
+    return objects;
 }
 
 template <typename Block>
@@ -1064,10 +1066,8 @@ bool RestoreGpuCheckpoint(Tegra::GPU& gpu, const GpuCheckpoint& checkpoint, std:
     if (!ValidateCheckpointForRestore(checkpoint, error)) {
         return false;
     }
-    bool has_channel = false;
-    gpu.ForEachChannel([&](Tegra::Control::ChannelState&) { has_channel = true; });
     RestoredObjects& registry = Registry();
-    if (has_channel || !registry.channels.empty()) {
+    if (!gpu.SnapshotChannels().empty() || !registry.channels.empty()) {
         return Refuse(error, "the GPU already has a channel: a checkpoint restores into an empty GPU");
     }
     const bool turing = (checkpoint.channels.front().flags & ChannelTuringMacros) != 0;
@@ -1077,12 +1077,10 @@ bool RestoreGpuCheckpoint(Tegra::GPU& gpu, const GpuCheckpoint& checkpoint, std:
                                  " mode but this process is not: set the mode before restoring");
     }
 
-    // The GPU keeps the channels already made when a later step refuses, and they point at the
-    // address spaces made here, so on a refusal these objects are deliberately never freed.
-    RestoredObjects& staged = *new RestoredObjects;
+    RestoredObjects staged; // Published only on success; channels own their address spaces.
     Core::System& system = gpu.Host1x().System();
     for (const AddressSpaceEntry& space : checkpoint.address_spaces) {
-        auto manager = std::make_unique<Tegra::MemoryManager>(
+        auto manager = std::make_shared<Tegra::MemoryManager>(
             system, space.address_space_bits, space.split_address, space.big_page_bits, 12);
         gpu.InitAddressSpace(*manager);
         staged.spaces.emplace(space.address_space_id, std::move(manager));
@@ -1093,7 +1091,7 @@ bool RestoreGpuCheckpoint(Tegra::GPU& gpu, const GpuCheckpoint& checkpoint, std:
             return Refuse(error, "the GPU allocated channel " + Num(static_cast<u64>(channel->bind_id)) +
                                      " where the checkpoint has channel " + Num(entry.channel_id));
         }
-        channel->memory_manager = staged.spaces.at(entry.address_space_id).get();
+        gpu.BindAddressSpace(*channel, staged.spaces.at(entry.address_space_id));
         staged.channels.emplace(entry.channel_id, channel);
         gpu.InitChannel(*channel, 0);
         const bool channel_turing = channel->payload->maxwell_3d.GetNativeMacroEngine().native_turing;
@@ -1113,7 +1111,6 @@ bool RestoreGpuCheckpoint(Tegra::GPU& gpu, const GpuCheckpoint& checkpoint, std:
         }
     }
     registry = std::move(staged);
-    delete &staged;
     return true;
 }
 
@@ -1124,11 +1121,11 @@ Tegra::Control::ChannelState* RestoredChannel(Core::System& system, u32 channel_
     return found == registry.channels.end() ? nullptr : found->second.get();
 }
 
-Tegra::MemoryManager* RestoredAddressSpace(Core::System& system, u32 address_space_id) {
+std::shared_ptr<Tegra::MemoryManager> RestoredAddressSpace(Core::System& system, u32 address_space_id) {
     static_cast<void>(system);
     const RestoredObjects& registry = Registry();
     const auto found = registry.spaces.find(address_space_id);
-    return found == registry.spaces.end() ? nullptr : found->second.get();
+    return found == registry.spaces.end() ? nullptr : found->second;
 }
 
 void ReleaseRestoredGpuState() {

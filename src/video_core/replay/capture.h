@@ -60,7 +60,7 @@ struct CaptureConfig {
 
 // Validates the destination with CheckPrivateOutput, opens the .partial file, registers the
 // capture and arms the hooks. Returns false with a message when the capture cannot start (nothing
-// is left behind). Must be called before the first selected frame presents.
+// is left behind). Must be called before GPU::Start, before guest publishers can run.
 [[nodiscard]] bool BeginCapture(Core::System& system, const CaptureConfig& config,
                                 std::string& error);
 

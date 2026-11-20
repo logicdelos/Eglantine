@@ -102,17 +102,18 @@ public:
     // Runs inside RunQuiescent's body, so on the GPU thread between two command lists.
     bool Cut(u64, CutState& out, std::string& error) override {
         Tegra::GPU& gpu = system.GPU();
-        SettleEngineSinks(gpu);
-        if (!CaptureGpuCheckpoint(gpu, out.checkpoint, error, &out.retry_later)) {
+        const auto channels = gpu.SnapshotChannels();
+        SettleEngineSinks(gpu, channels);
+        if (!CaptureGpuCheckpoint(channels, out.checkpoint, error, &out.retry_later)) {
             return false;
         }
-        std::map<u32, Tegra::MemoryManager*> spaces;
-        gpu.ForEachChannel([&spaces](Tegra::Control::ChannelState& channel) {
-            if (channel.memory_manager) {
-                spaces.emplace(static_cast<u32>(channel.memory_manager->GetID()),
-                               channel.memory_manager);
+        std::map<u32, std::shared_ptr<Tegra::MemoryManager>> spaces;
+        for (const auto& channel : channels) {
+            if (channel->initialized && channel->memory_manager) {
+                const auto& manager = channel->memory_manager;
+                spaces.emplace(static_cast<u32>(manager->GetID()), manager);
             }
-        });
+        }
         for (const auto& [space_id, manager] : spaces) {
             manager->ForEachMapping(
                 [&out, space_id](const Tegra::MemoryManager::MappingRun& run) {
@@ -143,8 +144,14 @@ public:
 
     bool RunQuiescent(u64 present_id, const std::function<CutOutcome(std::string&)>& body,
                       std::string& error) override {
+        // Keep a page-table change and its capture hook on the same side of the entire cut,
+        // including the recorder's switch from staging to recording, not just the registry walk.
+        const auto cut = [&](std::string& why) {
+            auto lock = system.GPU().Publication().Lock();
+            return body(why);
+        };
         if (present_id == 0) {
-            return body(error) == CutOutcome::Done;
+            return cut(error) == CutOutcome::Done;
         }
         // What the GPU thread and this thread share. The action may outlive this call (the system
         // stops before the action runs), so it owns this by shared pointer and touches `body` only
@@ -165,7 +172,7 @@ public:
         for (;;) {
             ++attempts;
             const auto shared = std::make_shared<Shared>();
-            system.GPU().RunQuiesced([shared, &body] {
+            system.GPU().RunQuiesced([shared, &cut] {
                 {
                     const std::scoped_lock lock{shared->mutex};
                     if (shared->abandoned) {
@@ -174,7 +181,7 @@ public:
                     shared->started = true;
                 }
                 std::string message;
-                const CutOutcome outcome = body(message);
+                const CutOutcome outcome = cut(message);
                 {
                     const std::scoped_lock lock{shared->mutex};
                     shared->outcome = outcome;
@@ -245,6 +252,10 @@ void SetCaptureHostHooks(const CaptureHostHooks& hooks) noexcept {
 }
 
 bool BeginCapture(Core::System& system, const CaptureConfig& config, std::string& error) {
+    if (!system.GPU().Publication().ArmBeforeRun()) {
+        error = "capture must be armed before GPU start";
+        return false;
+    }
     return BeginCaptureWithHost(std::make_unique<SystemHost>(system), config, error);
 }
 

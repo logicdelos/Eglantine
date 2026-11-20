@@ -22,20 +22,20 @@
 
 namespace Tegra::Control {
 
-void Scheduler::BindChannel(GPU& gpu, s32 bind_id) {
+void Scheduler::BindChannel(GPU& gpu, const std::shared_ptr<ChannelState>& channel) {
     // With the GPU thread split the rasterizer's channel switches with the methods around it, on
     // the back thread (deferred outside the lock: the back takes it to bind).
     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
         split.Defer(
-            [this, gpu_ptr = &gpu, bind_id] {
+            [this, gpu_ptr = &gpu, state = channel.get()] {
                 std::scoped_lock lk{scheduling_guard};
-                gpu_ptr->BindChannel(bind_id);
+                gpu_ptr->BindChannel(*state);
             },
             VideoCommon::GpuSplit::Effect::None);
         return;
     }
     std::scoped_lock lk{scheduling_guard};
-    gpu.BindChannel(bind_id);
+    gpu.BindChannel(*channel);
 }
 
 void Scheduler::PublishPendingState() {
@@ -49,11 +49,10 @@ void Scheduler::Push(GPU& gpu, s32 channel, CommandList&& entries) {
     std::shared_ptr<ChannelState> channel_state;
     {
         std::unique_lock lk(scheduling_guard);
-        auto it = channels.find(channel);
-        ASSERT(it != channels.end());
-        channel_state = it->second;
+        ASSERT(channel > 0 && static_cast<size_t>(channel) <= channels.size());
+        channel_state = channels[channel - 1];
     }
-    BindChannel(gpu, channel_state->bind_id);
+    BindChannel(gpu, channel_state);
     // Process commands outside the lock to reduce contention.
     // Multiple channels can prepare their commands in parallel.
     VideoCore::Replay::NoteSubmit(channel, entries);
@@ -87,7 +86,7 @@ bool Scheduler::ResumePending(GPU& gpu) {
             if (!dma_pusher.HasPendingAcquire() || !dma_pusher.CanResumeAcquire()) {
                 continue;
             }
-            BindChannel(gpu, state->bind_id);
+            BindChannel(gpu, state);
             dma_pusher.DispatchCalls();
             if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
                 split.Publish();
@@ -108,10 +107,14 @@ bool Scheduler::ResumePending(GPU& gpu) {
     return any_moved;
 }
 
-void Scheduler::DeclareChannel(std::shared_ptr<ChannelState> new_channel) {
-    s32 channel = new_channel->bind_id;
-    std::unique_lock lk(scheduling_guard);
-    channels.emplace(channel, new_channel);
+std::shared_ptr<ChannelState> Scheduler::AllocateChannel() {
+    std::scoped_lock lock{scheduling_guard};
+    return channels.emplace_back(std::make_shared<ChannelState>(static_cast<s32>(channels.size() + 1)));
+}
+
+std::vector<std::shared_ptr<ChannelState>> Scheduler::SnapshotChannels() {
+    std::scoped_lock lock{scheduling_guard};
+    return channels;
 }
 
 } // namespace Tegra::Control

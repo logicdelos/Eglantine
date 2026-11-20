@@ -287,6 +287,7 @@ GPUVAddr MemoryManager::Map(GPUVAddr gpu_addr, DAddr dev_addr, std::size_t size,
         rasterizer->FlushRegion(dev_addr, size, VideoCommon::CacheType::All);
         rasterizer->InvalidateRegion(dev_addr, size, VideoCommon::CacheType::TextureCache);
     }
+    auto publication = LockMappingPublication();
     const GPUVAddr result = is_big_pages
         ? BigPageTableOp(gpu_addr, dev_addr, size, kind, EntryType::Mapped)
         : PageTableOp(gpu_addr, dev_addr, size, kind, EntryType::Mapped);
@@ -298,6 +299,7 @@ GPUVAddr MemoryManager::Map(GPUVAddr gpu_addr, DAddr dev_addr, std::size_t size,
 
 GPUVAddr MemoryManager::MapSparse(GPUVAddr gpu_addr, std::size_t size, bool is_big_pages) {
     PreserveMapping(gpu_addr, size);
+    auto publication = LockMappingPublication();
     const GPUVAddr result = is_big_pages
         ? BigPageTableOp(gpu_addr, 0, size, PTEKind::INVALID, EntryType::Reserved)
         : PageTableOp(gpu_addr, 0, size, PTEKind::INVALID, EntryType::Reserved);
@@ -318,6 +320,7 @@ void MemoryManager::Unmap(GPUVAddr gpu_addr, std::size_t size) {
     }
     page_stash.clear();
 
+    auto publication = LockMappingPublication();
     BigPageTableOp(gpu_addr, 0, size, PTEKind::INVALID, EntryType::Free);
     PageTableOp(gpu_addr, 0, size, PTEKind::INVALID, EntryType::Free);
     VideoCore::Replay::NoteGpuUnmap(static_cast<u32>(GetID()), gpu_addr, size);
