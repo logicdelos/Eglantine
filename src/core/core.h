@@ -219,6 +219,25 @@ public:
                                           Service::AM::FrontendAppletParameters& params);
 
     /**
+     * Creates device memory, the kernel (without a guest process), the host1x core, the GPU and
+     * the renderer, for a replay (video_core/replay). The kernel's memory layout exists after
+     * this, which the replay's physical allocator reads. The system stays powered off and the GPU
+     * is not started.
+     * @returns False with a message in `error` when the GPU or renderer could not be created
+     * (the kernel is shut down again then).
+     */
+    [[nodiscard]] bool SetupForReplay(Frontend::EmuWindow& emu_window, std::string& error);
+
+    /// Stops the GPU thread and releases what SetupForReplay created, the kernel last.
+    void TeardownReplay();
+
+    /// The kernel step of SetupForReplay alone: initializes the kernel with no process.
+    void InitializeReplayKernel();
+
+    /// Undoes InitializeReplayKernel (SetupForReplay and TeardownReplay call both themselves).
+    void ShutdownReplayKernel();
+
+    /**
      * Indicates if the emulated system is powered on (all subsystems initialized and able to run an
      * application).
      * @returns True if the emulated system is powered on, otherwise false.

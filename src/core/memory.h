@@ -88,6 +88,13 @@ public:
     void SetCurrentPageTable(Kernel::KProcess& process);
 
     /**
+     * Changes the currently active page table to one that belongs to no process (a replay).
+     *
+     * @param page_table The page table to use; it must outlive this object's use of it.
+     */
+    void SetCurrentPageTable(Common::PageTable& page_table);
+
+    /**
      * Maps an allocated buffer onto a region of the emulated process address space.
      *
      * @param page_table The page table of the emulated process.

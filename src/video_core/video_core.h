@@ -26,4 +26,7 @@ namespace VideoCore {
 class RendererBase;
 void CreateGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_window, Core::System& system);
 
+/// The GPU a replay drives: synchronous, no video decoder, Vulkan only. `gpu` stays empty on failure.
+void CreateReplayGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_window, Core::System& system);
+
 } // namespace VideoCore

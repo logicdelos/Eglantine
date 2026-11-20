@@ -45,13 +45,10 @@ std::unique_ptr<VideoCore::RendererBase> CreateRenderer(Core::System& system, Co
 
 namespace VideoCore {
 
-/// @brief Creates an emulated GPU instance using the given system context.
-void CreateGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_window, Core::System& system) {
-    Settings::UpdateRescalingInfo();
+namespace {
 
-    const auto nvdec_value = Settings::values.nvdec_emulation.GetValue();
-    const bool use_nvdec = nvdec_value != Settings::NvdecEmulation::Off;
-    const bool use_async = Settings::values.use_asynchronous_gpu_emulation.GetValue();
+void EmplaceGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_window,
+                Core::System& system, bool use_async, bool use_nvdec) {
     gpu.emplace(system, use_async, use_nvdec);
     auto context = emu_window.CreateSharedContext();
     auto scope = context->Acquire();
@@ -63,6 +60,31 @@ void CreateGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_wi
         LOG_ERROR(HW_GPU, "Failed to initialize GPU: {}", exception.what());
         gpu.reset();
     }
+}
+
+} // Anonymous namespace
+
+/// @brief Creates an emulated GPU instance using the given system context.
+void CreateGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_window, Core::System& system) {
+    Settings::UpdateRescalingInfo();
+
+    const auto nvdec_value = Settings::values.nvdec_emulation.GetValue();
+    const bool use_nvdec = nvdec_value != Settings::NvdecEmulation::Off;
+    const bool use_async = Settings::values.use_asynchronous_gpu_emulation.GetValue();
+    EmplaceGPU(gpu, emu_window, system, use_async, use_nvdec);
+}
+
+/// @brief The GPU a replay drives (replay_session.h): synchronous, no video decoder, and only
+/// the Vulkan renderer, because the replay's off-screen composition lives there. Leaves `gpu`
+/// empty when the pinned backend is another one.
+void CreateReplayGPU(std::optional<Tegra::GPU>& gpu, Core::Frontend::EmuWindow& emu_window, Core::System& system) {
+    if (Settings::values.renderer_backend.GetValue() != Settings::RendererBackend::Vulkan) {
+        LOG_ERROR(HW_GPU, "A replay needs the Vulkan renderer");
+        gpu.reset();
+        return;
+    }
+    Settings::UpdateRescalingInfo();
+    EmplaceGPU(gpu, emu_window, system, false, false);
 }
 
 } // namespace VideoCore
