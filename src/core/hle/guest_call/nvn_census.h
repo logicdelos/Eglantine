@@ -5,6 +5,8 @@
 
 #include <atomic>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "common/common_types.h"
 
@@ -29,7 +31,7 @@ class KProcess;
 /// With auditing on (EDEN_NX2_NVN_CENSUS_AUDIT=1) the JIT also reports every branch from outside
 /// the library into it, which is how a call to a function the census did not know is noticed.
 ///
-/// The report (schema 2) keeps three things apart: whether the run ended cleanly (run_complete),
+/// The report (schema 3) keeps three things apart: whether the run ended cleanly (run_complete),
 /// whether every condition of a complete census held (coverage_complete) and whether the report
 /// holds what a replay of the library calls needs (library_replay_ready, never true while there
 /// is no capture of call arguments). A report written while the game runs is never complete.
@@ -60,6 +62,7 @@ void Configure(Options options);
 namespace detail {
 extern std::atomic<bool> g_active;
 void NotePresentSlow(PresentPath path, u64 stream, u64 token, u64 id);
+void NoteAcceptedPresentSlow(u64 present_id);
 } // namespace detail
 
 /// Whether a census is armed. The kernel's code-change bookkeeping, which only the census reads,
@@ -79,7 +82,7 @@ void Start(Kernel::KProcess& process, u64 program_id);
 /// cleanly is read from Common::RunOutcome.
 void Stop();
 
-/// A frame was accepted for presentation. `stream` is the owning queue (the nx2:vi2 session, or the
+/// A stream presented a frame (identity bookkeeping only; frames close at NoteAcceptedPresent). `stream` is the owning queue (the nx2:vi2 session, or the
 /// buffer-queue core) and `token` is that queue's client-buffer token (0 on the legacy queue, which
 /// has none). `id` numbers the frames of one stream: consecutive, so a missing or repeated one is
 /// noticed. A second token on the same stream marks it ambiguous; it is not split into another stream.
@@ -89,4 +92,26 @@ inline void NotePresent(PresentPath path, u64 stream, u64 token, u64 id) {
     }
 }
 
+/// A present reached the accepted-present seam (the same call that numbers the capture's frames,
+/// VideoCore::Replay::NoteAcceptedPresent). It closes the frame in progress, whose census row takes
+/// `present_id` as its frame id (report key frame_id_basis = "closing_accepted_present"). Dropped
+/// and refresh-only presents never get here and advance no frame.
+inline void NoteAcceptedPresent(u64 present_id) {
+    if (detail::g_active.load(std::memory_order_relaxed)) {
+        detail::NoteAcceptedPresentSlow(present_id);
+    }
+}
+
+/// Unit-test seam: a census with `targets` functions and no process or probes. Not for emulation.
+namespace testing {
+struct FrameRows {
+    std::vector<std::pair<u64, u64>> rows; ///< (frame id, calls) per recorded row, start-up included
+    u64 dropped{};
+    u64 closed{};
+    u64 accepted_presents{};
+};
+void Begin(std::size_t targets);
+void Call(u64 index);
+FrameRows End();
+} // namespace testing
 } // namespace Core::NvnCensus

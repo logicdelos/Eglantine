@@ -20,6 +20,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "core/hle/guest_call/nvn_census.h"
 #include "video_core/replay/capture.h"
 #include "video_core/replay/capture_host.h"
 #include "video_core/replay/checkpoint.h"
@@ -321,4 +322,78 @@ TEST_CASE("recorder: incomplete or abnormal close requests a reasoned nonzero ex
     REQUIRE_FALSE(std::filesystem::exists(path));
     REQUIRE_FALSE(std::filesystem::exists(dir.path / "expected_effects.jsonl"));
     REQUIRE(std::filesystem::exists(path.string() + ".partial"));
+}
+
+TEST_CASE("census and recorder number frames by the same closing accepted present",
+          "[video_core][replay][census_frame_ids]") {
+    namespace C = Core::NvnCensus;
+    TempDirectory dir;
+    HostScript script;
+    CaptureGuard guard;
+    const auto path = dir.path / "ids.egcap";
+    Start(script, MakeConfig(path, 1, 3, 0));
+    C::testing::Begin(4);
+    // One synthetic sequence feeds both: every graphics call reaches both counters, and only a
+    // present that passes the admission seam closes a frame in either.
+    u64 stream_id = 0;
+    const auto call = [](u64 index) {
+        C::testing::Call(index);
+        R::NoteGraphicsCall();
+    };
+    const auto not_admitted = [&] { // refresh-only or unmapped: the stream saw it, nobody admitted it
+        C::NotePresent(C::PresentPath::BufferQueue, 1, 0, ++stream_id);
+    };
+    const auto admitted = [&](u64 present_id) {
+        C::NotePresent(C::PresentPath::BufferQueue, 1, 0, ++stream_id);
+        C::NoteAcceptedPresent(present_id);
+        Present(present_id);
+    };
+    call(0);
+    call(1);
+    Submit();
+    admitted(1);
+    Consume();
+    R::NoteFrameComposed(1);
+    call(2);
+    not_admitted(); // refresh-only
+    call(2);
+    not_admitted(); // unmapped layer
+    call(3);
+    Submit();
+    admitted(2);
+    Consume();
+    R::NoteFrameComposed(2);
+    call(1);
+    Submit();
+    admitted(3);
+    script.before_quiescent = [] {
+        Consume();
+        R::NoteFrameComposed(3);
+    };
+    const auto report = R::EndCapture(true);
+    const C::testing::FrameRows census = C::testing::End();
+    INFO(report.error);
+    REQUIRE(report.run_complete);
+    REQUIRE(report.finalized_frames == 3);
+    R::CaptureReader reader;
+    std::string why;
+    REQUIRE(reader.Open(path, why) == R::ReadError::None);
+    std::vector<std::pair<u64, u64>> capture_rows;
+    for (;;) {
+        R::ChunkView chunk;
+        bool eof = false;
+        REQUIRE(reader.Next(chunk, eof, why) == R::ReadError::None);
+        if (eof) break;
+        if (chunk.type == R::ChunkType::FrameEnd) {
+            R::FrameEndRecord end;
+            REQUIRE(R::Decode(chunk.payload, end) == R::ReadError::None);
+            capture_rows.emplace_back(end.frame_id, end.call_count);
+        }
+    }
+    const std::vector<std::pair<u64, u64>> expected{{1, 2}, {2, 3}, {3, 1}};
+    REQUIRE(capture_rows == expected);
+    REQUIRE(census.rows == expected);
+    REQUIRE(census.dropped == 0);
+    REQUIRE(census.accepted_presents == 3);
+    REQUIRE(census.closed == 2); // start-up (frame 1) is a row, not a closed frame
 }

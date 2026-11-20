@@ -2717,6 +2717,7 @@ private:
         }
         const u64 present_id = VideoCore::Replay::NoteAcceptedPresent(
             VideoCore::Replay::PresentPath::Nx2, layers, fences);
+        Core::NvnCensus::NoteAcceptedPresent(present_id); // same id closes the census frame
         system.GPU().RequestComposite(present_id, std::move(layers), std::move(fences));
         Common::TestHooks::FrameDelay::ForProcess().Apply();
         Common::FrameTiming::Record(present_id);

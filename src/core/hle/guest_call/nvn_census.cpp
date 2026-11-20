@@ -265,7 +265,10 @@ struct State final : Dynarmic::A64::InstructionProbes {
     std::atomic<u64> name_read_failures{0};
     Counters c;
 
-    u64 presents{};
+    u64 presents{};          ///< every present the streams saw, accepted or not
+    u64 accepted_presents{}; ///< presents that reached the accepted-present seam; each closes a frame
+    /// Per epoch slot: the id of the accepted present that closed that epoch (its frame id).
+    std::array<u64, Epochs> close_id{};
     std::array<u64, 2> presents_by_path{};
     std::vector<StreamInfo> streams;
     u64 next_close{}; ///< The lowest epoch not yet folded into the per-frame figures.
@@ -818,6 +821,8 @@ void Reset(State& s) {
     s.name_read_failures.store(0, std::memory_order_relaxed);
     s.c = Counters{};
     s.presents = 0;
+    s.accepted_presents = 0;
+    s.close_id = {};
     s.presents_by_path = {};
     s.streams.clear();
     s.next_close = 0;
@@ -849,19 +854,23 @@ std::vector<u64> DrainEpoch(State& s, u64 epoch) {
     return row;
 }
 
-/// Caller holds s.m. Folds a finished frame into the per-function and per-frame figures. Frame 0
-/// is everything before the first present (start-up), not a frame.
+/// Caller holds s.m. Folds a finished epoch into the per-function and per-frame figures. Its frame
+/// id is the id of the accepted present that closed it, as the capture numbers FRAME_END: epoch 0,
+/// everything before the first present (start-up), is frame 1. Start-up keeps its own totals and is
+/// not a closed frame, but its row is kept so per-frame calls line up with the capture.
 void CloseEpoch(State& s, u64 epoch) {
     const std::vector<u64> row = DrainEpoch(s, epoch);
+    const u64 frame = s.close_id[epoch % Epochs];
     u64 frame_total = 0;
     FrameRow sparse;
-    sparse.frame = epoch;
+    sparse.frame = frame;
     for (std::size_t i = 0; i < row.size(); ++i) {
         const u64 calls = row[i];
         frame_total += calls;
         if (calls == 0) {
             continue;
         }
+        sparse.calls.emplace_back(static_cast<u32>(i), calls);
         Target& target = s.targets[i];
         if (epoch == 0) {
             target.startup = calls;
@@ -871,9 +880,13 @@ void CloseEpoch(State& s, u64 epoch) {
         target.frame_max = std::max(target.frame_max, calls);
         ++target.frames_called;
         if (target.first_frame < 0) {
-            target.first_frame = static_cast<s64>(epoch);
+            target.first_frame = static_cast<s64>(frame);
         }
-        sparse.calls.emplace_back(static_cast<u32>(i), calls);
+    }
+    if (s.frame_rows.size() < MaxFrameRows) {
+        s.frame_rows.push_back(std::move(sparse));
+    } else {
+        ++s.frame_rows_dropped;
     }
     if (epoch == 0) {
         s.startup_total = frame_total;
@@ -884,11 +897,6 @@ void CloseEpoch(State& s, u64 epoch) {
     s.frame_total_max = std::max(s.frame_total_max, frame_total);
     if (s.frame_totals.size() < MaxFrameTotals) {
         s.frame_totals.push_back(frame_total);
-    }
-    if (s.frame_rows.size() < MaxFrameRows) {
-        s.frame_rows.push_back(std::move(sparse));
-    } else {
-        ++s.frame_rows_dropped;
     }
 }
 
@@ -983,6 +991,7 @@ struct Snapshot {
     std::map<std::string, u64> nulls;
     std::map<std::string, u64> bootstrap_results;
     u64 presents{};
+    u64 accepted_presents{};
     std::array<u64, 2> presents_by_path{};
     std::vector<StreamInfo> streams;
     u64 frames_closed{};
@@ -1078,6 +1087,7 @@ Snapshot TakeSnapshot(State& s, bool is_last, bool run_complete, std::string sto
     snap.nulls = s.nulls;
     snap.bootstrap_results = s.bootstrap_results;
     snap.presents = s.presents;
+    snap.accepted_presents = s.accepted_presents;
     snap.presents_by_path = s.presents_by_path;
     snap.streams = s.streams;
     snap.frames_closed = s.frames_closed;
@@ -1242,7 +1252,7 @@ nlohmann::json BuildReport(const Snapshot& s) {
     inputs.stream_ambiguous = !s.streams.empty() && s.streams[0].ambiguous;
     inputs.stream_tokens = s.streams.empty() ? 0 : s.streams[0].tokens;
     inputs.identity_ok = identity_ok;
-    inputs.presents = s.presents;
+    inputs.presents = s.accepted_presents;
     inputs.frames_closed = s.frames_closed;
     inputs.min_frames = s.min_frames;
     inputs.id_gaps = s.c.id_gaps;
@@ -1268,7 +1278,9 @@ nlohmann::json BuildReport(const Snapshot& s) {
     }
 
     json report;
-    report["schema"] = 2;
+    report["schema"] = 3;
+    // frame_rows[*][0] is the id of the accepted present closing that frame (FRAME_END frame_id).
+    report["frame_id_basis"] = "closing_accepted_present";
     report["kind"] = "nvn_call_census";
     report["final"] = s.is_last;
     report["run_complete"] = s.run_complete;
@@ -1420,6 +1432,7 @@ nlohmann::json BuildReport(const Snapshot& s) {
     }
     json frame_info;
     frame_info["presents"] = s.presents;
+    frame_info["accepted_presents"] = s.accepted_presents;
     frame_info["presents_by_path"] = {{"nx2_vi2", s.presents_by_path[0]}, {"buffer_queue", s.presents_by_path[1]}};
     frame_info["streams"] = std::move(streams);
     frame_info["closed"] = frames;
@@ -1431,6 +1444,22 @@ nlohmann::json BuildReport(const Snapshot& s) {
     frame_info["calls_recorded"] = sorted.size();
     frame_info["rows_recorded"] = s.frame_rows.size();
     frame_info["rows_dropped"] = s.frame_rows_dropped;
+    // Per-frame rows join the capture's FRAME_END ids only when one unambiguous stream produced
+    // every present and each of them reached the accepted-present seam; otherwise a verifier must
+    // refuse per-frame qualification rather than guess which present closed which row.
+    std::string unjoinable;
+    if (s.streams.size() != 1) {
+        unjoinable = fmt::format("{} present streams", s.streams.size());
+    } else if (s.streams[0].ambiguous) {
+        unjoinable = "the present stream is ambiguous";
+    } else if (s.streams[0].presents != s.accepted_presents) {
+        unjoinable = fmt::format("{} stream presents but {} accepted presents",
+                                 s.streams[0].presents, s.accepted_presents);
+    } else if (s.frame_rows_dropped != 0) {
+        unjoinable = fmt::format("{} frame rows dropped", s.frame_rows_dropped);
+    }
+    frame_info["rows_joinable"] = unjoinable.empty();
+    frame_info["rows_unjoinable_reason"] = unjoinable.empty() ? json(nullptr) : json(unjoinable);
     report["frames"] = std::move(frame_info);
 
     // Per frame, sparse: [frame, [[function id, calls], ...]].
@@ -1938,11 +1967,18 @@ void detail::NotePresentSlow(PresentPath path, u64 stream, u64 token, u64 id) {
         it->last_id = id;
     }
 
-    // The present ends the frame in progress, epoch e, and starts epoch e + 1: calls that start
-    // after the store below count for the new frame. Epoch e - 1 is folded in now, a frame late,
-    // so a call that started in it and was still running has landed its count by then; one that
-    // lands after that is counted as late rather than lost.
+}
+
+namespace {
+
+/// Caller holds s.m. Accepted present `present_id` ends the frame in progress, epoch e, and starts
+/// epoch e + 1: calls that start after the store below count for the new frame. Epoch e - 1 is
+/// folded in now, a frame late, so a call that started in it and was still running has landed its
+/// count by then; one that lands after that is counted as late rather than lost.
+void AdvanceEpoch(State& s, u64 present_id) {
+    ++s.accepted_presents;
     const u64 next = s.epoch.load(std::memory_order_acquire) + 1;
+    s.close_id[(next - 1) % Epochs] = present_id;
     // The slot `next` reuses held epoch next-Epochs. Close it to new reservations first, so a
     // writer still holding that older epoch cannot reserve after the drain below has looked, then
     // wait out the writers that reserved before the close. A writer that comes late finds the slot
@@ -1961,5 +1997,58 @@ void detail::NotePresentSlow(PresentPath path, u64 stream, u64 token, u64 id) {
         CloseEpoch(s, s.next_close++);
     }
 }
+
+} // namespace
+
+void detail::NoteAcceptedPresentSlow(u64 present_id) {
+    State& s = S();
+    std::scoped_lock lock{s.m};
+    if (!s.started) {
+        return;
+    }
+    AdvanceEpoch(s, present_id);
+}
+
+namespace testing {
+
+void Begin(std::size_t targets) {
+    State& s = S();
+    std::scoped_lock lock{s.m};
+    Reset(s);
+    s.targets.resize(targets);
+    s.started = true;
+    detail::g_active.store(true, std::memory_order_release);
+}
+
+void Call(u64 index) {
+    State& s = S();
+    CountCall(s, ThisShard(s), index, false);
+}
+
+FrameRows End() {
+    State& s = S();
+    std::scoped_lock lock{s.m};
+    detail::g_active.store(false, std::memory_order_release);
+    const u64 current = s.epoch.load(std::memory_order_acquire);
+    while (s.next_close < current) {
+        CloseEpoch(s, s.next_close++);
+    }
+    FrameRows out;
+    for (const FrameRow& row : s.frame_rows) {
+        u64 total = 0;
+        for (const auto& [id, count] : row.calls) {
+            total += count;
+        }
+        out.rows.emplace_back(row.frame, total);
+    }
+    out.dropped = s.frame_rows_dropped;
+    out.closed = s.frames_closed;
+    out.accepted_presents = s.accepted_presents;
+    Reset(s);
+    s.started = false;
+    return out;
+}
+
+} // namespace testing
 
 } // namespace Core::NvnCensus

@@ -15,6 +15,7 @@
 #include "core/core_timing.h"
 #include "core/hle/service/nvdrv/core/container.h"
 #include "core/hle/service/nvdrv/core/nvmap.h"
+#include "core/hle/guest_call/nvn_census.h"
 #include "core/hle/service/nvdrv/devices/nvdisp_disp0.h"
 #include "core/perf_stats.h"
 #include "video_core/gpu.h"
@@ -92,6 +93,7 @@ void nvdisp_disp0::Composite(std::span<const Nvnflinger::HwcLayer> sorted_layers
 
     const u64 present_id = VideoCore::Replay::NoteAcceptedPresent(
         VideoCore::Replay::PresentPath::LegacyBufferQueue, output_layers, output_fences);
+    Core::NvnCensus::NoteAcceptedPresent(present_id); // same id closes the census frame
     system.GPU().RequestComposite(present_id, std::move(output_layers), std::move(output_fences));
     Common::TestHooks::FrameDelay::ForProcess().Apply();
     Common::FrameTiming::Record(present_id);
