@@ -92,7 +92,8 @@ void nvdisp_disp0::Composite(std::span<const Nvnflinger::HwcLayer> sorted_layers
     }
 
     const u64 present_id = VideoCore::Replay::NoteAcceptedPresent(
-        VideoCore::Replay::PresentPath::LegacyBufferQueue, output_layers, output_fences);
+        VideoCore::Replay::PresentPath::LegacyBufferQueue, output_layers, output_fences,
+        Core::NvnCensus::IsActive() || Common::FrameTiming::detail::Active());
     Core::NvnCensus::NoteAcceptedPresent(present_id); // same id closes the census frame
     system.GPU().RequestComposite(present_id, std::move(output_layers), std::move(output_fences));
     Common::TestHooks::FrameDelay::ForProcess().Apply();

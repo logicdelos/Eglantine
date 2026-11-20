@@ -21,6 +21,8 @@ namespace Tegra {
 
 namespace Host1x {
 
+enum class SyncpointSource { External, GpuCommand };
+
 class SyncpointManager {
 public:
     static constexpr size_t NUM_MAX_SYNCPOINTS = 192;
@@ -57,7 +59,7 @@ public:
 
     void DeregisterHostAction(u32 syncpoint_id, const ActionHandle& handle);
 
-    void IncrementGuest(u32 syncpoint_id);
+    void IncrementGuest(u32 syncpoint_id, SyncpointSource source = SyncpointSource::External);
 
     /// Called with a syncpoint's new guest value on every guest increment, before the value is
     /// published and the actions it meets run (empty to stop). Switch 2 clients read syncpoint values from a page the
@@ -93,7 +95,7 @@ public:
 private:
     void Increment(std::atomic<u32>& syncpoint, std::condition_variable& wait_cv,
                    std::list<RegisteredAction>& action_storage,
-                   u32 syncpoint_id, bool guest);
+                   u32 syncpoint_id, bool guest, SyncpointSource source);
 
     ActionHandle RegisterAction(std::atomic<u32>& syncpoint,
                                 std::list<RegisteredAction>& action_storage, u32 expected_value,

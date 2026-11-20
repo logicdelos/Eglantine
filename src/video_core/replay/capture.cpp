@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <nlohmann/json.hpp>
@@ -50,6 +51,7 @@
 #include "video_core/replay/library_call.h"
 #include "video_core/replay/memory_capture.h"
 #include "video_core/replay/options.h"
+#include "video_core/replay/present_extent.h"
 #include "video_core/replay/result.h"
 #include "video_core/replay/run_state.h"
 
@@ -452,12 +454,42 @@ private:
 
 };
 
+std::mutex g_lifecycle_mutex;
 std::mutex g_registry_mutex;
+std::condition_variable g_hooks_retired;
+size_t g_active_hooks = 0;
 std::shared_ptr<Capture> g_capture;
 
-[[nodiscard]] std::shared_ptr<Capture> Current() {
-    std::lock_guard lock{g_registry_mutex};
-    return g_capture;
+// A hook can leave the recorder mutex to pin pages, cut the GPU, or read a picture. Keep
+// the entire operation admitted until it returns, not merely the lifetime of its object.
+class CaptureLease {
+public:
+    CaptureLease() {
+        std::lock_guard lock{g_registry_mutex};
+        owner = g_capture.get();
+        if (owner) ++g_active_hooks;
+    }
+    CaptureLease(const CaptureLease&) = delete;
+    ~CaptureLease() {
+        if (!owner) return;
+        std::lock_guard lock{g_registry_mutex};
+        if (--g_active_hooks == 0) g_hooks_retired.notify_all();
+    }
+    explicit operator bool() const { return owner != nullptr; }
+    Capture* operator->() const { return owner; }
+private:
+    Capture* owner;
+};
+
+[[nodiscard]] CaptureLease Current() { return {}; }
+
+std::shared_ptr<Capture> DetachAndDrainHooks() {
+    std::unique_lock lock{g_registry_mutex};
+    auto owner = std::move(g_capture);
+    detail::g_capture_active.store(false, std::memory_order_relaxed);
+    detail::g_library_capture_active.store(false, std::memory_order_relaxed);
+    g_hooks_retired.wait(lock, [] { return g_active_hooks == 0; });
+    return owner;
 }
 
 void Capture::Deactivate() {
@@ -921,6 +953,13 @@ CutOutcome Capture::CutBody(u64 present_id, std::string& error) {
         AbandonCut();
         return cut.retry_later ? CutOutcome::Retry : CutOutcome::Failed;
     }
+    for (const auto& pin : cut.pins) {
+        if (pin.key == static_cast<u32>(SettingKey::VSync) && pin.value != 0) {
+            error = "capture requires Immediate VSync";
+            AbandonCut();
+            return CutOutcome::Failed;
+        }
+    }
     LibrarySink library_sink{config.limits.max_chunk_bytes - 64};
     CheckpointStatus library_status;
     if (has_library) {
@@ -1211,6 +1250,11 @@ void Capture::AcceptedPresent(u64 id, PresentPath path,
         Fail(IncompleteLimitExceeded, "the pending present exceeds the capture layer limit");
         return;
     }
+    if (fences.size() > 1 || (!fences.empty() &&
+        static_cast<u32>(fences.front().id) >= Service::Nvidia::MaxSyncPoints)) {
+        Fail(IncompleteUnresolvedResource, "PRESENT cannot encode multiple or invalid syncpoint fences");
+        return;
+    }
     // NVN call counts use the guest acceptance boundary. GPU words and effects keep belonging
     // to the open GPU frame until the renderer actually composites it.
     auto& present = pending_presents.emplace_back();
@@ -1218,7 +1262,6 @@ void Capture::AcceptedPresent(u64 id, PresentPath path,
     present.path = path;
     present.calls = std::exchange(frame_calls, 0);
     present.layers.assign(layers.begin(), layers.end());
-    // PRESENT encodes the leading fence only; the GPU still waits on the full fence list.
     if (!fences.empty()) present.fences.push_back(fences.front());
     g_open_frame.store(id + 1, std::memory_order_relaxed);
     final_pending = id == last_frame;
@@ -1238,6 +1281,9 @@ void Capture::RecordPresentLocked(u64 id, PresentPath path,
     if (!fences.empty()) {
         record.fence_id = static_cast<u32>(fences[0].id);
         record.fence_value = fences[0].value;
+        if (recorded_syncpoints[static_cast<u32>(record.fence_id)] < record.fence_value) {
+            NoteUnresolved("the PRESENT syncpoint threshold is not established by recorded producers");
+        }
     }
     for (size_t index = 0; index < layers.size(); ++index) {
         if (index >= MaxLayersPerPresent) {
@@ -1247,9 +1293,13 @@ void Capture::RecordPresentLocked(u64 id, PresentPath path,
         }
         const Tegra::FramebufferConfig& source_layer = layers[index];
         PresentLayer layer;
-        const u64 bytes = u64{source_layer.stride} * source_layer.height * 4 + source_layer.offset;
+        const auto bytes = PresentBackingBytes(source_layer.width, source_layer.height,
+                                               source_layer.stride, static_cast<u32>(source_layer.pixel_format));
+        const u64 available = std::numeric_limits<u64>::max() - source_layer.address;
         MemoryTracker::Location location;
-        if (tracker->Locate(source_layer.address, bytes, location)) {
+        if (bytes && source_layer.offset <= available && *bytes <= available - source_layer.offset &&
+            tracker->Locate(source_layer.address, source_layer.offset + *bytes, location) &&
+            tracker->IsResolved(source_layer.address + source_layer.offset, *bytes)) {
             layer.alloc_id = location.alloc_id;
             layer.alloc_offset = location.offset;
             layer.generation = location.generation;
@@ -1354,12 +1404,11 @@ void Capture::FrameComposed(u64 id) {
         have_picture = host->ReadComposedPicture(id, picture);
         if (have_picture) {
             const u64 expected = u64{picture.stride_bytes} * picture.height;
-            have_picture = picture.width != 0 && picture.height != 0 &&
+            have_picture = picture.frame_id == id && picture.width != 0 && picture.height != 0 &&
                            u64{picture.stride_bytes} >= u64{picture.width} * 4 &&
                            picture.pixels.size() == expected &&
                            expected + 128 <= config.limits.max_chunk_bytes;
             if (have_picture) {
-                picture.frame_id = id;
                 picture.kind = PictureKind::Composed;
                 picture.format = PictureFormat::B8G8R8A8Unorm;
                 picture.color = ColorEncoding::SdrSrgb;
@@ -1769,6 +1818,7 @@ void Capture::FenceProducedLocked(const FenceNote& note) {
             // FENCE also sets to an absolute value is not comparable and is skipped.
             u64& raises = gpu_syncpoint_raises[static_cast<u32>(note.id)];
             ++raises;
+            ++recorded_syncpoints[static_cast<u32>(note.id)];
             if (external_syncpoints.find(static_cast<u32>(note.id)) != external_syncpoints.end()) {
                 ++output_stats.syncpoints_skipped;
             } else {
@@ -2258,6 +2308,7 @@ CaptureReport Capture::End(bool run_ended_normally) {
 
 bool BeginCaptureWithHost(std::unique_ptr<CaptureHost> host, const CaptureConfig& config,
                           std::string& error) {
+    std::lock_guard lifecycle{g_lifecycle_mutex};
     auto capture = std::make_shared<Capture>(std::move(host), config);
     {
         std::lock_guard lock{g_registry_mutex};
@@ -2272,31 +2323,20 @@ bool BeginCaptureWithHost(std::unique_ptr<CaptureHost> host, const CaptureConfig
                        std::memory_order_relaxed);
     detail::g_capture_active.store(true, std::memory_order_relaxed);
     if (!capture->Begin(error)) {
+        DetachAndDrainHooks();
         capture->ReleasePins();
         Common::RunOutcome::Request(Common::RunOutcome::Reason::CaptureFailed, error);
-        detail::g_capture_active.store(false, std::memory_order_relaxed);
-        detail::g_library_capture_active.store(false, std::memory_order_relaxed);
-        {
-            std::lock_guard lock{g_registry_mutex};
-            g_capture.reset();
-        }
         return false;
     }
     return true;
 }
 
 CaptureReport EndCapture(bool run_ended_normally) {
-    static std::mutex end_mutex;
-    const std::lock_guard ending{end_mutex};
+    const std::lock_guard lifecycle{g_lifecycle_mutex};
     if (run_ended_normally) {
         if (auto pending = Current()) pending->DrainFinal();
     }
-    std::shared_ptr<Capture> capture;
-    {
-        std::lock_guard lock{g_registry_mutex};
-        capture = std::move(g_capture);
-        g_capture.reset();
-    }
+    auto capture = DetachAndDrainHooks();
     if (capture == nullptr) {
         return CaptureReport{};
     }
@@ -2446,7 +2486,7 @@ CallTicket NextCallTicket() noexcept {
 
 bool RecordLibraryCall(const CallTicket& ticket, const CallRecordView& record) noexcept {
     const auto capture = Current();
-    return capture == nullptr || capture->LibraryRecord(ticket, record);
+    return !capture || capture->LibraryRecord(ticket, record);
 }
 
 } // namespace VideoCore::Replay

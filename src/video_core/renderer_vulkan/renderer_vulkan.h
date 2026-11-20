@@ -32,6 +32,7 @@
 
 namespace VideoCore::Replay {
 struct DeviceIdentity;
+struct EndPicture;
 }
 
 namespace Core::Memory {
@@ -96,7 +97,8 @@ private:
     void RenderScreenshot(std::span<const Tegra::FramebufferConfig> framebuffers);
     void RenderAppletCaptureLayer(std::span<const Tegra::FramebufferConfig> framebuffers);
     void ComposeForReplay(std::span<const Tegra::FramebufferConfig> framebuffers);
-    void ComposeForCapture(std::span<const Tegra::FramebufferConfig> framebuffers);
+    void ComposeForCapture(std::span<const Tegra::FramebufferConfig> framebuffers,
+                           VideoCore::Replay::EndPicture& picture);
 
     std::vector<Tegra::FramebufferConfig> applet_capture_layers;
     std::vector<Tegra::FramebufferConfig> screenshot_layer_scratch;

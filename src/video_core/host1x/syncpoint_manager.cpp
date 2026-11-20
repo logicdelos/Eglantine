@@ -10,6 +10,7 @@
 #include "common/logging.h"
 #include "common/nx2_sampler.h"
 #include "video_core/host1x/syncpoint_manager.h"
+#include "video_core/replay/memory_capture.h"
 
 namespace Tegra {
 
@@ -62,9 +63,9 @@ void SyncpointManager::DeregisterHostAction(u32 syncpoint_id, const ActionHandle
     DeregisterAction(host_action_storage[syncpoint_id], handle);
 }
 
-void SyncpointManager::IncrementGuest(u32 syncpoint_id) {
+void SyncpointManager::IncrementGuest(u32 syncpoint_id, SyncpointSource source) {
     Increment(syncpoints_guest[syncpoint_id], wait_guest_cv, guest_action_storage[syncpoint_id],
-              syncpoint_id, true);
+              syncpoint_id, true, source);
 }
 
 void SyncpointManager::SetGuestMirror(GuestMirror mirror) {
@@ -74,7 +75,7 @@ void SyncpointManager::SetGuestMirror(GuestMirror mirror) {
 
 void SyncpointManager::IncrementHost(u32 syncpoint_id) {
     Increment(syncpoints_host[syncpoint_id], wait_host_cv, host_action_storage[syncpoint_id],
-              syncpoint_id, false);
+              syncpoint_id, false, SyncpointSource::External);
 }
 
 void SyncpointManager::WaitGuest(u32 syncpoint_id, u32 expected_value) {
@@ -99,12 +100,19 @@ bool SyncpointManager::WaitHostFor(u32 syncpoint_id, u32 expected_value,
 
 void SyncpointManager::Increment(std::atomic<u32>& syncpoint, std::condition_variable& wait_cv,
                                  std::list<RegisteredAction>& action_storage,
-                                 u32 syncpoint_id, bool guest) {
+                                 u32 syncpoint_id, bool guest, SyncpointSource source) {
     std::scoped_lock lk(guard);
     if (guest && guest_mirror) {
         // Before the value is published: the lock-free ready checks in RegisterAction and Wait
         // must not see it ahead of the page.
         guest_mirror(syncpoint_id, syncpoint.load(std::memory_order_relaxed) + 1);
+    }
+    // Lock-free ready checks and registered actions may compose as soon as this value is visible.
+    const bool external = source == SyncpointSource::External;
+    if (guest && (VideoCore::Replay::CaptureActive() || (!external && VideoCore::Replay::ReplayGpuRunning()))) {
+        VideoCore::Replay::NoteFenceProduced(VideoCore::Replay::FenceKind::SyncpointRaised, 0, 0,
+                                             syncpoint_id, syncpoint.load(std::memory_order_relaxed) + 1,
+                                             0, external);
     }
     const u32 new_value{syncpoint.fetch_add(1, std::memory_order_acq_rel) + 1};
     if (Nx2Sampler::DependencyTraceEnabled()) {
