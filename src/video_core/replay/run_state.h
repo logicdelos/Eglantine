@@ -68,23 +68,4 @@ inline void SetReplayGpuRunning(bool running) noexcept {
     return !replay_gpu_running;
 }
 
-// One observer of accepted presents outside the capture (the census of slice D registers here).
-// The function runs on the presenting thread and must be wait-free. nullptr clears it.
-using PresentObserver = void (*)(u64 present_id, PresentPath path) noexcept;
-
-namespace detail {
-inline std::atomic<PresentObserver> g_present_observer{nullptr};
-} // namespace detail
-
-inline void SetPresentObserver(PresentObserver observer) noexcept {
-    detail::g_present_observer.store(observer, std::memory_order_release);
-}
-
-inline void NotifyPresentObserver(u64 present_id, PresentPath path) noexcept {
-    if (const PresentObserver observer =
-            detail::g_present_observer.load(std::memory_order_acquire)) {
-        observer(present_id, path);
-    }
-}
-
 } // namespace VideoCore::Replay

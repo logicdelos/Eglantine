@@ -5,7 +5,6 @@
 #include "sync_manager.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/syncpoint_manager.h"
-#include "video_core/replay/memory_capture.h"
 
 namespace Tegra {
 namespace Host1x {
@@ -43,11 +42,6 @@ void SyncptIncrManager::IncrementAllDone() {
         auto& syncpoint_manager = host1x.GetSyncpointManager();
         syncpoint_manager.IncrementGuest(increments[done_count].syncpt_id);
         syncpoint_manager.IncrementHost(increments[done_count].syncpt_id);
-        if (VideoCore::Replay::CaptureActive()) {
-            VideoCore::Replay::NoteFenceProduced(
-                VideoCore::Replay::FenceKind::SyncpointRaised, 0, 0, increments[done_count].syncpt_id,
-                syncpoint_manager.GetGuestSyncpointValue(increments[done_count].syncpt_id), 0, true);
-        }
     }
     increments.erase(increments.begin(), increments.begin() + done_count);
 }

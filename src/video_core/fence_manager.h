@@ -32,7 +32,6 @@
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/rasterizer_interface.h"
-#include "video_core/replay/memory_capture.h"
 
 namespace VideoCommon {
 
@@ -138,12 +137,7 @@ public:
             LOG_ERROR(HW_GPU, "Signal of syncpoint {} past the table, ignored", value);
             return;
         }
-        syncpoint_manager.IncrementGuest(value);
-        if (VideoCore::Replay::CaptureActive() || VideoCore::Replay::ReplayGpuRunning()) {
-            VideoCore::Replay::NoteFenceProduced(
-                VideoCore::Replay::FenceKind::SyncpointRaised, 0, 0, value,
-                syncpoint_manager.GetGuestSyncpointValue(value), 0, false);
-        }
+        syncpoint_manager.IncrementGuest(value, Tegra::Host1x::SyncpointSource::GpuCommand);
         std::function<void()> func([this, value] { syncpoint_manager.IncrementHost(value); });
         SignalFence(std::move(func));
     }

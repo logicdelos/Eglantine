@@ -100,13 +100,14 @@ inline void NoteGuestWrite(u64 device_address, u64 size) {
 }
 
 // The single place a present is accepted for display, on either path. Assigns the logical frame
-// id (run_state.h), tells the census observer and the capture, and returns the id. Called before
+// id (run_state.h) when an enabled consumer needs it, or returns zero. Called before
 // RequestComposite with the layers and fences that call receives.
 inline u64 NoteAcceptedPresent(PresentPath path,
                                std::span<const Tegra::FramebufferConfig> layers,
-                               std::span<const Service::Nvidia::NvFence> fences) {
+                               std::span<const Service::Nvidia::NvFence> fences,
+                               bool census_or_timing = false) {
+    if (!CaptureActive() && !census_or_timing && !ReplayGpuRunning()) return 0;
     const u64 id = CountAcceptedPresent();
-    NotifyPresentObserver(id, path);
     if (CaptureActive()) {
         NoteAcceptedPresentSlow(id, path, layers, fences);
     }

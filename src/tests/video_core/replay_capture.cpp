@@ -11,6 +11,7 @@
 #include <functional>
 #include <fstream>
 #include <iterator>
+#include <latch>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -21,7 +22,9 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "core/hle/guest_call/nvn_census.h"
+#include "video_core/host1x/syncpoint_manager.h"
 #include "video_core/replay/capture.h"
+#include "video_core/replay/capture_composition.h"
 #include "video_core/replay/capture_host.h"
 #include "video_core/replay/checkpoint.h"
 #include "video_core/replay/events.h"
@@ -83,6 +86,9 @@ public:
 struct HostScript {
     std::function<void()> during_cut;
     std::function<void()> before_quiescent;
+    std::function<void(s32)> on_pin;
+    u64 vsync = 0;
+    bool wrong_picture = false;
 };
 
 class FakeHost final : public R::CaptureHost {
@@ -113,6 +119,10 @@ public:
         mapping.size = MapBytes;
         mapping.device = DeviceBase;
         out.mappings.push_back(mapping);
+        R::SessionPin vsync;
+        vsync.key = static_cast<u32>(R::SettingKey::VSync);
+        vsync.value = script.vsync;
+        out.pins.push_back(vsync);
         R::SessionPin backend;
         backend.key = static_cast<u32>(R::SettingKey::ShaderBackend);
         out.pins.push_back(backend);
@@ -140,9 +150,12 @@ public:
         return false;
     }
 
-    void PinPages(std::span<const std::pair<u64, size_t>>, s32) override {}
+    void PinPages(std::span<const std::pair<u64, size_t>> runs, s32 delta) override {
+        if (script.on_pin) script.on_pin(static_cast<s32>(runs.size()) * delta);
+    }
 
     bool ReadComposedPicture(u64 present_id, R::EndPicture& out) override {
+        out.frame_id = present_id + script.wrong_picture;
         out.width = 4;
         out.height = 4;
         out.stride_bytes = 16;
@@ -378,6 +391,7 @@ TEST_CASE("census and recorder number frames by the same closing accepted presen
     R::CaptureReader reader;
     std::string why;
     REQUIRE(reader.Open(path, why) == R::ReadError::None);
+    REQUIRE(reader.Validate(why) == R::ReadError::None);
     std::vector<std::pair<u64, u64>> capture_rows;
     for (;;) {
         R::ChunkView chunk;
@@ -396,4 +410,165 @@ TEST_CASE("census and recorder number frames by the same closing accepted presen
     REQUIRE(census.dropped == 0);
     REQUIRE(census.accepted_presents == 3);
     REQUIRE(census.closed == 2); // start-up (frame 1) is a row, not a closed frame
+}
+
+TEST_CASE("recorder: the publishing guest increment precedes its inline final composite", "[video_core][replay][recorder]") {
+    TempDirectory dir;
+    HostScript script;
+    CaptureGuard guard;
+    const auto path = dir.path / "fence.egcap";
+    Start(script, MakeConfig(path, 1, 1, 0));
+    Tegra::Host1x::SyncpointManager manager;
+    using Source = Tegra::Host1x::SyncpointSource;
+    Source source = Source::External;
+    SECTION("external producer") {}
+    SECTION("recorded GPU command producer") { source = Source::GpuCommand; }
+    Submit();
+    Consume();
+    const Service::Nvidia::NvFence fence{7, 1};
+    R::NoteAcceptedPresentSlow(1, R::PresentPath::Nx2, {}, {&fence, 1});
+    manager.RegisterGuestAction(7, 1, [] { R::NoteFrameComposed(1); });
+    manager.IncrementGuest(7, source);
+    const auto report = R::EndCapture(true);
+    INFO(report.error);
+    REQUIRE(report.run_complete);
+    std::ifstream ledger{dir.path / "expected_effects.jsonl"};
+    std::vector<std::string> kinds;
+    for (std::string row; std::getline(ledger, row);) kinds.push_back(nlohmann::json::parse(row).at("kind"));
+    const std::vector<std::string> expected{"submit", "consume", source == Source::External ? "fence_signal" : "syncpoint_increment", "present_compose"};
+    REQUIRE(kinds == expected);
+    R::CaptureReader reader;
+    std::string error;
+    REQUIRE(reader.Open(path, error) == R::ReadError::None);
+    REQUIRE(reader.Validate(error) == R::ReadError::None);
+    std::vector<R::ChunkType> boundary;
+    for (;;) {
+        R::ChunkView chunk;
+        bool eof = false;
+        REQUIRE(reader.Next(chunk, eof, error) == R::ReadError::None);
+        if (eof) break;
+        if (chunk.type == R::ChunkType::Fence || chunk.type == R::ChunkType::Present) boundary.push_back(chunk.type);
+    }
+    std::vector<R::ChunkType> expected_chunks;
+    if (source == Source::External) expected_chunks.push_back(R::ChunkType::Fence);
+    expected_chunks.push_back(R::ChunkType::Present);
+    REQUIRE(boundary == expected_chunks);
+}
+
+TEST_CASE("recorder: unrepresentable display dependency refuses a clean capture", "[video_core][replay][recorder]") {
+    TempDirectory dir;
+    HostScript script;
+    CaptureGuard guard;
+    Start(script, MakeConfig(dir.path / "bad.egcap", 1, 1, 0));
+    u32 reason = R::IncompleteUnresolvedResource;
+    SECTION("two fence thresholds") {
+        const std::array<Service::Nvidia::NvFence, 2> fences{{{3, 1}, {4, 1}}};
+        R::NoteAcceptedPresentSlow(1, R::PresentPath::Nx2, {}, fences);
+    }
+    SECTION("missing padded backing") {
+        // Linear bytes fit MapBytes; the 128-row raw fallback needs 32 KiB.
+        Tegra::FramebufferConfig layer{.address = DeviceBase, .width = 64, .height = 32,
+            .stride = 64, .pixel_format = Service::android::PixelFormat::Rgba8888};
+        R::NoteAcceptedPresentSlow(1, R::PresentPath::Nx2, {&layer, 1}, {});
+    }
+    SECTION("wrong picture owner") { script.wrong_picture = true; Present(1); }
+    SECTION("uncaptured producing threshold") {
+        reason = R::IncompleteMissingFence;
+        const Service::Nvidia::NvFence fence{7, 3};
+        R::NoteAcceptedPresentSlow(1, R::PresentPath::Nx2, {}, {&fence, 1});
+    }
+    R::NoteFrameComposed(1);
+    const auto report = R::EndCapture(true);
+    REQUIRE_FALSE(report.run_complete);
+    REQUIRE((report.incomplete_reasons & reason) != 0);
+    REQUIRE_FALSE(report.error.empty());
+}
+
+TEST_CASE("recorder: outstanding compositions drain in order with exact picture ownership", "[video_core][replay][recorder]") {
+    R::CaptureCompositeQueue queue;
+    std::vector<u64> ids;
+    std::vector<u8> pixels;
+    bool wrong = false;
+    std::latch entered{1}, resume{1};
+    const auto make = [&](u64 id) {
+        return queue.Enqueue([&, id] {
+            R::CaptureComposition scope{id};
+            R::CaptureComposition::Target()->pixels = {static_cast<u8>(id + 10)};
+            if (id == 1) { entered.count_down(); resume.wait(); }
+            R::EndPicture picture;
+            wrong |= R::CaptureComposition::Take(id + 1, picture);
+            if (R::CaptureComposition::Take(id, picture)) {
+                ids.push_back(picture.frame_id);
+                pixels.push_back(picture.pixels.at(0));
+            }
+            wrong |= R::CaptureComposition::Take(id, picture);
+        });
+    };
+    auto first = make(1), second = make(2), third = make(3);
+    queue.Ready(second);
+    std::thread signaling{[&] { queue.Ready(first); }};
+    entered.wait();
+    queue.Ready(third);
+    resume.count_down();
+    signaling.join();
+    REQUIRE_FALSE(wrong);
+    REQUIRE(ids == std::vector<u64>{1, 2, 3});
+    REQUIRE(pixels == std::vector<u8>{11, 12, 13});
+}
+
+TEST_CASE("recorder: shutdown retires pins after all admitted hooks leave", "[video_core][replay][recorder]") {
+    TempDirectory dir;
+    HostScript script;
+    CaptureGuard guard;
+    std::latch entered{1}, resume{1};
+    std::atomic<int> pins{};
+    std::function<void()> operation;
+    script.on_pin = [&](s32 delta) { pins += delta; };
+    SECTION("checkpoint in progress") {
+        Start(script, MakeConfig(dir.path / "cut.egcap", 2, 1, 0));
+        script.during_cut = [&] { entered.count_down(); resume.wait(); };
+        operation = [] { Present(1); };
+    }
+    SECTION("mapping pin in progress") {
+        Start(script, MakeConfig(dir.path / "mapping.egcap", 1, 1, 0));
+        script.on_pin = [&](s32 delta) {
+            if (delta > 0) { entered.count_down(); resume.wait(); }
+            pins += delta;
+        };
+        operation = [] { R::NoteGpuMap(Space, MapGpu + MapBytes, 4096, DeviceBase + MapBytes, 0, 0); };
+    }
+    std::thread worker{operation};
+    entered.wait();
+    std::atomic<bool> ended{};
+    R::CaptureReport report;
+    std::thread closer{[&] { report = R::EndCapture(false); ended = true; }};
+    while (R::CaptureActive()) std::this_thread::yield();
+    const bool ended_before_release = ended.load();
+    resume.count_down();
+    worker.join();
+    closer.join();
+    REQUIRE_FALSE(ended_before_release);
+    REQUIRE_FALSE(report.run_complete);
+    REQUIRE(pins.load() == 0);
+    REQUIRE_FALSE(R::CaptureActive());
+}
+
+TEST_CASE("recorder: non-Immediate VSync cannot advertise an Immediate session", "[video_core][replay][recorder]") {
+    TempDirectory dir;
+    HostScript script;
+    CaptureGuard guard;
+    script.vsync = 2; // FIFO
+    R::SetAcceptedPresentBase(0);
+    std::string error;
+    REQUIRE_FALSE(R::BeginCaptureWithHost(std::make_unique<FakeHost>(script), MakeConfig(dir.path / "fifo.egcap", 1, 1, 0), error));
+    REQUIRE(error.find("VSync") != std::string::npos);
+}
+
+TEST_CASE("recorder: accepted ids advance only for enabled consumers", "[video_core][replay][recorder]") {
+    R::SetAcceptedPresentBase(9);
+    REQUIRE(R::NoteAcceptedPresent(R::PresentPath::Nx2, {}, {}) == 0);
+    REQUIRE(R::LastAcceptedPresentId() == 9);
+    REQUIRE(R::NoteAcceptedPresent(R::PresentPath::LegacyBufferQueue, {}, {}, true) == 10);
+    REQUIRE(R::NoteAcceptedPresent(R::PresentPath::Nx2, {}, {}, true) == 11);
+    R::SetAcceptedPresentBase(0);
 }

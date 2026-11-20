@@ -49,6 +49,7 @@
 #include "video_core/nx2_spikes.h"
 #include "video_core/renderer_base.h"
 #include "video_core/replay/capture.h"
+#include "video_core/replay/capture_composition.h"
 #include "video_core/replay/memory_capture.h"
 #include "video_core/replay/run_state.h"
 #include "video_core/shader_notify.h"
@@ -369,14 +370,25 @@ struct GPU::Impl {
         }
         pending_composite_fence = RequestSyncOperation(
             [this, present_id, current_request_counter, num_fences,
-             composite_layers = std::move(layers), composite_fences = std::move(fences)] {
+             composite_layers = std::move(layers), composite_fences = std::move(fences)]() mutable {
+                VideoCore::Replay::CaptureCompositeQueue::Ticket ticket;
+                if (present_id && VideoCore::Replay::CaptureActive()) {
+                    ticket = capture_composites.Enqueue([this, present_id, layers = std::move(composite_layers)] {
+                        VideoCore::Replay::CaptureComposition scope{present_id};
+                        renderer->Composite(layers);
+                        VideoCore::Replay::NoteFrameComposed(present_id);
+                    });
+                }
+                auto compose = [this, ticket = std::move(ticket), layers = std::move(composite_layers)] {
+                    if (ticket) capture_composites.Ready(ticket);
+                    else renderer->Composite(layers);
+                };
                 if (num_fences == 0) {
-                    renderer->Composite(composite_layers);
-                    VideoCore::Replay::NoteFrameComposed(present_id);
+                    compose();
                     return;
                 }
                 auto& syncpoint_manager = system.Host1x().GetSyncpointManager();
-                const auto executer = [this, present_id, current_request_counter, composite_layers]() {
+                const auto executer = [this, current_request_counter, compose = std::move(compose)]() {
                     {
                         std::unique_lock<std::mutex> lk(request_swap_mutex);
                         if (--request_swap_counters[current_request_counter] != 0) {
@@ -384,8 +396,7 @@ struct GPU::Impl {
                         }
                         free_swap_counters.push_back(current_request_counter);
                     }
-                    renderer->Composite(composite_layers);
-                    VideoCore::Replay::NoteFrameComposed(present_id);
+                    compose();
                 };
                 for (size_t i = 0; i < num_fences; i++) {
                     syncpoint_manager.RegisterGuestAction(composite_fences[i].id,
@@ -472,6 +483,7 @@ struct GPU::Impl {
 
     std::deque<size_t> free_swap_counters;
     std::deque<size_t> request_swap_counters;
+    VideoCore::Replay::CaptureCompositeQueue capture_composites;
     std::mutex request_swap_mutex;
     u64 pending_composite_fence{};
 };

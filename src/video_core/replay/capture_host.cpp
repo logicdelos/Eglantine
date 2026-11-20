@@ -84,7 +84,7 @@ std::vector<SessionPin> CollectSessionPins(const GpuCheckpoint& checkpoint) {
     pin(SettingKey::ShaderBackend, 0);
     pin(SettingKey::OutputLayerMask, 0);
     pin(SettingKey::TuringMacros, turing ? 1 : 0);
-    pin(SettingKey::VSync, 0);
+    pin(SettingKey::VSync, static_cast<u64>(Settings::values.vsync_mode.GetValue()));
     pin(SettingKey::AstcRecompression,
         static_cast<u64>(Settings::values.astc_recompression.GetValue()));
     return pins;

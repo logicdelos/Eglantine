@@ -33,6 +33,7 @@
 #include "video_core/gpu.h"
 #include "video_core/present.h"
 #include "video_core/replay/capture.h"
+#include "video_core/replay/capture_composition.h"
 #include "video_core/replay/memory_capture.h"
 #include "video_core/replay/run_state.h"
 #include "video_core/renderer_vulkan/present/util.h"
@@ -75,25 +76,9 @@ std::vector<u8> replay_picture;
 u32 replay_picture_width = 0;
 u32 replay_picture_height = 0;
 
-// The picture of the last live composite while a capture runs (read right after the composite,
-// on the same thread, by the capture's host hook).
-std::mutex capture_picture_mutex;
-std::vector<u8> capture_picture;
-u32 capture_picture_width = 0;
-u32 capture_picture_height = 0;
-
-bool ReadCapturePicture([[maybe_unused]] Core::System& system, [[maybe_unused]] u64 present_id,
+bool ReadCapturePicture([[maybe_unused]] Core::System& system, u64 present_id,
                         VideoCore::Replay::EndPicture& out) {
-    std::scoped_lock lock{capture_picture_mutex};
-    if (capture_picture.empty()) {
-        return false;
-    }
-    out.width = capture_picture_width;
-    out.height = capture_picture_height;
-    out.stride_bytes = capture_picture_width * 4;
-    out.pixels = std::move(capture_picture);
-    capture_picture.clear();
-    return true;
+    return VideoCore::Replay::CaptureComposition::Take(present_id, out);
 }
 
 // Registered by the RendererVulkan constructor, so the renderer of the system is one.
@@ -299,11 +284,10 @@ RendererVulkan::~RendererVulkan() {
     void(device.GetLogical().WaitIdle());
 }
 
-void RendererVulkan::ComposeForCapture(std::span<const Tegra::FramebufferConfig> framebuffers) {
+void RendererVulkan::ComposeForCapture(std::span<const Tegra::FramebufferConfig> framebuffers,
+                                       VideoCore::Replay::EndPicture& picture) {
     const auto layers = Tegra::FilterLayerStack(
         framebuffers, Service::Nvnflinger::LayerStackId::Default, screenshot_layer_scratch);
-    std::scoped_lock lock{capture_picture_mutex};
-    capture_picture.clear();
     u32 width = 0;
     u32 height = 0;
     if (!Tegra::PictureExtent(layers, width, height)) {
@@ -313,9 +297,10 @@ void RendererVulkan::ComposeForCapture(std::span<const Tegra::FramebufferConfig>
         RenderToBuffer(layers, Layout::DefaultFrameLayout(width, height), VK_FORMAT_B8G8R8A8_UNORM,
                        VkDeviceSize{width} * height * 4);
     const auto mapped = buffer.Mapped();
-    capture_picture.assign(mapped.begin(), mapped.end());
-    capture_picture_width = width;
-    capture_picture_height = height;
+    picture.pixels.assign(mapped.begin(), mapped.end());
+    picture.width = width;
+    picture.height = height;
+    picture.stride_bytes = width * 4;
 }
 
 bool RendererVulkan::FillDeviceIdentity(VideoCore::Replay::DeviceIdentity& out) const {
@@ -343,8 +328,8 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     RenderAppletCaptureLayer(framebuffers);
     // A live capture keeps the picture the way a replay composes it: at the guest size, layer
     // stack default, no overlay. Only while a capture runs.
-    if (VideoCore::Replay::CaptureActive()) {
-        ComposeForCapture(framebuffers);
+    if (auto* picture = VideoCore::Replay::CaptureComposition::Target()) {
+        ComposeForCapture(framebuffers, *picture);
     }
     if (!render_window.IsShown()) {
         // Nothing is presented, but the frame still ends for the per-frame resources: without the

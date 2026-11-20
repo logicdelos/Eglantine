@@ -13,7 +13,6 @@
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/renderer_null/null_rasterizer.h"
-#include "video_core/replay/memory_capture.h"
 
 namespace Null {
 
@@ -84,13 +83,8 @@ void RasterizerNull::SyncOperation(std::function<void()>&& func) {
 }
 void RasterizerNull::SignalSyncPoint(u32 value) {
     auto& syncpoint_manager = m_gpu.Host1x().GetSyncpointManager();
-    syncpoint_manager.IncrementGuest(value);
+    syncpoint_manager.IncrementGuest(value, Tegra::Host1x::SyncpointSource::GpuCommand);
     syncpoint_manager.IncrementHost(value);
-    if (VideoCore::Replay::CaptureActive() || VideoCore::Replay::ReplayGpuRunning()) {
-        VideoCore::Replay::NoteFenceProduced(VideoCore::Replay::FenceKind::SyncpointRaised, 0, 0,
-                                             value, syncpoint_manager.GetGuestSyncpointValue(value),
-                                             0, false);
-    }
 }
 void RasterizerNull::SignalReference() {}
 void RasterizerNull::ReleaseFences(bool) {}
