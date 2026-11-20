@@ -68,7 +68,7 @@ For a title reference scene to pass Issue #5, **all** calls and effects must rec
 
 1. **Independent Call Denominator (`nvn_census_verdict.h` / `EvaluateCoverage`):**
    - `discovered = named_targets + audit_targets + unknown_targets`, where `audit_targets` are entry points discovered by Dynarmic's A64 external-branch audit (`OnAuditBranch`), excluding return sites (`EntryClass::ReturnSite`: a `RET` landing immediately after `BL`/`BLR`/`BLRAA*`/`BLRAB*` in library code).
-   - Completeness requires all 11 conditions: `bootstrap_found_before_first_request`, `every_target_resolved` (`unknown_targets == 0`), `every_target_instrumented`, `audit_found_entries_counted_at_entry`, `no_unknown_dispatch` (`unknown_calls == 0`, `unaudited_entries == 0`), `audit_matches_counts` (`audit_shortfall_calls <= audit_tolerance`), `frame_accounting_exact` (`executed == startup + frames + late + tail`, `late == 0`, `mismatched == 0`), `one_present_stream`, `presents_consistent` (`frames_closed + 1 == accepted_presents`), `enough_frames`, `no_dropped_or_lost_events`.
+   - Completeness requires all 11 conditions: `bootstrap_found_before_first_request`, `every_target_resolved` (`unknown_targets == 0`), `every_target_instrumented`, `audit_found_entries_counted_at_entry`, `no_unknown_dispatch` (`unknown_calls == 0`, `unaudited_entries == 0`), `audit_matches_counts` (`audited == known_entries`, `shortfall == 0`, reported shortfall equal, `audited <= executed`; the older one-entry tolerance is gone), `frame_accounting_exact` (`executed == startup + frames + late + tail`, `late == 0`, `mismatched == 0`), `one_present_stream`, `presents_consistent` (`frames_closed + 1 == accepted_presents`), `enough_frames`, `no_dropped_or_lost_events`.
    - Frame ids (census report schema 3, `frame_id_basis: "closing_accepted_present"`): census frames close at the same admitted-present seam the recorder numbers `FRAME_END` from (`VideoCore::Replay::NoteAcceptedPresent`, then `Core::NvnCensus::NoteAcceptedPresent` with the same id). A `frame_rows` entry's frame is the id of the accepted present that closed it. Start-up, the calls before the first present, is frame 1, so census frame N's calls equal capture `FRAME_END(N).call_count`. Refresh-only and dropped presents close no frame in either. `frames.presents` counts every stream present and `frames.accepted_presents` the admitted ones. `frames.rows_joinable` is false, with `rows_unjoinable_reason` set, unless one unambiguous stream produced every present, each of them was admitted, and no row was dropped. A verifier must refuse per-frame qualification when it is false and must apply no offset mapping.
 2. **Event Reconciliation (Supported / Fallback / Unsupported / Unobservable):**
    - A replay witness is an ordered pair of independent JSONL ledgers: `expected_effects.jsonl` (live/capture side, from the recorder) and `effects.jsonl` (replay/observed side). Each row is `{schema: 1, frame_id, ordinal, kind, classification, payload?, outcome?, reason?}`. Event identity is `(frame_id, ordinal, kind)`; `ordinal` is zero-based, unique and contiguous from 0 within a frame, and both ledgers must reproduce the same identity sequence in recorded order.
@@ -92,7 +92,8 @@ For a title reference scene to pass Issue #5, **all** calls and effects must rec
   - Image envelope: `max_rgb_mae <= 1.0`, `max_channel_delta <= 4`, `outlier_fraction <= 0.005` (threshold `2`), `max_alpha_delta == 0`, strict RGBA8 PNG CRC and dimension check. `frames.jsonl` checksums are 16-digit hexadecimal over **BGRA** before PNG conversion.
   - Reconciliation: event identity `(frame_id, ordinal, kind)`, both ledgers in recorded order, per-frame declared counts, payload/outcome equality for `supported`/`fallback`, classification-specific reason rules for opaque effects. Rejections cover missing, extra, duplicate, reordered, mismatched, deleted-from-both-sidecars, missing-frame, stale-checksum and changed-image cases.
   - Live guest calls: every frame's `call_count` (copied from `FRAME_END`, never recomputed) must equal the live census `frame_rows` total for that same frame id. Supply `--title-census <census.json>`; an in-directory `census.json` with `frame_rows` is used when the flag is absent. A frame missing from the census, an off-by-one total, or a non-zero `call_count` with no census is FAIL (fail closed, counts never rewritten). A zero-call witness needs no census.
-  - Exit codes: `0` PASS, `1` reconciliation/image FAIL, `2` INVALID input (malformed JSON, schema mismatch, missing files, frame gap), `3` INCOMPLETE (census gate failed, or `--require-equivalent` with opaque effects remaining).
+  - Capture anchoring: a `standalone_replay_witness` (and any run given `--capture`) must supply a finalized EGLCAP v2 stream. The verifier reads only the 256-byte header, `INDEX`, `FRAME_END` and `COMPLETE`, checks CRC/header/length/`Complete`/required features, derives the trusted window from `preroll + finalized`, and requires it to equal `manifest.expected_frame_ids` with no gaps. Per selected frame, `frames.jsonl` `call_count`/`effect_count` must equal the stream `FRAME_END` counts. The adjacent `report.json` (or `--run-report`) must be complete, replay every selected frame, write every picture, execute the declared pre-roll, report zero guest calls, and carry the `COMPLETE.chain_digest`; a missing/truncated capture, missing report or wrong window is INVALID. Pre-roll effect counts come from `preroll_frames.jsonl` and are reconciled through `preroll_effects.jsonl` in frame order, so a dropped pre-roll effect is still caught.
+  - Exit codes: `0` PASS, `1` reconciliation/image FAIL, `2` INVALID input (malformed JSON, schema mismatch, missing files, frame gap, truncated/partial capture, missing report), `3` INCOMPLETE (census gate failed, or `--require-equivalent` with opaque effects remaining).
   - `--reconcile-census` derives coverage from the emitted schema-2 `functions`, `bootstrap`, `audit`, `errors`, `accounting`, `guest_threads`, `frames` and `provenance` sections. Only a final, clean, independently complete census passes; a separate `replay_capture.failed` does not alter the census verdict.
   - `--verify-images` remains image/semantics-only: it cannot certify effect coverage or a complete capture.
   - `--write-fixture <empty-dir>` regenerates deterministic bytes and refuses a non-empty directory, so real evidence is never overwritten. Qualification manifest schema 3 and frame schema 2 are required; schema-2 manifests and format-1 streams are rejected rather than silently upgraded.
@@ -100,7 +101,7 @@ For a title reference scene to pass Issue #5, **all** calls and effects must rec
 ### Single-Command Reproduction
 
 ```sh
-# 1. Positive & adversarial self-controls (57 checks; exit 0)
+# 1. Positive & adversarial self-controls (73 checks; exit 0)
 python -X utf8 -I -S -B tools/replay_qualify/replay_qualify.py --selftest
 
 # 2. Original fixture verification (PASS, exit 0; replay_equivalent false by design)
@@ -115,20 +116,23 @@ tests.exe "[compute_clean_cut]"
 ```sh
 # One run: observed side next to the replay images, capture-side ledger supplied separately.
 python -X utf8 -I -S -B tools/replay_qualify/replay_qualify.py \
-  --verify <replay_dir> --expected-effects <capture_dir>/expected_effects.jsonl [--require-equivalent]
+  --verify <replay_dir> --expected-effects <capture_dir>/expected_effects.jsonl \
+  [--capture <scene.egcap> [--run-report <replay_dir>/report.json]] [--require-equivalent]
 
 # Game-free replay witness for a capture with executed guest titles: reconcile calls.
 python -X utf8 -I -S -B tools/replay_qualify/replay_qualify.py \
-  --verify-replay <replay_dir> --expected-effects <capture_dir>/expected_effects.jsonl \
+  --verify-replay <replay_dir> --capture <scene.egcap> \
+  --expected-effects <capture_dir>/expected_effects.jsonl \
   --title-census <census.json> [--require-equivalent]
 
-# A zero-call witness needs no census (manifest kind standalone_replay_witness, every
-# frame call_count == 0, no census.json).
-python -X utf8 -I -S -B tools/replay_qualify/replay_qualify.py --verify-replay <replay_dir>
+# A zero-call witness still needs its finalized capture + report; only the census is absent.
+python -X utf8 -I -S -B tools/replay_qualify/replay_qualify.py --verify-replay <replay_dir> \
+  --capture <scene.egcap>
 
 # Two runs: verify each independently, then require identical witnesses.
 python -X utf8 -I -S -B tools/replay_qualify/replay_qualify.py \
-  --compare-runs <run_a> <run_b> [--witness-only] [--title-census <census.json>]
+  --compare-runs <run_a> <run_b> [--witness-only] [--title-census <census.json>] \
+  [--capture <scene.egcap>]
 ```
 
 `--compare-runs` compares per-frame ledger content and image checksums (not path names), so two runs from different directories compare cleanly; any divergence exits 1. `--verify-replay` reconciles every `call_count` against the live census's per-frame `frame_rows` total; a non-zero count without `--title-census` (or an in-directory census) is unreconciled and exits 1, never rewritten. The verifier never rewrites, migrates or deletes a witness or capture.
