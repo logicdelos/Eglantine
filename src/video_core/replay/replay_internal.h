@@ -598,10 +598,6 @@ inline void RecordStop(std::string& message, ReadError& kind, std::string text,
     return kind == ReadError::None ? message : message + " (" + ErrorKindText(kind) + ")";
 }
 
-[[nodiscard]] inline u64 PicturesWritten(u64 frames_with_files) noexcept {
-    return frames_with_files * 2U;
-}
-
 // ---- PNG, stored zlib, 8-bit RGBA ----------------------------------------------------------
 
 [[nodiscard]] inline u32 Crc32(std::span<const u8> data) noexcept {

@@ -147,8 +147,12 @@ TEST_CASE("Replay report: section documents", "[video_core][replay]") {
     REQUIRE(R::ToJson(replay)["replay_guest_call_count"].is_null());
     replay.replay_guest_call_count = 0;
     replay.capture_chain_digest = 0x12ab;
+    replay.pictures_written = 2;
+    replay.picture_files_written = 4;
     const nlohmann::json replay_json = R::ToJson(replay);
     REQUIRE(replay_json["replay_guest_call_count"] == 0);
+    REQUIRE(replay_json["pictures_written"] == 2);
+    REQUIRE(replay_json["picture_files_written"] == 4);
     REQUIRE(replay_json["capture_chain_digest"] == "00000000000012ab");
     REQUIRE(replay_json["capture_session_id"] == "000000000000abcd");
 

@@ -124,6 +124,7 @@ Json ToJson(const ReplayReport& report) {
     json["frames_replayed"] = report.frames_replayed;
     json["preroll_frames_executed"] = report.preroll_frames_executed;
     json["pictures_written"] = report.pictures_written;
+    json["picture_files_written"] = report.picture_files_written;
     json["identical_frames"] = report.identical_frames;
     json["semantic_mismatches"] = report.semantic_mismatches;
     json["replay_digest"] = Hex(report.replay_digest);

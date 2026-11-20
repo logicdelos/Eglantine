@@ -105,7 +105,8 @@ struct ReplayReport {
     u64 frames_expected = 0;
     u64 frames_replayed = 0;
     u64 preroll_frames_executed = 0;
-    u64 pictures_written = 0;
+    u64 pictures_written = 0;       // completed selected frames with both picture files
+    u64 picture_files_written = 0;  // successfully written live-reference and replay-render PNGs
     u64 identical_frames = 0;       // replay checksum equals the live checksum (informational)
     u64 semantic_mismatches = 0;
     u64 replay_digest = 0;          // FNV-1a chain over the replay checksum of every frame

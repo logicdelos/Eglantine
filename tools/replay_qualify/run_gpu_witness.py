@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Run the original witness twice on the actual GPU and reject both corrupt controls."""
+"""Run the original GPU witness twice and check each negative control's reason."""
 import argparse
 import json
 import shutil
@@ -33,6 +33,8 @@ def main():
         rc = subprocess.run([args.cli.resolve(), "--user-dir", profile, "--replay", path,
                              "--replay-images", images, "--report", report], timeout=180).returncode
         result = json.loads(report.read_text(encoding="utf-8"))["replay"]
+        if result["pictures_written"] != result["frames_replayed"] or result["picture_files_written"] != len(list(images.glob("*.png"))):
+            raise ValueError(f"{label}: wrong selected frame or PNG file count: {result}")
         if rejection:
             if (rc == 0 or result["run_complete"] or rejection not in result["error"]
                     or result["frames_replayed"] != completed):
