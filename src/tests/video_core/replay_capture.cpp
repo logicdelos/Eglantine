@@ -302,6 +302,55 @@ TEST_CASE("recorder: two live frames preserve repeated effects and independent c
     REQUIRE(rows[3]["payload"]["value"] == 9);
 }
 
+TEST_CASE("readback origins: verification probes do not become emulated effects",
+          "[video_core][replay][readback-origin]") {
+    static std::atomic<u32> rows;
+    rows.store(0);
+    REQUIRE_FALSE(R::CaptureActive());
+    R::SetReplayEffectObserver([](const R::LiveEffect& effect) noexcept {
+        if (effect.kind == R::EffectKind::ReadbackVisibility) ++rows;
+    });
+    struct ResetObserver {
+        ~ResetObserver() { R::SetReplayEffectObserver(nullptr); }
+    } reset;
+    {
+        R::ScopedReplayVerificationRead fence_probe;
+        {
+            R::ScopedReplayVerificationRead nested_probe;
+            R::NoteHostReadback(DeviceBase, 4);
+        }
+        R::NoteHostReadback(DeviceBase, 4);
+        CHECK(rows.load() == 0);
+        // Same address, same size, same observer/frame; only the caller's origin differs.
+        std::thread gpu_worker{[] { R::NoteHostReadback(DeviceBase, 4); }};
+        gpu_worker.join();
+        CHECK(rows.load() == 1);
+    }
+    R::NoteHostReadback(DeviceBase, 4);
+    CHECK(rows.load() == 2);
+}
+
+TEST_CASE("readback origins: live recording still records a guest readback",
+          "[video_core][replay][recorder][readback-origin]") {
+    TempDirectory dir;
+    HostScript script;
+    CaptureGuard guard;
+    Start(script, MakeConfig(dir.path / "guest-read.egcap", 1, 1, 0));
+    R::NoteHostReadback(DeviceBase, 4);
+    PresentAndCompose(1);
+    const auto report = R::EndCapture(true);
+    INFO(report.error);
+    REQUIRE(report.run_complete);
+    std::ifstream ledger{dir.path / "expected_effects.jsonl"};
+    std::vector<std::string> kinds;
+    for (std::string line; std::getline(ledger, line);) {
+        const auto row = nlohmann::json::parse(line);
+        REQUIRE(row["frame_id"] == 1);
+        kinds.push_back(row.at("kind").get<std::string>());
+    }
+    CHECK(kinds == std::vector<std::string>{"readback_visibility", "present_compose"});
+}
+
 TEST_CASE("recorder: an effect racing the GPU checkpoint refuses the cut", "[video_core][replay][recorder]") {
     TempDirectory dir;
     HostScript script;

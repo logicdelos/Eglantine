@@ -36,6 +36,8 @@
 #include "video_core/host1x/syncpoint_manager.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/rasterizer_interface.h"
+#include "video_core/renderer_base.h"
 #include "video_core/replay/effect.h"
 #include "video_core/replay/present_extent.h"
 #include "video_core/replay/format_io.h"
@@ -221,7 +223,8 @@ private:
         }
         if (effects_.size() != end.effect_count) {
             return Fail("observed effect count differs from FRAME_END on frame " +
-                        std::to_string(end.frame_id));
+                        std::to_string(end.frame_id) + ": expected " + std::to_string(end.effect_count) +
+                        ", observed " + std::to_string(effects_.size()));
         }
         effects_.clear();
         return true;
@@ -755,7 +758,10 @@ private:
                 channel->second.memory->WriteBlock(fence.id, &fence.value, bytes);
             }
             u64 observed{};
-            channel->second.memory->ReadBlock(fence.id, &observed, bytes);
+            {
+                ScopedReplayVerificationRead probe;
+                channel->second.memory->ReadBlock(fence.id, &observed, bytes);
+            }
             ObserveEffect({EffectKind::FenceSignal, fence.id, observed, true});
         }
         // Wakes a channel suspended on the value that was just written.
@@ -892,6 +898,7 @@ private:
         for (auto& [channel_id, channel] : channels_) {
             if (channel.space == space && channel.memory->IsFullyMappedRange(gpu_va, bytes)) {
                 u64 raw = 0;
+                ScopedReplayVerificationRead probe;
                 channel.memory->ReadBlock(gpu_va, &raw, bytes);
                 value = raw;
                 return true;
@@ -946,7 +953,13 @@ private:
                 if (it->first.first != want.id || want.value_hi > it->second.size) {
                     continue;
                 }
-                gpu_->FlushRegion(it->second.device_address, want.value_hi);
+                // FinishFrame already drained GPU work. Flush synchronously: an asynchronous
+                // GPU flush could skip the download or run outside the probe's thread scope.
+                {
+                    ScopedReplayVerificationRead probe;
+                    gpu_->Renderer().ReadRasterizer()->FlushRegion(it->second.device_address,
+                                                                    want.value_hi);
+                }
                 got.value_lo = Fnv1a64(std::span<const u8>{
                     it->second.host_bytes, static_cast<size_t>(want.value_hi)});
                 got.value_hi = want.value_hi;

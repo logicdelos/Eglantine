@@ -51,6 +51,8 @@ void Make(const std::filesystem::path& path, std::string_view mode) {
     const bool omit_page = mode == "--missing-page";
     const bool lost_effect = mode == "--lost-effect";
     const bool preroll = mode == "--preroll";
+    const bool guest_read = mode == "--guest-readback";
+    const bool expect_read = guest_read || mode == "--lost-guest-readback";
     h.first_frame = preroll ? 2 : 1;
     h.preroll_frames = preroll ? 1 : 0;
     h.requested_frames = preroll ? 1 : 2;
@@ -90,10 +92,20 @@ void Make(const std::filesystem::path& path, std::string_view mode) {
             append(R::ChunkType::Map, frame, std::array{R::MapEntry{0, 0, Base, AllocationSize, 1, 0, 1, 0}});
         }
         R::GpuEvent submit, consume;
-        submit.submit = {.channel_id = 1, .submit_id = frame, .entries = {{Base + TiledBytes, 1, 0}}};
+        std::vector<u32> words{InlineNop};
+        if (guest_read && frame == 1) {
+            // Bind Maxwell B, then set RENDER_ENABLE to IfEqual at a mapped, uncached word.
+            // With neither operand GPU-modified, ProcessQueryCondition reads the comparison
+            // through both caches. These are guest-command readbacks, not verification probes.
+            constexpr u32 increasing = 1U << 29;
+            words = {increasing | (1U << 16), 0xB197,
+                     increasing | (3U << 16) | (0x1550U / 4), 0, static_cast<u32>(Fence), 3};
+        }
+        const u32 word_count = static_cast<u32>(words.size());
+        submit.submit = {.channel_id = 1, .submit_id = frame, .entries = {{Base + TiledBytes, word_count, 0}}};
         consume.kind = R::GpuEventKind::Consume;
         consume.consume = {.channel_id = 1, .submit_id = frame, .consume_id = frame,
-                           .gpu_va = Base + TiledBytes, .flags = R::ConsumeEntryEnd, .words = {InlineNop}};
+                           .gpu_va = Base + TiledBytes, .flags = R::ConsumeEntryEnd, .words = std::move(words)};
         append(R::ChunkType::GpuEvent, frame, std::array{submit, consume});
         append(R::ChunkType::Fence, frame, std::array{R::FenceEntry{R::FenceKind::SemaphoreWrite, 1, Fence, frame}});
         R::PresentRecord present{.path = R::PresentPath::LegacyBufferQueue, .present_id = frame,
@@ -111,14 +123,14 @@ void Make(const std::filesystem::path& path, std::string_view mode) {
         const bool warmup = preroll && frame == 1;
         if (!warmup) append(R::ChunkType::EndPicture, frame, image);
         R::FrameEndRecord end{.frame_id = frame, .flags = R::FrameComplete | (warmup ? R::FramePreroll : R::FrameHasLivePicture),
-                              .gpu_words = 1, .first_sequence = first, .last_sequence = out.NextSequence(),
+                              .gpu_words = word_count, .first_sequence = first, .last_sequence = out.NextSequence(),
                               .output_id = frame, .call_count = 0,
-                              .effect_count = lost_effect && frame == 2 ? 5U : 4U};
+                              .effect_count = expect_read && frame == 1 ? 6U : lost_effect && frame == 2 ? 5U : 4U};
         end.outputs.push_back({R::SemanticKind::SemaphoreValue, Fence, frame, 0, R::SpaceTag(0)});
         append(R::ChunkType::FrameEnd, frame, end);
     }
     h.finalized_frames = h.requested_frames;
-    R::CompleteRecord complete{.status = R::CompleteStatus::Complete, .gpu_words = 2,
+    R::CompleteRecord complete{.status = R::CompleteStatus::Complete, .gpu_words = guest_read ? 7U : 2U,
                                .initial_backing_bytes = AllocationSize, .delta_bytes = TiledBytes,
                                .dependency_complete = 1};
     if (!out.Finalize(h, complete, why)) throw std::runtime_error(why);
@@ -134,8 +146,9 @@ void Make(const std::filesystem::path& path, std::string_view mode) {
 int main(int argc, char** argv) try {
     const std::string_view mode = argc == 3 ? argv[2] : "";
     if (argc < 2 || argc > 3 || (!mode.empty() && mode != "--missing-page" && mode != "--lost-effect" &&
-                                 mode != "--preroll" && mode != "--unmet-present-fence")) {
-        std::cerr << "usage: make_gpu_witness OUTPUT.egcap [--missing-page | --lost-effect | --preroll | --unmet-present-fence]\n";
+                                 mode != "--preroll" && mode != "--unmet-present-fence" &&
+                                 mode != "--guest-readback" && mode != "--lost-guest-readback")) {
+        std::cerr << "usage: make_gpu_witness OUTPUT.egcap [--missing-page | --lost-effect | --preroll | --unmet-present-fence | --guest-readback | --lost-guest-readback]\n";
         return 2;
     }
     Make(argv[1], mode);

@@ -542,7 +542,7 @@ inline void NoteHostReadback(u64 device, u64 size) {
     if (CaptureActive()) {
         NoteHostReadbackSlow(device, size);
     } else {
-        ObserveReplayEffect({EffectKind::ReadbackVisibility, 0, 0, false});
+        ObserveReplayReadback();
     }
 }
 
