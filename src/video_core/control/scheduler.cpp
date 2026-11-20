@@ -17,6 +17,8 @@
 #include "video_core/control/scheduler.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
+#include "video_core/replay/capture.h"
+#include "video_core/replay/run_state.h"
 
 namespace Tegra::Control {
 
@@ -54,6 +56,7 @@ void Scheduler::Push(GPU& gpu, s32 channel, CommandList&& entries) {
     BindChannel(gpu, channel_state->bind_id);
     // Process commands outside the lock to reduce contention.
     // Multiple channels can prepare their commands in parallel.
+    VideoCore::Replay::NoteSubmit(channel, entries);
     channel_state->payload->dma_pusher.Push(std::move(entries));
     channel_state->payload->dma_pusher.DispatchCalls();
     if (channel_state->payload->dma_pusher.HasPendingAcquire() &&
@@ -77,7 +80,7 @@ bool Scheduler::ResumePending(GPU& gpu) {
             // Powered off (shutting down), DispatchCalls returns at once and the acquire stays
             // pending: resuming it again counted as progress forever and the GPU thread never
             // reached its stop request (closing the game hung).
-            if (!dma_pusher.system.IsPoweredOn()) {
+            if (!VideoCore::Replay::GpuWorkRunning(dma_pusher.system.IsPoweredOn())) {
                 PublishPendingState();
                 return any_moved;
             }

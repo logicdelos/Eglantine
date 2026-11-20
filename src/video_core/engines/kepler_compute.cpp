@@ -46,6 +46,7 @@
 #include "video_core/macro_turing_jit.h"
 #endif
 #include "video_core/rasterizer_interface.h"
+#include "video_core/replay/memory_capture.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/textures/decoders.h"
 
@@ -181,6 +182,7 @@ void KeplerCompute::ProcessNativeReportSemaphore(u32 argument) {
         // REDUCTION_FORMAT 18:17: UNSIGNED_32 0, SIGNED_32 1 (EDEN_NX2_CLASS_FIXES, c4).
         const bool is_signed = VideoCommon::Nx2Census::FixOn(VideoCommon::Nx2Census::Fix::C4) &&
                                ((argument >> 17) & 3) == 1;
+        VideoCore::Replay::NoteOutputNotComparable();  // value computed at fence time
         rasterizer->SignalFence(
             [this, address, payload, reduction, is_signed,
              issued = IssueRelease(memory_manager, address, reduction, is_signed, payload)] {
@@ -196,6 +198,9 @@ void KeplerCompute::ProcessNativeReportSemaphore(u32 argument) {
             });
         return;
     }
+    VideoCore::Replay::NoteFenceProduced(
+        VideoCore::Replay::FenceKind::SemaphoreWrite, -1, static_cast<u32>(memory_manager.GetID()),
+        address, payload, one_word ? 4 : 8, false);
     rasterizer->Query(address, VideoCommon::QueryType::Payload,
                       one_word ? VideoCommon::QueryPropertiesFlags::IsAFence
                                : VideoCommon::QueryPropertiesFlags::HasTimeout,
@@ -463,6 +468,7 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                 }
                 if (!memory_manager.IsFullyMappedRange(address, four_words ? 16 : sizeof(payload))) return false;
                 if (flags & (1U << 26)) {
+                    VideoCore::Replay::NoteOutputNotComparable();  // value computed at fence time
                     rasterizer->SignalFence([this, address, payload, flags,
                                              issued = IssueRelease(memory_manager, address,
                                                                    (flags >> 20) & 7,
@@ -490,6 +496,9 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                         }
                     });
                 } else if (four_words) {
+                    VideoCore::Replay::NoteFenceProduced(
+                        VideoCore::Replay::FenceKind::SemaphoreWrite, -1,
+                        static_cast<u32>(memory_manager.GetID()), address, payload, 8, false);
                     rasterizer->Query(address, VideoCommon::QueryType::Payload,
                         VideoCommon::QueryPropertiesFlags::IsAFence | VideoCommon::QueryPropertiesFlags::HasTimeout,
                         payload, 0);
@@ -500,6 +509,7 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                     // syncpoint into that word only advances it for the same reason
                     // (QueryPropertiesFlags::AdvanceOnly).
                     // ReduceSemaphore's unsigned MAX.
+                    VideoCore::Replay::NoteOutputNotComparable();  // value computed at fence time
                     rasterizer->SignalFence(
                         [this, address, payload,
                          issued = IssueRelease(memory_manager, address, 2, false, payload)] {
@@ -520,6 +530,9 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                     if (watch != 0 && (address & ~u64{0xf}) == (watch & ~u64{0xf})) {
                         LOG_INFO(HW_GPU, "Semaphore watch: QMD release {:#x} = {:#x} flags {:#x}", address, payload, flags);
                     }
+                    VideoCore::Replay::NoteFenceProduced(
+                        VideoCore::Replay::FenceKind::SemaphoreWrite, -1,
+                        static_cast<u32>(memory_manager.GetID()), address, payload, 4, false);
                     rasterizer->Query(address, VideoCommon::QueryType::Payload,
                         VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
                 }
@@ -970,6 +983,7 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
     bool replaced = false;
     try {
         rasterizer->DispatchCompute();
+        VideoCore::Replay::NoteEngineEffect(VideoCore::Replay::EffectKind::ComputeDispatch);
         diag_note("ok");
     } catch (const Shader::Exception& error) {
         diag_note("failed", error.what());
@@ -2089,6 +2103,7 @@ void KeplerCompute::ProcessLaunch() {
         launch_description.local_crs_alloc.Assign(launch_description.local_crs_alloc.Value() & 0xfffffU);
     }
     rasterizer->DispatchCompute();
+    VideoCore::Replay::NoteEngineEffect(VideoCore::Replay::EffectKind::ComputeDispatch);
 }
 
 Texture::TICEntry KeplerCompute::GetTICEntry(u32 tic_index) const {

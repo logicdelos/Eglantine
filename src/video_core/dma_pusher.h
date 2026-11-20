@@ -213,6 +213,8 @@ private:
     /// Returns how many words were processed: fewer than given when a semaphore acquire
     /// suspended the channel.
     size_t ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset = 0);
+    /// The processing itself; ProcessCommands adds the capture note around it.
+    size_t ProcessCommandsImpl(std::span<const CommandHeader> commands, size_t word_offset);
     size_t command_resume_offset{}; ///< Words of the current entry done before a suspension
 
     void SetState(const CommandHeader& command_header);
