@@ -572,3 +572,45 @@ TEST_CASE("recorder: accepted ids advance only for enabled consumers", "[video_c
     REQUIRE(R::NoteAcceptedPresent(R::PresentPath::Nx2, {}, {}, true) == 11);
     R::SetAcceptedPresentBase(0);
 }
+
+TEST_CASE("recorder: preroll stays in the live ledger without stealing the selected picture", "[video_core][replay][recorder]") {
+    TempDirectory dir;
+    HostScript script;
+    CaptureGuard guard;
+    const auto path = dir.path / "with-preroll.egcap";
+    Start(script, MakeConfig(path, 2, 1, 1));
+    Present(1);
+    R::NoteFrameComposed(1);
+    Present(2);
+    R::NoteFrameComposed(2);
+    const auto report = R::EndCapture(true);
+    INFO(report.error);
+    REQUIRE(report.run_complete);
+    REQUIRE(report.preroll_frames == 1);
+    std::ifstream ledger{dir.path / "expected_effects.jsonl"};
+    std::vector<u64> effects, pictures;
+    for (std::string row; std::getline(ledger, row);) {
+        const auto effect = nlohmann::json::parse(row);
+        REQUIRE(effect.at("kind") == "present_compose");
+        effects.push_back(effect.at("frame_id"));
+    }
+    REQUIRE(effects == std::vector<u64>{1, 2});
+    R::CaptureReader reader;
+    std::string error;
+    REQUIRE(reader.Open(path, error) == R::ReadError::None);
+    REQUIRE(reader.Validate(error) == R::ReadError::None);
+    for (;;) {
+        R::ChunkView chunk;
+        bool eof = false;
+        REQUIRE(reader.Next(chunk, eof, error) == R::ReadError::None);
+        if (eof) break;
+        if (chunk.type == R::ChunkType::EndPicture) pictures.push_back(chunk.header.frame_id);
+        if (chunk.type == R::ChunkType::FrameEnd) {
+            R::FrameEndRecord end;
+            REQUIRE(R::Decode(chunk.payload, end) == R::ReadError::None);
+            REQUIRE(end.effect_count == 1);
+            REQUIRE(((end.flags & R::FramePreroll) != 0) == (end.frame_id == 1));
+        }
+    }
+    REQUIRE(pictures == std::vector<u64>{2});
+}
