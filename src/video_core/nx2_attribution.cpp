@@ -1392,6 +1392,7 @@ struct Session {
     void MarkOpenIncomplete();
     void Prune(bool force = false);
     bool Reserve(std::vector<SpanRec>& spans);
+    bool ReclaimSpare();
     void Trim(std::vector<SpanRec>& spans, bool force = false);
     void NoteRetained();
     void Process(const Item& item);
@@ -1698,9 +1699,6 @@ bool Session::CloseSpan(const PendingEnd& end) {
     if (owner.closed.capacity() == 0 && owner.open.empty()) {
         // Move the empty allocation rather than charge two vectors for one span.
         owner.open.swap(owner.closed);
-    } else if (owner.closed.size() == owner.closed.capacity() && history >= history_cap) {
-        // Another slot is already charged to the open vector: reclaim it before reserving.
-        Trim(owner.open, true);
     }
     if (!Reserve(owner.closed)) {
         // The finished record does not fit: lost like a span refused at its Begin.
@@ -2027,6 +2025,27 @@ void Session::MarkOpenIncomplete() {
     }
 }
 
+/// Return unused slots from one vector without changing any recorded span or its owner.
+bool Session::ReclaimSpare() {
+    std::vector<SpanRec>* donor = nullptr;
+    size_t most_spare = 0;
+    const u32 count = thread_count.load(std::memory_order_acquire);
+    for (u32 i = 0; i < count; ++i) {
+        for (auto* spans : {&states[i].open, &states[i].closed}) {
+            const size_t spare = spans->capacity() - spans->size();
+            if (spare > most_spare) {
+                most_spare = spare;
+                donor = spans;
+            }
+        }
+    }
+    if (!donor) {
+        return false;
+    }
+    Trim(*donor, true);
+    return true;
+}
+
 /// Makes room for one more record in `spans`. The capacity of a vector is storage the session
 /// owns whether or not it is in use, so growth is charged to `history` (in records) and refused
 /// when it does not fit in `history_cap`; the charge is returned only by Trim, when the storage is
@@ -2035,8 +2054,21 @@ bool Session::Reserve(std::vector<SpanRec>& spans) {
     if (spans.size() < spans.capacity()) {
         return true;
     }
+    if (history >= history_cap && !ReclaimSpare() && last_resolved_ts > pruned_through) {
+        // Every slot is live. Apply the ordinary retention rule, never resolve an interval from
+        // inside a ring drain. Pruning can leave spare slots in a vector it did not shrink.
+        const u64 old_floor = pruned_through;
+        Prune();
+        if (spans.size() < spans.capacity()) {
+            return true;
+        }
+        if (history >= history_cap && pruned_through > old_floor) {
+            ReclaimSpare();
+        }
+    }
     const size_t room = history < history_cap ? history_cap - history : 0;
-    const size_t grow = std::min(std::max(spans.capacity(), MinSpanCapacity), room);
+    // Do not let a single geometric growth take all remaining slots from the other threads.
+    const size_t grow = std::min(std::max(spans.capacity(), MinSpanCapacity), room - room / 2);
     if (grow == 0) {
         return false;
     }

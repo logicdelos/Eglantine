@@ -1005,80 +1005,328 @@ TEST_CASE("A span closing at capacity reuses its open history slot",
     CHECK((ended.frame.unknown_reasons & UnknownReason::LostSpans) == 0);
 }
 
-TEST_CASE("A full history can transfer a span and reports only actual overflow",
+TEST_CASE("A full history reclaims stranded allocations before it refuses a closed record",
           "[nx2][attribution][history]") {
-    SessionConfig config = Config(100 * Ms);
-    config.buffer_bytes = 16 * 1024; // 64 history slots and four events per producer ring
-    Run run{config};
-    const u64 future = run.T(3'600'000 * Ms);
-    // Fill all 64 charged slots: 16 closed (including the probe) and 16 open on the
-    // presenter, then 32 closed on the other producer. No presents can prune these yet.
-    REQUIRE(AwaitIdle());
-    for (u64 i = 0; i < 15; ++i) {
-        RecordSpan(Cause::Texture, future, future + Ms);
+    // The history is charged by the capacity of every open and closed vector, not by the records
+    // held in them. A vector that grew for a burst and then resolved part of it leaves slack:
+    // another producer's closed record must reclaim that slack before it is called overflow. A
+    // record is refused only when all 64 slots hold a live record.
+    SECTION("Fifty live records are accepted although all 64 slots are charged") {
+        SessionConfig config = Config(100 * Ms);
+        config.buffer_bytes = 16 * 1024; // 64 history slots and four events per producer ring
+        Run run{config};
         REQUIRE(AwaitIdle());
-    }
-    const SpanToken open = BeginSpan(Cause::Shader);
-    REQUIRE(open.Valid());
-    REQUIRE(AwaitIdle());
-    std::atomic<bool> drained{true};
-    OnThread([&] {
-        for (u64 i = 0; i < 32; ++i) {
+        const u64 future = run.T(3'600'000 * Ms);
+        // The probe and fifteen more closed records fill the presenter's 16-slot vector.
+        for (u64 i = 0; i < 15; ++i) {
             RecordSpan(Cause::Texture, future, future + Ms);
-            if (!AwaitIdle()) {
-                drained = false;
-                break;
-            }
+            REQUIRE(AwaitIdle());
         }
-    });
-    REQUIRE(drained.load());
-    CHECK(ReadAttributionSnapshot().lost_events == 0);
-
-    bool overflow = false;
-    u64 before_drop{};
-    u64 after_drop{};
-    SECTION("Transfer without a free slot") {}
-    SECTION("One new span beyond capacity") {
-        overflow = true;
-        before_drop = NowNs();
-        // The lost span intersects both the short and the long frame, but not the next one.
-        RecordSpan(Cause::Disk, run.T(0) + 1, std::max(before_drop, run.T(2 * Ms)));
+        const SpanToken open = BeginSpan(Cause::Shader);
+        REQUIRE(open.Valid());
         REQUIRE(AwaitIdle());
-        after_drop = NowNs();
-    }
-    EndSpan(open);
-    REQUIRE(AwaitIdle());
-    Present(run.T(0));
-    if (overflow) {
-        Present(run.T(Ms));
-    }
-    const u64 end = std::max(NowNs(), run.T(Ms)) + 150 * Ms;
-    Present(end);
-    Present(end + 150 * Ms);
-    const AttributionSnapshot snap = run.Finish();
+        // Another producer's 32 closed records grow its vector twice, 16 then 32: with the
+        // presenter's two vectors all 64 slots are charged while only 49 records are live.
+        std::atomic<bool> drained{true};
+        OnThread([&] {
+            RegisterThread("filler");
+            for (u64 i = 0; i < 32; ++i) {
+                RecordSpan(Cause::Texture, future, future + Ms);
+                if (!AwaitIdle()) {
+                    drained = false;
+                    break;
+                }
+            }
+        });
+        REQUIRE(drained.load());
+        CHECK(ReadAttributionSnapshot().lost_events == 0);
 
-    CHECK(snap.lost_events == (overflow ? 1 : 0));
-    CHECK(snap.complete == !overflow);
-    const auto& closed_loss =
-        snap.history_loss[static_cast<size_t>(HistoryLossCause::ClosedCapacity)];
-    CHECK(closed_loss.count == (overflow ? 1 : 0));
-    CHECK(snap.history_loss[static_cast<size_t>(HistoryLossCause::BeginCapacity)].count == 0);
-    CHECK(snap.history_loss[static_cast<size_t>(HistoryLossCause::TransferCapacity)].count == 0);
-    if (overflow) {
+        // The 50th live record: every vector but the presenter's open one is full, and the unused
+        // slots of that one are enough. It is accepted, and so is the end of the open span.
+        RecordSpan(Cause::Disk, run.T(0) + 1, run.T(Ms));
+        REQUIRE(AwaitIdle());
+        CHECK(ReadAttributionSnapshot().lost_events == 0);
+        EndSpan(open);
+        REQUIRE(AwaitIdle());
+        const u64 open_end = NowNs();
+
+        const u64 boundary = std::max(run.T(200 * Ms), open_end + 200 * Ms);
+        Present(run.T(0));
+        Present(boundary);
+        AwaitFrames(1);
+        Present(boundary + 200 * Ms);
+        AwaitFrames(2);
+        const AttributionSnapshot snap = run.Finish();
+        CHECK(snap.lost_events == 0);
+        CHECK(snap.complete);
+        for (const HistoryLossSummary& loss : snap.history_loss) {
+            CHECK(loss.count == 0);
+        }
+        CHECK(snap.first_120s.frames_with_history_loss == 0);
+        REQUIRE(g_frames.size() == 2);
+        const LongFrame& first = g_frames[0];
+        CHECK(first.duration_ns == boundary - run.T(0));
+        CHECK_FALSE(first.history_loss);
+        CHECK(first.instrumentation_complete);
+        CHECK(Total(first.cause_ns) == first.duration_ns);
+        CHECK(At(first.activity_ns, Cause::Disk) == Ms - 1); // accepted, not dropped
+        CHECK(At(first.cause_ns, Cause::Disk) > 0);
+        CHECK(At(first.cause_ns, Cause::Shader) > 0); // the closed span still transferred
+        CHECK_FALSE(g_frames[1].history_loss);
+        CHECK(g_frames[1].instrumentation_complete);
+        CHECK(At(g_frames[1].cause_ns, Cause::Unknown) == g_frames[1].duration_ns);
+        CHECK(Detail::PeakRetainedHistoryBytes() <= config.buffer_bytes / 2);
+    }
+
+    SECTION("The 65th record is refused once every slot holds a live record") {
+        SessionConfig config = Config(100 * Ms);
+        config.buffer_bytes = 16 * 1024; // 64 history slots and four events per producer ring
+        Run run{config};
+        REQUIRE(AwaitIdle());
+        const u64 future = run.T(3'600'000 * Ms);
+        Present(run.T(0)); // the anchor; nothing below is resolved before the frames close
+        // 16 closed records (the probe included), one open record, then 47 closed records on
+        // another producer: exactly 64 live records, each holding a charged slot.
+        for (u64 i = 0; i < 15; ++i) {
+            RecordSpan(Cause::Texture, future, future + Ms);
+            REQUIRE(AwaitIdle());
+        }
+        const SpanToken open = BeginSpan(Cause::Shader);
+        REQUIRE(open.Valid());
+        REQUIRE(AwaitIdle());
+        std::atomic<bool> drained{true};
+        OnThread([&] {
+            RegisterThread("filler");
+            for (u64 i = 0; i < 47; ++i) {
+                RecordSpan(Cause::Texture, future, future + Ms);
+                if (!AwaitIdle()) {
+                    drained = false;
+                    break;
+                }
+            }
+        });
+        REQUIRE(drained.load());
+        CHECK(ReadAttributionSnapshot().lost_events == 0); // 64 live records: the whole cap
+
+        // The 65th live record has nowhere to go: every charged slot holds a record.
+        const u64 before_drop = NowNs();
+        RecordSpan(Cause::Disk, run.T(0) + 1, run.T(Ms)); // inside the first frame
+        REQUIRE(AwaitIdle());
+        const u64 after_drop = NowNs();
+        // The end of the open span transfers by reclaiming the slot it emptied, not by a loss.
+        EndSpan(open);
+        REQUIRE(AwaitIdle());
+        const u64 open_end = NowNs();
+
+        const u64 boundary = std::max(run.T(200 * Ms), open_end + 200 * Ms);
+        Present(boundary);
+        AwaitFrames(1);
+        Present(boundary + 200 * Ms);
+        AwaitFrames(2);
+        const AttributionSnapshot snap = run.Finish();
+
+        CHECK_FALSE(snap.complete);
+        CHECK(snap.lost_events == 1);
+        const auto& closed_loss =
+            snap.history_loss[static_cast<size_t>(HistoryLossCause::ClosedCapacity)];
+        CHECK(closed_loss.count == 1);
         CHECK(closed_loss.first_drop_ns >= before_drop);
         CHECK(closed_loss.last_drop_ns <= after_drop);
         CHECK(closed_loss.first_drop_ns == closed_loss.last_drop_ns);
+        CHECK(snap.history_loss[static_cast<size_t>(HistoryLossCause::BeginCapacity)].count == 0);
+        CHECK(
+            snap.history_loss[static_cast<size_t>(HistoryLossCause::TransferCapacity)].count == 0);
+        CHECK(snap.first_120s.frames_with_history_loss == 1);
+        REQUIRE(g_frames.size() == 2);
+        const LongFrame& first = g_frames[0];
+        CHECK(first.history_loss);
+        CHECK_FALSE(first.instrumentation_complete);
+        CHECK((first.unknown_reasons & UnknownReason::LostSpans) != 0);
+        CHECK(Total(first.cause_ns) == first.duration_ns);
+        CHECK(At(first.activity_ns, Cause::Disk) == 0); // the refused record is not credited
+        CHECK(At(first.cause_ns, Cause::Disk) == 0);
+        CHECK(At(first.cause_ns, Cause::Shader) > 0); // the transferred span is still there
+        CHECK_FALSE(g_frames[1].history_loss); // the loss episode ends with the first frame
+        CHECK(g_frames[1].instrumentation_complete);
+        CHECK(Detail::PeakRetainedHistoryBytes() <= config.buffer_bytes / 2);
     }
-    CHECK(snap.first_120s.frames_with_history_loss == (overflow ? 2 : 0));
-    REQUIRE(g_frames.size() == 2);
-    CHECK(g_frames[0].history_loss == overflow);
-    CHECK(g_frames[0].instrumentation_complete == !overflow);
-    CHECK(Total(g_frames[0].cause_ns) == g_frames[0].duration_ns);
-    if (!overflow) {
-        CHECK(At(g_frames[0].cause_ns, Cause::Shader) > 0);
+}
+
+TEST_CASE("A dense uneven closed burst inside a long unpresented frame keeps every record",
+          "[nx2][attribution][history]") {
+    // The shape of the first-minute FE frame that lost eight closed records: a 1.6 s frame with
+    // no present, four producers publishing ten thousand closed records per second in uneven
+    // bursts while the consumer is held off. Distinct, non-overlapping spans are tiled so each
+    // cause has its own exact total: a refused record or a duplicate would move those totals.
+    // The shipped defaults are kept, so the presenting thread's gaps are charged by what the
+    // producers were doing: a gap that lands between spans is Waiting.
+    SessionConfig config;
+    Run run{config};
+    constexpr u64 Delay = 1600 * Ms;
+    constexpr u64 Step = 100'000; // 16,000 records over the frame: 10,000 records per second
+    constexpr u64 Work = Step / 2;
+    constexpr size_t Producers = 4;
+    constexpr std::array<u64, Producers> Counts{4096, 4096, 4096, 3712};
+    constexpr std::array<Cause, Producers> Causes{Cause::Shader, Cause::Texture, Cause::Pipeline,
+                                                  Cause::Disk};
+    std::array<u64, Producers> first{};
+    u64 total = 0;
+    for (size_t p = 0; p < Producers; ++p) {
+        first[p] = total;
+        total += Counts[p];
     }
-    CHECK_FALSE(g_frames[1].history_loss);
-    CHECK(g_frames[1].instrumentation_complete);
+    CHECK(total == 16'000);
+    const u64 start = run.T(0);
+    Present(start); // the anchor; the interval below is the unpresented frame
+    REQUIRE(Detail::HoldConsumer(true)); // the rings take the whole burst before the consumer
+    std::vector<std::thread> threads;
+    for (size_t p = 0; p < Producers; ++p) {
+        threads.emplace_back([&, p] {
+            RegisterThread("frame producer");
+            for (u64 i = 0; i < Counts[p]; ++i) {
+                const u64 begin = start + 1 + (first[p] + i) * Step;
+                RecordSpan(Causes[p], begin, begin + Work);
+            }
+        });
+    }
+    for (std::thread& thread : threads) {
+        thread.join();
+    }
+    Present(start + Delay);
+    REQUIRE(Detail::HoldConsumer(false));
+    AwaitFrames(1);
+    const AttributionSnapshot snap = run.Finish();
+
+    CHECK(snap.lost_events == 0);
+    CHECK(snap.complete);
+    for (const HistoryLossSummary& loss : snap.history_loss) {
+        CHECK(loss.count == 0);
+    }
+    CHECK(snap.first_120s.frames_with_history_loss == 0);
+    REQUIRE(g_frames.size() == 1);
+    const LongFrame& frame = g_frames[0];
+    CHECK(frame.duration_ns == Delay);
+    CHECK_FALSE(frame.history_loss);
+    CHECK(frame.instrumentation_complete);
+    CHECK((frame.unknown_reasons & UnknownReason::LostSpans) == 0);
+    CHECK(Total(frame.cause_ns) == Delay);
+    u64 covered = 0;
+    for (size_t p = 0; p < Producers; ++p) {
+        const u64 expected = Counts[p] * Work;
+        covered += expected;
+        CHECK(At(frame.activity_ns, Causes[p]) == expected); // every distinct span survived
+        CHECK(At(frame.cause_ns, Causes[p]) == expected);
+    }
+    CHECK(At(frame.cause_ns, Cause::Unknown) == 0); // every gap is charged by the producers
+    CHECK(At(frame.cause_ns, Cause::Waiting) == Delay - covered); // the idle time between spans
+    CHECK(Detail::PeakRetainedHistoryBytes() <= (size_t{64} << 20));
+}
+
+TEST_CASE("A long unpresented frame keeps an uneven burst that strands slack across producers",
+          "[nx2][attribution][history]") {
+    // A long frame resolves nothing, so no vector can be pruned by time. One producer grows a
+    // 48-slot vector for 40 records while each other needs one allocation: its growth must not
+    // take the last of the budget, or the other producers' records are refused with free slots
+    // all over the frame. The growth rule keeps room and the later producers fit around the
+    // stranded slack.
+    SessionConfig config = Config(100 * Ms);
+    config.buffer_bytes = 16 * 1024; // 64 history slots and four events per producer ring
+    config.charge_presenter_gaps = true; // as the FE runs: the frame's gaps carry the producers
+    Run run{config};
+    Present(run.T(0)); // the anchor; the frame below is unpresented throughout
+    std::atomic<bool> drained{true};
+    const auto publish = [&](Cause cause, u64 count, u64 first_ms, u64 spacing_ms, u64 work_ms) {
+        OnThread([&, cause, count, first_ms, spacing_ms, work_ms] {
+            RegisterThread("burst producer");
+            for (u64 i = 0; i < count && drained.load(); ++i) {
+                const u64 begin = run.T((first_ms + i * spacing_ms) * Ms);
+                RecordSpan(cause, begin, begin + work_ms * Ms);
+                if (!AwaitIdle()) {
+                    drained = false;
+                }
+            }
+        });
+    };
+    publish(Cause::Shader, 40, 100, 20, 10); // 400 ms, the vector grows 16 -> 32 -> 48
+    CHECK(ReadAttributionSnapshot().lost_events == 0);
+    publish(Cause::Texture, 3, 1000, 10, 5); // 15 ms
+    CHECK(ReadAttributionSnapshot().lost_events == 0);
+    publish(Cause::Pipeline, 3, 1200, 10, 4); // 12 ms
+    CHECK(ReadAttributionSnapshot().lost_events == 0);
+    publish(Cause::Disk, 1, 1400, 10, 6); // 6 ms
+    REQUIRE(drained.load());
+    CHECK(ReadAttributionSnapshot().lost_events == 0);
+
+    Present(run.T(1600 * Ms));
+    AwaitFrames(1);
+    const AttributionSnapshot snap = run.Finish();
+    CHECK(snap.lost_events == 0);
+    CHECK(snap.complete);
+    for (const HistoryLossSummary& loss : snap.history_loss) {
+        CHECK(loss.count == 0);
+    }
+    CHECK(snap.first_120s.frames_with_history_loss == 0);
+    REQUIRE(g_frames.size() == 1);
+    const LongFrame& frame = g_frames[0];
+    CHECK(frame.duration_ns == 1600 * Ms);
+    CHECK_FALSE(frame.history_loss);
+    CHECK(frame.instrumentation_complete);
+    CHECK(Total(frame.cause_ns) == frame.duration_ns);
+    CHECK(At(frame.activity_ns, Cause::Shader) == 400 * Ms);
+    CHECK(At(frame.activity_ns, Cause::Texture) == 15 * Ms);
+    CHECK(At(frame.activity_ns, Cause::Pipeline) == 12 * Ms);
+    CHECK(At(frame.activity_ns, Cause::Disk) == 6 * Ms);
+    CHECK(At(frame.cause_ns, Cause::Shader) == 400 * Ms);
+    CHECK(At(frame.cause_ns, Cause::Texture) == 15 * Ms);
+    CHECK(At(frame.cause_ns, Cause::Pipeline) == 12 * Ms);
+    CHECK(At(frame.cause_ns, Cause::Disk) == 6 * Ms);
+    CHECK(At(frame.cause_ns, Cause::Unknown) == 0);
+    CHECK(At(frame.cause_ns, Cause::Waiting) == frame.duration_ns - 433 * Ms);
+    CHECK(Detail::PeakRetainedHistoryBytes() <= config.buffer_bytes / 2);
+}
+
+TEST_CASE("A linked wait charges the last-ending worker span, not every worker on the frame",
+          "[nx2][attribution][history]") {
+    // The presenter waits for one build while two workers run it: where the two spans overlap the
+    // one that ends last is the critical path, and the wait beyond it stays Waiting. A third
+    // worker on an unrelated work id is activity on the frame, but it is not on the path the
+    // presenter waited for, so it is not charged to its cause. The wait covers the whole frame,
+    // so no presenter gap is inferred and the totals are exact.
+    Run run; // strict: only what a root span covers is attributed
+    const WorkId build = NewWorkId();
+    const WorkId read = NewWorkId();
+    Present(run.T(0));
+    OnThread([&] {
+        RegisterThread("early build worker");
+        RecordSpan(Cause::Shader, run.T(10 * Ms), run.T(60 * Ms), build);
+    });
+    OnThread([&] {
+        RegisterThread("late build worker");
+        RecordSpan(Cause::Texture, run.T(40 * Ms), run.T(80 * Ms), build);
+    });
+    OnThread([&] {
+        RegisterThread("disk worker");
+        RecordSpan(Cause::Disk, run.T(0), run.T(200 * Ms), read);
+    });
+    const SpanToken wait = run.NextRootToken();
+    RecordSpan(Cause::Waiting, run.T(0), run.T(200 * Ms));
+    LinkWait(wait, build, DependencyKind::Job);
+    Present(run.T(200 * Ms));
+    const AttributionSnapshot snap = run.Finish();
+    REQUIRE(g_frames.size() == 1);
+    const LongFrame& frame = g_frames[0];
+    CHECK(frame.duration_ns == 200 * Ms);
+    CHECK_FALSE(frame.history_loss);
+    CHECK(frame.instrumentation_complete);
+    CHECK(At(frame.cause_ns, Cause::Shader) == 30 * Ms); // [10, 40): it ends first
+    CHECK(At(frame.cause_ns, Cause::Texture) == 40 * Ms); // [40, 80): the critical path there
+    CHECK(At(frame.cause_ns, Cause::Waiting) == 130 * Ms); // [0, 10) and [80, 200)
+    CHECK(At(frame.cause_ns, Cause::Disk) == 0); // another work id is not the path
+    CHECK(At(frame.cause_ns, Cause::Unknown) == 0);
+    CHECK(At(frame.activity_ns, Cause::Disk) == 200 * Ms); // still visible as activity
+    CHECK(Total(frame.cause_ns) == frame.duration_ns);
+    CHECK(snap.lost_events == 0);
+    CHECK(snap.complete);
 }
 
 TEST_CASE("Deeply nested spans with distinct work ids keep the resolver scratch linear",
