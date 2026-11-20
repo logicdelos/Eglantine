@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <array>
+#include <string>
 #include <QObject>
 #include "common/fs/path_util.h"
 
@@ -74,5 +76,4 @@ private:
     Emulator selected_emu;
     bool clear_shader_cache;
     MigrationStrategy strategy;
-    QString success_text = tr("Data was migrated successfully.");
 };

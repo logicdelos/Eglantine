@@ -7,7 +7,17 @@
 // SPDX-FileCopyrightText: 2016 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
 #include <memory>
+#include <tuple>
+#include <QPushButton>
+#include <QScreen>
+#include <QScrollArea>
+#include <QScrollBar>
+#include <QStyle>
+#include <QTabBar>
+#include <QTimer>
 #include "common/logging.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
@@ -64,7 +74,7 @@ ConfigureDialog::ConfigureDialog(QWidget* parent, HotkeyRegistry& registry_,
           nullptr, *builder, this)},
       hotkeys_tab{std::make_unique<ConfigureHotkeys>(system_.HIDCore(), this)},
       input_tab{std::make_unique<ConfigureInput>(system_, this)},
-      network_tab{std::make_unique<ConfigureNetwork>(system_, this)},
+      network_tab{std::make_unique<ConfigureNetwork>(system_, false, this)},
       performance_state{std::make_unique<Performance::State>()},
       performance_gpu_tab{
           std::make_unique<ConfigureGpu>(*performance_state, vk_device_records, this)},
@@ -103,6 +113,40 @@ ConfigureDialog::ConfigureDialog(QWidget* parent, HotkeyRegistry& registry_,
     general_tab->SetResetCallback([&] { this->close(); });
 
     SetConfiguration();
+
+    const std::array<std::pair<QWidget*, const char*>, 16> tab_icons{{
+        {general_tab.get(), "sliders"},
+        {hotkeys_tab.get(), "keyboard"},
+        {ui_tab.get(), "list"},
+        {web_tab.get(), "cloud"},
+        {debug_tab_tab.get(), "bug"},
+        {system_tab.get(), "system"},
+        {profile_tab.get(), "user"},
+        {network_tab.get(), "globe"},
+        {filesystem_tab.get(), "drive"},
+        {applets_tab.get(), "apps"},
+        {cpu_tab.get(), "cpu"},
+        {graphics_tab.get(), "monitor"},
+        {graphics_advanced_tab.get(), "layers"},
+        {graphics_extensions_tab.get(), "wand"},
+        {frame_gen_tab.get(), "frame_generation"},
+        {audio_tab.get(), "audio"},
+    }};
+    for (const auto& [tab, icon] : tab_icons) {
+        tab->setProperty("tabIcon", QString::fromLatin1(icon));
+        ConfigurationShared::UseToggles(tab);
+    }
+    for (auto* const tab : {static_cast<QWidget*>(performance_gpu_tab.get()),
+                            static_cast<QWidget*>(performance_shaders_tab.get()),
+                            static_cast<QWidget*>(performance_ram_tab.get())}) {
+        tab->setProperty("tabIcon", QStringLiteral("performance"));
+    }
+    for (auto* const tab : input_tab->GetSubTabs()) {
+        tab->setProperty("tabIcon", QStringLiteral("gamepad"));
+    }
+    graphics_tab->LinkFrameGeneration(frame_gen_tab->EnabledCheckBox(),
+                                      frame_gen_tab->TypeComboBox());
+
     PopulateSelectionList();
 
     connect(ui->tabWidget, &QTabWidget::currentChanged, this, [this](int index) {
@@ -110,6 +154,8 @@ ConfigureDialog::ConfigureDialog(QWidget* parent, HotkeyRegistry& registry_,
             debug_tab_tab->SetCurrentIndex(0);
         }
     });
+    connect(ui->tabWidget, &QTabWidget::currentChanged, this,
+            [this] { QTimer::singleShot(0, this, &ConfigureDialog::FitPageWidth); });
     connect(ui_tab.get(), &ConfigureUi::LanguageChanged, this, &ConfigureDialog::OnLanguageChanged);
     connect(general_tab.get(), &ConfigureGeneral::ExternalContentDirsChanged, this,
             &ConfigureDialog::ExternalContentDirsChanged);
@@ -122,7 +168,9 @@ ConfigureDialog::ConfigureDialog(QWidget* parent, HotkeyRegistry& registry_,
                 &ConfigureDialog::HandleApplyButtonClicked);
     }
 
-    adjustSize();
+    ui->selectorList->setFixedWidth(std::max(184, ui->selectorList->sizeHintForColumn(0) +
+                                                      2 * ui->selectorList->frameWidth() + 32));
+    ConfigurationShared::FitToScreen(this, QSize(1040, 760));
     ui->selectorList->setCurrentRow(0);
 
     // Selects the leftmost button on the bottom bar (Cancel as of writing)
@@ -162,12 +210,85 @@ void ConfigureDialog::ApplyConfiguration() {
     Settings::LogSettings();
 }
 
+void ConfigureDialog::RestoreInputConfiguration() {
+    input_tab->RestoreConfiguration();
+}
+
 void ConfigureDialog::changeEvent(QEvent* event) {
     if (event->type() == QEvent::LanguageChange) {
         RetranslateUI();
     }
 
     QDialog::changeEvent(event);
+}
+
+void ConfigureDialog::showEvent(QShowEvent* event) {
+    QDialog::showEvent(event);
+    QTimer::singleShot(0, this, &ConfigureDialog::FitPageWidth);
+}
+
+void ConfigureDialog::FitPageWidth() {
+    if (!isVisible()) {
+        return;
+    }
+    auto* const area = qobject_cast<QScrollArea*>(ui->tabWidget->currentWidget());
+    if (area == nullptr || area->widget() == nullptr || area->parentWidget() == nullptr) {
+        return;
+    }
+    QWidget* const page = area->widget();
+    // The stacked holder has the same size for every tab, also for one not laid out yet.
+    const QWidget* const holder = area->parentWidget();
+
+    const auto missing_width = [&] {
+        const QSize page_min = page->minimumSizeHint().expandedTo(page->minimumSize());
+        int view_width = holder->width() - 2 * area->frameWidth();
+        if (page_min.height() > holder->height()) {
+            view_width -= area->verticalScrollBar()->sizeHint().width();
+        }
+        const int page_missing = page_min.width() - view_width;
+        const int tabs_missing = ui->tabWidget->tabBar()->sizeHint().width() - holder->width();
+        return std::max(page_missing, tabs_missing);
+    };
+
+    const int missing = missing_width();
+    if (missing <= 0) {
+        return;
+    }
+
+    const QScreen* const current_screen = screen();
+    if (current_screen == nullptr) {
+        return;
+    }
+    const QRect available = current_screen->availableGeometry();
+    const int frame_extra = frameGeometry().width() - width();
+    const int max_width = available.width() * 95 / 100 - frame_extra;
+    const int wanted_width = width() + missing;
+    const int new_width = std::min(wanted_width, max_width);
+
+    if (new_width > width()) {
+        // Grow around the current center, then keep the whole frame on the screen.
+        const int grow = new_width - width();
+        resize(new_width, height());
+        QRect frame = frameGeometry();
+        frame.moveLeft(frame.left() - grow / 2);
+        if (frame.right() > available.right()) {
+            frame.moveRight(available.right());
+        }
+        if (frame.left() < available.left()) {
+            frame.moveLeft(available.left());
+        }
+        move(frame.topLeft());
+    }
+
+    if (wanted_width > new_width && !page->property("compactPage").toBool()) {
+        // Even the screen is too narrow: use tighter buttons so less of the page scrolls.
+        page->setProperty("compactPage", true);
+        for (auto* const button : page->findChildren<QPushButton*>()) {
+            button->style()->unpolish(button);
+            button->style()->polish(button);
+        }
+        page->updateGeometry();
+    }
 }
 
 void ConfigureDialog::RetranslateUI() {
@@ -191,28 +312,33 @@ void ConfigureDialog::HandleApplyButtonClicked() {
 Q_DECLARE_METATYPE(QList<QWidget*>);
 
 void ConfigureDialog::PopulateSelectionList() {
-    const std::array<std::pair<QString, QList<QWidget*>>, 7> items{
+    const std::array<std::tuple<QString, const char*, QList<QWidget*>>, 7> items{
         {{tr("General"),
+          "sliders",
           {general_tab.get(), hotkeys_tab.get(), ui_tab.get(), web_tab.get(), debug_tab_tab.get()}},
          {tr("System"),
+          "system",
           {system_tab.get(), profile_tab.get(), network_tab.get(), filesystem_tab.get(),
            applets_tab.get()}},
-         {tr("CPU"), {cpu_tab.get()}},
+         {tr("CPU"), "cpu", {cpu_tab.get()}},
          {tr("Graphics"),
+          "monitor",
           {graphics_tab.get(), graphics_advanced_tab.get(), graphics_extensions_tab.get(),
            frame_gen_tab.get()}},
          {tr("Performance"),
+          "performance",
           {performance_gpu_tab.get(), performance_shaders_tab.get(), performance_ram_tab.get()}},
-         {tr("Audio"), {audio_tab.get()}},
-         {tr("Controls"), input_tab->GetSubTabs()}},
+         {tr("Audio"), "audio", {audio_tab.get()}},
+         {tr("Controls"), "gamepad", input_tab->GetSubTabs()}},
     };
 
     [[maybe_unused]] const QSignalBlocker blocker(ui->selectorList);
 
     ui->selectorList->clear();
-    for (const auto& entry : items) {
-        auto* const item = new QListWidgetItem(entry.first);
-        item->setData(Qt::UserRole, QVariant::fromValue(entry.second));
+    for (const auto& [name, icon, tabs] : items) {
+        auto* const item =
+            new QListWidgetItem(ConfigurationShared::PageIcon(QString::fromLatin1(icon)), name);
+        item->setData(Qt::UserRole, QVariant::fromValue(tabs));
 
         ui->selectorList->addItem(item);
     }
@@ -228,7 +354,7 @@ void ConfigureDialog::SelectProfilesTab() {
         }
     }
 
-    ui->tabWidget->setCurrentWidget(profile_tab.get());
+    ui->tabWidget->setCurrentWidget(scroll_areas.value(profile_tab.get(), nullptr));
 }
 
 void ConfigureDialog::OnLanguageChanged(const QString& locale) {
@@ -255,6 +381,14 @@ void ConfigureDialog::UpdateVisibleTabs() {
 
     for (auto* const tab : tabs) {
         LOG_DEBUG(Frontend, "{}", tab->accessibleName().toStdString());
-        ui->tabWidget->addTab(tab, tab->accessibleName());
+        auto& area = scroll_areas[tab];
+        if (area == nullptr) {
+            area = ConfigurationShared::ScrollTab(tab);
+        }
+        ui->tabWidget->addTab(area,
+                              ConfigurationShared::PageIcon(tab->property("tabIcon").toString()),
+                              tab->accessibleName());
     }
+
+    QTimer::singleShot(0, this, &ConfigureDialog::FitPageWidth);
 }

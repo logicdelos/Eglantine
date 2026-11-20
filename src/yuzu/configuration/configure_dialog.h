@@ -12,6 +12,7 @@
 #include <memory>
 #include <vector>
 #include <QDialog>
+#include <QHash>
 #include "configuration/shared_widget.h"
 #include "qt_common/config/shared_translation.h"
 #include "qt_common/util/vk.h"
@@ -57,6 +58,8 @@ namespace Ui {
 class ConfigureDialog;
 }
 
+class QScrollArea;
+
 class ConfigureDialog : public QDialog {
     Q_OBJECT
 
@@ -72,6 +75,9 @@ public:
     /// Selects the Profiles tab of the System category.
     void SelectProfilesTab();
 
+    /// Drop the controller edits that were not applied; the Controls tab changes them live.
+    void RestoreInputConfiguration();
+
 private slots:
     void OnLanguageChanged(const QString& locale);
 
@@ -81,7 +87,12 @@ signals:
 
 private:
     void changeEvent(QEvent* event) override;
+    void showEvent(QShowEvent* event) override;
     void RetranslateUI();
+
+    /// Widens the dialog until the open page and its tab row fit without a horizontal scrollbar,
+    /// up to the screen width. A page that still does not fit is switched to its compact style.
+    void FitPageWidth();
 
     void HandleApplyButtonClicked();
 
@@ -117,4 +128,7 @@ private:
     std::unique_ptr<ConfigureProfileManager> profile_tab;
     std::unique_ptr<ConfigureSystem> system_tab;
     std::unique_ptr<ConfigureWeb> web_tab;
+
+    /// The scroll area each tab is shown in, created when its category is first opened.
+    QHash<QWidget*, QScrollArea*> scroll_areas;
 };

@@ -7,11 +7,13 @@
 #pragma once
 
 #include <atomic>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include <QFutureWatcher>
+#include <QImage>
 #include <QObject>
 #include <QString>
 
@@ -38,6 +40,45 @@ struct IconSearchResult {
     std::string resolved_title;
     std::string error;
 };
+
+enum class ArtworkLookupStatus { Found, NotFound, BadApiKey, NetworkError, Cancelled };
+
+struct ArtworkLookupResult {
+    ArtworkLookupStatus status{ArtworkLookupStatus::NotFound};
+    QImage image;
+    std::string detail; // Never contains the API key.
+};
+
+// Finds square artwork for a game title on SteamGridDB with the user's API key: the best title
+// match, then its first 512x512 or 1024x1024 grid, else its first icon. A year at the end of the
+// title, like "(2026)", picks the entry released that year. prefer_newest picks the newest entry
+// of the best match's name (remakes share the name of the original). Blocking, so run it off the
+// UI thread; it stops within 30 seconds or as soon as cancel is set. An empty key sends nothing.
+ArtworkLookupResult LookUpSteamGridDbArtwork(const std::string& title, const std::string& api_key,
+                                             const std::atomic_bool& cancel,
+                                             bool prefer_newest = false);
+
+enum class IconDetectStatus { Found, NoLocalMatch, NotFound, TimedOut, Cancelled, Failed };
+
+struct IconDetectResult {
+    IconDetectStatus status{IconDetectStatus::NotFound};
+    std::vector<u8> icon_bytes; // A 256x256 PNG when found.
+    std::string resolved_title; // The canonical title when the name was an alias, else empty.
+    std::string search_name;
+};
+
+// Finds a picture for the Properties dialog. First image files next to the game file
+// (<name slug>, <file stem> or "icon" with .png/.jpg/.jpeg/.webp). Only when allow_online is set:
+// SteamGridDB (only with a key), the Eden boxart repository on GitHub, Wikipedia page images and
+// Bing square thumbnails, under one 20 second budget of at most 24 requests. Blocking, so run it
+// off the UI thread; it stops as soon as cancel is set.
+IconDetectResult DetectGameIcon(const std::string& name, u64 title_id,
+                                const std::filesystem::path& game_path, bool allow_online,
+                                const std::string& sgdb_api_key, const std::atomic_bool& cancel);
+
+// Reads a user-chosen picture (PNG, JPEG, BMP or WebP; at most 8 MiB, 8192 pixels per side and
+// 16 megapixels) as a 256x256 PNG. Empty when the file is not such a picture.
+std::vector<u8> ReadSquareIconFile(const QString& path);
 
 // Looks an icon up by game name on switchiconshowdown.com, falling back to SteamGridDB when the
 // user has set an API key. The search runs in the background under one 10 second deadline; errors,

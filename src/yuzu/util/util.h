@@ -10,6 +10,7 @@
 #pragma once
 
 #include <QFont>
+#include <QIcon>
 #include <QString>
 #include <QStringList>
 #include "common/uuid.h"
@@ -19,6 +20,10 @@
 
 /// Returns ordered directories to search for UI translation files (.qm).
 [[nodiscard]] QStringList GetLanguageSearchDirectories();
+
+/// A menu icon from the Eglantine Dark icon set, white on the highlighted row. Other themes keep
+/// menus without icons, so this returns a null icon unless Eglantine Dark is active.
+[[nodiscard]] QIcon MenuIcon(const char* name);
 
 /**
  * Prompt the user for a profile ID. If there is only one valid profile, returns that profile.

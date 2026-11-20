@@ -15,7 +15,15 @@
 #include "qt_common/config/uisettings.h"
 #include "qt_common/qt_common.h"
 
+#include <algorithm>
+#include <filesystem>
+
+#include <fmt/format.h>
+
 #include <QDesktopServices>
+#include <QFile>
+#include <QImage>
+#include <QSaveFile>
 #include <QStandardPaths>
 #include <QUrl>
 
@@ -651,6 +659,116 @@ bool SaveIconToFile(const std::filesystem::path& icon_path, const QImage& image)
 #else
     return false;
 #endif
+}
+
+namespace {
+
+constexpr qint64 MaxCustomArtworkBytes = 16 * 1024 * 1024;
+constexpr int MaxCustomArtworkSide = 1024;
+// Larger name files are ignored when read, so a longer name is never saved.
+constexpr qint64 MaxCustomTitleBytes = 4096;
+
+QString ToQPath(const std::filesystem::path& path) {
+    return QString::fromStdString(Common::FS::PathToUTF8String(path));
+}
+
+// True when nothing is left at the path. A path that cannot be checked counts as still there.
+bool RemoveCustomFile(const std::filesystem::path& path) {
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    const bool still_there = std::filesystem::exists(path, ec);
+    return !still_there && !ec;
+}
+
+} // namespace
+
+bool IsSwitch2Program(u64 program_id) {
+    return (program_id >> 56) == 0x04;
+}
+
+std::filesystem::path CustomArtworkPath(u64 program_id) {
+    return Common::FS::GetEdenPath(Common::FS::EdenPath::EdenDir) / "artwork" /
+           fmt::format("{:016X}.png", program_id);
+}
+
+std::vector<u8> ReadCustomArtwork(u64 program_id) {
+    if (program_id == 0) {
+        return {};
+    }
+    QFile file(ToQPath(CustomArtworkPath(program_id)));
+    if (!file.open(QIODevice::ReadOnly) || file.size() > MaxCustomArtworkBytes) {
+        return {};
+    }
+    const QByteArray bytes = file.readAll();
+    return std::vector<u8>(bytes.begin(), bytes.end());
+}
+
+bool SaveCustomArtwork(u64 program_id, const QImage& image) {
+    if (program_id == 0 || image.isNull()) {
+        return false;
+    }
+    const QImage scaled = std::max(image.width(), image.height()) > MaxCustomArtworkSide
+                              ? image.scaled(MaxCustomArtworkSide, MaxCustomArtworkSide,
+                                             Qt::KeepAspectRatio, Qt::SmoothTransformation)
+                              : image;
+    const auto path = CustomArtworkPath(program_id);
+    if (!Common::FS::CreateDirs(path.parent_path())) {
+        LOG_ERROR(Frontend, "Cannot create the custom artwork folder");
+        return false;
+    }
+    // Written to a temporary file and swapped in, so a failed save never leaves a broken image.
+    QSaveFile file(ToQPath(path));
+    if (!file.open(QIODevice::WriteOnly) || !scaled.save(&file, "PNG") || !file.commit()) {
+        LOG_ERROR(Frontend, "Cannot write custom artwork for {:016X}", program_id);
+        return false;
+    }
+    return true;
+}
+
+bool RemoveCustomArtwork(u64 program_id) {
+    return RemoveCustomFile(CustomArtworkPath(program_id));
+}
+
+std::filesystem::path CustomTitlePath(u64 program_id) {
+    return Common::FS::GetEdenPath(Common::FS::EdenPath::EdenDir) / "names" /
+           fmt::format("{:016X}.txt", program_id);
+}
+
+std::string ReadCustomTitle(u64 program_id) {
+    if (program_id == 0) {
+        return {};
+    }
+    QFile file(ToQPath(CustomTitlePath(program_id)));
+    if (!file.open(QIODevice::ReadOnly) || file.size() > MaxCustomTitleBytes) {
+        return {};
+    }
+    return QString::fromUtf8(file.readAll()).simplified().toStdString();
+}
+
+bool SaveCustomTitle(u64 program_id, const std::string& title) {
+    if (program_id == 0) {
+        return false;
+    }
+    const QString name = QString::fromStdString(title).simplified();
+    const auto path = CustomTitlePath(program_id);
+    if (name.isEmpty()) {
+        return RemoveCustomFile(path);
+    }
+    const QByteArray bytes = name.toUtf8();
+    if (bytes.size() > MaxCustomTitleBytes) {
+        LOG_ERROR(Frontend, "The custom name for {:016X} is too long", program_id);
+        return false;
+    }
+    if (!Common::FS::CreateDirs(path.parent_path())) {
+        LOG_ERROR(Frontend, "Cannot create the custom name folder");
+        return false;
+    }
+    QSaveFile file(ToQPath(path));
+    if (!file.open(QIODevice::WriteOnly) || file.write(bytes) < 0 || !file.commit()) {
+        LOG_ERROR(Frontend, "Cannot write the custom name for {:016X}", program_id);
+        return false;
+    }
+    return true;
 }
 
 } // namespace QtCommon::Game

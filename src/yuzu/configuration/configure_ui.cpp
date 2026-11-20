@@ -19,9 +19,14 @@
 #include <QDirIterator>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QHBoxLayout>
+#include <QLabel>
+#include <QLineEdit>
+#include <QLocale>
 #include <QSet>
 #include <QString>
 #include <QToolButton>
+#include <QTranslator>
 #include <QVariant>
 
 #include "common/common_types.h"
@@ -62,6 +67,13 @@ QString GetTranslatedFolderIconSize(size_t index) {
 QString GetTranslatedRowTextName(size_t index) {
     return QCoreApplication::translate("ConfigureUI", row_text_names[index]);
 }
+
+/// A translation's name in the language list, e.g. "German (Germany)" for "de".
+QString LanguageName(const QString& locale) {
+    const QLocale language(locale);
+    return QStringLiteral("%1 (%2)").arg(QLocale::languageToString(language.language()),
+                                         QLocale::territoryToString(language.territory()));
+}
 } // Anonymous namespace
 
 static float GetUpFactor(Settings::ResolutionSetup res_setup) {
@@ -99,6 +111,33 @@ ConfigureUi::ConfigureUi(Core::System& system_, QWidget* parent)
       ratio{Settings::values.aspect_ratio.GetValue()},
       resolution_setting{Settings::values.resolution_setup.GetValue()}, system{system_} {
     ui->setupUi(this);
+
+    // Optional SteamGridDB artwork lookup for games without artwork; off while the key is empty.
+    {
+        auto* const key_layout = new QHBoxLayout;
+        auto* const key_label = new QLabel(tr("SteamGridDB API key:"), this);
+        steamgriddb_key_edit = new QLineEdit(this);
+        steamgriddb_key_edit->setEchoMode(QLineEdit::Password);
+        steamgriddb_key_edit->setPlaceholderText(tr("Empty: no online lookup"));
+        steamgriddb_key_edit->setClearButtonEnabled(true);
+        const QString tooltip =
+            tr("Artwork is looked up on steamgriddb.com only when a key is set, for games that "
+               "have no icon and no custom artwork. The picture is saved as the game's custom "
+               "artwork, so you can still replace it in Configure Game.");
+        key_label->setToolTip(tooltip);
+        key_label->setBuddy(steamgriddb_key_edit);
+        steamgriddb_key_edit->setToolTip(tooltip);
+        auto* const key_link = new QLabel(
+            tr("<a href=\"%1\">Get a key</a>")
+                .arg(QStringLiteral("https://www.steamgriddb.com/profile/preferences/api")),
+            this);
+        key_link->setOpenExternalLinks(true);
+        key_link->setTextInteractionFlags(Qt::TextBrowserInteraction);
+        key_layout->addWidget(key_label);
+        key_layout->addWidget(steamgriddb_key_edit, 1);
+        key_layout->addWidget(key_link);
+        ui->GeneralVerticalLayout->addLayout(key_layout);
+    }
 
     InitializeLanguageComboBox();
 
@@ -165,6 +204,7 @@ void ConfigureUi::ApplyConfiguration() {
     UISettings::values.folder_icon_size = ui->folder_icon_size_combobox->currentData().toUInt();
     UISettings::values.row_1_text_id = ui->row_1_text_combobox->currentData().toUInt();
     UISettings::values.row_2_text_id = ui->row_2_text_combobox->currentData().toUInt();
+    UISettings::values.steamgriddb_api_key = steamgriddb_key_edit->text().trimmed().toStdString();
 
     UISettings::values.enable_screenshot_save_as = ui->enable_screenshot_save_as->isChecked();
     Common::FS::SetEdenPath(Common::FS::EdenPath::ScreenshotsDir,
@@ -182,10 +222,30 @@ void ConfigureUi::RequestGameListUpdate() {
 }
 
 void ConfigureUi::SetConfiguration() {
+    steamgriddb_key_edit->setText(
+        QString::fromStdString(UISettings::values.steamgriddb_api_key.GetValue()));
     ui->theme_combobox->setCurrentIndex(
         ui->theme_combobox->findData(QString::fromStdString(UISettings::values.theme)));
-    ui->language_combobox->setCurrentIndex(ui->language_combobox->findData(
-        QString::fromStdString(UISettings::values.language.GetValue())));
+    const QString language = QString::fromStdString(UISettings::values.language.GetValue());
+    if (ui->language_combobox->findData(language) == -1) {
+        // A language the list doesn't have, listed so that the setting stays until another one is
+        // chosen. It is marked missing only if no translation folder loads it (a load falls back
+        // to the base language, de.qm for de_AT).
+        QTranslator probe;
+        bool found = false;
+        for (const auto& dir_path : GetLanguageSearchDirectories()) {
+            if (probe.load(language, dir_path)) {
+                found = true;
+                break;
+            }
+        }
+        QString name = LanguageName(language);
+        if (!found) {
+            name = tr("%1 - not in this build").arg(name);
+        }
+        ui->language_combobox->addItem(name, language);
+    }
+    ui->language_combobox->setCurrentIndex(ui->language_combobox->findData(language));
     ui->show_add_ons->setChecked(UISettings::values.show_add_ons.GetValue());
     ui->show_size->setChecked(UISettings::values.show_size.GetValue());
     ui->show_types->setChecked(UISettings::values.show_types.GetValue());
@@ -222,11 +282,13 @@ void ConfigureUi::RetranslateUI() {
             i, GetTranslatedFolderIconSize(static_cast<size_t>(i)));
     }
 
-    for (int i = 0; i < ui->row_1_text_combobox->count(); i++) {
-        const QString name = GetTranslatedRowTextName(static_cast<size_t>(i));
-
-        ui->row_1_text_combobox->setItemText(i, name);
-        ui->row_2_text_combobox->setItemText(i, name);
+    // Each row list leaves names out (the first has no None, and neither lists the other row's
+    // choice), so an item's name comes from its data, not its position.
+    for (QComboBox* const combobox : {ui->row_1_text_combobox, ui->row_2_text_combobox}) {
+        for (int i = 0; i < combobox->count(); i++) {
+            combobox->setItemText(
+                i, GetTranslatedRowTextName(static_cast<size_t>(combobox->itemData(i).toUInt())));
+        }
     }
 }
 

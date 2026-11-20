@@ -6,15 +6,9 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>980</width>
-    <height>607</height>
+    <width>1040</width>
+    <height>760</height>
    </rect>
-  </property>
-  <property name="minimumSize">
-   <size>
-    <width>900</width>
-    <height>0</height>
-   </size>
   </property>
   <property name="windowTitle">
    <string>Dialog</string>
@@ -23,7 +17,7 @@
    <item>
     <layout class="QHBoxLayout" name="horizontalLayout">
      <item>
-      <widget class="QGroupBox" name="groupBox">
+      <widget class="QGroupBox" name="gameInfo">
        <property name="sizePolicy">
         <sizepolicy hsizetype="Maximum" vsizetype="Preferred">
          <horstretch>0</horstretch>
@@ -63,6 +57,94 @@
           <property name="interactive">
            <bool>false</bool>
           </property>
+         </widget>
+        </item>
+        <item alignment="Qt::AlignHCenter">
+         <widget class="QWidget" name="custom_icon_widget" native="true">
+          <property name="minimumSize">
+           <size>
+            <width>256</width>
+            <height>0</height>
+           </size>
+          </property>
+          <property name="maximumSize">
+           <size>
+            <width>256</width>
+            <height>16777215</height>
+           </size>
+          </property>
+          <layout class="QGridLayout" name="custom_icon_layout">
+           <property name="spacing">
+            <number>6</number>
+           </property>
+           <property name="leftMargin">
+            <number>0</number>
+           </property>
+           <property name="topMargin">
+            <number>0</number>
+           </property>
+           <property name="rightMargin">
+            <number>0</number>
+           </property>
+           <property name="bottomMargin">
+            <number>2</number>
+           </property>
+           <item row="0" column="0">
+            <widget class="QPushButton" name="button_detect_icon">
+             <property name="sizePolicy">
+              <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+               <horstretch>0</horstretch>
+               <verstretch>0</verstretch>
+              </sizepolicy>
+             </property>
+             <property name="toolTip">
+              <string>Preview an icon image found next to the game file. Online lookup is optional. Apply or OK saves changes.</string>
+             </property>
+             <property name="text">
+              <string>Detect Icon</string>
+             </property>
+            </widget>
+           </item>
+           <item row="0" column="1">
+            <widget class="QPushButton" name="button_upload_icon">
+             <property name="sizePolicy">
+              <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+               <horstretch>0</horstretch>
+               <verstretch>0</verstretch>
+              </sizepolicy>
+             </property>
+             <property name="toolTip">
+              <string>Preview a local image as the game icon. Apply or OK saves changes.</string>
+             </property>
+             <property name="text">
+              <string>Upload Icon...</string>
+             </property>
+            </widget>
+           </item>
+           <item row="1" column="0" colspan="2">
+            <widget class="QPushButton" name="button_remove_icon">
+             <property name="toolTip">
+              <string>Show the game's own icon again. Apply or OK saves changes.</string>
+             </property>
+             <property name="text">
+              <string>Remove Custom Icon</string>
+             </property>
+            </widget>
+           </item>
+           <item row="2" column="0" colspan="2">
+            <widget class="QCheckBox" name="allow_online_detection">
+             <property name="text">
+              <string>Allow online lookup</string>
+             </property>
+             <property name="toolTip">
+              <string>If no local icon is found, send the game name to SteamGridDB (only with your API key), GitHub, Wikipedia and Bing to look for an icon. Off by default.</string>
+             </property>
+             <property name="checked">
+              <bool>false</bool>
+             </property>
+            </widget>
+           </item>
+          </layout>
          </widget>
         </item>
         <item>

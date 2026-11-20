@@ -25,6 +25,7 @@
 #include "core/file_sys/registered_cache.h"
 #include "frontend_common/play_time_manager.h"
 #include "qt_common/config/uisettings.h"
+#include "qt_common/game_list/patch_cache.h"
 
 namespace Core {
 class System;
@@ -100,6 +101,9 @@ private:
     std::condition_variable cv;
     std::deque<std::function<void(GameListModel*)>> queued_events;
     std::atomic_bool stop_requested = false;
+    GameListPatchCache patch_cache;
+    /// Loose dumps found by this scan, sized after the list is shown.
+    std::vector<std::string> loose_dumps;
     Common::Event processing_completed;
 
     Core::System& system;
