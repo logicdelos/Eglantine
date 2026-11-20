@@ -40,6 +40,8 @@ class ReplayBoundaries(unittest.TestCase):
         self.assertEqual(rc, 0, result)
         self.assertTrue(result["run_complete"])
         self.assertEqual(result["frames_replayed"], 2)
+        self.assertEqual(result["pictures_written"], 2)
+        self.assertEqual(result["picture_files_written"], 4)
         rows = self.rows(images, "effects.jsonl")
         self.assertEqual([row["kind"] for row in rows if row["frame_id"] == 1],
                          ["submit", "readback_visibility", "readback_visibility", "consume",

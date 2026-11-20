@@ -475,7 +475,6 @@ TEST_CASE("Replay session: the exit reason follows what happened", "[video_core]
 
     CHECK(R::StartsWith("startup failed: no seam", R::StartupPrefix));
     CHECK_FALSE(R::StartsWith("startup", R::StartupPrefix));
-    CHECK(R::PicturesWritten(3) == 6);
 }
 
 TEST_CASE("Replay session: a consume reaches the pusher where it was recorded",

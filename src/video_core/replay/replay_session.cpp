@@ -990,6 +990,7 @@ private:
         if (!file) {
             return Fail(std::string(ReportIoPrefix) + "cannot write " + name);
         }
+        ++report_.picture_files_written;
         return true;
     }
 
@@ -1075,7 +1076,6 @@ private:
                     !WritePicture(ReplayPictureName(frame_id), bgra, record.width, record.height, record.width * 4U)) {
                     return false;
                 }
-                report_.pictures_written += PicturesWritten(1);
                 frames_file_ << ReplayFrameLine(record) << '\n';
                 frames_file_.flush();
                 if (!frames_file_) {
@@ -1091,6 +1091,9 @@ private:
             return Fail("semantic output differs on frame " + std::to_string(frame_id));
         }
         ++report_.frames_replayed;
+        if (!config_.benchmark && !config_.images_dir.empty()) {
+            ++report_.pictures_written;
+        }
         ResetFrame();
         return true;
     }
