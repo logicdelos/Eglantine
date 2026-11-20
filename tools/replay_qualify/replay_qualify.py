@@ -69,6 +69,8 @@ IMAGE_LIMITS = {
 FIXTURE_SCHEMA = 3
 FRAME_SCHEMA = 2
 EFFECT_SCHEMA = 1
+TITLE_CENSUS_SCHEMA = 3
+TITLE_CENSUS_FRAME_ID_BASIS = "closing_accepted_present"
 OPAQUE_CLASSIFICATIONS = frozenset({"unsupported", "unobservable"})
 LOSS_COUNTERS = (
     "role_conflicts", "probe_table_full", "target_table_full", "pending_overflow",
@@ -403,7 +405,7 @@ def write_synthetic_fixture(out_dir: Path, width: int = 32, height: int = 32) ->
                     "identical": True,
                     "semantic_mismatches": 0,
                     "replay_ns": 0,
-                    "call_count": 12 + frame_id,
+                    "call_count": 5,
                     "effect_count": len(effects),
                 },
                 sort_keys=True,
@@ -434,7 +436,7 @@ def write_synthetic_fixture(out_dir: Path, width: int = 32, height: int = 32) ->
     outputs["manifest.json"] = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()
 
     census = {
-        "schema": 2,
+        "schema": TITLE_CENSUS_SCHEMA,
         "kind": "nvn_call_census",
         "final": True,
         "run_complete": True,
@@ -465,6 +467,8 @@ def write_synthetic_fixture(out_dir: Path, width: int = 32, height: int = 32) ->
             "streams": [{"path": "nx2_vi2", "stream": "0x1", "token": "0x1", "tokens": 1,
                          "ambiguous": False, "presents": 3}],
         },
+        "frame_rows": [[frame_id, [[7, 5]]] for frame_id in frame_ids],
+        "frame_id_basis": TITLE_CENSUS_FRAME_ID_BASIS,
     }
     outputs["census.json"] = (json.dumps(census, indent=2, sort_keys=True) + "\n").encode()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -557,8 +561,10 @@ def evaluate_census_completeness(census: dict[str, Any]) -> dict[str, Any]:
     """Re-derive all 11 completeness conditions matching nvn_census_verdict.h."""
     if not isinstance(census, dict):
         raise InvalidInputError("census JSON must be an object")
-    if census.get("schema") != 2 or census.get("kind") != "nvn_call_census":
-        raise InvalidInputError("expected schema=2 nvn_call_census document")
+    if census.get("schema") != TITLE_CENSUS_SCHEMA or census.get("kind") != "nvn_call_census":
+        raise InvalidInputError(
+            f"expected schema={TITLE_CENSUS_SCHEMA} nvn_call_census document"
+        )
 
     def section(key: str) -> dict:
         return field(census, key, dict, "census")
@@ -977,6 +983,67 @@ def verify_effect_ledgers(
     return report, failures, equivalent, equivalence_reasons
 
 
+def read_title_census(path: Path) -> dict[int, int]:
+    """Per-frame live call totals from a #5 census report's `frame_rows`."""
+    document = read_json(path)
+    if not isinstance(document, dict):
+        raise InvalidInputError(f"{path}: census must be a JSON object")
+    convention = document.get("frame_id_basis")
+    schema = document.get("schema")
+    if schema != TITLE_CENSUS_SCHEMA or convention != TITLE_CENSUS_FRAME_ID_BASIS:
+        raise InvalidInputError(
+            f"{path}: frame_rows requires schema {TITLE_CENSUS_SCHEMA} and "
+            f"frame_id_basis={TITLE_CENSUS_FRAME_ID_BASIS!r}; "
+            f"got schema={schema!r} frame_id_basis={convention!r}"
+        )
+    rows = document.get("frame_rows")
+    if not isinstance(rows, list) or not rows:
+        raise InvalidInputError(f"{path}: no frame_rows; not a live census report")
+    totals: dict[int, int] = {}
+    for row in rows:
+        if not isinstance(row, list) or len(row) != 2:
+            raise InvalidInputError(f"{path}: frame_rows entry {row!r} is not [frame_id, counts]")
+        frame_id, entries = row
+        if type(frame_id) is not int or frame_id < 0:
+            raise InvalidInputError(
+                f"{path}: frame id {frame_id!r} is not a non-negative integer"
+            )
+        if not isinstance(entries, list):
+            raise InvalidInputError(f"{path}: frame {frame_id} counts are not a list")
+        total = 0
+        for entry in entries:
+            if not (isinstance(entry, list) and len(entry) == 2):
+                raise InvalidInputError(
+                    f"{path}: frame {frame_id} count {entry!r} is not [target, calls]"
+                )
+            target, calls = entry
+            if type(target) is not int or type(calls) is not int or calls < 0:
+                raise InvalidInputError(
+                    f"{path}: frame {frame_id} count {entry!r} is not non-negative integers"
+                )
+            total += calls
+        if frame_id in totals:
+            raise InvalidInputError(f"{path}: duplicate frame id {frame_id} in frame_rows")
+        totals[frame_id] = total
+    return totals
+
+
+def resolve_title_census(fixture_dir: Path, explicit: Path | None) -> Path | None:
+    """The explicit report wins; otherwise an in-directory census with frame_rows."""
+    if explicit is not None:
+        return explicit
+    candidate = fixture_dir / "census.json"
+    if not candidate.is_file():
+        return None
+    try:
+        document = read_json(candidate)
+    except (InvalidInputError, OSError, ValueError):
+        return None
+    if isinstance(document, dict) and isinstance(document.get("frame_rows"), list):
+        return candidate
+    return None
+
+
 def verify_fixture_dir(
     fixture_dir: Path,
     *,
@@ -984,6 +1051,7 @@ def verify_fixture_dir(
     expected_effects: Path | None = None,
     require_equivalent: bool = False,
     witness_only: bool = False,
+    title_census: Path | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Raw replay image evidence alone is not an effect ledger or census certificate."""
     try:
@@ -1021,18 +1089,47 @@ def verify_fixture_dir(
             counts_required=not images_only,
             expected_ids=expected_ids,
         )
-        if witness_only:
+        title_path = None if images_only else resolve_title_census(fixture_dir, title_census)
+        call_report: dict[str, Any] = {"scope": "not_present", "required": False}
+        if title_path is not None:
+            totals = read_title_census(title_path)
+            call_failures: list[str] = []
             for fid in sorted(frames):
-                if frames[fid]["call_count"] != 0:
-                    message = (
-                        f"frame {fid}: game-free replay declares call_count="
-                        f"{frames[fid]['call_count']}, expected 0"
+                declared = frames[fid]["call_count"]
+                if fid not in totals:
+                    call_failures.append(
+                        f"{title_path}: frame {fid} is missing; replay declares call_count={declared}"
                     )
-                    failures.append(message)
+                elif totals[fid] != declared:
+                    call_failures.append(
+                        f"{title_path}: frame {fid} live calls {totals[fid]} != "
+                        f"replay call_count {declared}"
+                    )
+            failures.extend(call_failures)
+            if call_failures:
+                for fid in frames:
+                    if fid not in totals or totals[fid] != frames[fid]["call_count"]:
+                        frames[fid]["passed"] = False
+            call_report = {
+                "scope": "title_census",
+                "required": True,
+                "path": str(title_path),
+                "frames": len(totals),
+                "reconciled": not call_failures,
+            }
+        elif any(frames[fid]["call_count"] for fid in frames):
+            for fid in sorted(frames):
+                if frames[fid]["call_count"]:
+                    failures.append(
+                        f"frame {fid}: call_count={frames[fid]['call_count']} is unreconciled; "
+                        "pass --title-census <live census.json>"
+                    )
                     frames[fid]["passed"] = False
+            call_report = {"scope": "unreconciled", "required": True}
         result: dict[str, Any] = {
             "scope": "images" if images_only else ("replay_witness" if witness_only else "fixture"),
             "frames": list(frames.values()),
+            "title_census": call_report,
             "failures": failures,
         }
         code = EXIT_FAIL if failures else EXIT_PASS
@@ -1100,6 +1197,7 @@ def compare_runs(
     expected_effects: Path | None = None,
     require_equivalent: bool = False,
     witness_only: bool = False,
+    title_census: Path | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Two standalone replays are identical only if every witness and image agrees."""
     code_a, result_a = verify_fixture_dir(
@@ -1107,12 +1205,14 @@ def compare_runs(
         expected_effects=expected_effects,
         require_equivalent=require_equivalent,
         witness_only=witness_only,
+        title_census=title_census,
     )
     code_b, result_b = verify_fixture_dir(
         run_b,
         expected_effects=expected_effects,
         require_equivalent=require_equivalent,
         witness_only=witness_only,
+        title_census=title_census,
     )
     if code_a == EXIT_INVALID or code_b == EXIT_INVALID:
         return EXIT_INVALID, {
@@ -1469,6 +1569,66 @@ def run_selftest() -> int:
         code, _ = verify_fixture_dir(opaque_witness, witness_only=True, require_equivalent=True)
         checks.append(("game_free_opaque_require_incomplete", EXIT_INCOMPLETE, code))
 
+        # 20c. Nonzero guest calls reconcile against the live census and are never rewritten.
+        counted = write_synthetic_fixture(root / "case_counted_witness")
+        manifest = read_json(counted / "manifest.json")
+        manifest["kind"] = "standalone_replay_witness"
+        (counted / "manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        (counted / "census.json").unlink()
+        code, _ = verify_fixture_dir(counted, witness_only=True)
+        checks.append(("unreconciled_calls_fail", EXIT_FAIL, code))
+
+        title_census = write_synthetic_fixture(root / "case_title_census") / "census.json"
+        code, _ = verify_fixture_dir(counted, witness_only=True, title_census=title_census)
+        checks.append(("title_census_reconciled_pass", EXIT_PASS, code))
+
+        in_dir = root / "case_counted_in_dir"
+        shutil.copytree(counted, in_dir)
+        shutil.copyfile(title_census, in_dir / "census.json")
+        code, _ = verify_fixture_dir(in_dir, witness_only=True)
+        checks.append(("in_dir_title_census_pass", EXIT_PASS, code))
+
+        undeclared = root / "case_title_census_undeclared.json"
+        census_doc = read_json(title_census)
+        del census_doc["frame_id_basis"]
+        undeclared.write_text(json.dumps(census_doc), encoding="utf-8")
+        code, _ = verify_fixture_dir(counted, witness_only=True, title_census=undeclared)
+        checks.append(("title_census_undeclared_invalid", EXIT_INVALID, code))
+
+        wrong_convention = root / "case_title_census_wrong_basis.json"
+        census_doc["frame_id_basis"] = "frame_index"
+        wrong_convention.write_text(json.dumps(census_doc), encoding="utf-8")
+        code, _ = verify_fixture_dir(counted, witness_only=True, title_census=wrong_convention)
+        checks.append(("title_census_wrong_basis_invalid", EXIT_INVALID, code))
+
+        old_schema = root / "case_title_census_schema2.json"
+        census_doc["frame_id_basis"] = TITLE_CENSUS_FRAME_ID_BASIS
+        census_doc["schema"] = 2
+        old_schema.write_text(json.dumps(census_doc), encoding="utf-8")
+        code, _ = verify_fixture_dir(counted, witness_only=True, title_census=old_schema)
+        checks.append(("title_census_schema2_invalid", EXIT_INVALID, code))
+
+        off_by_one = root / "case_title_census_off_by_one.json"
+        census_doc = read_json(title_census)
+        census_doc["frame_rows"][0][1] = [[7, 4]]
+        off_by_one.write_text(json.dumps(census_doc), encoding="utf-8")
+        code, _ = verify_fixture_dir(counted, witness_only=True, title_census=off_by_one)
+        checks.append(("title_census_off_by_one_fail", EXIT_FAIL, code))
+
+        missing_frame = root / "case_title_census_missing_frame.json"
+        census_doc = read_json(title_census)
+        census_doc["frame_rows"] = census_doc["frame_rows"][:1]
+        missing_frame.write_text(json.dumps(census_doc), encoding="utf-8")
+        code, _ = verify_fixture_dir(counted, witness_only=True, title_census=missing_frame)
+        checks.append(("title_census_missing_frame_fail", EXIT_FAIL, code))
+
+        code, _ = compare_runs(counted, counted, witness_only=True, title_census=title_census)
+        checks.append(("title_census_compare_pass", EXIT_PASS, code))
+        code, _ = compare_runs(counted, counted, witness_only=True)
+        checks.append(("title_census_compare_absent_fail", EXIT_FAIL, code))
+
         # 21. Independent expected ledger supplied from the capture directory.
         external = write_synthetic_fixture(root / "case_external")
         external_expected = root / "capture_expected_effects.jsonl"
@@ -1536,7 +1696,7 @@ def main(argv: list[str] | None = None) -> int:
     group.add_argument("--verify", type=Path,
                        help="Verify qualification fixture in DIR (images + ledgers + census)")
     group.add_argument("--verify-replay", type=Path,
-                       help="Verify a game-free replay witness in DIR (zero guest calls, no census)")
+                       help="Verify a replay witness in DIR (effects + images; guest calls reconciled)")
     group.add_argument("--compare-runs", type=Path, nargs=2, metavar=("RUN_A", "RUN_B"),
                        help="Verify two replay runs independently, then require identical witnesses")
     group.add_argument("--verify-images", type=Path,
@@ -1545,6 +1705,8 @@ def main(argv: list[str] | None = None) -> int:
     group.add_argument("--selftest", action="store_true", help="Run positive & negative controls")
     parser.add_argument("--expected-effects", type=Path,
                         help="Capture-side expected_effects.jsonl when it is not inside the run directory")
+    parser.add_argument("--title-census", type=Path,
+                        help="Live census JSON; every captured frame's call_count must match its frame_rows")
     parser.add_argument("--witness-only", action="store_true",
                         help="With --compare-runs, treat both runs as game-free replay witnesses")
     parser.add_argument("--require-equivalent", action="store_true",
@@ -1577,6 +1739,7 @@ def main(argv: list[str] | None = None) -> int:
             expected_effects=args.expected_effects,
             require_equivalent=args.require_equivalent,
             witness_only=args.witness_only,
+            title_census=args.title_census,
         )
     elif args.verify_replay is not None:
         code, summary = verify_fixture_dir(
@@ -1584,6 +1747,7 @@ def main(argv: list[str] | None = None) -> int:
             expected_effects=args.expected_effects,
             require_equivalent=args.require_equivalent,
             witness_only=True,
+            title_census=args.title_census,
         )
     else:
         code, summary = verify_fixture_dir(
@@ -1591,6 +1755,7 @@ def main(argv: list[str] | None = None) -> int:
             images_only=args.verify_images is not None,
             expected_effects=args.expected_effects,
             require_equivalent=args.require_equivalent,
+            title_census=args.title_census,
         )
     print(json.dumps(summary, indent=2, sort_keys=True))
     return code
