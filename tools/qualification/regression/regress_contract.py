@@ -27,6 +27,9 @@ VERDICTS = (VERDICT_PASS, VERDICT_FAIL, VERDICT_INCONCLUSIVE, VERDICT_INVALID)
 VERDICT_EXIT = {VERDICT_PASS: EXIT_PASS, VERDICT_FAIL: EXIT_REGRESSION,
                 VERDICT_INCONCLUSIVE: EXIT_INCONCLUSIVE, VERDICT_INVALID: EXIT_BAD_INPUT}
 
+EVIDENCE_MEASURED = "measured"      # a real emulator run; the only evidence a check may accept
+EVIDENCE_SYNTHETIC = "synthetic"    # generated telemetry; logic verification only
+
 # ---- picture comparison (0.6 gate) ----------------------------------------------------------
 # Same measure as lab_kit.imgdiff: grayscale, resized to 160 x 90, mean absolute difference / 255.
 IMGDIFF_WIDTH = 160

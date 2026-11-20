@@ -4,8 +4,8 @@
 LOGIC AND CONTRACT VERIFICATION ONLY (marked evidence="synthetic").
 Generates checked-in synthetic --frame-times JSONL logs, report.json files, and
 manifests under tools/qualification/regression/fixtures/, then invokes
-regress_stats.py on every positive and negative control and asserts verdicts
-and exit codes.
+regress_stats.py on every positive and negative control and asserts verdicts,
+exit codes, and that each result stays labelled evidence="synthetic".
 """
 
 import argparse
@@ -15,6 +15,7 @@ import os
 import random
 import subprocess
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REGRESS_STATS = os.path.join(HERE, 'regress_stats.py')
@@ -62,10 +63,10 @@ def _write_frame_times(path, frame_ms, start_ns=1_000_000_000, truncate=False):
 
 
 def _write_report(path, metrics_complete=True, shutdown_complete=True, frame_gen=False,
-                  generated_frames=0):
+                  generated_frames=0, exit_code=0, exit_reason='normal_end'):
     doc = dict(
         schema_version=2,
-        exit=dict(code=0, reason='normal_end', metrics_complete=metrics_complete,
+        exit=dict(code=exit_code, reason=exit_reason, metrics_complete=metrics_complete,
                   shutdown_complete=shutdown_complete),
         settings=dict(initial=dict(frame_gen=frame_gen, allow_speed_up=True,
                                    use_speed_limit=False, use_vsync=0),
@@ -97,6 +98,8 @@ def generate_fixtures(out_dir=FIXTURES_DIR):
                   shutdown_complete=False)
     _write_report(os.path.join(out_dir, 'logs/bad_frame_gen.report.json'),
                   frame_gen=True, generated_frames=400)
+    _write_report(os.path.join(out_dir, 'logs/bad_abnormal_exit.report.json'),
+                  exit_code=124, exit_reason='timeout')
 
     def make_run(role, pair, build, add_ms=0.0, tag='ok', truncate=False):
         fname = f'logs/{role}_{pair}_{tag}.jsonl'
@@ -191,7 +194,12 @@ def generate_fixtures(out_dir=FIXTURES_DIR):
     neg_mix['runs'][1]['cache_state'] = 'cold'
     _write_json(os.path.join(out_dir, 'neg_mixed_cache_runs.json'), neg_mix)
 
-    # Negative control 5: truncated --frame-times log
+    # Negative control 5: run that ended abnormally (timeout) but wrote a complete report
+    neg_exit = json.loads(json.dumps(aa_doc))
+    neg_exit['runs'][1]['report'] = 'logs/bad_abnormal_exit.report.json'
+    _write_json(os.path.join(out_dir, 'neg_abnormal_exit_runs.json'), neg_exit)
+
+    # Negative control 6: truncated --frame-times log
     neg_trunc = json.loads(json.dumps(aa_doc))
     neg_trunc['runs'][0]['file'] = 'logs/truncated.jsonl'
     _write_json(os.path.join(out_dir, 'neg_truncated_log_runs.json'), neg_trunc)
@@ -210,34 +218,43 @@ def verify_fixtures(fixtures_dir=FIXTURES_DIR):
          'generated-frame inflation'),
         ('neg_mixed_cache_runs.json', C.EXIT_INCONCLUSIVE, C.VERDICT_INCONCLUSIVE,
          'mixes cache states'),
+        ('neg_abnormal_exit_runs.json', C.EXIT_INCONCLUSIVE, C.VERDICT_INCONCLUSIVE,
+         'ended abnormally'),
         ('neg_truncated_log_runs.json', C.EXIT_BAD_INPUT, C.VERDICT_INVALID, 'truncated'),
     ]
-    for name, want_code, want_verdict, want_substr in cases:
-        manifest_path = os.path.join(fixtures_dir, name)
-        out_path = os.path.join(os.environ.get('TEMP', '/tmp'), f'ci_verify_{name}')
-        proc = subprocess.run(
-            [sys.executable, '-B', REGRESS_STATS, '--runs', manifest_path, '--out', out_path],
-            capture_output=True, text=True, check=False)
-        if proc.returncode != want_code:
-            print(f'FAIL {name}: exit={proc.returncode} expected={want_code}\n{proc.stdout}\n{proc.stderr}')
-            return 1
-        with open(out_path, encoding='utf-8') as handle:
-            res = json.load(handle)
-        problems = C.validate_result(res)
-        if problems:
-            print(f'FAIL {name}: result schema invalid: {problems}')
-            return 1
-        if res['verdict'] != want_verdict:
-            print(f'FAIL {name}: verdict={res["verdict"]} expected={want_verdict}')
-            return 1
-        if want_substr and not any(want_substr in r for r in res['reasons']):
-            print(f'FAIL {name}: missing {want_substr!r} in reasons={res["reasons"]}')
-            return 1
-        if name == 'self_proof_5pct_runs.json':
-            if res['aa']['verdict'] != C.VERDICT_PASS or res['injection']['proof'] != 'caught':
-                print(f'FAIL {name}: aa/injection unexpected: {res.get("aa")}, {res.get("injection")}')
+    with tempfile.TemporaryDirectory(prefix='ci_verify_') as scratch:
+        for name, want_code, want_verdict, want_substr in cases:
+            manifest_path = os.path.join(fixtures_dir, name)
+            out_path = os.path.join(scratch, name + '.result.json')
+            proc = subprocess.run(
+                [sys.executable, '-B', REGRESS_STATS, '--runs', manifest_path, '--out', out_path],
+                capture_output=True, text=True, check=False)
+            if proc.returncode != want_code:
+                print(f'FAIL {name}: exit={proc.returncode} expected={want_code}\n{proc.stdout}\n{proc.stderr}')
                 return 1
-        print(f'ok   {name}: exit={proc.returncode} verdict={res["verdict"]} evidence={res["evidence"]}')
+            with open(out_path, encoding='utf-8') as handle:
+                res = json.load(handle)
+            problems = C.validate_result(res)
+            if problems:
+                print(f'FAIL {name}: result schema invalid: {problems}')
+                return 1
+            if res['verdict'] != want_verdict:
+                print(f'FAIL {name}: verdict={res["verdict"]} expected={want_verdict}')
+                return 1
+            if res['evidence'] != C.EVIDENCE_SYNTHETIC:
+                print(f'FAIL {name}: evidence={res["evidence"]} expected={C.EVIDENCE_SYNTHETIC}; '
+                      f'a fixture must never pass as measured evidence')
+                return 1
+            if want_substr and not any(want_substr in r for r in res['reasons']):
+                print(f'FAIL {name}: missing {want_substr!r} in reasons={res["reasons"]}')
+                return 1
+            if name == 'self_proof_5pct_runs.json':
+                if res['aa']['verdict'] != C.VERDICT_PASS or res['injection']['proof'] != 'caught':
+                    print(f'FAIL {name}: aa/injection unexpected: {res.get("aa")}, '
+                          f'{res.get("injection")}')
+                    return 1
+            print(f'ok   {name}: exit={proc.returncode} verdict={res["verdict"]} '
+                  f'evidence={res["evidence"]}')
     print(f'{len(cases)} of {len(cases)} synthetic CI fixture checks passed')
     return 0
 

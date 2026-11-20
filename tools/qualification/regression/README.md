@@ -10,9 +10,10 @@ Statistical regression checker (`regress_stats.py`) and frozen contract (`regres
    - In `self_proof` mode: exit `0` (`PASS`) requires **both** A/A `PASS` (no false alarm) and the 5 % injection `FAIL` (caught and valid). A false alarm on A/A exits `1` (`FAIL`).
    - In `check` mode: exit `0` (`PASS`) requires ruling out a 5 % loss across all scenes; exit `1` (`FAIL`) flags a significant slowdown in `median_fps` or `inverse_p99`.
 4. **Integrity & rejection guards:**
-   - **Incomplete metrics or shutdown:** Rejects truncated/lossy `--frame-times` logs, `metrics_complete=false`, and `shutdown_complete=false` (inline or in `--report` JSON `exit` block) -> exit `3` (`INCONCLUSIVE`) or `2` (`INVALID`).
-   - **Generated-frame inflation:** Rejects `frame_gen=true` (inline or in `--report` JSON `settings`), `generated_frames > 0`, `frame_gen_multiplier > 1`, or generated-frame sources -> exit `3` (`INCONCLUSIVE`).
-   - **Mixed cold/warm samples:** Rejects mismatched `cache_state` within any pair, mismatched `cache_state` against a manifest-level pinned `cache_state`, and mixing `cold` and `warm` pairs within a scene -> exit `3` (`INCONCLUSIVE`).
+   - **Incomplete metrics or shutdown:** Rejects truncated/lossy `--frame-times` logs, `metrics_complete=false`, and `shutdown_complete=false` (inline or in `--report` JSON `exit` block) -> exit `3` (`INCONCLUSIVE`) or `2` (`INVALID`). A measured sample (a real log with no report) is accepted only on explicit completeness evidence: `metrics_complete=true` *and* `shutdown_complete=true`, or a `report`. Silence is not evidence, and an inline flag written as anything but a JSON boolean (e.g. `"true"`, `1`) is malformed -> exit `2` (`INVALID`), never read as off or complete. Synthetic runs and inline-frame fixtures are exempt from the report/flag requirement.
+   - **Abnormal end in `--report`:** Rejects a report whose `exit.code` is not `0` (timeout `124`, device lost, crash) even when `metrics_complete`/`shutdown_complete` are true, and a report missing its `exit`, `settings.initial`, `settings.final` or `summary` block -> exit `3` (`INCONCLUSIVE`).
+   - **Generated-frame inflation:** Rejects `frame_gen=true` (inline or in a `--report` `settings` block), `generated_frames > 0`, `frame_gen_multiplier > 1`, or generated-frame sources -> exit `3` (`INCONCLUSIVE`). An inline `frame_gen` must be a JSON boolean; any other inline encoding (`"true"`, `1`) is malformed -> exit `2`. Counts and multipliers may be numbers or numeric strings (`120`, `"120"`). In a report, `frame_gen` is read as bool, number or `true`/`false`/`on`/`off`/`yes`/`no` (an empty value means the setting is not a boolean switch), and an unrecognised value is rejected rather than read as off.
+   - **Mixed cold/warm samples:** Rejects mismatched `cache_state` within any pair, mismatched `cache_state` against a manifest-level pinned `cache_state`, mixing `cold` and `warm` pairs within a scene, and a pair that declares no `cache_state` beside pairs that declare one -> exit `3` (`INCONCLUSIVE`).
    - **Synthetic vs measured separation:** Inline `frame_ms` and synthetic runs are always labelled `evidence="synthetic"` and rejected if mixed with measured runs (`EXIT_BAD_INPUT = 2`).
 
 ## Synthetic CI Fixture & Invocations
@@ -36,11 +37,12 @@ python -B tools/qualification/regression/regress_stats.py --runs tools/qualifica
 # 3. Check mode against 5% slowed positive control -> exit 1 (FAIL)
 python -B tools/qualification/regression/regress_stats.py --runs tools/qualification/regression/fixtures/check_5pct_regression_runs.json
 
-# 4. Negative controls (incomplete metrics/shutdown, generated frames, mixed cold/warm, truncated log)
+# 4. Negative controls (incomplete metrics/shutdown, generated frames, mixed cold/warm, abnormal exit, truncated log)
 python -B tools/qualification/regression/regress_stats.py --runs tools/qualification/regression/fixtures/neg_incomplete_metrics_runs.json   # exit 3
 python -B tools/qualification/regression/regress_stats.py --runs tools/qualification/regression/fixtures/neg_incomplete_shutdown_runs.json  # exit 3
 python -B tools/qualification/regression/regress_stats.py --runs tools/qualification/regression/fixtures/neg_generated_frames_runs.json     # exit 3
 python -B tools/qualification/regression/regress_stats.py --runs tools/qualification/regression/fixtures/neg_mixed_cache_runs.json          # exit 3
+python -B tools/qualification/regression/regress_stats.py --runs tools/qualification/regression/fixtures/neg_abnormal_exit_runs.json        # exit 3
 python -B tools/qualification/regression/regress_stats.py --runs tools/qualification/regression/fixtures/neg_truncated_log_runs.json        # exit 2
 ```
 
@@ -49,7 +51,8 @@ python -B tools/qualification/regression/regress_stats.py --runs tools/qualifica
 Measured A/A control result is checked in as [`sanitized_title_aa_result.json`](sanitized_title_aa_result.json) (path-free, zero game data/keys/firmware).
 
 - **Candidate build:** `b5aef6b73b2229c9930668eccb395e9f894a2886` (`acc/h-int54`, `Eglantine-w23-s54-verified\eden-cli.exe`, SHA-256 `03edae9b781bf437bba1ebb73d306626c5bf4cb80a8032ec9cb71a3c5dfc8326`).
-- **Pinned configuration:** sanitized scene `sanitized_title_scene` (XC2 title screen), true-present `host_present` metric (`--frame-times`, 420 frames per run), `cache_state="warm"`, hardware/driver `NVIDIA GeForce RTX 5070 Ti Laptop GPU` (`621.14`, Windows 11), settings `--baseline --baseline-allow use_speed_limit=false,allow_speed_up=true,use_vsync=0` (`allow_speed_up=true`, `frame_gen=false`).
+- **Measured window:** `sanitized_title_scene` is an XC2 launch-window label. The 420-frame sample includes boot frames; neither the invocation nor the receipt checks arrival at the title screen. This is a live A/A control, not a fixed-scene title-screen result.
+- **Pinned configuration:** `host_present` (`--frame-times`), warm cache; NVIDIA GeForce RTX 5070 Ti Laptop GPU, driver 621.14, Windows 11; `--baseline --baseline-allow use_speed_limit=false,allow_speed_up=true,use_vsync=0`, frame generation off.
 - **Exact per-run invocation (8 alternating AB/BA runs in isolated temp `--user-dir`):**
 
 ```powershell

@@ -92,6 +92,8 @@ import os
 import random
 import statistics
 import sys
+import tempfile
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import regress_contract as C  # noqa: E402
@@ -113,8 +115,6 @@ ROLE_REPEAT = 'baseline_repeat'  # A2 of a self-proof triplet
 ROLE_INJECTED = 'injected'       # I of a self-proof triplet (baseline build + injected delay)
 ROLES = (ROLE_BASELINE, ROLE_CANDIDATE, ROLE_CAL_A, ROLE_CAL_B, ROLE_REPEAT, ROLE_INJECTED)
 FORMATS = ('presentmon', 'frame_times')
-EVIDENCE_MEASURED = 'measured'
-EVIDENCE_SYNTHETIC = 'synthetic'
 BIAS_ALPHA = 0.01                # two-sided, per scene and metric, on the A/A mean
 CAL_COMPAT_ALPHA = 0.01          # F test: are these pairs noisier than the stored calibration?
 MODE_CHECK = 'check'
@@ -498,30 +498,79 @@ def check_manifest(manifest):
 GENERATED_SOURCES = ('generated_frames', 'frame_gen', 'lossless_scaling')
 
 
-def _is_truthy_setting(value):
+def _as_number(value):
+    """The finite number a JSON value holds, or None. Accepts numbers and numeric strings and
+    rejects booleans, NaN and infinities, so a serialised count cannot slip past a numeric guard."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        number = value
+    elif isinstance(value, str):
+        try:
+            number = float(value.strip())
+        except ValueError:
+            return None
+    else:
+        return None
+    return number if math.isfinite(number) else None
+
+
+FRAME_GEN_WORDS = {'true': True, 'yes': True, 'on': True,
+                   'false': False, 'no': False, 'off': False}
+
+
+def _frame_gen_setting(value, where):
+    """Whether a report's frame_gen switch is on. run_report writes a boolean, a number or a
+    true/false word; an empty value means the setting is not a boolean switch (no signal), and an
+    unrecognised value is rejected rather than read as off."""
+    if value is None:
+        return False
     if isinstance(value, bool):
         return value
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return value != 0
+    number = _as_number(value)
+    if number is not None:
+        return number != 0
     if isinstance(value, str):
-        return value.strip().lower() in ('true', '1', 'yes', 'on')
-    return False
+        word = value.strip().lower()
+        if not word:
+            return False
+        if word in FRAME_GEN_WORDS:
+            return FRAME_GEN_WORDS[word]
+    raise TelemetryError(f'generated-frame inflation: {where} has an unrecognised value '
+                         f'{value!r}', 'integrity')
+
+
+def _inline_flag(entry, key):
+    """Tri-state inline completeness flag: True, False, or None when the manifest omits it. A
+    present value that is not a JSON boolean is malformed - never 'off' or 'complete'."""
+    if key not in entry:
+        return None
+    value = entry[key]
+    if isinstance(value, bool):
+        return value
+    raise TelemetryError(f'{key} is malformed ({value!r}): a run flag must be true or false',
+                         'invalid')
 
 
 def _validate_run_metadata(entry, base_dir):
     """Reject incomplete metrics/shutdown and generated-frame inflation before scoring."""
-    if entry.get('metrics_complete') is False:
+    metrics_flag = _inline_flag(entry, 'metrics_complete')
+    if metrics_flag is False:
         raise TelemetryError('metrics_complete is false', 'incomplete')
-    if entry.get('shutdown_complete') is False:
+    shutdown_flag = _inline_flag(entry, 'shutdown_complete')
+    if shutdown_flag is False:
         raise TelemetryError('shutdown_complete is false', 'incomplete')
+    if 'frame_gen' in entry and not isinstance(entry['frame_gen'], bool):
+        raise TelemetryError(f'frame_gen is malformed ({entry["frame_gen"]!r}): a run flag must '
+                             f'be true or false', 'invalid')
     if entry.get('frame_gen') is True:
         raise TelemetryError('generated-frame inflation: frame_gen is true', 'integrity')
-    gen_count = entry.get('generated_frames')
-    if isinstance(gen_count, (int, float)) and not isinstance(gen_count, bool) and gen_count > 0:
+    gen_count = _as_number(entry.get('generated_frames'))
+    if gen_count is not None and gen_count > 0:
         raise TelemetryError(f'generated-frame inflation: generated_frames={gen_count}',
                              'integrity')
-    mult = entry.get('frame_gen_multiplier')
-    if isinstance(mult, (int, float)) and not isinstance(mult, bool) and mult > 1:
+    mult = _as_number(entry.get('frame_gen_multiplier'))
+    if mult is not None and mult > 1:
         raise TelemetryError(f'generated-frame inflation: frame_gen_multiplier={mult}',
                              'integrity')
     if entry.get('source') in GENERATED_SOURCES:
@@ -529,6 +578,15 @@ def _validate_run_metadata(entry, base_dir):
                              'integrity')
     report_ref = entry.get('report')
     if report_ref is None:
+        # Inline frames and runs marked synthetic are generated telemetry: they never need a
+        # report. A measured sample (a real log with no report) passes only on explicit
+        # completeness evidence; silence is not evidence.
+        measured_sample = entry.get('synthetic') is not True and 'frame_ms' not in entry
+        if measured_sample and (metrics_flag is not True or shutdown_flag is not True):
+            raise TelemetryError(
+                'no report and no explicit completeness evidence: a measured sample must set '
+                'metrics_complete=true and shutdown_complete=true, or point at a run report',
+                'incomplete')
         return
     if not isinstance(report_ref, str) or not report_ref:
         raise TelemetryError('report path must be a non-empty string', 'invalid')
@@ -543,29 +601,43 @@ def _validate_run_metadata(entry, base_dir):
                              'invalid') from None
     if not isinstance(report, dict):
         raise TelemetryError(f'{os.path.basename(report_path)}: report is not an object', 'invalid')
+    name = os.path.basename(report_path)
     exit_info = report.get('exit')
     if not isinstance(exit_info, dict):
-        raise TelemetryError(f'{os.path.basename(report_path)}: report missing exit block',
-                             'incomplete')
+        raise TelemetryError(f'{name}: report missing exit block', 'incomplete')
+    code = exit_info.get('code')
+    if isinstance(code, bool) or not isinstance(code, int):
+        raise TelemetryError(f'{name}: report exit.code is missing or not an integer '
+                             f'({code!r})', 'incomplete')
+    if code != 0:
+        reason = exit_info.get('reason')
+        detail = f', reason {reason!r}' if isinstance(reason, str) and reason else ''
+        raise TelemetryError(f'{name}: the run ended abnormally (exit code {code}{detail}); a '
+                             f'run that did not end normally cannot be compared', 'incomplete')
     if exit_info.get('metrics_complete') is not True:
         raise TelemetryError('report exit.metrics_complete is not true', 'incomplete')
     if exit_info.get('shutdown_complete') is not True:
         raise TelemetryError('report exit.shutdown_complete is not true', 'incomplete')
     settings = report.get('settings')
-    if isinstance(settings, dict):
-        for phase in ('initial', 'final'):
-            block = settings.get(phase)
-            if isinstance(block, dict) and _is_truthy_setting(block.get('frame_gen')):
-                raise TelemetryError(
-                    f'generated-frame inflation: report settings.{phase}.frame_gen is enabled',
-                    'integrity')
-    summary = report.get('summary')
-    if isinstance(summary, dict):
-        rep_gen = summary.get('generated_frames')
-        if isinstance(rep_gen, (int, float)) and not isinstance(rep_gen, bool) and rep_gen > 0:
+    if not isinstance(settings, dict):
+        raise TelemetryError(f'{name}: report missing settings block', 'incomplete')
+    for phase in ('initial', 'final'):
+        block = settings.get(phase)
+        if not isinstance(block, dict):
+            raise TelemetryError(f'{name}: report settings.{phase} is missing', 'incomplete')
+        if _frame_gen_setting(block.get('frame_gen'),
+                              f'report settings.{phase}.frame_gen'):
             raise TelemetryError(
-                f'generated-frame inflation: report summary.generated_frames={rep_gen}',
+                f'generated-frame inflation: report settings.{phase}.frame_gen is enabled',
                 'integrity')
+    summary = report.get('summary')
+    if not isinstance(summary, dict):
+        raise TelemetryError(f'{name}: report missing summary block', 'incomplete')
+    rep_gen = _as_number(summary.get('generated_frames'))
+    if rep_gen is not None and rep_gen > 0:
+        raise TelemetryError(
+            f'generated-frame inflation: report summary.generated_frames={rep_gen}',
+            'integrity')
 
 
 def load_run(entry, base_dir):
@@ -671,6 +743,7 @@ def gather(manifest, base_dir):
                               and role in (role_a, role_b)})
             kept = []
             cache_states = set()
+            unlabelled = 0
             for number in numbers:
                 if (role_b, scene, number) in gone and (role_b, scene, number) not in entries:
                     continue                    # that run was discarded on purpose (a restart)
@@ -696,14 +769,21 @@ def gather(manifest, base_dir):
                     ev.integrity.append(f'{family} pair {number} of {scene} is incomparable: '
                                         + '; '.join(problems))
                     continue
-                for val in (ca, cb):
-                    if val is not None:
-                        cache_states.add(val)
+                if ca is None:
+                    unlabelled += 1
+                else:
+                    cache_states.add(ca)
                 kept.append((number, a['metrics'], b['metrics']))
             if len(cache_states) > 1:
                 ev.integrity.append(
                     f'{family} {scene} mixes cache states ({", ".join(sorted(cache_states))}): '
                     f'cold and warm samples cannot be mixed')
+                kept = []
+            elif unlabelled and cache_states:
+                ev.integrity.append(
+                    f'{family} {scene}: {unlabelled} pair(s) declare no cache_state while other '
+                    f'pairs declare {", ".join(sorted(cache_states))}; an undeclared pair could be '
+                    f'cold or warm, so the states cannot be shown to agree')
                 kept = []
             ev.pairs[(family, scene)] = kept
     known = set(manifest['scenes'])
@@ -1042,7 +1122,7 @@ def analyze(manifest, base_dir='.', calibration=None):
         alpha=C.ALPHA_FAMILY, delta=C.DELTA, calibration=None, metrics={}, pictures=None,
         census=None, reasons=[], tool=TOOL, mode=mode, scenes=list(scenes),
         baseline_build=manifest['baseline_build'], candidate_build=manifest['candidate_build'],
-        evidence=EVIDENCE_SYNTHETIC if ev.synthetic else EVIDENCE_MEASURED,
+        evidence=C.EVIDENCE_SYNTHETIC if ev.synthetic else C.EVIDENCE_MEASURED,
         beta=C.BETA_PLAN, min_pairs=design['min_pairs'], injection=None,
         design=dict(kind=design['kind'], min_pairs=design['min_pairs'],
                     max_pairs=design['max_pairs'], looks=looks, k=k, alpha_family=C.ALPHA_FAMILY,
@@ -1318,7 +1398,7 @@ def describe(result):
              f'{len(design["looks"])} look(s); K={result["family_k"]} tests, family alpha '
              f'{result["alpha"]}, alpha per test per look {design["alpha_per_test"]:.2e}; delta '
              f'{result["delta"]:.6f} = {C.INJECTED_LOSS * 100:.0f} % loss']
-    if result['evidence'] == EVIDENCE_SYNTHETIC:
+    if result['evidence'] == C.EVIDENCE_SYNTHETIC:
         lines.append('SYNTHETIC DATA: this run tests the logic only, it is not acceptance '
                      'evidence')
     for key, row in result['metrics'].items():
@@ -1349,12 +1429,36 @@ def describe(result):
     return '\n'.join(lines)
 
 
+def _replace(temp, path):
+    """Rename over the target. Windows refuses a rename while another process holds the target
+    open, so a sharing violation is retried briefly; the file on disk is never partial."""
+    for attempt in range(8):
+        try:
+            os.replace(temp, path)
+            return
+        except PermissionError:
+            if attempt == 7:
+                raise
+            time.sleep(0.02)
+
+
 def write_json(path, document):
-    temp = path + '.tmp'
-    with open(temp, 'w', encoding='utf-8', newline='\n') as handle:
-        json.dump(document, handle, indent=2, sort_keys=False)
-        handle.write('\n')
-    os.replace(temp, path)
+    """Write the document atomically: a unique temporary file in the same folder, then a rename,
+    so a crash or a concurrent reader never sees a half-written result."""
+    folder = os.path.dirname(os.path.abspath(path))
+    handle, temp = tempfile.mkstemp(dir=folder, prefix=os.path.basename(path) + '.',
+                                    suffix='.tmp')
+    try:
+        with os.fdopen(handle, 'w', encoding='utf-8', newline='\n') as stream:
+            json.dump(document, stream, indent=2, sort_keys=False)
+            stream.write('\n')
+        _replace(temp, path)
+    except BaseException:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+        raise
 
 
 def validate_logs(paths):

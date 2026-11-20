@@ -15,6 +15,7 @@ import os
 import random
 import statistics
 import tempfile
+import threading
 import unittest
 
 import regress_contract as C
@@ -354,7 +355,8 @@ class Comparability(unittest.TestCase):
     def test_mixed_synthetic_and_measured_is_invalid(self):
         doc = manifest(seed=39, pairs=C.MIN_PAIRS)
         doc['runs'][0] = dict(id='x', role=R.ROLE_CAL_A, scene='scene_a', pair=1,
-                              build='build-base', format='presentmon', file='nothing.csv')
+                              build='build-base', format='presentmon', file='nothing.csv',
+                              metrics_complete=True, shutdown_complete=True)
         # a missing file is only missing, so give the mixed case a readable measured run
         with tempfile.TemporaryDirectory() as tmp:
             write_presentmon(os.path.join(tmp, 'nothing.csv'), frames(random.Random(2)))
@@ -629,7 +631,8 @@ def file_manifest(directory, seed, cal_pairs, pairs, candidate_add_ms=0.0, scene
         name = f'{role}-{scene}-{pair}.jsonl'
         write_frame_times(os.path.join(directory, name), frames(rng, count=500, **kw))
         runs.append(dict(id=f'{role}-{scene}-{pair}', role=role, scene=scene, pair=pair,
-                         build=build, format='frame_times', file=name, source='host_present'))
+                         build=build, format='frame_times', file=name, source='host_present',
+                         metrics_complete=True, shutdown_complete=True))
 
     for scene in scenes:
         for pair in range(1, cal_pairs + 1):
@@ -1015,10 +1018,10 @@ class Simulation(unittest.TestCase):
 
 
 def _write_report(path, metrics_complete=True, shutdown_complete=True, frame_gen=False,
-                  generated_frames=0):
+                  generated_frames=0, exit_code=0, exit_reason='normal_end'):
     doc = dict(
         schema_version=2,
-        exit=dict(code=0, reason='normal_end', metrics_complete=metrics_complete,
+        exit=dict(code=exit_code, reason=exit_reason, metrics_complete=metrics_complete,
                   shutdown_complete=shutdown_complete),
         settings=dict(initial=dict(frame_gen=frame_gen, allow_speed_up=True),
                       final=dict(frame_gen=frame_gen, allow_speed_up=True)),
@@ -1140,6 +1143,185 @@ class Issue6RejectionAndProofGuards(unittest.TestCase):
         self.assertEqual(result['verdict'], C.VERDICT_INCONCLUSIVE)
         self.assertEqual(code, C.EXIT_INCONCLUSIVE)
         self.assertTrue(any('does not match pinned' in r for r in result['reasons']))
+
+    def test_undeclared_cache_state_beside_declared_pairs_is_rejected(self):
+        doc = manifest(seed=211, pairs=10)
+        for run in doc['runs']:
+            if run['scene'] == 'scene_a' and run['role'] in (R.ROLE_BASELINE, R.ROLE_CANDIDATE) \
+                    and run['pair'] <= 9:
+                run['cache_state'] = 'warm'
+        result, code = verdict_of(doc)
+        self.assertEqual(result['verdict'], C.VERDICT_INCONCLUSIVE)
+        self.assertEqual(code, C.EXIT_INCONCLUSIVE)
+        self.assertTrue(any('declare no cache_state' in r for r in result['reasons']))
+
+    def test_abnormal_report_exit_is_rejected(self):
+        doc = self._file_manifest_with_reports(
+            seed=212, pairs=10,
+            report_kwargs={'candidate-scene_a-1': dict(exit_code=124, exit_reason='timeout')})
+        result, code = verdict_of_dir(doc, self.dir)
+        self.assertEqual(result['verdict'], C.VERDICT_INCONCLUSIVE)
+        self.assertEqual(code, C.EXIT_INCONCLUSIVE)
+        self.assertTrue(any('ended abnormally' in r and '124' in r for r in result['reasons']),
+                        result['reasons'])
+
+    def _rewrite_report(self, run_id, mutate):
+        path = os.path.join(self.dir, run_id + '.report.json')
+        with open(path, encoding='utf-8') as handle:
+            payload = json.load(handle)
+        mutate(payload)
+        with open(path, 'w', encoding='utf-8', newline='\n') as handle:
+            json.dump(payload, handle, indent=2)
+
+    def test_report_without_exit_code_or_blocks_is_rejected(self):
+        cases = (
+            (lambda rep: rep['exit'].pop('code'), 'exit.code'),
+            (lambda rep: rep['exit'].pop('metrics_complete'), 'metrics_complete is not true'),
+            (lambda rep: rep.pop('settings'), 'missing settings block'),
+            (lambda rep: rep['settings'].pop('final'), 'settings.final is missing'),
+            (lambda rep: rep.pop('summary'), 'missing summary block'),
+        )
+        for mutate, expected in cases:
+            doc = self._file_manifest_with_reports(seed=213, pairs=10)
+            self._rewrite_report('candidate-scene_a-1', mutate)
+            result, code = verdict_of_dir(doc, self.dir)
+            self.assertEqual(result['verdict'], C.VERDICT_INCONCLUSIVE, expected)
+            self.assertEqual(code, C.EXIT_INCONCLUSIVE)
+            self.assertTrue(any(expected in r for r in result['reasons']),
+                            (expected, result['reasons']))
+
+    def test_inline_frame_generation_flags_must_be_booleans(self):
+        for mut in (dict(frame_gen='true'), dict(frame_gen='false'), dict(frame_gen=1),
+                    dict(frame_gen=0)):
+            doc = manifest(seed=214, pairs=10)
+            doc['runs'][0].update(mut)
+            result, code = verdict_of(doc)
+            self.assertEqual(result['verdict'], C.VERDICT_INVALID, mut)
+            self.assertEqual(code, C.EXIT_BAD_INPUT)
+            self.assertTrue(any('frame_gen is malformed' in r for r in result['reasons']), mut)
+
+    def test_frame_generation_counts_encoded_as_text_are_rejected(self):
+        for mut in (
+            dict(frame_gen=True),
+            dict(generated_frames='120'),
+            dict(generated_frames=120.0),
+            dict(frame_gen_multiplier='2'),
+        ):
+            doc = manifest(seed=214, pairs=10)
+            doc['runs'][0].update(mut)
+            result, code = verdict_of(doc)
+            self.assertEqual(result['verdict'], C.VERDICT_INCONCLUSIVE, mut)
+            self.assertEqual(code, C.EXIT_INCONCLUSIVE)
+            self.assertTrue(any('generated-frame inflation' in r for r in result['reasons']), mut)
+
+    def test_measured_sample_needs_a_report_or_explicit_completeness(self):
+        doc = manifest(seed=216, pairs=10)
+        doc['runs'][0].update(dict(synthetic=False, format='presentmon', file='runs.csv'))
+        doc['runs'][0].pop('frame_ms', None)      # a measured run now, not inline telemetry
+        result, code = verdict_of(doc)
+        self.assertEqual(result['verdict'], C.VERDICT_INCONCLUSIVE)
+        self.assertEqual(code, C.EXIT_INCONCLUSIVE)
+        self.assertTrue(any('no report and no explicit completeness evidence' in r
+                            for r in result['reasons']), result['reasons'])
+
+    def test_measured_sample_passes_with_explicit_completeness(self):
+        doc = file_manifest(self.dir, seed=217, cal_pairs=0, pairs=10)
+        doc['design'] = dict(min_pairs=4, max_pairs=10)
+        result, code = verdict_of_dir(doc, self.dir)
+        self.assertEqual(result['verdict'], C.VERDICT_PASS, result['reasons'])
+        self.assertEqual(result['evidence'], C.EVIDENCE_MEASURED)
+
+    def test_report_frame_gen_blank_means_not_a_boolean_switch(self):
+        def blank(rep):
+            for phase in ('initial', 'final'):
+                rep['settings'][phase]['frame_gen'] = ''
+        doc = self._file_manifest_with_reports(seed=219, pairs=10)
+        self._rewrite_report('candidate-scene_a-1', blank)
+        result, code = verdict_of_dir(doc, self.dir)
+        self.assertEqual(result['verdict'], C.VERDICT_PASS, result['reasons'])
+
+    def test_report_omitting_frame_gen_is_not_a_contradiction(self):
+        def omit(rep):
+            for phase in ('initial', 'final'):
+                rep['settings'][phase].pop('frame_gen', None)
+        doc = self._file_manifest_with_reports(seed=221, pairs=10)
+        self._rewrite_report('candidate-scene_a-1', omit)
+        result, code = verdict_of_dir(doc, self.dir)
+        self.assertEqual(result['verdict'], C.VERDICT_PASS, result['reasons'])
+
+    def test_report_frame_gen_unrecognised_value_is_rejected(self):
+        def maybe(rep):
+            rep['settings']['final']['frame_gen'] = 'maybe'
+        doc = self._file_manifest_with_reports(seed=220, pairs=10)
+        self._rewrite_report('candidate-scene_a-1', maybe)
+        result, code = verdict_of_dir(doc, self.dir)
+        self.assertEqual(result['verdict'], C.VERDICT_INCONCLUSIVE)
+        self.assertTrue(any('unrecognised value' in r for r in result['reasons']),
+                        result['reasons'])
+
+    def test_report_false_completeness_overrides_inline_true(self):
+        doc = self._file_manifest_with_reports(
+            seed=222, pairs=10,
+            report_kwargs={'candidate-scene_a-1': dict(metrics_complete=False)})
+        result, code = verdict_of_dir(doc, self.dir)
+        self.assertEqual(result['verdict'], C.VERDICT_INCONCLUSIVE)
+        self.assertEqual(code, C.EXIT_INCONCLUSIVE)
+        self.assertTrue(any('report exit.metrics_complete is not true' in r
+                            for r in result['reasons']), result['reasons'])
+
+    def test_inline_completeness_flags_must_be_booleans(self):
+        for mut in (dict(metrics_complete='true'), dict(metrics_complete=1),
+                    dict(shutdown_complete='false'), dict(shutdown_complete=0)):
+            doc = manifest(seed=218, pairs=10)
+            doc['runs'][0].update(mut)
+            result, code = verdict_of(doc)
+            self.assertEqual(result['verdict'], C.VERDICT_INVALID, mut)
+            self.assertEqual(code, C.EXIT_BAD_INPUT)
+            self.assertTrue(any('is malformed' in r for r in result['reasons']), mut)
+
+    def test_report_frame_generation_encoded_as_text_is_rejected(self):
+        def as_text(rep):
+            rep['settings']['initial']['frame_gen'] = 'true'
+        cases = ((as_text, 'settings.initial.frame_gen'),
+                 (lambda rep: rep['summary'].update(generated_frames='400'),
+                  'summary.generated_frames'))
+        for mutate, expected in cases:
+            doc = self._file_manifest_with_reports(seed=215, pairs=10)
+            self._rewrite_report('candidate-scene_a-2', mutate)
+            result, code = verdict_of_dir(doc, self.dir)
+            self.assertEqual(result['verdict'], C.VERDICT_INCONCLUSIVE, expected)
+            self.assertEqual(code, C.EXIT_INCONCLUSIVE)
+            self.assertTrue(any(expected in r for r in result['reasons']),
+                            (expected, result['reasons']))
+
+    def test_result_writes_are_complete_and_leave_no_temporary_files(self):
+        path = os.path.join(self.dir, 'result.json')
+        for value in range(3):
+            R.write_json(path, dict(value=value))
+        with open(path, encoding='utf-8') as handle:
+            self.assertEqual(json.load(handle), dict(value=2))
+        self.assertEqual([name for name in os.listdir(self.dir) if name.endswith('.tmp')], [])
+
+    def test_concurrent_result_writes_never_tear_the_file(self):
+        path = os.path.join(self.dir, 'result.json')
+        rows = list(range(1500))
+        errors = []
+
+        def worker(tag):
+            try:
+                for _ in range(6):
+                    R.write_json(path, dict(tag=tag, rows=rows))
+            except Exception as exc:          # a torn write or a lost temporary shows up here
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(tag,)) for tag in ('a', 'b')]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        with open(path, encoding='utf-8') as handle:
+            self.assertIn(json.load(handle)['tag'], ('a', 'b'))
 
 
 if __name__ == '__main__':
