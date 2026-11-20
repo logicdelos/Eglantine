@@ -102,7 +102,7 @@ inline void NoteAcceptedPresent(u64 present_id) {
     }
 }
 
-/// Unit-test seam: a census with `targets` functions and no process or probes. Not for emulation.
+/// Unit-test seam: a census with synthetic entry addresses and no guest process. Not for emulation.
 namespace testing {
 struct FrameRows {
     std::vector<std::pair<u64, u64>> rows; ///< (frame id, calls) per recorded row, start-up included
@@ -112,6 +112,8 @@ struct FrameRows {
 };
 void Begin(std::size_t targets);
 void Call(u64 index);
+void AuditBranch(u64 index);
 FrameRows End();
+std::string EndReport(); ///< Finalize and serialize through the production report builder.
 } // namespace testing
 } // namespace Core::NvnCensus
