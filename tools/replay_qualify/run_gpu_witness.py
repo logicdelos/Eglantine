@@ -27,32 +27,37 @@ def main():
     expected = fixture / "expected_effects.jsonl"
     verifier = [sys.executable, "-X", "utf8", "-I", "-S", "-B", here / "replay_qualify.py"]
 
-    def replay(label, path, rejection=None):
+    def replay(label, path, rejection=None, completed=0):
         profile, images, report = (out / (label + suffix) for suffix in ("-profile", "-images", "-report.json"))
         profile.mkdir()  # Always new; no inherited game, firmware, save or keys.
         rc = subprocess.run([args.cli.resolve(), "--user-dir", profile, "--replay", path,
                              "--replay-images", images, "--report", report], timeout=180).returncode
         result = json.loads(report.read_text(encoding="utf-8"))["replay"]
         if rejection:
-            if rc == 0 or result["run_complete"] or rejection not in result["error"]:
+            if (rc == 0 or result["run_complete"] or rejection not in result["error"]
+                    or result["frames_replayed"] != completed):
                 raise ValueError(f"{label}: wrong rejection: {rc}, {result}")
         else:
             if rc or not result["run_complete"] or result["frames_replayed"] != 2:
                 raise ValueError(f"{label}: replay did not finish two frames: {rc}, {result}")
             shutil.copyfile(fixture / "manifest.json", images / "manifest.json")
+            shutil.copyfile(report, images / "report.json")
             subprocess.run([*verifier, "--verify-replay", images, "--expected-effects", expected,
-                            "--require-equivalent"], check=True)
+                            "--capture", path, "--require-equivalent"], check=True)
         return images
 
     a = replay("a", capture)
     b = replay("b", capture)
     subprocess.run([*verifier, "--compare-runs", a, b, "--witness-only", "--expected-effects",
-                    expected, "--require-equivalent"], check=True)
-    for label, reason in (("missing-page", "lacks captured backing"),
-                          ("lost-effect", "observed effect count differs")):
+                    expected, "--capture", capture, "--require-equivalent"], check=True)
+    for label, reason, completed in (
+        ("missing-page", "lacks captured backing", 0),
+        ("lost-effect", "observed effect count differs from FRAME_END on frame 2: expected 5, observed 4", 1),
+        ("unmet-present-fence", "PRESENT guest syncpoint fence was not satisfied", 1),
+    ):
         path = out / (label + ".egcap")
         subprocess.run([args.producer.resolve(), path, "--" + label], check=True)
-        replay(label, path, rejection=reason)
+        replay(label, path, rejection=reason, completed=completed)
 
 
 if __name__ == "__main__":

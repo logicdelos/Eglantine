@@ -35,6 +35,24 @@ class ReplayBoundaries(unittest.TestCase):
         self.assertEqual(result["frames_replayed"], 1)
         self.assertFalse((images / "replay_00000002.png").exists())
 
+    def test_guest_readbacks_survive_verification_probes(self):
+        rc, result, images = self.replay("--guest-readback")
+        self.assertEqual(rc, 0, result)
+        self.assertTrue(result["run_complete"])
+        self.assertEqual(result["frames_replayed"], 2)
+        rows = self.rows(images, "effects.jsonl")
+        self.assertEqual([row["kind"] for row in rows if row["frame_id"] == 1],
+                         ["submit", "readback_visibility", "readback_visibility", "consume",
+                          "fence_signal", "present_compose"])
+        readbacks = [row for row in rows if row["kind"] == "readback_visibility"]
+        self.assertEqual([row["frame_id"] for row in readbacks], [1, 1])
+        self.assertTrue(all(row["classification"] == "unobservable" for row in readbacks))
+        rc, result, _ = self.replay("--lost-guest-readback")
+        self.assertNotEqual(rc, 0)
+        self.assertFalse(result["run_complete"])
+        self.assertEqual(result["frames_replayed"], 0)
+        self.assertIn("on frame 1: expected 6, observed 4", result["error"])
+
     def test_preroll_is_accounted_separately(self):
         rc, result, images = self.replay("--preroll")
         self.assertEqual(rc, 0, result)
