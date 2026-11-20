@@ -1,5 +1,6 @@
 {
   "census_invocation": "eden-cli --baseline -g <owned_title_path> --nvn-census <census.json> --nvn-census-audit --run-seconds 300 --report <report.json>",
+  "effects_schema": 1,
   "envelope": {
     "max_alpha_delta": 0,
     "max_channel_delta": 4,
@@ -7,41 +8,14 @@
     "max_rgb_mae": 1.0,
     "outlier_delta_threshold": 2
   },
-  "expected_effects": {
-    "1": {
-      "fence_id": 100,
-      "kinds": [
-        "submit",
-        "consume",
-        "draw",
-        "compute_dispatch",
-        "syncpoint_increment",
-        "fence_signal",
-        "readback_visibility",
-        "draw",
-        "present_compose"
-      ],
-      "syncpoint_value": 10
-    },
-    "2": {
-      "fence_id": 200,
-      "kinds": [
-        "submit",
-        "consume",
-        "draw",
-        "compute_dispatch",
-        "syncpoint_increment",
-        "fence_signal",
-        "readback_visibility",
-        "draw",
-        "present_compose"
-      ],
-      "syncpoint_value": 20
-    }
-  },
+  "event_identity": "frame_id/ordinal/kind",
+  "expected_frame_ids": [
+    1,
+    2
+  ],
   "expected_frames": 2,
   "kind": "standalone_replay_qualification_fixture",
   "origin": "synthetic_procedural_original",
   "runner_invocation": "eden-cli --replay <capture.egcap> --replay-images <out_dir> --report <report.json>",
-  "schema": 2
+  "schema": 3
 }
