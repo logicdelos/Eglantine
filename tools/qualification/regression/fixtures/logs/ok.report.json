@@ -1,0 +1,27 @@
+{
+  "schema_version": 2,
+  "exit": {
+    "code": 0,
+    "reason": "normal_end",
+    "metrics_complete": true,
+    "shutdown_complete": true
+  },
+  "settings": {
+    "initial": {
+      "frame_gen": false,
+      "allow_speed_up": true,
+      "use_speed_limit": false,
+      "use_vsync": 0
+    },
+    "final": {
+      "frame_gen": false,
+      "allow_speed_up": true,
+      "use_speed_limit": false,
+      "use_vsync": 0
+    }
+  },
+  "summary": {
+    "frames": 400,
+    "generated_frames": 0
+  }
+}
