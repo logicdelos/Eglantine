@@ -6,6 +6,10 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <nlohmann/json.hpp>
+
+#include "core/arm/arm_interface.h"
+#include "core/hle/guest_call/nvn_census.h"
 #include "core/hle/guest_call/nvn_census_verdict.h"
 
 namespace {
@@ -134,6 +138,75 @@ TEST_CASE("NVN census verdict: an audit-found function counted only at the branc
     const Verdict none = EvaluateCoverage(in);
     CHECK_FALSE(none.complete);
     CHECK(Failed(none, "audit_found_entries_counted_at_entry"));
+}
+
+TEST_CASE("NVN census keeps sparse rows across a late capture window and reports overflow",
+          "[core][nvn_census]") {
+    u64 last{};
+    SECTION("late selected frames") { last = 7900; }
+    SECTION("first dropped row") { last = 8193; }
+    testing::Begin(1);
+    for (u64 frame = 1; frame <= last; ++frame) {
+        testing::Call(0);
+        NotePresent(PresentPath::BufferQueue, 1, 0, frame);
+        NoteAcceptedPresent(frame);
+    }
+    const auto report = nlohmann::json::parse(testing::EndReport());
+    const auto& rows = report.at("frame_rows");
+    const auto& frames = report.at("frames");
+    const auto dropped = last == 8193 ? 1 : 0;
+    REQUIRE(rows.size() == last - dropped);
+    CHECK(frames.at("rows_recorded") == rows.size());
+    CHECK(frames.at("rows_dropped") == dropped);
+    CHECK(report.at("errors").at("frame_rows_dropped") == dropped);
+    CHECK(frames.at("rows_joinable") == (dropped == 0));
+    const auto& conditions = report.at("coverage").at("conditions");
+    CHECK(conditions.at("no_dropped_or_lost_events").at("ok") == (dropped == 0));
+    CHECK(report.at("accounting").at("executed_total") == last);
+    if (dropped != 0) {
+        CHECK(report.at("coverage_complete") == false);
+    }
+    for (u64 id = 7800; id <= 7819; ++id) {
+        CHECK(rows.at(id - 1) == nlohmann::json::array({id, {{0, 1}}}));
+    }
+}
+
+TEST_CASE("NVN census dispatch shortfall cannot cancel against calls to another function",
+          "[core][nvn_census]") {
+    bool missing{};
+    SECTION("matched dispatch") { missing = false; }
+    SECTION("one shortfall despite matching totals") { missing = true; }
+    testing::Begin(2);
+    Core::CoreRunState state;
+    Core::ScopedRun run{state, 7};
+    testing::Call(0);
+    testing::Call(1);
+    testing::Call(1);
+    testing::AuditBranch(0);
+    testing::AuditBranch(1);
+    testing::AuditBranch(missing ? 0 : 1);
+    const auto report = nlohmann::json::parse(testing::EndReport());
+    const auto& audit = report.at("audit");
+    REQUIRE(report.at("guest_threads") == nlohmann::json::array({{{"id", 7}, {"calls", 3}}}));
+    u64 calls = 0, entries = 0, short_calls = 0, short_functions = 0;
+    for (const auto& function : report.at("functions")) {
+        const auto count = function.at("calls").get<u64>();
+        const auto audited = function.at("audited_entries").get<u64>();
+        calls += count;
+        entries += audited;
+        if (audited > count) {
+            short_calls += audited - count;
+            ++short_functions;
+        }
+    }
+    REQUIRE(calls == 3);
+    REQUIRE(entries == calls);
+    CHECK(report.at("accounting").at("executed_total") == calls);
+    CHECK(audit.at("known_entries") == entries);
+    CHECK(short_calls == (missing ? 1 : 0));
+    CHECK(audit.at("mismatched_calls") == short_calls);
+    CHECK(audit.at("mismatched_functions") == short_functions);
+    CHECK(report.at("coverage").at("conditions").at("audit_matches_counts").at("ok") == !missing);
 }
 
 TEST_CASE("NVN census verdict: a single audited entry missing at dispatch fails closed", "[core][nvn_census]") {

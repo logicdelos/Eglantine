@@ -67,7 +67,7 @@ constexpr std::size_t MaxGuestThreads = 64; // power of two, per shard
 constexpr std::size_t MaxUnknown = 256;     // power of two, per shard
 constexpr std::size_t MaxReturnSites = 1024; // power of two, per shard
 constexpr std::size_t MaxStreams = 16;
-constexpr std::size_t MaxFrameRows = 4096;
+constexpr std::size_t MaxFrameRows = 8192;
 constexpr std::size_t MaxFrameTotals = std::size_t{1} << 18;
 constexpr std::size_t MaxReportedUnknown = 64;
 constexpr std::size_t MaxReportedMismatches = 64;
@@ -2016,6 +2016,15 @@ void Begin(std::size_t targets) {
     std::scoped_lock lock{s.m};
     Reset(s);
     s.targets.resize(targets);
+    s.start = std::chrono::steady_clock::now();
+    s.audit_enabled = true;
+    s.audit_lo = sizeof(u32);
+    s.audit_hi = (targets + 1) * sizeof(u32);
+    for (u32 i = 0; i < targets; ++i) {
+        auto& target = s.targets[i];
+        target.address = (u64{i} + 1) * sizeof(u32);
+        target.acked = AddProbe(s, target.address, Role::Count, i) == AddResult::Added;
+    }
     s.started = true;
     detail::g_active.store(true, std::memory_order_release);
 }
@@ -2025,14 +2034,26 @@ void Call(u64 index) {
     CountCall(s, ThisShard(s), index, false);
 }
 
-FrameRows End() {
+void AuditBranch(u64 index) {
+    OnAuditBranch(S().targets.at(index).address, 0, static_cast<u64>(BranchKind::Direct));
+}
+
+static Snapshot Finish() {
     State& s = S();
     std::scoped_lock lock{s.m};
     detail::g_active.store(false, std::memory_order_release);
-    const u64 current = s.epoch.load(std::memory_order_acquire);
-    while (s.next_close < current) {
-        CloseEpoch(s, s.next_close++);
-    }
+    auto snap = TakeSnapshot(s, true, true, "frame_limit");
+    Reset(s);
+    s.started = false;
+    return snap;
+}
+
+std::string EndReport() {
+    return BuildReport(Finish()).dump();
+}
+
+FrameRows End() {
+    const Snapshot s = Finish();
     FrameRows out;
     for (const FrameRow& row : s.frame_rows) {
         u64 total = 0;
@@ -2044,8 +2065,6 @@ FrameRows End() {
     out.dropped = s.frame_rows_dropped;
     out.closed = s.frames_closed;
     out.accepted_presents = s.accepted_presents;
-    Reset(s);
-    s.started = false;
     return out;
 }
 
