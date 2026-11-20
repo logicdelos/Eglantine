@@ -102,17 +102,18 @@ void SyncpointManager::Increment(std::atomic<u32>& syncpoint, std::condition_var
                                  std::list<RegisteredAction>& action_storage,
                                  u32 syncpoint_id, bool guest, SyncpointSource source) {
     std::scoped_lock lk(guard);
+    // Publish the effect before either the guest mirror or lock-free ready checks can see it.
+    const bool external = source == SyncpointSource::External;
+    if (guest && (VideoCore::Replay::CaptureActive() ||
+                  (!external && VideoCore::Replay::ReplayGpuRunning()))) {
+        VideoCore::Replay::NoteFenceProduced(VideoCore::Replay::FenceKind::SyncpointRaised, 0, 0,
+                                             syncpoint_id, syncpoint.load(std::memory_order_relaxed) + 1,
+                                             0, external);
+    }
     if (guest && guest_mirror) {
         // Before the value is published: the lock-free ready checks in RegisterAction and Wait
         // must not see it ahead of the page.
         guest_mirror(syncpoint_id, syncpoint.load(std::memory_order_relaxed) + 1);
-    }
-    // Lock-free ready checks and registered actions may compose as soon as this value is visible.
-    const bool external = source == SyncpointSource::External;
-    if (guest && (VideoCore::Replay::CaptureActive() || (!external && VideoCore::Replay::ReplayGpuRunning()))) {
-        VideoCore::Replay::NoteFenceProduced(VideoCore::Replay::FenceKind::SyncpointRaised, 0, 0,
-                                             syncpoint_id, syncpoint.load(std::memory_order_relaxed) + 1,
-                                             0, external);
     }
     const u32 new_value{syncpoint.fetch_add(1, std::memory_order_acq_rel) + 1};
     if (Nx2Sampler::DependencyTraceEnabled()) {

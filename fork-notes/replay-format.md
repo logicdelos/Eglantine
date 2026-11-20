@@ -20,3 +20,10 @@ picture or a tightly packed `stride * height` image. `PresentBackingBytes` check
 and format, then aligns row bytes to a 64-byte GOB and height to 128 rows. RGBA8888, RGBX8888,
 BGRA8888 and RGBA1010102 use four bytes per pixel; RGB565 uses two. Recorder, validator and
 replayer must require the entire range from `alloc_offset + framebuffer_offset`.
+
+PRESENT carries at most one guest syncpoint threshold. The recorder refuses a fence list
+or threshold it cannot reproduce. It records a guest raise before publishing the mirrored
+page or waking a compositor. Ready compositions drain in submission order; the selected
+picture belongs to that composition's present ID. Preroll effects remain in the ordered
+live ledger and count toward their own FRAME_END, but require no live picture. Capture
+requires the observed VSync mode to be Immediate; it does not change the user's profile.
