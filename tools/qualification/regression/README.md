@@ -18,7 +18,7 @@ Statistical regression checker (`regress_stats.py`) and frozen contract (`regres
 
 ## Synthetic CI Fixture & Invocations
 
-Run unit tests (92 tests) and the checked-in synthetic CI fixture suite (`tools/qualification/regression/fixtures/`):
+Run unit tests (107 tests) and the checked-in synthetic CI fixture suite (`tools/qualification/regression/fixtures/`):
 
 ```sh
 python -B tools/qualification/regression/test_regress_stats.py

@@ -172,7 +172,7 @@ class Verdicts(unittest.TestCase):
         self.assertEqual(code, C.EXIT_PASS)
         self.assertEqual(C.validate_result(result), [])
         self.assertEqual(result['family_k'], len(SCENES) * len(C.METRICS_DEFAULT))
-        self.assertEqual(result['evidence'], R.EVIDENCE_SYNTHETIC)
+        self.assertEqual(result['evidence'], C.EVIDENCE_SYNTHETIC)
         self.assertEqual(result['reasons'], [])
         self.assertEqual(len(result['metrics']), 4)
         for row in result['metrics'].values():
@@ -589,7 +589,7 @@ class FrameTimesInput(unittest.TestCase):
         result, code = verdict_of_dir(doc, self.dir)
         self.assertEqual(result['verdict'], C.VERDICT_PASS, result['reasons'])
         self.assertEqual(code, C.EXIT_PASS)
-        self.assertEqual(result['evidence'], R.EVIDENCE_MEASURED)
+        self.assertEqual(result['evidence'], C.EVIDENCE_MEASURED)
         slow = file_manifest(os.path.join(self.dir, 'slow'), seed=54,
                              cal_pairs=C.MIN_CALIBRATION_PAIRS, pairs=12, candidate_add_ms=0.9)
         result, code = verdict_of_dir(slow, os.path.join(self.dir, 'slow'))
