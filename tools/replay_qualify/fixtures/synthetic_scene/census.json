@@ -1,0 +1,60 @@
+{
+  "accounting": {
+    "exact": true,
+    "executed": 1200,
+    "frames": 1060,
+    "late": 0,
+    "mismatched": 0,
+    "startup": 120,
+    "tail": 20
+  },
+  "audit": {
+    "audited_entries": 1200,
+    "bootstrap_calls": 4,
+    "bootstrap_sites": 2,
+    "code_changes": 0,
+    "enabled": true,
+    "late_modules": 0,
+    "region_known": true,
+    "return_sites": 18,
+    "shortfall_calls": 0,
+    "shortfall_functions": 0,
+    "tolerance": 4,
+    "unaudited_entries": 0,
+    "unknown_calls": 0,
+    "unknown_overflow": 0,
+    "unknown_targets": 0
+  },
+  "coverage": {
+    "audit_found_counted_at_entry": 3,
+    "audit_found_targets": 3,
+    "instrumented_targets": 45,
+    "lost_detail": "",
+    "lost_events": 0,
+    "named_targets": 42
+  },
+  "final": true,
+  "kind": "nvn_call_census",
+  "presents": {
+    "frames_closed": 2,
+    "id_duplicates": 0,
+    "id_gaps": 0,
+    "identity_ok": true,
+    "min_frames": 2,
+    "paths_used": 1,
+    "presents": 3,
+    "stream_ambiguous": false,
+    "stream_tokens": 1,
+    "streams": 1
+  },
+  "replay_capture": {
+    "detail": "",
+    "failed": false
+  },
+  "run_complete": true,
+  "schema": 2,
+  "stop": {
+    "clean": true,
+    "reason": "frame_limit"
+  }
+}

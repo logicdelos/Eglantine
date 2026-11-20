@@ -1,0 +1,15 @@
+{
+  "census_invocation": "eden-cli --baseline -g <owned_title_path> --nvn-census <census.json> --nvn-census-audit --run-seconds 300 --report <report.json>",
+  "envelope": {
+    "max_alpha_delta": 0,
+    "max_channel_delta": 4,
+    "max_outlier_fraction": 0.005,
+    "max_rgb_mae": 1.0,
+    "outlier_delta_threshold": 2
+  },
+  "expected_frames": 2,
+  "kind": "standalone_replay_qualification_fixture",
+  "origin": "synthetic_procedural_original",
+  "runner_invocation": "eden-cli --replay <capture.egcap> --replay-images <out_dir> --report <report.json>",
+  "schema": 1
+}

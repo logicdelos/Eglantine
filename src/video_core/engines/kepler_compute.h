@@ -303,6 +303,26 @@ public:
                               const u32* base_start, u32 amount, u32 methods_pending,
                               const GPUVAddr* segment);
 
+    /// Why this engine is not at a clean cut (replay checkpoint capture); nullptr when it is.
+    [[nodiscard]] const char* CleanCutBlocker() const {
+        if (front != nullptr || front_macros) {
+            return "the split GPU thread front holds macro state";
+        }
+        if (native_executing_macro.has_value() || !native_parameters.empty()) {
+            return "a compute macro is being fed its parameters";
+        }
+        if (!uploads.empty()) {
+            return "a compute upload waits for its launch";
+        }
+        if (upload_state.HasPendingData()) {
+            return "an inline compute upload is unfinished";
+        }
+        if (indirect_compute.has_value()) {
+            return "an indirect compute launch is in progress";
+        }
+        return nullptr;
+    }
+
 private:
     struct FrontState;
     FrontState& Front(VideoCommon::GpuSplit& split);

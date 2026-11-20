@@ -81,6 +81,10 @@ public:
         return copy_size;
     }
 
+    [[nodiscard]] bool HasPendingData() const noexcept {
+        return write_offset < copy_size;
+    }
+
 private:
     void ProcessData(std::span<const u8> read_buffer);
 

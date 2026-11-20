@@ -581,7 +581,12 @@ void KeplerCompute::CallMethod(Core::System& system, u32 method, u32 method_argu
                         .exec_address = upload_state.ExecTargetAddress(),
                         .copy_size = upload_state.GetUploadSize(),
                         .was_dirty = upload_dirty};
-        uploads.push_back(info);
+        // Only a later `launch` reads this list and empties it. A native engine launches through
+        // the QMD control methods (ProcessNativeMethod) and never writes `launch`, so there the
+        // list would only grow, and the engine would never be at a clean cut again.
+        if (!native_mode) {
+            uploads.push_back(info);
+        }
         upload_state.ProcessExec(regs.exec_upload.linear != 0);
         break;
     }

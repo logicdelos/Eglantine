@@ -128,6 +128,7 @@ add_executable(tests
     video_core/shader_attributes.cpp
     video_core/indirect_reset.cpp
     video_core/ocarina_upscale.cpp
+    video_core/compute_clean_cut.cpp
     input_common/calibration_configuration_job.cpp
 )
 
