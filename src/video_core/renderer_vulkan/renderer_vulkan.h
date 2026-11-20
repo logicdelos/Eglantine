@@ -30,6 +30,10 @@
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
+namespace VideoCore::Replay {
+struct DeviceIdentity;
+}
+
 namespace Core::Memory {
 class Memory;
 }
@@ -65,6 +69,20 @@ public:
     // Enhanced platform-specific initialization
     void InitializePlatformSpecific();
 
+    /// Replay (video_core/replay/replay_host.h). Once called, every Composite draws off-screen at
+    /// the pinned picture size and never reaches the window or the swapchain. With `readback` the
+    /// finished B8G8R8A8 picture is kept for ReadReplayPicture; without it nothing is downloaded
+    /// (benchmark). Process-wide: the replay owns the only renderer.
+    static void SetReplayReadback(bool readback);
+
+    /// Copies the last picture composed with readback on: tightly packed B8G8R8A8, unscaled, no
+    /// window or overlay. False with `error` set when no picture exists yet.
+    [[nodiscard]] static bool ReadReplayPicture(u32& width, u32& height, std::vector<u8>& bgra,
+                                                std::string& error);
+
+    /// The identity of the device for a capture's session record. Always true.
+    [[nodiscard]] bool FillDeviceIdentity(VideoCore::Replay::DeviceIdentity& out) const;
+
 private:
     void InterpolateFrames(Frame* prev_frame, Frame* curr_frame);
     Frame* previous_frame = nullptr;  // Store the previous frame for interpolation
@@ -77,6 +95,8 @@ private:
                               VkDeviceSize buffer_size);
     void RenderScreenshot(std::span<const Tegra::FramebufferConfig> framebuffers);
     void RenderAppletCaptureLayer(std::span<const Tegra::FramebufferConfig> framebuffers);
+    void ComposeForReplay(std::span<const Tegra::FramebufferConfig> framebuffers);
+    void ComposeForCapture(std::span<const Tegra::FramebufferConfig> framebuffers);
 
     std::vector<Tegra::FramebufferConfig> applet_capture_layers;
     std::vector<Tegra::FramebufferConfig> screenshot_layer_scratch;
@@ -113,6 +133,8 @@ private:
     std::optional<TurboMode> turbo_mode;
 
     Frame applet_frame;
+    Frame replay_frame; ///< Cached off-screen target of the timing-only replay path.
+    VkExtent2D replay_frame_extent{}; ///< The size `replay_frame` was made for.
 };
 
 } // namespace Vulkan

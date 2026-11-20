@@ -1,0 +1,19 @@
+{
+  "schema": 3,
+  "kind": "standalone_replay_witness",
+  "origin": "synthetic_procedural_original",
+  "effects_schema": 1,
+  "event_identity": "frame_id/ordinal/kind",
+  "expected_frame_ids": [
+    1,
+    2
+  ],
+  "expected_frames": 2,
+  "envelope": {
+    "max_alpha_delta": 0,
+    "max_channel_delta": 4,
+    "max_outlier_fraction": 0.005,
+    "max_rgb_mae": 1.0,
+    "outlier_delta_threshold": 2
+  }
+}

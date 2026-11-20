@@ -54,4 +54,12 @@ std::span<const FramebufferConfig> FilterLayerStack(std::span<const FramebufferC
                                                     Service::Nvnflinger::LayerStackId stack,
                                                     std::vector<FramebufferConfig>& scratch);
 
+/**
+ * The size of the picture a composite of `layers` (already filtered to the default stack) gives:
+ * the crop of the first layer, or its framebuffer when it has no crop. Capture and replay both
+ * size their picture with this, so the two cannot disagree. False when there is no layer or the
+ * extent is empty.
+ */
+bool PictureExtent(std::span<const FramebufferConfig> layers, u32& width, u32& height);
+
 } // namespace Tegra

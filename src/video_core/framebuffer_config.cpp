@@ -30,6 +30,18 @@ std::span<const FramebufferConfig> FilterLayerStack(
     return scratch;
 }
 
+bool PictureExtent(std::span<const FramebufferConfig> layers, u32& width, u32& height) {
+    if (layers.empty()) {
+        return false;
+    }
+    const FramebufferConfig& front = layers.front();
+    const int crop_width = front.crop_rect.GetWidth();
+    const int crop_height = front.crop_rect.GetHeight();
+    width = front.crop_rect.IsEmpty() ? front.width : static_cast<u32>(crop_width);
+    height = front.crop_rect.IsEmpty() ? front.height : static_cast<u32>(crop_height);
+    return width != 0 && height != 0;
+}
+
 Common::Rectangle<f32> NormalizeCrop(const FramebufferConfig& framebuffer, u32 texture_width,
                                      u32 texture_height) {
     f32 left, top, right, bottom;
