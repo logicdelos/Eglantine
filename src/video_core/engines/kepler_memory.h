@@ -45,6 +45,11 @@ public:
     /// Binds a rasterizer to this engine.
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
 
+    /// Whether an inline upload is unfinished (replay checkpoint clean-cut check).
+    [[nodiscard]] bool HasPendingUpload() const noexcept {
+        return upload_state.HasPendingData();
+    }
+
     /// Write the value to the register identified by method.
     void CallMethod(Core::System& system, u32 method, u32 method_argument, bool is_last_call) override;
 

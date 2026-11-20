@@ -13,8 +13,10 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <algorithm>
 #include <memory>
 #include <optional>
+#include <span>
 #include <vector>
 #include "common/bit_field.h"
 #include "common/common_funcs.h"
@@ -101,6 +103,47 @@ public:
     [[nodiscard]] bool HasCpuDependentAcquire() const {
         return pending_acquire && !pending_acquire->fence_lean;
     }
+
+    /// Words of the host register file StateWords serializes (the extent of Regs::reg_array).
+    static constexpr std::size_t RegisterWordCount = 0x40;
+    /// Words in StateWords: the host register file, then the engine bound to each subchannel.
+    static constexpr std::size_t StateWordCount = RegisterWordCount + 8;
+    /// The host method state a command stream continues from (replay checkpoint capture).
+    [[nodiscard]] std::vector<u32> StateWords() const {
+        std::vector<u32> words(regs.reg_array.begin(), regs.reg_array.end());
+        for (const EngineID engine : bound_engines) {
+            words.push_back(static_cast<u32>(engine));
+        }
+        return words;
+    }
+    /// Replaces that state without running any method (replay checkpoint restore). False, and
+    /// nothing written, unless `words` is exactly StateWords' layout with known engine ids.
+    [[nodiscard]] bool RestoreStateWords(std::span<const u32> words) {
+        static_assert(StateWordCount == RegisterWordCount + 8);
+        if (words.size() != StateWordCount) {
+            return false;
+        }
+        std::array<EngineID, 8> engines{};
+        for (std::size_t i = 0; i < engines.size(); ++i) {
+            const u32 id = words[regs.reg_array.size() + i];
+            switch (id) {
+            case 0:
+            case static_cast<u32>(EngineID::NV01_TIMER):
+            case static_cast<u32>(EngineID::FERMI_TWOD_A):
+            case static_cast<u32>(EngineID::MAXWELL_B):
+            case static_cast<u32>(EngineID::KEPLER_COMPUTE_B):
+            case static_cast<u32>(EngineID::KEPLER_INLINE_TO_MEMORY_B):
+            case static_cast<u32>(EngineID::MAXWELL_DMA_COPY_A):
+                engines[i] = static_cast<EngineID>(id);
+                break;
+            default:
+                return false;
+            }
+        }
+        std::copy_n(words.begin(), regs.reg_array.size(), regs.reg_array.begin());
+        bound_engines = engines;
+        return true;
+    }
     [[nodiscard]] bool CanResumeAcquire(DmaPusher& dma_pusher);
     /// Clears the pending acquire once it is met; false while the channel has to keep waiting.
     bool ResumeAcquire(DmaPusher& dma_pusher);
@@ -112,9 +155,8 @@ public:
     void CallEngineMethod(DmaPusher& dma_pusher, const MethodCall& method_call);
     void CallEngineMultiMethod(DmaPusher& dma_pusher, u32 method, u32 subchannel, const u32* base_start, u32 amount, u32 methods_pending);
 private:
-    static constexpr std::size_t NUM_REGS = 0x800;
     struct Regs {
-        static constexpr size_t NUM_REGS = 0x40;
+        static constexpr size_t NUM_REGS = RegisterWordCount;
 
         union {
             struct {

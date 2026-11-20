@@ -678,4 +678,18 @@ void GPU::FlushAndInvalidateRegion(DAddr addr, u64 size) {
     impl->FlushAndInvalidateRegion(addr, size);
 }
 
+void GPU::ForEachChannel(const std::function<void(Control::ChannelState&)>& visit) {
+    std::vector<Control::ChannelState*> ordered;
+    ordered.reserve(impl->channels.size());
+    for (auto& [id, channel] : impl->channels) {
+        ordered.push_back(channel.get());
+    }
+    std::ranges::sort(ordered, [](const Control::ChannelState* a, const Control::ChannelState* b) {
+        return a->bind_id < b->bind_id;
+    });
+    for (Control::ChannelState* channel : ordered) {
+        visit(*channel);
+    }
+}
+
 } // namespace Tegra

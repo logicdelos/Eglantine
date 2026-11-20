@@ -3198,6 +3198,38 @@ public:
     /// This channel's MME data RAM (shared with its compute engine).
     std::array<u32, 0xc00>& GetNativeDataRam() { return native_data_ram; }
     std::span<u32> GetNativeMacroPositions() { return native_macro_context ? std::span<u32>{native_macro_context->positions} : std::span<u32>{macro_positions}; }
+    /// The macro context the Switch 2 channels share (graphics and compute macro RAM); nullptr on
+    /// a Switch 1 channel.
+    [[nodiscard]] NativeMacroContext* GetNativeMacroContextPtr() const noexcept {
+        return native_macro_context.get();
+    }
+
+    /// Why this engine is not at a clean cut (replay checkpoint capture); nullptr when it is: no
+    /// macro is half fed, no inline upload is unfinished, no instances wait to be drawn, no HLE
+    /// macro is running, conditional rendering has not switched execution off and the split GPU
+    /// thread's front keeps no macro state of its own.
+    [[nodiscard]] const char* CleanCutBlocker() const {
+        if (executing_macro != 0 || macro_next_method != 0 || !macro_params.empty() ||
+            !macro_segments.empty()) {
+            return "a macro is being fed its parameters";
+        }
+        if (front != nullptr || front_macros) {
+            return "the split GPU thread front holds macro state";
+        }
+        if (upload_state.HasPendingData()) {
+            return "an inline upload is unfinished";
+        }
+        if (draw_manager.HasDeferredDraw() || draw_manager.draw_state.drawn_instances != 0) {
+            return "instances wait to be drawn";
+        }
+        if (engine_state != EngineHint::None || !replace_table.empty()) {
+            return "an HLE macro is running";
+        }
+        if (!execute_on) {
+            return "conditional rendering has switched execution off";
+        }
+        return nullptr;
+    }
 
     /// Root tables: eight 256-byte tables written inline (method 0x504 selects a table, bits 0-2,
     /// and a byte offset, bits 8-15; each 0x508 writes the next word) that shaders read as constant

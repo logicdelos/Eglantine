@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -270,6 +271,40 @@ public:
 
     std::optional<GPUVAddr> GetIndirectComputeAddress() const {
         return indirect_compute;
+    }
+
+    /// Native (Switch 2) mode state (IsNativeMode), which the replay checkpoint keeps instead of
+    /// `regs`: the register file, the macro position bind pointer and whether the context's
+    /// compute macro engine, not the graphics one, runs this engine's macros.
+    [[nodiscard]] std::span<const u32> NativeRegisterWords() const noexcept {
+        return native_registers;
+    }
+    [[nodiscard]] u32 NativeBindPointer() const noexcept {
+        return native_bind_pointer;
+    }
+    [[nodiscard]] bool NativeComputeUploaded() const noexcept {
+        return native_compute_uploaded;
+    }
+    /// Writes that state without running any method: the native register file, the `regs` copy
+    /// that lags it, the bind pointer and the flag. False, and nothing written, when the engine is
+    /// not native or a block is not exactly the size of the file it replaces.
+    [[nodiscard]] bool RestoreNativeState(std::span<const u32> registers,
+                                          std::span<const u32> regs_copy, u32 bind_pointer,
+                                          bool compute_uploaded) {
+        if (!native_mode || native_context == nullptr ||
+            registers.size() != native_registers.size() || regs_copy.size() != regs.reg_array.size()) {
+            return false;
+        }
+        std::copy(registers.begin(), registers.end(), native_registers.begin());
+        std::copy(regs_copy.begin(), regs_copy.end(), regs.reg_array.begin());
+        native_bind_pointer = bind_pointer;
+        native_compute_uploaded = compute_uploaded;
+        native_macro = compute_uploaded ? &native_context->compute_engine : &native_context->engine;
+        native_macro_positions = compute_uploaded ? std::span<u32>{native_context->compute_positions}
+                                                  : std::span<u32>{native_context->positions};
+        native_executing_macro.reset();
+        native_parameters.clear();
+        return true;
     }
 
     bool IsNativeMode() const {
