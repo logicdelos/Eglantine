@@ -72,7 +72,7 @@ For a title reference scene to pass Issue #5, **all** calls and effects must rec
 2. **Event Reconciliation (Supported / Fallback / Unsupported / Unobservable):**
    - A replay witness is an ordered pair of independent JSONL ledgers: `expected_effects.jsonl` (live/capture side, from the recorder) and `effects.jsonl` (replay/observed side). Each row is `{schema: 1, frame_id, ordinal, kind, classification, payload?, outcome?, reason?}`. Event identity is `(frame_id, ordinal, kind)`; `ordinal` is zero-based, unique and contiguous from 0 within a frame, and both ledgers must reproduce the same identity sequence in recorded order.
    - `frames.jsonl` schema 2 carries `call_count` and `effect_count` copied from the stream's `FRAME_END`, never recomputed from a sidecar. Per frame, `effect_count` must equal both ledgers' row counts. That is how an effect deleted from **both** sidecars is still rejected: the stream count disagrees. A missing or extra frame ID, a missing PNG, a changed pixel beyond the envelope, or a stale checksum also fails.
-   - `supported` and `fallback` require equal `payload` and `outcome` (strict JSON equality, so `1` and `true` do not match); `fallback` additionally requires a reason. `unobservable` and `unsupported` require equal classification and a non-empty reason on both sides, and must not declare payload/outcome — a fabricated match is rejected.
+   - `supported` and `fallback` require equal `payload` and `outcome` (strict JSON equality, so `1` and `true` do not match). A live/expected row is `supported` when the capture saw a normal event; the replay/observed row may instead be `fallback` when the renderer takes a documented alternate path. That refinement is allowed only with equal payload/outcome and a non-empty observed reason. A live-supported effect that becomes `unsupported` or `unobservable` in replay is a loss and fails. `fallback` on both sides requires a reason on both. `unobservable` and `unsupported` require equal classification and a non-empty reason on both sides, and must not declare payload/outcome — a fabricated match is rejected.
    - Missing, extra, duplicate, reordered or mismatched effects, declared-count disagreement and frame gaps return exit 1. `unsupported`/`unobservable` rows are counted by class with their reasons published; while any remain the result carries `replay_equivalent: false` and must not be read as replay equivalence. `--require-equivalent` promotes that honest non-equivalence to exit 3 (INCOMPLETE).
 3. **Current Two-Title Status (Sanitized Historical Baseline vs. Candidate Gap):**
    - Historical pre-fix `fork-0.6.0-pre1` (`a62b6b2641`, `src/fe-lab/plans/wave7_Run06.md`):
@@ -98,7 +98,7 @@ For a title reference scene to pass Issue #5, **all** calls and effects must rec
 ### Single-Command Reproduction
 
 ```sh
-# 1. Positive & adversarial self-controls (45 checks; exit 0)
+# 1. Positive & adversarial self-controls (48 checks; exit 0)
 python -X utf8 -I -S -B tools/replay_qualify/replay_qualify.py --selftest
 
 # 2. Original fixture verification (PASS, exit 0; replay_equivalent false by design)

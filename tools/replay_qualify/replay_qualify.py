@@ -12,8 +12,9 @@ Commands:
     python tools/replay_qualify/replay_qualify.py --write-fixture <dir>
     python tools/replay_qualify/replay_qualify.py --verify <dir> \\
         [--expected-effects <expected_effects.jsonl>] [--require-equivalent]
+    python tools/replay_qualify/replay_qualify.py --verify-replay <game-free-witness-dir>
     python tools/replay_qualify/replay_qualify.py --compare-runs <dir-a> <dir-b> \\
-        [--expected-effects <expected_effects.jsonl>] [--require-equivalent]
+        [--witness-only] [--expected-effects <expected_effects.jsonl>] [--require-equivalent]
     python tools/replay_qualify/replay_qualify.py --verify-images <replay-images-dir>
     python tools/replay_qualify/replay_qualify.py --reconcile-census <census.json>
     python tools/replay_qualify/replay_qualify.py --selftest
@@ -23,9 +24,11 @@ recorded order and must be contiguous, unique and reproduced in that order. effe
 the replay/observed ledger; expected_effects.jsonl is the independent live/recorder ledger.
 Per frame, the stream FRAME_END effect_count (frames.jsonl) must equal both ledgers' row
 counts, so deleting an effect from both sidecars is still rejected. Supported and fallback
-effects require equal payload and outcome. Unobservable and unsupported effects must carry an
-explicit reason, never a fabricated payload/outcome; they are reported and the replay is not
-called equivalent while any remain.
+effects require equal payload and outcome; a live-supported effect may be fallback in replay
+with a reason, but not unsupported or unobservable. Unobservable and unsupported effects must
+carry an explicit reason, never a fabricated payload/outcome; they are reported and the replay
+is not called equivalent while any remain. --verify-replay requires manifest kind
+standalone_replay_witness with zero guest calls per frame and no census.
 
 Exit codes:
     0  PASS (inputs valid, images within envelope, every effect accounted and reconciled)
@@ -791,27 +794,29 @@ def compare_effect_pair(fid: int, expected: dict, observed: dict) -> list[str]:
     failures: list[str] = []
     expected_cls = expected["classification"]
     observed_cls = observed["classification"]
-    if expected_cls != observed_cls:
+    live_supported = expected_cls == "supported"
+    replay_fallback = observed_cls == "fallback"
+    if expected_cls != observed_cls and not (live_supported and replay_fallback):
         return [f"{ident}: classification {expected_cls} != observed {observed_cls}"]
 
     expected_payload = expected.get("payload")
     observed_payload = observed.get("payload")
     expected_outcome = expected.get("outcome")
     observed_outcome = observed.get("outcome")
-    if expected_cls in OPAQUE_CLASSIFICATIONS:
+    if observed_cls in OPAQUE_CLASSIFICATIONS:
         if (expected_payload is not None or observed_payload is not None
                 or expected_outcome is not None or observed_outcome is not None):
-            failures.append(f"{ident}: {expected_cls} effect must not fabricate a payload/outcome")
+            failures.append(f"{ident}: {observed_cls} effect must not fabricate a payload/outcome")
         if not (expected.get("reason") or "").strip():
-            failures.append(f"{ident}: expected {expected_cls} effect has no reason")
+            failures.append(f"{ident}: expected {observed_cls} effect has no reason")
         if not (observed.get("reason") or "").strip():
-            failures.append(f"{ident}: observed {expected_cls} effect has no reason")
+            failures.append(f"{ident}: observed {observed_cls} effect has no reason")
         return failures
 
     if expected_payload is None or expected_outcome is None:
         failures.append(f"{ident}: expected {expected_cls} effect declares no payload/outcome")
     if observed_payload is None or observed_outcome is None:
-        failures.append(f"{ident}: observed {expected_cls} effect declares no payload/outcome")
+        failures.append(f"{ident}: observed {observed_cls} effect declares no payload/outcome")
     if (expected_payload is not None and observed_payload is not None
             and canonical(expected_payload) != canonical(observed_payload)):
         failures.append(
@@ -824,7 +829,9 @@ def compare_effect_pair(fid: int, expected: dict, observed: dict) -> list[str]:
             f"{ident}: outcome mismatch expected={expected_outcome!r} observed={observed_outcome!r}"
         )
     if expected_cls == "fallback" and not (expected.get("reason") or "").strip():
-        failures.append(f"{ident}: fallback effect requires a reason")
+        failures.append(f"{ident}: expected fallback effect requires a reason")
+    if observed_cls == "fallback" and not (observed.get("reason") or "").strip():
+        failures.append(f"{ident}: observed fallback effect requires a reason")
     return failures
 
 
@@ -1338,6 +1345,30 @@ def run_selftest() -> int:
             write_rows(scene / "effects.jsonl", rows)
             code, _ = verify_fixture_dir(scene)
             checks.append((f"opaque_{label}_reject", EXIT_FAIL, code))
+
+        # 16b. Live-supported effect may take a documented replay fallback path.
+        fallback_path = write_synthetic_fixture(root / "case_fallback_path")
+        rows = ledger(fallback_path, "expected_effects.jsonl")
+        rows[3]["classification"] = "supported"
+        write_rows(fallback_path / "expected_effects.jsonl", rows)
+        code, _ = verify_fixture_dir(fallback_path)
+        checks.append(("live_supported_replay_fallback_pass", EXIT_PASS, code))
+        rows = ledger(fallback_path)
+        rows[3].pop("reason", None)
+        write_rows(fallback_path / "effects.jsonl", rows)
+        code, _ = verify_fixture_dir(fallback_path)
+        checks.append(("fallback_observed_no_reason_reject", EXIT_FAIL, code))
+
+        # 16c. A live-observable effect may not become unobservable in replay.
+        became_opaque = write_synthetic_fixture(root / "case_became_opaque")
+        rows = ledger(became_opaque)
+        rows[0]["classification"] = "unobservable"
+        rows[0].pop("payload", None)
+        rows[0].pop("outcome", None)
+        rows[0]["reason"] = "replay could not observe the submission"
+        write_rows(became_opaque / "effects.jsonl", rows)
+        code, _ = verify_fixture_dir(became_opaque)
+        checks.append(("observable_to_unobservable_reject", EXIT_FAIL, code))
 
         # 17. Orphan effect row referencing an undeclared frame -> INVALID (2)
         orphan_dir = write_synthetic_fixture(root / "case_orphan_effect")
