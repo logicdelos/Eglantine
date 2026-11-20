@@ -13,6 +13,7 @@
 #include <vector>
 #include "common/common_types.h"
 #include "network/room.h"
+#include "video_core/replay/options.h"
 
 namespace Core {
 
@@ -66,6 +67,9 @@ struct LaunchParams {
     bool baseline = false;
     std::vector<std::string> baseline_allow{};
     bool print_baseline = false;
+    // Capture, replay, census and frame-times options (--capture, --replay, --nvn-census,
+    // --frame-times ...): parsed by video_core/replay, validated by the SDL frontend.
+    VideoCore::Replay::Options replay{};
     u16 port = Network::DefaultRoomPort;
     bool use_multiplayer = false;
     bool fullscreen = false;

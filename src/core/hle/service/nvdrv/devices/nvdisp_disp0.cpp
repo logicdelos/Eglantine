@@ -8,6 +8,7 @@
 
 #include "common/adpf.h"
 #include "common/assert.h"
+#include "common/frame_timing_log.h"
 #include "common/logging.h"
 #include "common/test_frame_delay.h"
 #include "core/core.h"
@@ -17,6 +18,7 @@
 #include "core/hle/service/nvdrv/devices/nvdisp_disp0.h"
 #include "core/perf_stats.h"
 #include "video_core/gpu.h"
+#include "video_core/replay/run_state.h"
 
 namespace Service::Nvidia::Devices {
 
@@ -88,8 +90,10 @@ void nvdisp_disp0::Composite(std::span<const Nvnflinger::HwcLayer> sorted_layers
         }
     }
 
+    const u64 present_id = VideoCore::Replay::CountAcceptedPresent();
     system.GPU().RequestComposite(std::move(output_layers), std::move(output_fences));
     Common::TestHooks::FrameDelay::ForProcess().Apply();
+    Common::FrameTiming::Record(present_id);
     Common::ADPF::ReportFrameInterval();
     system.SpeedLimiter().DoSpeedLimiting(system.CoreTiming().GetGlobalTimeUs());
     system.GetPerfStats().EndSystemFrame();

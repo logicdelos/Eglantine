@@ -45,6 +45,7 @@ add_executable(tests
     core/launch_params_early.cpp
     common/speed_limit.cpp
     common/test_frame_delay.cpp
+    common/frame_timing_log.cpp
     core/conductor_pace.cpp
     yuzu_cmd/run_report_documents.cpp
     ../yuzu_cmd/run_report.cpp

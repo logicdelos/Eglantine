@@ -38,6 +38,7 @@
 #include "common/nx2_dependency_wait.h"
 #include "common/nx2_sampler.h"
 #include "common/settings.h"
+#include "common/frame_timing_log.h"
 #include "common/test_frame_delay.h"
 #include "common/thread.h"
 #include "core/core.h"
@@ -47,6 +48,7 @@
 #include "video_core/nx2_spikes.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
+#include "video_core/replay/run_state.h"
 #include "core/frontend/framebuffer_layout.h"
 #include "core/perf_stats.h"
 #include "video_core/gpu.h"
@@ -2702,8 +2704,10 @@ private:
         if (fence_id < 192) {
             fences.push_back({static_cast<s32>(fence_id), fence_value});
         }
+        const u64 present_id = VideoCore::Replay::CountAcceptedPresent();
         system.GPU().RequestComposite(std::move(layers), std::move(fences));
         Common::TestHooks::FrameDelay::ForProcess().Apply();
+        Common::FrameTiming::Record(present_id);
         CaptureFrame();
         DumpRanges();
         // With the release fence pacing the game, limiting here would hold the present thread

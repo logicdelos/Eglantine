@@ -23,6 +23,7 @@
 #include "core/core.h"
 #include "core/hle/service/acc/profile_manager.h"
 #include "core/launch_params.h"
+#include "video_core/replay/options.h"
 
 #undef _UNICODE
 #include <getopt.h>
@@ -123,6 +124,22 @@ static struct option kLongOptions[] = {
     // clang-format on
 };
 
+/// The long-option table that getopt_long, ScanEarlyOptions and ResolveLongOption all read:
+/// kLongOptions, then the capture, replay, census and frame-times options of video_core/replay,
+/// which keep their own table. Ends with the null entry getopt_long needs.
+static const std::vector<struct option>& LongOptions() {
+    static const std::vector<struct option> options = [] {
+        std::vector<struct option> list(std::begin(kLongOptions), std::end(kLongOptions) - 1);
+        for (const VideoCore::Replay::OptionSpec& spec : VideoCore::Replay::OptionSpecs()) {
+            list.push_back({spec.name, spec.takes_argument ? required_argument : no_argument,
+                            nullptr, spec.code});
+        }
+        list.push_back({nullptr, 0, nullptr, 0});
+        return list;
+    }();
+    return options;
+}
+
 /// What --set and --control say when their operand is missing or not usable, whichever of
 /// ScanEarlyOptions and ParseLaunchParams sees it first.
 static constexpr std::string_view kSetOperandMessage =
@@ -182,7 +199,7 @@ static std::string BaselineRefusal(bool baseline, const std::vector<std::string>
 static const struct option* FindLongOption(std::string_view name) {
     const struct option* abbreviated = nullptr;
     bool ambiguous = false;
-    for (const struct option* entry = kLongOptions; entry->name != nullptr; ++entry) {
+    for (const struct option* entry = LongOptions().data(); entry->name != nullptr; ++entry) {
         const std::string_view full{entry->name};
         if (full == name) {
             return entry;
@@ -200,7 +217,7 @@ static const struct option* FindLongOption(std::string_view name) {
 
 std::vector<LongOptionEntry> LongOptionTable() {
     std::vector<LongOptionEntry> table;
-    for (const struct option* entry = kLongOptions; entry->name != nullptr; ++entry) {
+    for (const struct option* entry = LongOptions().data(); entry->name != nullptr; ++entry) {
         table.push_back({entry->name, entry->has_arg != no_argument,
                          entry->has_arg == required_argument, entry->val});
     }
@@ -398,7 +415,8 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
     while (optind < argc) {
         // -d takes an optional port (-d1234); -i takes the input profile. Both read optarg but
         // were declared without arguments, so optarg was null and they crashed.
-        if (int arg = getopt_long(argc, argv, kShortOptions, kLongOptions, &option_index); arg != -1) {
+        if (int arg = getopt_long(argc, argv, kShortOptions, LongOptions().data(), &option_index);
+            arg != -1) {
             switch (arg) {
             case 'd':
                 // Without a port, the configured one is used (the config is not loaded yet).
@@ -635,6 +653,15 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
             case 0x112:
                 p.print_baseline = true;
                 break;
+            default:
+                // The capture, replay, census and frame-times options (video_core/replay).
+                if (VideoCore::Replay::IsReplayOptionCode(arg)) {
+                    std::string error;
+                    if (!VideoCore::Replay::ParseOption(arg, optarg, p.replay, error)) {
+                        fail(std::move(error));
+                    }
+                }
+                break;
             case '?':
                 // getopt leaves the value of the option in optopt when its operand is missing at
                 // the end of the command line; it is 0 for an unknown long option. The options of
@@ -692,6 +719,12 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
     if (std::string refusal = BaselineRefusal(p.baseline, set_names, p.baseline_allow);
         !refusal.empty()) {
         fail(std::move(refusal));
+    }
+    // A replay runs to its end inside start-up, where the queue of the control channel is never
+    // served: a `stop` or any other queued command sent over it would wait until it timed out.
+    if (p.control_name && p.replay.ReplayRequested()) {
+        fail("--control cannot be combined with --replay: a replay does not serve the control "
+             "channel");
     }
     if ((p.report_path || p.run_seconds || p.run_frames) &&
         (p.print_help || p.print_version || p.list_settings || p.print_baseline ||
@@ -791,11 +824,13 @@ void ApplyLaunchParams(LaunchParams const& lp) noexcept {
             "--print-baseline      Print the baseline version, hash and settings, and exit\n"
             "Exit codes: 0 normal or frame limit, 1 startup failure, 64 bad arguments, 70 guest crash,\n"
             "71 device lost, 72 shader or pipeline failure, 73 emulator crash, 74 report not written,\n"
-            "75 restart, 124 --run-seconds reached, 130 interrupted. The codes after 1 apply only to\n"
+            "75 restart, 76 capture not written (--capture-frames ended without a complete capture),\n"
+            "124 --run-seconds reached, 130 interrupted. The codes after 1 apply only to\n"
             "runs that use --report, --run-seconds or --run-frames. After an emulator crash the report\n"
             "has exit.reason host_crash and only the frame count of the summary.\n",
             lp.argv0
         );
+        LOG_INFO(Frontend, "{}", VideoCore::Replay::HelpText());
     }
 }
 
