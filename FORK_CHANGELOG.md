@@ -18,6 +18,7 @@ Milestone 0.5, "Smoother first minutes": the report says where the first minutes
 
 ### New
 
+- On Windows x64, a stale translation hint no longer commits executable memory. A matching hint skips precompilation if Windows refuses the first commit; on-demand translation keeps its existing retry policy.
 - The unattended-run report is schema version 2. It keeps every schema 1 field and adds `startup` (process start to the first present and to an interactive marker, with the boot phases), `first_120s` (frames and frames over 100 ms in the first 120 s after the first present), `cache` and `attribution`. `attribution` lists every frame over 100 ms with its causes (disk, shader compile, translation, decompression, waits and others) and the share of wall time that has no cause (`Unknown`).
 - `cache` lists each cache file as accepted, rejected or missing, with the reason, and counts recorded, prepared and adopted pipelines, evictions, checkpoints and bytes committed. A rejected cache changes no exit code. Translation time is not measured on its own: it is part of the build time of a record, and the report says `not_separately_measured`.
 - Host file reads, NUP decompression, JIT translation and guest present waits are attributed to causes. `attribution.dropped_boundaries` and `lost_events` count what the instrumentation could not record, and `complete` is false when any was lost.

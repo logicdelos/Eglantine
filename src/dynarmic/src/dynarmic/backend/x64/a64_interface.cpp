@@ -350,7 +350,6 @@ public:
         if (block_of_code.SpaceRemaining() < MINIMUM_REMAINING_PRECOMPILE_CODESIZE) {
             return PrecompileResult::NoSpace;
         }
-        block_of_code.EnsureMemoryCommitted(1 * 1024 * 1024);
 
         CodeFold fold;
         const auto get_code = [this, &fold](u64 vaddr) { return fold.Read(conf.callbacks, vaddr); };
@@ -359,6 +358,9 @@ public:
         A64::Translate(ir_block, arch_descriptor, get_code, {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
         if (fold.unreadable || fold.hash != expected_guest_hash) {
             return PrecompileResult::CodeMismatch;
+        }
+        if (!block_of_code.EnsureMemoryCommitted(1 * 1024 * 1024, Backend::X64::CodeCommit::Optional)) {
+            return PrecompileResult::NoSpace;
         }
         Optimization::Optimize(ir_block, conf, polyfill_options);
         emitter.Emit(ir_block);

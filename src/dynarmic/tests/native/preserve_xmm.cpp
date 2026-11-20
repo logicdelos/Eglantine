@@ -10,6 +10,11 @@
 #include "dynarmic/common/fp/fpsr.h"
 #include "dynarmic/interface/exclusive_monitor.h"
 
+#ifdef _WIN32
+#    include "dynarmic/backend/x64/block_of_code.h"
+#    include <windows.h>
+#endif
+
 using namespace Dynarmic;
 using namespace oaknut::util;
 
@@ -63,3 +68,50 @@ TEST_CASE("X86: Preserve XMM regs", "[x86]") {
     CHECK(jit.GetVector(8) == vectors[8]);
     CHECK(jit.GetVector(9) == vectors[9]);
 }
+
+TEST_CASE("X86: a stale translation hint leaves the block available for a matching hint", "[x86][jit_prewarm]") {
+    A64TestEnv env;
+    env.code_mem = {0x14000000};  // B .
+    A64::UserConfig conf{};
+    conf.callbacks = &env;
+    A64::Jit jit{conf};
+    struct Hint {
+        std::uint64_t location;
+        std::uint64_t hash;
+        unsigned recordings;
+    } hint{};
+    jit.SetBlockCompiledCallback([](void* user, std::uint64_t location, std::uint64_t hash) {
+        auto& result = *static_cast<Hint*>(user);
+        result = {location, hash, result.recordings + 1};
+    }, &hint);
+    jit.SetPC(0);
+    env.ticks_left = 1;
+    CheckedRun([&] { jit.Run(); });
+    REQUIRE(hint.recordings == 1);
+    jit.ClearCache();
+
+    CHECK(jit.PrecompileBlock(hint.location, hint.hash ^ 1) == A64::PrecompileResult::CodeMismatch);
+    CHECK(jit.PrecompileBlock(hint.location, hint.hash) == A64::PrecompileResult::Compiled);
+    CHECK(jit.PrecompileBlock(hint.location, hint.hash) == A64::PrecompileResult::AlreadyCompiled);
+    CHECK(hint.recordings == 1);
+}
+
+#ifdef _WIN32
+TEST_CASE("X86: an unavailable optional code commit leaves the reservation usable", "[x86][jit_prewarm]") {
+    using Dynarmic::Backend::X64::CodeCommit;
+    using Dynarmic::Backend::X64::detail::CommitCodePages;
+    SYSTEM_INFO info{};
+    GetSystemInfo(&info);
+    const size_t size = info.dwAllocationGranularity;
+    void* const base = VirtualAlloc(nullptr, size, MEM_RESERVE, PAGE_NOACCESS);
+    REQUIRE(base != nullptr);
+
+    // Cross one reservation boundary: Windows must refuse, without exhausting system memory.
+    CHECK_FALSE(CommitCodePages(base, size + info.dwPageSize, CodeCommit::Optional));
+    MEMORY_BASIC_INFORMATION region{};
+    CHECK(VirtualQuery(base, &region, sizeof(region)) == sizeof(region));
+    CHECK(region.State == MEM_RESERVE);
+    CHECK(CommitCodePages(base, size, CodeCommit::Required));
+    CHECK(VirtualFree(base, 0, MEM_RELEASE) != 0);
+}
+#endif

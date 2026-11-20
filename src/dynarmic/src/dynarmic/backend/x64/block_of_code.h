@@ -30,6 +30,14 @@ namespace Dynarmic::Backend::X64 {
 
 using CodePtr = const void*;
 
+enum class CodeCommit { Required, Optional };
+
+#ifdef _WIN32
+namespace detail {
+bool CommitCodePages(void* base, size_t size, CodeCommit mode);
+}
+#endif
+
 struct RunCodeCallbacks {
     ArgCallback LookupBlock;
     ArgCallback AddTicks;
@@ -55,8 +63,8 @@ public:
     void ClearCache();
     /// Calculates how much space is remaining to use.
     size_t SpaceRemaining() const;
-    /// Ensure at least codesize bytes of code cache memory are committed at the current code_ptr.
-    void EnsureMemoryCommitted(size_t codesize);
+    /// Required commits retry on memory pressure. Optional commits return false without retrying.
+    bool EnsureMemoryCommitted(size_t codesize, CodeCommit mode = CodeCommit::Required);
 
     /// Runs emulated code from code_ptr.
     HaltReason RunCode(void* jit_state, CodePtr code_ptr) const;

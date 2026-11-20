@@ -26,7 +26,7 @@ enum class PrecompileResult : std::uint8_t {
     Compiled,        ///< The block was translated and is now in the code cache.
     AlreadyCompiled, ///< The block was in the code cache; nothing was done.
     CodeMismatch,    ///< The guest code is not what the caller expected (or unreadable); nothing was compiled.
-    NoSpace,         ///< The code cache is too full to compile ahead without evicting; nothing was done.
+    NoSpace,         ///< Code space could not be obtained without waiting or evicting; nothing was emitted.
     Busy,            ///< The Jit is executing; nothing was done.
     Unsupported,     ///< This backend cannot compile ahead.
 };
