@@ -1431,6 +1431,44 @@ def run_selftest() -> int:
         code, _ = verify_fixture_dir(witness)
         checks.append(("witness_cannot_use_census_mode", EXIT_INVALID, code))
 
+        # 20b. --require-equivalent passes only a witness with every effect observable.
+        equivalent = write_synthetic_fixture(root / "case_witness_equivalent")
+        manifest = read_json(equivalent / "manifest.json")
+        manifest["kind"] = "standalone_replay_witness"
+        (equivalent / "manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        for name in ("expected_effects.jsonl", "effects.jsonl"):
+            kept = [row for row in ledger(equivalent, name) if row["ordinal"] not in (6, 7)]
+            rows = []
+            for fid in sorted({row["frame_id"] for row in kept}):
+                for ordinal, row in enumerate(row for row in kept if row["frame_id"] == fid):
+                    row["ordinal"] = ordinal
+                    rows.append(row)
+            write_rows(equivalent / name, rows)
+        rows = frame_rows(equivalent)
+        for row in rows:
+            row["call_count"] = 0
+            row["effect_count"] = 7
+        write_rows(equivalent / "frames.jsonl", rows)
+        (equivalent / "census.json").unlink()
+        code, _ = verify_fixture_dir(equivalent, witness_only=True, require_equivalent=True)
+        checks.append(("game_free_equivalent_pass", EXIT_PASS, code))
+
+        opaque_witness = write_synthetic_fixture(root / "case_witness_opaque")
+        manifest = read_json(opaque_witness / "manifest.json")
+        manifest["kind"] = "standalone_replay_witness"
+        (opaque_witness / "manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        rows = frame_rows(opaque_witness)
+        for row in rows:
+            row["call_count"] = 0
+        write_rows(opaque_witness / "frames.jsonl", rows)
+        (opaque_witness / "census.json").unlink()
+        code, _ = verify_fixture_dir(opaque_witness, witness_only=True, require_equivalent=True)
+        checks.append(("game_free_opaque_require_incomplete", EXIT_INCOMPLETE, code))
+
         # 21. Independent expected ledger supplied from the capture directory.
         external = write_synthetic_fixture(root / "case_external")
         external_expected = root / "capture_expected_effects.jsonl"

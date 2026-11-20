@@ -98,7 +98,7 @@ For a title reference scene to pass Issue #5, **all** calls and effects must rec
 ### Single-Command Reproduction
 
 ```sh
-# 1. Positive & adversarial self-controls (48 checks; exit 0)
+# 1. Positive & adversarial self-controls (50 checks; exit 0)
 python -X utf8 -I -S -B tools/replay_qualify/replay_qualify.py --selftest
 
 # 2. Original fixture verification (PASS, exit 0; replay_equivalent false by design)
