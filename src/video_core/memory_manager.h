@@ -66,6 +66,17 @@ public:
         return unique_identifier;
     }
 
+    /// Layout of this address space (the replay capture's GPU checkpoint records it).
+    [[nodiscard]] u64 GetAddressSpaceBits() const noexcept {
+        return address_space_bits;
+    }
+    [[nodiscard]] u64 GetBigPageBits() const noexcept {
+        return big_page_bits;
+    }
+    [[nodiscard]] GPUVAddr GetSplitAddress() const noexcept {
+        return split_address;
+    }
+
     /// Binds a renderer to the memory manager.
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
 

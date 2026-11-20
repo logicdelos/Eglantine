@@ -6,8 +6,10 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
+#include <span>
 #include <vector>
 
 #include "common/bit_field.h"
@@ -247,6 +249,21 @@ public:
     static_assert(sizeof(RemapConst) == 12);
 
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
+
+    /// The register file in method order (replay checkpoint capture).
+    [[nodiscard]] std::span<const u32> RegisterWords() const noexcept {
+        return regs.reg_array;
+    }
+
+    /// Replaces the register file without running any method (replay checkpoint restore).
+    /// False, and nothing written, unless `words` is exactly one register file.
+    [[nodiscard]] bool RestoreRegisterWords(std::span<const u32> words) noexcept {
+        if (words.size() != regs.reg_array.size()) {
+            return false;
+        }
+        std::copy(words.begin(), words.end(), regs.reg_array.begin());
+        return true;
+    }
 
     explicit MaxwellDMA(MemoryManager& memory_manager_);
     ~MaxwellDMA() override;

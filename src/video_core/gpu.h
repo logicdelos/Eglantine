@@ -180,6 +180,13 @@ public:
 
     void WaitForIdle();
 
+    /// Visits every channel in ascending channel id order (the replay capture's checkpoint cut:
+    /// its file must not depend on container order). Caller contract: the caller runs inside a
+    /// RunQuiesced function, so the GPU thread is between two command lists and no engine is in
+    /// use, and no guest thread allocates or releases a channel during the walk (channels are
+    /// created and destroyed only by the guest's nvdrv ioctls).
+    void ForEachChannel(const std::function<void(Control::ChannelState&)>& visit);
+
     /// Tick pending requests within the GPU.
     void TickWork();
 
