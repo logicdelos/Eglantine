@@ -11,6 +11,7 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "common/cpu_features.h"
+#include "core/hle/guest_call/nvn_census.h"
 #include "core/hle/kernel/k_event.h"
 #include "core/hle/kernel/k_readable_event.h"
 #include "core/hle/kernel/kernel.h"
@@ -547,6 +548,12 @@ Status BufferQueueProducer::QueueBuffer(s32 slot, const QueueBufferInput& input,
     } else if (listener_replaced) {
         listener_replaced->OnFrameReplaced(item);
     }
+
+    // The frame is accepted (census: the next NVN calls belong to the next frame). `core` is the
+    // producer; the legacy queue has no client-buffer token, so the token argument stays 0.
+    Core::NvnCensus::NotePresent(Core::NvnCensus::PresentPath::BufferQueue,
+                                 static_cast<u64>(reinterpret_cast<std::uintptr_t>(core.get())), 0,
+                                 item.frame_number);
 
     return Status::NoError;
 }

@@ -41,6 +41,7 @@ extern char** environ;
 #include "common/settings.h"
 #include "common/settings_common.h"
 #include "common/settings_secret.h"
+#include "common/test_frame_delay.h"
 #include "yuzu_cmd/run_control.h"
 #include "yuzu_cmd/run_report.h"
 
@@ -410,6 +411,19 @@ ReportParts Document(State& state, Common::RunOutcome::Reason reason, int code,
     document["baseline"] =
         Settings::Baseline::ReportJson(state.baseline_requested, state.baseline_declared);
     document["settings"] = std::move(settings);
+    const auto delay = Common::TestHooks::FrameDelay::ForProcess().Snapshot();
+    if (delay.configured) {
+        document["test_hooks"] = {
+            {"version", 1},
+            {"frame_delay_enabled", delay.requested_ns != 0},
+            {"target", delay.requested_ns ? Json("cpu-present") : Json(nullptr)},
+            {"requested_ns", delay.requested_ns},
+            {"frames_delayed", delay.frames_delayed},
+            {"added_ns_total", delay.added_ns_total},
+            {"max_added_ns", delay.max_added_ns},
+            {"env_error", delay.error.empty() ? Json(nullptr) : Json(delay.error)},
+        };
+    }
 
     ReportParts parts;
     // Invalid UTF-8 (a detail quoting a game string) must not cost the whole report.

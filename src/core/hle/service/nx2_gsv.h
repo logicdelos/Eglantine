@@ -38,9 +38,11 @@
 #include "common/nx2_dependency_wait.h"
 #include "common/nx2_sampler.h"
 #include "common/settings.h"
+#include "common/test_frame_delay.h"
 #include "common/thread.h"
 #include "core/core.h"
 #include "core/device_memory.h"
+#include "core/hle/guest_call/nvn_census.h"
 #include "video_core/nx2_diag.h"
 #include "video_core/nx2_spikes.h"
 #include "video_core/rasterizer_interface.h"
@@ -65,6 +67,7 @@
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/k_transfer_memory.h"
 #include "core/hle/kernel/svc_results.h"
+#include "core/hle/service/present_admission.h"
 #include "core/memory.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/nx2_video_decoder.h"
@@ -1974,6 +1977,11 @@ private:
         ++m_presents;
         VideoCommon::Nx2GpuLatency::NotePresent();
         Core::g_nx2_present_count.fetch_add(1, std::memory_order_relaxed);
+        if (Core::NvnCensus::IsActive()) {
+            const u64 token = u64{w[2]} | (u64{w[3]} << 32);
+            Core::NvnCensus::detail::NotePresentSlow(Core::NvnCensus::PresentPath::Nx2Vi2,
+                static_cast<u64>(reinterpret_cast<std::uintptr_t>(this)), token, m_presents);
+        }
         if (m_presents <= 4 || (m_presents % 600) == 0) {
             LOG_INFO(Service, "nx2:vi2 229 present #{} token={:#x} slot={} image={}", m_presents,
                      u64{w[2]} | (u64{w[3]} << 32), w[4], w[5]);
@@ -2625,7 +2633,7 @@ private:
             image_format = image->second.preference[6];
         }
         const auto device = Nvidia::Devices::Nx2GpuMemoryRegistry::Get().DeviceAddressOf(address);
-        if (!device) {
+        if (!PresentAdmission::HasMappedGsvImage(device)) {
             LOG_WARNING(Service, "nx2:vi2 present: image {} at {:#x} has no device mapping",
                         image_id, address);
             return;
@@ -2695,6 +2703,7 @@ private:
             fences.push_back({static_cast<s32>(fence_id), fence_value});
         }
         system.GPU().RequestComposite(std::move(layers), std::move(fences));
+        Common::TestHooks::FrameDelay::ForProcess().Apply();
         CaptureFrame();
         DumpRanges();
         // With the release fence pacing the game, limiting here would hold the present thread

@@ -48,6 +48,7 @@
 #include "core/file_sys/vfs/vfs_concat.h"
 #include "core/file_sys/vfs/vfs_real.h"
 #include "core/gpu_dirty_memory_manager.h"
+#include "core/hle/guest_call/nvn_census.h"
 #include "core/hle/kernel/k_memory_manager.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_resource_limit.h"
@@ -536,6 +537,9 @@ struct System::Impl {
             cheat_engine->Initialize();
         }
 
+        // Probes go in before the first guest instruction runs (EDEN_NX2_NVN_CENSUS; a no-op when unset).
+        NvnCensus::Start(*process->GetHandle(), params.program_id);
+
         // Register with applet manager
         // All threads are started, begin main process execution, now that we're in the clear
         applet_manager.CreateAndInsertByFrontendAppletParameters(std::move(process), params);
@@ -607,6 +611,7 @@ struct System::Impl {
         kernel.SuspendEmulation(true);
         kernel.CloseServices();
         kernel.ShutdownCores();
+        NvnCensus::Stop();
         Nx2Bottleneck::ClearSleepThreadCounters();
         Service::LogUnimplementedCommandCounts();
         services.reset();

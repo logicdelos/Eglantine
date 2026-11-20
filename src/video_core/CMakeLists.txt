@@ -28,6 +28,20 @@ add_library(video_core STATIC
     cache_envelope.cpp
     cache_envelope.h
     cache_types.h
+    replay/capture.h
+    replay/checkpoint.cpp
+    replay/checkpoint.h
+    replay/events.h
+    replay/format.h
+    replay/format_io.cpp
+    replay/format_io.h
+    replay/library_call.h
+    replay/memory_capture.cpp
+    replay/memory_capture.h
+    replay/memory_restore.h
+    replay/result.h
+    replay/run_state.h
+    replay/staging_writer.cpp
     capture.h
     cdma_pusher.cpp
     cdma_pusher.h

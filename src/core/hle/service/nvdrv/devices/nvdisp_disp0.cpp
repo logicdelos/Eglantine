@@ -9,6 +9,7 @@
 #include "common/adpf.h"
 #include "common/assert.h"
 #include "common/logging.h"
+#include "common/test_frame_delay.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/hle/service/nvdrv/core/container.h"
@@ -88,6 +89,7 @@ void nvdisp_disp0::Composite(std::span<const Nvnflinger::HwcLayer> sorted_layers
     }
 
     system.GPU().RequestComposite(std::move(output_layers), std::move(output_fences));
+    Common::TestHooks::FrameDelay::ForProcess().Apply();
     Common::ADPF::ReportFrameInterval();
     system.SpeedLimiter().DoSpeedLimiting(system.CoreTiming().GetGlobalTimeUs());
     system.GetPerfStats().EndSystemFrame();
