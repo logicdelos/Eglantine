@@ -536,6 +536,24 @@ class FrameTimesInput(unittest.TestCase):
         windowed = R.read_presentmon(path, (1.0, 3.0))
         self.assertTrue(190 <= len(windowed) <= 210)
 
+    def test_scene_window_is_never_ignored(self):
+        fixtures = os.path.join(os.path.dirname(__file__), 'fixtures')
+        with open(os.path.join(fixtures, 'aa_control_runs.json'), encoding='utf-8') as handle:
+            run = json.load(handle)['runs'][0]
+        for extra in ({}, {'frame_ms': [16.] * 400}):
+            with self.subTest(extra=list(extra)), self.assertRaises(R.TelemetryError) as ctx:
+                R.load_run(dict(run, window=[999998, 999999], **extra), fixtures)
+            self.assertEqual(ctx.exception.kind, 'invalid')
+
+        pm = dict(run, format='presentmon', file=self.path('pm.csv'))
+        write_presentmon(pm['file'], [10.0] * 500)
+        for bounds in ([3, 1], [True, 2], ['1', 3], [1, float('inf')], None):
+            with self.subTest(bounds=bounds), self.assertRaises(R.TelemetryError) as ctx:
+                R.load_run(dict(pm, window=bounds), fixtures)
+            self.assertEqual(ctx.exception.kind, 'invalid')
+        self.assertEqual(R.load_run(dict(pm, window=[1., 4.5]), fixtures)['metrics']['frames'],
+                         350)
+
     def test_presentmon_damage_is_invalid(self):
         path = self.path('bad.csv')
         with open(path, 'w', encoding='utf-8') as handle:

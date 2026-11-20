@@ -646,6 +646,9 @@ def load_run(entry, base_dir):
         raise TelemetryError('the run failed: ' + '; '.join(entry.get('failures') or ['no detail'])
                              [:200], 'missing')
     _validate_run_metadata(entry, base_dir)
+    if 'window' in entry and ('frame_ms' in entry or entry.get('format') != 'presentmon'):
+        # Neither inline intervals nor steady_ns logs carry the PresentMon time origin.
+        raise TelemetryError('scene window requires a PresentMon CSV', 'invalid')
     if 'frame_ms' in entry:
         frames = entry['frame_ms']
         if not isinstance(frames, list):
@@ -663,9 +666,12 @@ def load_run(entry, base_dir):
         return dict(metrics=run_metrics(frames), source=log['source'], complete=log['complete'],
                     synthetic=entry.get('synthetic') is True, lost=log['lost'])
     window = entry.get('window')
-    if window is not None and not (isinstance(window, list) and len(window) == 2):
-        raise TelemetryError('window must be [low, high]', 'invalid')
-    frames = read_presentmon(path, tuple(window) if window else None)
+    if 'window' in entry and not (
+            isinstance(window, list) and len(window) == 2
+            and all(type(v) in (int, float) and -math.inf < v < math.inf for v in window)
+            and 0 <= window[0] < window[1]):
+        raise TelemetryError('window must be finite seconds with 0 <= low < high', 'invalid')
+    frames = read_presentmon(path, window)
     return dict(metrics=run_metrics(frames), source='presentmon', complete=True,
                 synthetic=entry.get('synthetic') is True, lost=0)
 
