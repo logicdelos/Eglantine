@@ -44,6 +44,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/rasterizer_download_area.h"
+#include "video_core/replay/capture.h"
 
 namespace Core::Memory {
 
@@ -971,6 +972,7 @@ struct Memory::Impl {
             }
         };
         gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
+            VideoCore::Replay::NoteGuestWrite(address, size);
             auto& current_area = rasterizer_write_areas[core];
             PAddr subaddress = address >> YUZU_PAGEBITS;
             // Performance note:

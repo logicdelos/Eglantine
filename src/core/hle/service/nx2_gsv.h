@@ -48,7 +48,8 @@
 #include "video_core/nx2_spikes.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
-#include "video_core/replay/run_state.h"
+#include "video_core/replay/capture.h"
+#include "video_core/replay/memory_capture.h"
 #include "core/frontend/framebuffer_layout.h"
 #include "core/perf_stats.h"
 #include "video_core/gpu.h"
@@ -1944,6 +1945,11 @@ public:
             while (static_cast<s32>(m_release_value -
                                     syncpoints.GetGuestSyncpointValue(m_release_syncpoint)) > 0) {
                 syncpoints.IncrementGuest(m_release_syncpoint);
+                if (VideoCore::Replay::CaptureActive()) {
+                    VideoCore::Replay::NoteFenceProduced(
+                        VideoCore::Replay::FenceKind::SyncpointRaised, 0, 0, m_release_syncpoint,
+                        syncpoints.GetGuestSyncpointValue(m_release_syncpoint), 0, true);
+                }
             }
             NvdrvSyncpoints().FreeSyncpoint(m_release_syncpoint);
         }
@@ -2211,6 +2217,11 @@ private:
                 [&syncpoints = system.Host1x().GetSyncpointManager(), id = m_release_syncpoint](
                     s64, std::chrono::nanoseconds) -> std::optional<std::chrono::nanoseconds> {
                     syncpoints.IncrementGuest(id);
+                    if (VideoCore::Replay::CaptureActive()) {
+                        VideoCore::Replay::NoteFenceProduced(
+                            VideoCore::Replay::FenceKind::SyncpointRaised, 0, 0, id,
+                            syncpoints.GetGuestSyncpointValue(id), 0, true);
+                    }
                     return std::nullopt;
                 });
             LOG_INFO(Service, "nx2:vi2 display release syncpoint {}", m_release_syncpoint);
@@ -2704,8 +2715,9 @@ private:
         if (fence_id < 192) {
             fences.push_back({static_cast<s32>(fence_id), fence_value});
         }
-        const u64 present_id = VideoCore::Replay::CountAcceptedPresent();
-        system.GPU().RequestComposite(std::move(layers), std::move(fences));
+        const u64 present_id = VideoCore::Replay::NoteAcceptedPresent(
+            VideoCore::Replay::PresentPath::Nx2, layers, fences);
+        system.GPU().RequestComposite(present_id, std::move(layers), std::move(fences));
         Common::TestHooks::FrameDelay::ForProcess().Apply();
         Common::FrameTiming::Record(present_id);
         CaptureFrame();
@@ -3578,6 +3590,11 @@ private:
         u32 current = static_cast<u32>(syncpoints.GetGuestSyncpointValue(m_syncpoint));
         while (static_cast<s32>(target - current) > 0) {
             syncpoints.IncrementGuest(m_syncpoint);
+            if (VideoCore::Replay::CaptureActive()) {
+                VideoCore::Replay::NoteFenceProduced(
+                    VideoCore::Replay::FenceKind::SyncpointRaised, 0, 0, m_syncpoint,
+                    syncpoints.GetGuestSyncpointValue(m_syncpoint), 0, true);
+            }
             ++current;
         }
     }
@@ -3666,6 +3683,12 @@ private:
                     m_ready->room.store(false, std::memory_order_relaxed);
                 }
                 system.Host1x().GetSyncpointManager().IncrementGuest(m_syncpoint);
+                if (VideoCore::Replay::CaptureActive()) {
+                    VideoCore::Replay::NoteFenceProduced(
+                        VideoCore::Replay::FenceKind::SyncpointRaised, 0, 0, m_syncpoint,
+                        system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(m_syncpoint), 0,
+                        true);
+                }
                 ++m_frames_out;
                 if (m_frames_out == 1 || (m_frames_out % 600) == 0 || frame.end) {
                     LOG_INFO(Service,

@@ -48,6 +48,9 @@
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_spikes.h"
 #include "video_core/renderer_base.h"
+#include "video_core/replay/capture.h"
+#include "video_core/replay/memory_capture.h"
+#include "video_core/replay/run_state.h"
 #include "video_core/shader_notify.h"
 
 namespace Tegra {
@@ -88,6 +91,15 @@ struct GPU::Impl {
         to_init.Init(system, program_id);
         to_init.BindRasterizer(renderer->ReadRasterizer());
         renderer->ReadRasterizer()->InitializeChannel(to_init);
+        if (VideoCore::Replay::CaptureActive() && to_init.memory_manager != nullptr &&
+            to_init.payload.has_value()) {
+            const bool turing = to_init.payload->maxwell_3d.GetNativeMacroEngine().native_turing;
+            VideoCore::Replay::NoteChannelCreate(
+                to_init.bind_id, static_cast<u32>(to_init.memory_manager->GetID()),
+                (to_init.memory_manager->UsesNativeTiling() ? VideoCore::Replay::ChannelNativeTiling
+                                                            : 0U) |
+                    (turing ? VideoCore::Replay::ChannelTuringMacros : 0U));
+        }
     }
 
     void InitAddressSpace(Tegra::MemoryManager& memory_manager) {
@@ -95,6 +107,7 @@ struct GPU::Impl {
     }
 
     void ReleaseChannel(Control::ChannelState& to_release) {
+        VideoCore::Replay::NoteChannelRelease(to_release.bind_id);
         UNIMPLEMENTED();
     }
 
@@ -266,6 +279,10 @@ struct GPU::Impl {
         gpu_thread.Run(std::move(func), true);
     }
 
+    void RunQuiesced(std::function<void()>&& func) {
+        gpu_thread.Run(std::move(func), true, true);
+    }
+
     void MapInOrder(GPUVAddr gpu_addr, u64 size, std::function<void()>&& func) {
         u64 id;
         {
@@ -349,7 +366,7 @@ struct GPU::Impl {
         gpu_thread.FlushAndInvalidateRegion(addr, size, is_async);
     }
 
-    void RequestComposite(std::vector<Tegra::FramebufferConfig>&& layers, std::vector<Service::Nvidia::NvFence>&& fences) {
+    void RequestComposite(u64 present_id, std::vector<Tegra::FramebufferConfig>&& layers, std::vector<Service::Nvidia::NvFence>&& fences) {
         const size_t num_fences{fences.size()};
         size_t current_request_counter{};
         if (num_fences != 0) {
@@ -364,14 +381,15 @@ struct GPU::Impl {
             }
         }
         pending_composite_fence = RequestSyncOperation(
-            [this, current_request_counter, num_fences, composite_layers = std::move(layers),
-             composite_fences = std::move(fences)] {
+            [this, present_id, current_request_counter, num_fences,
+             composite_layers = std::move(layers), composite_fences = std::move(fences)] {
                 if (num_fences == 0) {
                     renderer->Composite(composite_layers);
+                    VideoCore::Replay::NoteFrameComposed(present_id);
                     return;
                 }
                 auto& syncpoint_manager = system.Host1x().GetSyncpointManager();
-                const auto executer = [this, current_request_counter, composite_layers]() {
+                const auto executer = [this, present_id, current_request_counter, composite_layers]() {
                     {
                         std::unique_lock<std::mutex> lk(request_swap_mutex);
                         if (--request_swap_counters[current_request_counter] != 0) {
@@ -380,6 +398,7 @@ struct GPU::Impl {
                         free_swap_counters.push_back(current_request_counter);
                     }
                     renderer->Composite(composite_layers);
+                    VideoCore::Replay::NoteFrameComposed(present_id);
                 };
                 for (size_t i = 0; i < num_fences; i++) {
                     syncpoint_manager.RegisterGuestAction(composite_fences[i].id,
@@ -589,9 +608,9 @@ const VideoCore::ShaderNotify& GPU::ShaderNotify() const {
     return impl->shader_notify;
 }
 
-void GPU::RequestComposite(std::vector<Tegra::FramebufferConfig>&& layers,
+void GPU::RequestComposite(u64 present_id, std::vector<Tegra::FramebufferConfig>&& layers,
                            std::vector<Service::Nvidia::NvFence>&& fences) {
-    impl->RequestComposite(std::move(layers), std::move(fences));
+    impl->RequestComposite(present_id, std::move(layers), std::move(fences));
 }
 
 void GPU::WaitForComposite() {
@@ -658,6 +677,10 @@ void GPU::RunInOrder(std::function<void()>&& func) {
     impl->RunInOrder(std::move(func));
 }
 
+void GPU::RunQuiesced(std::function<void()>&& func) {
+    impl->RunQuiesced(std::move(func));
+}
+
 void GPU::MapInOrder(GPUVAddr gpu_addr, u64 size, std::function<void()>&& func) {
     impl->MapInOrder(gpu_addr, size, std::move(func));
 }
@@ -691,5 +714,6 @@ void GPU::ForEachChannel(const std::function<void(Control::ChannelState&)>& visi
         visit(*channel);
     }
 }
+
 
 } // namespace Tegra

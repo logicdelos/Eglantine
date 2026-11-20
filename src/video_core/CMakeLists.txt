@@ -164,6 +164,10 @@ add_library(video_core STATIC
     rasterizer_interface.h
     renderer_base.cpp
     renderer_base.h
+    replay/capture.cpp
+    replay/capture_host.cpp
+    replay/capture_host.h
+    replay/effect.h
     replay/replay_host.h
     replay/replay_internal.h
     replay/replay_session.cpp

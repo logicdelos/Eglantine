@@ -72,6 +72,7 @@
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
 #include "video_core/shader_warm/shader_warm_builder.h"
+#include "video_core/replay/capture.h"
 #include "yuzu_cmd/cli_settings.h"
 #include "yuzu_cmd/control_commands.h"
 #include "yuzu_cmd/run_control.h"
@@ -235,6 +236,10 @@ static std::string startup_detail;
 static bool attribution_session_started = false;
 namespace Spikes = VideoCommon::Nx2Spikes;
 
+// Frames a capture records before its first selected frame; a replay runs them without comparing.
+static constexpr u64 CapturePrerollFrames = 2;
+// --capture was begun; SDL_AppIterate ends the run once the capture has finished by itself.
+static bool capture_begun = false;
 // --frame-times was started; it is stopped before the report is published.
 static bool frame_timing_started = false;
 
@@ -1054,6 +1059,27 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         }
     }
 
+    // --capture: begins before the GPU starts, so the selected frames cannot present before it
+    // is armed. SDL_AppIterate ends the run when the capture finishes by itself.
+    if (lp.replay.CaptureRequested()) {
+        const VideoCore::Replay::Options& replay = lp.replay;
+        VideoCore::Replay::CaptureConfig capture{
+            .path = replay.capture_path,
+            .first_frame = replay.capture_first_frame,
+            .frame_count = replay.capture_frame_count,
+            .preroll_frames = static_cast<u32>(std::min<u64>(replay.capture_first_frame - 1, CapturePrerollFrames)),
+            .title_id = state->system.GetApplicationProcessProgramID(),
+            .limits = {},
+        };
+        std::string capture_error;
+        if (!VideoCore::Replay::BeginCapture(state->system, capture, capture_error)) {
+            fmt::print(stderr, "--capture: {}\n", capture_error);
+            Common::RunOutcome::Request(Common::RunOutcome::Reason::CaptureFailed, capture_error);
+            return SDL_APP_FAILURE;
+        }
+        capture_begun = true;
+    }
+
     // Core is loaded, start the GPU (makes the GPU contexts current to this thread)
     state->system.GPU().Start();
     state->system.GetCpuManager().OnGpuReady();
@@ -1344,6 +1370,11 @@ extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
     if (Common::RunOutcome::StopRequested()) {
         return SDL_APP_SUCCESS;
     }
+    if (capture_begun && !VideoCore::Replay::CaptureActive()) {
+        // The capture finished or stopped by itself; its report says which.
+        Common::RunOutcome::Request(Common::RunOutcome::Reason::FrameLimit, "the capture ended");
+        return SDL_APP_SUCCESS;
+    }
     RunKeyScript(state->input_subsystem, state->system);
     if (state->control) {
         state->control->Poll();
@@ -1422,6 +1453,10 @@ extern "C" void SDL_AppQuit(void *appstate, SDL_AppResult result) {
     state->mcp_server.reset(); // stops serving before the system goes away
     state->mcp_host.reset();
 #endif
+    if (capture_begun) {
+        capture_begun = false;
+        VideoCore::Replay::EndCapture(RunEndedNormally());
+    }
     state->system.DetachDebugger();
     // SDL calls this even when SDL_AppInit never powered the system on (no ROM given, --help or
     // --version): the kernel is uninitialised then, and Pause()/ShutdownMainProcess() would

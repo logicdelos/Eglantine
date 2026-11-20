@@ -18,7 +18,7 @@
 #include "core/hle/service/nvdrv/devices/nvdisp_disp0.h"
 #include "core/perf_stats.h"
 #include "video_core/gpu.h"
-#include "video_core/replay/run_state.h"
+#include "video_core/replay/capture.h"
 
 namespace Service::Nvidia::Devices {
 
@@ -90,8 +90,9 @@ void nvdisp_disp0::Composite(std::span<const Nvnflinger::HwcLayer> sorted_layers
         }
     }
 
-    const u64 present_id = VideoCore::Replay::CountAcceptedPresent();
-    system.GPU().RequestComposite(std::move(output_layers), std::move(output_fences));
+    const u64 present_id = VideoCore::Replay::NoteAcceptedPresent(
+        VideoCore::Replay::PresentPath::LegacyBufferQueue, output_layers, output_fences);
+    system.GPU().RequestComposite(present_id, std::move(output_layers), std::move(output_fences));
     Common::TestHooks::FrameDelay::ForProcess().Apply();
     Common::FrameTiming::Record(present_id);
     Common::ADPF::ReportFrameInterval();

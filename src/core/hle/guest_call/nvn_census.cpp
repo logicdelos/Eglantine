@@ -37,6 +37,7 @@
 #include "core/hle/kernel/k_process.h"
 #include "core/memory.h"
 #include "dynarmic/interface/A64/config.h"
+#include "video_core/replay/capture.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -550,6 +551,8 @@ void OnCall(u64 index, u64 lr, u64) {
     const u64 hi = s.audit_hi.load(std::memory_order_relaxed);
     const bool outside = hi != 0 && (lr < s.audit_lo.load(std::memory_order_relaxed) || lr >= hi);
     CountCall(s, ThisShard(s), index, outside);
+    // One observed NVN entry: the capture's FRAME_END call_count counts the same population.
+    VideoCore::Replay::NoteGraphicsCall();
 }
 
 /// Makes `target`, an address in the library that a branch from outside reached and nothing knew, an

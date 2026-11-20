@@ -103,6 +103,7 @@ add_executable(tests
     video_core/cache_envelope.cpp
     video_core/nx2_attribution.cpp
     video_core/pipeline_prepare.cpp
+    video_core/replay_capture.cpp
     video_core/report_schema2.cpp
     video_core/replay_checkpoint.cpp
     video_core/replay_codec.cpp
