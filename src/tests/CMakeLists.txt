@@ -68,6 +68,7 @@ add_executable(tests
     common/slot_vector.cpp
     common/unique_function.cpp
     common/zstd_compression.cpp
+    video_core/replay_session.cpp
     core/core_timing.cpp
     core/ldn.cpp
     core/internal_network/socket_proxy.cpp
@@ -77,6 +78,7 @@ add_executable(tests
     core/nx2_movie_pacing.cpp
     core/nx2_gpu_memory_registry.cpp
     core/priority_queue.cpp
+    core/replay_kernel.cpp
     core/internal_network/network.cpp
     video_core/frame_dump_schedule.cpp
     video_core/framebuffer_limits.cpp

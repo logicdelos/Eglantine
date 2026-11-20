@@ -24,6 +24,7 @@
 #include <optional>
 #include <regex>
 #include <string>
+#include <thread>
 #include "common/frame_timing_log.h"
 #include "common/fs/fs_util.h"
 #include "common/settings_enums.h"
@@ -74,6 +75,8 @@
 #include "yuzu_cmd/cli_settings.h"
 #include "yuzu_cmd/control_commands.h"
 #include "yuzu_cmd/run_control.h"
+#include "yuzu_cmd/replay_runner.h"
+#include "yuzu_cmd/replay_seams.h"
 #include "yuzu_cmd/run_report.h"
 #include "yuzu_cmd/user_dir.h"
 #include "yuzu_cmd/version_info.h"
@@ -902,12 +905,13 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         Common::RunOutcome::InstallSignalHandlers();
     }
 
-    // --frame-times: the raw per-frame log of this run's accepted presents.
+    // --frame-times: the raw per-frame log of this run (a replay's frames or a game's presents).
     if (!lp.replay.frame_times_path.empty()) {
         std::string timing_error;
         const Common::FrameTiming::Config timing{
             .path = lp.replay.frame_times_path,
-            .source = Common::FrameTiming::Source::HostPresent,
+            .source = lp.replay.ReplayRequested() ? Common::FrameTiming::Source::ReplayFrame
+                                                  : Common::FrameTiming::Source::HostPresent,
         };
         if (!VideoCore::Replay::CheckPrivateOutput(timing.path, VideoCore::Replay::OutputKind::File,
                                                    timing_error) ||
@@ -936,6 +940,36 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     Common::Windows::SetCurrentTimerResolutionToMaximum();
     state->system.CoreTiming().SetTimerResolutionNs(Common::Windows::GetCurrentTimerResolution());
 #endif
+
+    // --replay: the capture stands in for the game. Nothing below loads content or starts a guest
+    // process; the run ends here and the usual unattended end (report, exit code) follows.
+    if (lp.replay.ReplayRequested()) {
+        ReplayRunner::RegisterHost();
+        std::atomic<bool> replay_stop{false};
+        std::jthread stop_watcher{[&replay_stop](std::stop_token token) {
+            while (!token.stop_requested() && !Common::RunOutcome::StopRequested()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+            if (Common::RunOutcome::StopRequested()) {
+                replay_stop.store(true);
+            }
+        }};
+        const ReplayRunner::Outcome outcome =
+            ReplayRunner::Run(state->system, *state->emu_window, lp.replay,
+                              lp.run_frames.value_or(0), replay_stop);
+        stop_watcher.request_stop();
+        stop_watcher.join();
+        using Common::RunOutcome::Reason;
+        StopFrameTiming(outcome.reason == Reason::FrameLimit);
+        if (outcome.reason == Reason::BadArguments || outcome.reason == Reason::ReportIoError) {
+            // Set by the frontend, never requested (Common::RunOutcome::Request).
+            startup_reason = outcome.reason;
+            startup_detail = outcome.detail;
+        } else {
+            Common::RunOutcome::Request(outcome.reason, outcome.detail);
+        }
+        return outcome.reason == Reason::FrameLimit ? SDL_APP_SUCCESS : SDL_APP_FAILURE;
+    }
 
     state->system.SetContentProvider(std::make_unique<FileSys::ContentProviderUnion>());
     state->system.SetFilesystem(std::make_shared<FileSys::RealVfsFilesystem>());
