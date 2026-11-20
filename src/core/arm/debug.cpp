@@ -9,6 +9,8 @@
 
 #include <array>
 #include <cstring>
+#include <chrono>
+#include <thread>
 
 #include "common/demangle.h"
 #include "core/arm/debug.h"
@@ -352,6 +354,61 @@ void InvalidateInstructionCacheRange(const Kernel::KProcess* process, u64 addres
             interface->InvalidateCacheRange(address, size);
         }
     }
+}
+
+bool InvalidateInstructionCacheRangeAndWait(const Kernel::KProcess* process, u64 address, u64 size,
+                                            std::chrono::milliseconds timeout) {
+    InvalidateInstructionCacheRange(process, address, size);
+
+    struct Running {
+        CoreRunState* state;
+        u64 entered;
+    };
+    std::array<Running, Core::Hardware::NUM_CPU_CORES> running{};
+    std::size_t count = 0;
+    CoreRunState* const self = CurrentRun();
+    for (std::size_t i = 0; i < Core::Hardware::NUM_CPU_CORES; i++) {
+        auto* interface = process->GetArmInterface(i);
+        if (!interface || !interface->TracksRuns()) {
+            continue;
+        }
+        CoreRunState& state = interface->RunState();
+        if (&state == self) {
+            continue;
+        }
+        const u64 entered = state.entered.load(std::memory_order_seq_cst);
+        if (state.left.load(std::memory_order_seq_cst) == entered) {
+            // Idle: its next slice starts by servicing the invalidation requested above.
+            continue;
+        }
+        running[count++] = {&state, entered};
+    }
+    if (count == 0) {
+        return true;
+    }
+
+    // This core runs no guest code while it waits. Mark it so a core waiting on this one for
+    // its own discovery does not wait for a slice that cannot end until it is done.
+    if (self) {
+        self->parked.store(true, std::memory_order_seq_cst);
+    }
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    bool acknowledged = true;
+    for (std::size_t i = 0; i < count && acknowledged; i++) {
+        const Running& other = running[i];
+        while (other.state->left.load(std::memory_order_acquire) < other.entered &&
+               !other.state->parked.load(std::memory_order_acquire)) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                acknowledged = false;
+                break;
+            }
+            std::this_thread::yield();
+        }
+    }
+    if (self) {
+        self->parked.store(false, std::memory_order_seq_cst);
+    }
+    return acknowledged;
 }
 
 std::vector<BacktraceEntry> GetBacktraceFromContext(Kernel::KProcess* process,

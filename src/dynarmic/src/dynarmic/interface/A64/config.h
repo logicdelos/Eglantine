@@ -149,6 +149,56 @@ struct UserCallbacks {
     virtual std::uint64_t GetCNTPCT() = 0;
 };
 
+/// A host call emitted before one guest instruction, with the guest state read live (the values
+/// the instruction itself would see), so it is exact in the middle of a block too.
+struct InstructionProbe {
+    /// XReg reads general register `imm` (0..30; 31 reads zero).
+    enum class Arg : std::uint8_t { Imm, X0, X1, X30, SP, XReg };
+    struct Operand {
+        Arg kind = Arg::Imm;
+        std::uint64_t imm = 0;  ///< Used when kind is Imm or XReg.
+    };
+    void (*fn)(std::uint64_t, std::uint64_t, std::uint64_t) = nullptr;
+    std::array<Operand, 3> operands{};
+    /// The call changes what the next instructions must see (it installed probes and asked the
+    /// JIT to invalidate). The block is ended after the probed instruction, and whatever that
+    /// instruction ends the block with (a link, a return-stack or fast-dispatch hop) is replaced
+    /// by a return to the dispatcher, which services the pending invalidation before another
+    /// instruction runs. Without that, a stale link or return-stack entry could enter old code.
+    bool end_block_after = false;
+};
+
+/// Every probe wanted at one address, in a fixed order. The flags of all of them combine.
+struct InstructionProbeSet {
+    static constexpr std::size_t max_probes = 4;
+    std::array<InstructionProbe, max_probes> probes{};
+    std::size_t count = 0;
+};
+
+enum class BranchKind : std::uint8_t {
+    Direct,       ///< B or BL: the target is known when translating.
+    Indirect,     ///< BR or BLR: the target is read from a register when the branch runs.
+    Return,       ///< RET: the target is read from a register when the branch runs.
+    Conditional,  ///< B.cond, CBZ, CBNZ, TBZ, TBNZ: the target is known, but the branch may not be taken.
+};
+
+/// Consulted once per translated instruction; never at run time. A probe added after code was
+/// translated takes effect once the JIT invalidates that address (InvalidateCacheRange).
+/// Must be safe to call from every core's translating thread at once.
+class InstructionProbes {
+public:
+    virtual ~InstructionProbes() = default;
+    /// Fills `out` with every probe wanted before the instruction at `pc` and returns how many.
+    virtual std::size_t Find(VAddr pc, InstructionProbeSet& out) const = 0;
+    /// Asked for every B/BL (`target_or_reg` is the destination) and BR/BLR (`target_or_reg` is
+    /// the register number) the translator meets. Returns true and fills `out` to get a call
+    /// before that branch. The default asks for nothing.
+    virtual bool FindBranch(VAddr /*pc*/, BranchKind /*kind*/, std::uint64_t /*target_or_reg*/,
+                            InstructionProbe& /*out*/) const {
+        return false;
+    }
+};
+
 struct UserConfig {
     /// Fastmem Pointer
     /// This should point to the beginning of a 2^page_table_address_space_bits bytes
@@ -158,6 +208,9 @@ struct UserConfig {
     std::optional<std::uintptr_t> fastmem_pointer = std::nullopt;
 
     UserCallbacks* callbacks;
+
+    /// Optional observer: host calls emitted before chosen instructions. Null emits nothing.
+    const InstructionProbes* probes = nullptr;
 
     ExclusiveMonitor* global_monitor = nullptr;
 

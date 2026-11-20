@@ -1321,6 +1321,7 @@ void KProcess::LoadModule(KernelCore& kernel, CodeSet code_set, KProcessAddress 
         }
     }
 #endif
+    this->NoteCodeChange();
 }
 
 void KProcess::AddInitialCodeRange(KProcessAddress begin, size_t size) noexcept {

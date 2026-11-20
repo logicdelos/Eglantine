@@ -11,6 +11,32 @@
 
 namespace Core {
 
+namespace {
+thread_local CoreRunState* t_current_run = nullptr;
+thread_local u64 t_guest_thread = 0;
+} // namespace
+
+ScopedRun::ScopedRun(CoreRunState& state, u64 guest_thread_id) noexcept
+    : m_state{state}, m_previous{t_current_run}, m_previous_thread{t_guest_thread} {
+    t_current_run = &m_state;
+    t_guest_thread = guest_thread_id;
+    m_state.entered.fetch_add(1, std::memory_order_seq_cst);
+}
+
+ScopedRun::~ScopedRun() {
+    m_state.left.fetch_add(1, std::memory_order_seq_cst);
+    t_current_run = m_previous;
+    t_guest_thread = m_previous_thread;
+}
+
+CoreRunState* CurrentRun() noexcept {
+    return t_current_run;
+}
+
+u64 CurrentGuestThreadId() noexcept {
+    return t_guest_thread;
+}
+
 void ArmInterface::LogBacktrace(Kernel::KProcess* process) const {
     Kernel::Svc::ThreadContext ctx;
     this->GetContext(ctx);

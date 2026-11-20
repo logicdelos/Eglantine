@@ -25,8 +25,12 @@ struct ReturnToDispatch {};
 /// cycles remaining. If we do not have enough cycles remaining, we return to the
 /// dispatcher, which will return control to the host.
 struct LinkBlock {
-    explicit LinkBlock(const LocationDescriptor& next_) : next(next_) {}
+    explicit LinkBlock(const LocationDescriptor& next_, bool force_dispatch_ = false)
+        : next(next_), force_dispatch(force_dispatch_) {}
     LocationDescriptor next;  ///< Location descriptor for next block.
+    /// Never link: always return to the dispatcher, which services a pending halt (and any
+    /// cache invalidation it carries) before the next block runs, with or without cycle counting.
+    bool force_dispatch;
 };
 
 /// This terminal instruction jumps to the basic block described by `next` unconditionally.

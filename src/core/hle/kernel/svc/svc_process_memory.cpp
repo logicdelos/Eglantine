@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "core/core.h"
+#include "core/hle/guest_call/nvn_census.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/svc.h"
 
@@ -25,6 +26,41 @@ constexpr bool IsValidProcessMemoryPermission(Svc::MemoryPermission perm) {
     default:
         return false;
     }
+}
+
+/// A permission change counts only when it grants or removes execute, or rewrites a code region.
+/// Querying first keeps a data mprotect (heap, stack, read-only) from looking like a new module.
+bool CountsAsCodeChange(KProcess& process, u64 address, u64 size, MemoryPermission perm) {
+    if (!Core::NvnCensus::IsActive()) {
+        return false; // only the census reads the generation: no page-table walk when it is off
+    }
+    if (perm == MemoryPermission::ReadExecute || perm == MemoryPermission::Execute) {
+        return true;
+    }
+    auto& page_table = process.GetPageTable();
+    u64 cursor = address;
+    const u64 end = address + size;
+    while (cursor < end) {
+        KMemoryInfo info{};
+        PageInfo page_info{};
+        if (R_FAILED(page_table.QueryInfo(&info, &page_info, cursor))) {
+            return true;
+        }
+        const auto state = info.GetSvcState();
+        const bool code_region = state == MemoryState::Code || state == MemoryState::AliasCode ||
+                                 state == MemoryState::SharedCode || state == MemoryState::GeneratedCode;
+        const auto old_bits = static_cast<u32>(info.GetSvcMemoryInfo().permission);
+        const bool was_executable = (old_bits & static_cast<u32>(MemoryPermission::Execute)) != 0;
+        if (code_region || was_executable) {
+            return true;
+        }
+        const u64 next = info.GetEndAddress();
+        if (next <= cursor) {
+            return true;
+        }
+        cursor = next;
+    }
+    return false;
 }
 
 } // namespace
@@ -55,8 +91,13 @@ Result SetProcessMemoryPermission(Core::System& system, Handle process_handle, u
     auto& page_table = process->GetPageTable();
     R_UNLESS(page_table.Contains(address, size), ResultInvalidCurrentMemory);
 
-    // Set the memory permission.
-    R_RETURN(page_table.SetProcessMemoryPermission(address, size, perm));
+    // Set the memory permission. Sample the old region first: a later query would see the new bits.
+    const bool code_change = CountsAsCodeChange(*process, address, size, perm);
+    const Result result = page_table.SetProcessMemoryPermission(address, size, perm);
+    if (R_SUCCEEDED(result) && code_change) {
+        process->NoteCodeChange();
+    }
+    R_RETURN(result);
 }
 
 Result MapProcessMemory(Core::System& system, u64 dst_address, Handle process_handle,
@@ -96,8 +137,12 @@ Result MapProcessMemory(Core::System& system, u64 dst_address, Handle process_ha
         KMemoryAttribute::All, KMemoryAttribute::None));
 
     // Map the group.
-    R_RETURN(dst_pt.MapPageGroup(dst_address, pg, KMemoryState::SharedCode,
-                                 KMemoryPermission::UserReadWrite));
+    const Result mapped = dst_pt.MapPageGroup(dst_address, pg, KMemoryState::SharedCode,
+                                              KMemoryPermission::UserReadWrite);
+    if (R_SUCCEEDED(mapped)) {
+        dst_process->NoteCodeChange();
+    }
+    R_RETURN(mapped);
 }
 
 Result UnmapProcessMemory(Core::System& system, u64 dst_address, Handle process_handle,
@@ -130,7 +175,11 @@ Result UnmapProcessMemory(Core::System& system, u64 dst_address, Handle process_
              ResultInvalidMemoryRegion);
 
     // Unmap the memory.
-    R_RETURN(dst_pt.UnmapProcessMemory(dst_address, size, src_pt, src_address));
+    const Result unmapped = dst_pt.UnmapProcessMemory(dst_address, size, src_pt, src_address);
+    if (R_SUCCEEDED(unmapped)) {
+        dst_process->NoteCodeChange();
+    }
+    R_RETURN(unmapped);
 }
 
 Result MapProcessCodeMemory(Core::System& system, Handle process_handle, u64 dst_address,
@@ -191,7 +240,11 @@ Result MapProcessCodeMemory(Core::System& system, Handle process_handle, u64 dst
     }
 
     R_UNLESS(page_table.CanContain(dst_address, size, KMemoryState::AliasCode), ResultInvalidCurrentMemory);
-    R_RETURN(page_table.MapCodeMemory(dst_address, src_address, size));
+    const Result mapped = page_table.MapCodeMemory(dst_address, src_address, size);
+    if (R_SUCCEEDED(mapped)) {
+        process->NoteCodeChange();
+    }
+    R_RETURN(mapped);
 }
 
 Result UnmapProcessCodeMemory(Core::System& system, Handle process_handle, u64 dst_address,
@@ -252,7 +305,11 @@ Result UnmapProcessCodeMemory(Core::System& system, Handle process_handle, u64 d
     }
 
     R_UNLESS(page_table.CanContain(dst_address, size, KMemoryState::AliasCode), ResultInvalidCurrentMemory);
-    R_RETURN(page_table.UnmapCodeMemory(dst_address, src_address, size));
+    const Result unmapped = page_table.UnmapCodeMemory(dst_address, src_address, size);
+    if (R_SUCCEEDED(unmapped)) {
+        process->NoteCodeChange();
+    }
+    R_RETURN(unmapped);
 }
 
 Result SetProcessMemoryPermission64(Core::System& system, Handle process_handle, uint64_t address,

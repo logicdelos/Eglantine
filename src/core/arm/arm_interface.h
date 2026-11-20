@@ -45,6 +45,35 @@ enum class Architecture {
     AArch32,
 };
 
+/// Whether a core is executing guest code, kept so another core can tell when code it has
+/// asked to invalidate can no longer be running on this one.
+struct CoreRunState {
+    std::atomic<u64> entered{0}; ///< Run slices started.
+    std::atomic<u64> left{0};    ///< Run slices finished; equal to `entered` when idle.
+    std::atomic<bool> parked{false}; ///< Waiting in a host call: runs no guest code meanwhile.
+};
+
+/// Marks one run slice on the calling host thread: which core it is and which guest thread it
+/// runs. A host thread runs one guest thread per slice.
+class ScopedRun {
+public:
+    explicit ScopedRun(CoreRunState& state, u64 guest_thread_id) noexcept;
+    ~ScopedRun();
+    YUZU_NON_COPYABLE(ScopedRun);
+    YUZU_NON_MOVEABLE(ScopedRun);
+
+private:
+    CoreRunState& m_state;
+    CoreRunState* m_previous;
+    u64 m_previous_thread;
+};
+
+/// The run state of the core the calling host thread is currently running guest code on.
+CoreRunState* CurrentRun() noexcept;
+
+/// The id of the guest thread of that slice; 0 outside one.
+u64 CurrentGuestThreadId() noexcept;
+
 /// What a core's interface wants of its idle time (ArmInterface::PrewarmIdle).
 enum class PrewarmState : u8 {
     Finished, ///< Nothing, now or later: the core just waits
@@ -117,6 +146,15 @@ public:
     virtual const Kernel::DebugWatchpoint* HaltedWatchpoint() const = 0;
     virtual void RewindBreakpointInstruction() = 0;
 
+    // Run slices are recorded only by a JIT that has instruction probes (the NVN census); see
+    // Core::InvalidateInstructionCacheRangeAndWait.
+    CoreRunState& RunState() noexcept {
+        return m_run_state;
+    }
+    bool TracksRuns() const noexcept {
+        return m_tracks_runs;
+    }
+
 protected:
     const Kernel::DebugWatchpoint* MatchingWatchpoint(
         u64 addr, u64 size, Kernel::DebugWatchpointType access_type) const;
@@ -124,6 +162,10 @@ protected:
 protected:
     const WatchpointArray* m_watchpoints{};
     bool m_uses_wall_clock{};
+    bool m_tracks_runs{};
+
+private:
+    CoreRunState m_run_state;
 };
 
 } // namespace Core

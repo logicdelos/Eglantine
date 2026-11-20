@@ -312,7 +312,7 @@ private:
         // LocationDescriptor ctor() does important ops (like tflags) do not skip
         auto const arch_descriptor = A64::LocationDescriptor{descriptor};
         ir_block.Reset(arch_descriptor);
-        const TranslationOptions options{conf.define_unpredictable_behaviour, conf.wall_clock_cntpct};
+        const TranslationOptions options{conf.define_unpredictable_behaviour, conf.wall_clock_cntpct, true, conf.probes};
         CodeCapture capture{arch_descriptor.PC()};
         if (block_compiled_callback && !arch_descriptor.SingleStepping() && capture.start % sizeof(u32) == 0) {
             const auto record_code = [&](u64 pc) {
@@ -399,7 +399,7 @@ public:
         };
         ir_block.Reset(arch_descriptor);
         A64::Translate(ir_block, arch_descriptor, std::cref(get_code),
-                       {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
+                       {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct, true, conf.probes});
         const auto expected_end = arch_descriptor.AdvancePC(static_cast<int>(words.size_bytes()));
         if (outside_span || A64::LocationDescriptor{ir_block.EndLocation()}.PC() != expected_end.PC()) {
             return PrecompileResult::CodeMismatch;
