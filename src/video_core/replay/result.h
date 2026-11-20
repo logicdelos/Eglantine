@@ -99,6 +99,8 @@ struct ReplayReport {
     u32 format_minor = 0;
     u64 capture_session_id = 0;
     u64 capture_build_id = 0;
+    u64 capture_chain_digest = 0;
+    std::optional<u64> replay_guest_call_count; // unknown until the no-process check succeeds
     u64 settings_hash = 0;
     u64 frames_expected = 0;
     u64 frames_replayed = 0;
@@ -125,6 +127,7 @@ struct ReplayFrameRecord {
     // The FRAME_END declarations of the captured frame.
     u64 call_count = 0;
     u32 effect_count = 0;
+    u64 replay_guest_call_count = 0; // independent of the capture's call_count
 };
 
 // The counters of the call census (plan 5.1). Slice D fills them; the criteria below are pure
@@ -230,6 +233,7 @@ struct TestHookReport {
 
 // One JSONL line (no trailing newline) of frames.jsonl, keys in a fixed order.
 [[nodiscard]] std::string ReplayFrameLine(const ReplayFrameRecord& record);
+[[nodiscard]] std::string ReplayPrerollFrameLine(const ReplayFrameRecord& record, u64 output_id);
 // File names inside the replay image directory.
 [[nodiscard]] std::string LivePictureName(u64 frame_id);
 [[nodiscard]] std::string ReplayPictureName(u64 frame_id);

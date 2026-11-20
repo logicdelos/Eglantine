@@ -42,6 +42,7 @@ TEST_CASE("the replay kernel has its memory layout and no process", "[core][repl
     // The slab heaps sit at SlabHeapBase, so the allocator's first free byte is above it.
     REQUIRE(EndOfKernelDram(system) > Core::DramMemoryMap::SlabHeapBase);
     REQUIRE(system.Kernel().ApplicationProcess() == nullptr);
+    REQUIRE_FALSE(system.Kernel().HasCreatedUserProcess());
     system.ShutdownReplayKernel();
 }
 
