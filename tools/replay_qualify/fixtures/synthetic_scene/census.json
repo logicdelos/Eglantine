@@ -1,51 +1,107 @@
 {
   "accounting": {
+    "closed_frame_calls": 10,
     "exact": true,
-    "executed": 1200,
-    "frames": 1060,
-    "late": 0,
-    "mismatched": 0,
-    "startup": 120,
-    "tail": 20
+    "executed_total": 12,
+    "late_calls": 0,
+    "mismatched_functions": 0,
+    "open_tail_calls": 0,
+    "startup_calls": 2
   },
   "audit": {
-    "audited_entries": 1200,
-    "bootstrap_calls": 4,
-    "bootstrap_sites": 2,
-    "code_changes": 0,
     "enabled": true,
-    "late_modules": 0,
+    "known_entries": 12,
+    "mismatched_calls": 0,
     "region_known": true,
-    "return_sites": 18,
-    "shortfall_calls": 0,
-    "shortfall_functions": 0,
-    "tolerance": 4,
-    "unaudited_entries": 0,
     "unknown_calls": 0,
     "unknown_overflow": 0,
     "unknown_targets": 0
   },
-  "coverage": {
-    "audit_found_counted_at_entry": 3,
-    "audit_found_targets": 3,
-    "instrumented_targets": 45,
-    "lost_detail": "",
-    "lost_events": 0,
-    "named_targets": 42
+  "bootstrap": {
+    "bootstrap_calls": 4,
+    "sites": 1
   },
-  "final": true,
-  "kind": "nvn_call_census",
-  "presents": {
-    "frames_closed": 2,
+  "coverage": {
+    "failed": [],
+    "instrumented_target_share": 1.0,
+    "resolved_target_share": 1.0
+  },
+  "coverage_complete": true,
+  "errors": {
+    "ambiguous_pending": 0,
+    "code_changes": 0,
+    "epoch_reservation_timeouts": 0,
+    "guest_thread_overflow": 0,
     "id_duplicates": 0,
     "id_gaps": 0,
-    "identity_ok": true,
-    "min_frames": 2,
-    "paths_used": 1,
+    "late_calls": 0,
+    "late_modules": 0,
+    "name_read_failures": 0,
+    "pending_overflow": 0,
+    "probe_table_full": 0,
+    "rendezvous_timeouts": 0,
+    "returns_not_observed": 0,
+    "role_conflicts": 0,
+    "stream_overflow": 0,
+    "target_table_full": 0,
+    "unaudited_entries": 0,
+    "unknown_overflow": 0,
+    "unmatched_returns": 0
+  },
+  "final": true,
+  "frames": {
+    "closed": 2,
     "presents": 3,
-    "stream_ambiguous": false,
-    "stream_tokens": 1,
-    "streams": 1
+    "presents_by_path": {
+      "buffer_queue": 0,
+      "nx2_vi2": 3
+    },
+    "streams": [
+      {
+        "ambiguous": false,
+        "path": "nx2_vi2",
+        "presents": 3,
+        "stream": "0x1",
+        "token": "0x1",
+        "tokens": 1
+      }
+    ]
+  },
+  "functions": [
+    {
+      "acked": true,
+      "audited_entries": 6,
+      "calls": 6,
+      "frame_calls": 5,
+      "late_calls": 0,
+      "open_tail_calls": 0,
+      "provenance": [
+        "resolver"
+      ],
+      "startup_calls": 1
+    },
+    {
+      "acked": true,
+      "audited_entries": 6,
+      "calls": 6,
+      "frame_calls": 5,
+      "late_calls": 0,
+      "open_tail_calls": 0,
+      "provenance": [
+        "audit"
+      ],
+      "startup_calls": 1
+    }
+  ],
+  "guest_threads": [
+    {
+      "calls": 12,
+      "id": 1
+    }
+  ],
+  "kind": "nvn_call_census",
+  "provenance": {
+    "min_frames": 2
   },
   "replay_capture": {
     "detail": "",
