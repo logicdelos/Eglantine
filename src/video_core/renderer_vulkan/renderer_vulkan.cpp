@@ -34,6 +34,7 @@
 #include "video_core/present.h"
 #include "video_core/replay/capture.h"
 #include "video_core/replay/memory_capture.h"
+#include "video_core/replay/run_state.h"
 #include "video_core/renderer_vulkan/present/util.h"
 #ifdef HAS_RESHADE
 #include "video_core/post_processing/fx_chain.h"
@@ -68,7 +69,6 @@ constexpr VkExtent2D CaptureImageSize{
 
 // Replay composition (RendererVulkan::SetReplayReadback). One replay owns the process, so the
 // state is process-wide; the picture is written by the GPU thread and read by the replay thread.
-std::atomic<bool> replay_composition{false};
 std::atomic<bool> replay_readback{false};
 std::mutex replay_picture_mutex;
 std::vector<u8> replay_picture;
@@ -335,7 +335,7 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     };
 
     // A replay never reaches the window, the swapchain, the applet capture or frame generation.
-    if (replay_composition.load(std::memory_order_acquire)) {
+    if (VideoCore::Replay::ReplayGpuRunning()) {
         ComposeForReplay(framebuffers);
         return;
     }
@@ -414,7 +414,8 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
 
 void RendererVulkan::SetReplayReadback(bool readback) {
     replay_readback.store(readback, std::memory_order_release);
-    replay_composition.store(true, std::memory_order_release);
+    std::scoped_lock lock{replay_picture_mutex};
+    replay_picture.clear();
 }
 
 bool RendererVulkan::ReadReplayPicture(u32& width, u32& height, std::vector<u8>& bgra,

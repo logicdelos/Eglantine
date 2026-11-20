@@ -22,6 +22,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "common/frame_timing_log.h"
 #include "common/run_outcome.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -844,6 +845,12 @@ private:
             config.layer_stack_mask = layer.layer_stack_mask;
             layers.push_back(config);
         }
+        constexpr u32 default_stack = Service::Nvnflinger::DefaultLayerStackMask;
+        if (std::ranges::none_of(layers, [](const auto& layer) {
+                return (layer.layer_stack_mask & default_stack) != 0;
+            })) {
+            return Fail("present has no composable layer on the default stack");
+        }
         gpu_->RequestComposite(counted, std::move(layers), {});
         gpu_->WaitForComposite();
         ObserveEffect({EffectKind::PresentCompose, counted, present.output_id, true});
@@ -976,6 +983,7 @@ private:
             ResetFrame();
             return true;
         }
+        Common::FrameTiming::Record(frame_id);
         ReplayFrameRecord record;
         record.frame_id = frame_id;
         record.replay_ns = work_ns;
