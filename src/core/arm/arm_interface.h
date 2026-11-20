@@ -69,6 +69,8 @@ public:
     virtual PrewarmState PrewarmIdle(const std::atomic<bool>& stop) {
         return PrewarmState::Finished;
     }
+    /// Controlled shutdown only, after the core's host thread has joined.
+    virtual void LogPrewarmOutcomes() const {}
 
     // Runs the CPU until an event happens.
     virtual HaltReason RunThread(Kernel::KThread* thread) = 0;

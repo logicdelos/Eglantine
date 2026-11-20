@@ -162,6 +162,12 @@ TEST_CASE("Unswizzle parts need a megabyte of output each", "[video_core][textur
     REQUIRE(UnswizzleParts(33'177'600, 17, 4) == 4);
     REQUIRE(UnswizzleParts(33'177'600, 17, 16) == 16);
     REQUIRE(UnswizzleParts(33'177'600, 17, 64) == 17);
+    // The two shapes of the largest CPU unswizzles in the 0.5 first-minutes run: a 2048x2048
+    // D32_FLOAT depth target (16 MiB, block height 4, 16 block rows) and a 2560x1440
+    // R16G16B16A16_FLOAT image (29.5 MiB, block height 0, 180 block rows). Four threads split
+    // both in four, so the run's log lines are of images that took the parallel path.
+    REQUIRE(UnswizzleParts(16'777'216, Common::DivCeil(2048, GOB_SIZE_Y << 4), 4) == 4);
+    REQUIRE(UnswizzleParts(29'491'200, Common::DivCeil(1440, GOB_SIZE_Y << 0), 4) == 4);
     // Never less than one.
     REQUIRE(UnswizzleParts(0, 0, 0) == 1);
     REQUIRE(UnswizzleParts(8 * MiB, 0, 4) == 1);

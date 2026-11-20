@@ -11,6 +11,7 @@
 
 #include <atomic>
 #include <map>
+#include <span>
 
 #include "core/arm/arm_interface.h"
 #include "core/file_sys/program_metadata.h"
@@ -68,6 +69,12 @@ public:
     static constexpr u64 ProcessIdMin = InitialProcessIdMax + 1;
     static constexpr u64 ProcessIdMax = (std::numeric_limits<u64>::max)();
 
+    /// One executable span of the initial image, as LoadModule published it: [begin, end).
+    struct InitialCodeSpan {
+        u64 begin{};
+        u64 end{};
+    };
+
 private:
     using SharedMemoryInfoList = Common::IntrusiveListBaseTraits<KSharedMemoryInfo>::ListType;
     using TLPTree = Common::IntrusiveRedBlackTreeBaseTraits<KThreadLocalPage>::TreeType<KThreadLocalPage>;
@@ -113,6 +120,12 @@ private:
     KResourceLimit* m_resource_limit{};
     KSystemResource* m_system_resource{};
     KThread* m_exception_thread{};
+
+    /// One per module in the initial image; the loaders place at most rtld, main, sdk and ten
+    /// subsdks. A segment past the cap is not published, so its blocks are not recorded ahead.
+    static constexpr std::size_t MaxInitialCodeRanges = 16;
+    std::array<InitialCodeSpan, MaxInitialCodeRanges> m_initial_code_ranges{};
+    std::atomic<u32> m_initial_code_range_count{0};
 
     size_t m_code_size{};
     size_t m_main_thread_stack_size{};
@@ -261,6 +274,37 @@ public:
 
     KProcessAddress GetEntryPoint() const {
         return m_code_address;
+    }
+
+    /// Bytes reserved for the initial image, from the entry point up. This is the code allocation
+    /// of LoadFromMetadata, fixed at load; no page-table lock is taken.
+    size_t GetInitialCodeSize() const {
+        return m_code_size;
+    }
+
+    /// True when [address, address + size) lies wholly inside one of the initial image's executable
+    /// segments (the text of a module LoadModule placed in this process). The segments are
+    /// published once during loading, before a core runs, so the query takes no lock and is safe on
+    /// a guest or idle JIT thread. A span that crosses two segments is not contained.
+    [[nodiscard]] bool ContainsInitialCode(u64 address, size_t size) const noexcept;
+
+    /// The rule ContainsInitialCode applies to the published spans: one containing span, not a
+    /// union of several. Constexpr so the boundaries can be checked without a process.
+    [[nodiscard]] static constexpr bool IsInsideInitialCode(std::span<const InitialCodeSpan> spans,
+                                                            u64 address, size_t size) noexcept {
+        if (size == 0) {
+            return false;
+        }
+        const u64 end = address + size;
+        if (end < address) {
+            return false;
+        }
+        for (const InitialCodeSpan& span : spans) {
+            if (address >= span.begin && end <= span.end) {
+                return true;
+            }
+        }
+        return false;
     }
 
     void SetArgPointer(KProcessAddress addr) {
@@ -599,6 +643,10 @@ public:
     void DoWorkerTaskImpl(KernelCore& kernel);
 
 private:
+    /// Publishes one executable segment of the initial image. Called by LoadModule on the loading
+    /// thread, before any core runs; a full table drops the segment (fail closed).
+    void AddInitialCodeRange(KProcessAddress begin, size_t size) noexcept;
+
     void ChangeState(KernelCore& kernel, State new_state) {
         if (m_state != new_state) {
             m_state = new_state;

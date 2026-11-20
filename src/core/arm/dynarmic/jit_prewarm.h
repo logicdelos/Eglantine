@@ -3,13 +3,11 @@
 
 // Second-launch code translation ahead of the guest.
 //
-// While a program runs, the guest entry address of every block the JIT translated in the first
-// minutes is kept, with a hash of the instruction words that translation read, per CPU core. The
-// list is written to a file next to the title's pipeline caches. On the next launch of the same
-// program in the same build, each core translates the blocks of its own list while it has nothing
-// to run (PhysicalCore::Idle), from the guest code as it is then, and keeps a block only when its
-// hash still matches. A list that is absent, corrupt or for another build or program is ignored
-// and replaced. EDEN_NX2_JIT_PREWARM=0 turns it off.
+// Early demand translations record their image-relative location, instruction count and hash.
+// The list is written next to the title's pipeline caches. On the next launch of the same program
+// in the same build, each idle core snapshots each recorded span and translates it only if the
+// snapshot matches. A list that is absent, corrupt, obsolete or for another build or program is
+// ignored and replaced. EDEN_NX2_JIT_PREWARM=0 turns it off.
 //
 // Threading: a core's JIT is only ever used by that core's host thread, so the blocks of a core
 // are translated by it and by nothing else. The one helper thread reads and writes the file; it
@@ -30,15 +28,23 @@
 
 namespace Core::JitPrewarm {
 
-/// One block a core translated: where it starts (the JIT's location descriptor value) and the hash
-/// of the guest instruction words the translator read for it.
+/// The PC field is a byte offset from the initial process image; translation flags are unchanged.
 struct Entry {
     u64 location{};
     u64 guest_hash{};
+    u32 word_count{};
 
     friend bool operator==(const Entry&, const Entry&) = default;
 };
-static_assert(sizeof(Entry) == 16);
+
+/// Initial process image, not the page table's (larger) code allocation region.
+struct CodeImage {
+    u64 base;
+    u64 size;
+
+    [[nodiscard]] std::optional<u64> ToRelative(u64 location, u32 word_count) const noexcept;
+    [[nodiscard]] std::optional<u64> ToAbsolute(u64 location, u32 word_count) const noexcept;
+};
 
 /// What a list is valid for. The emulator build and the program (content stamp, title, version) are
 /// the identity; core_count is the number of per-core lists the file holds.
@@ -52,9 +58,9 @@ struct Identity {
     friend bool operator==(const Identity&, const Identity&) = default;
 };
 
-constexpr u32 FormatVersion = 1;
+constexpr u32 FormatVersion = 3; // v1 and v2 stored absolute PCs and cannot be rebased.
 constexpr u32 MaxCores = 16;
-/// Per core. At 16 bytes an entry, the largest list is 4 MiB a core.
+/// Per core. At 20 bytes per entry on disk, the largest list is 5 MiB a core.
 constexpr std::size_t MaxEntriesPerCore = std::size_t{1} << 18;
 constexpr std::size_t HeaderBytes = 80;
 
@@ -72,6 +78,7 @@ enum class Reject : u8 {
     BodySize,
     BodyChecksum,
     TooManyEntries,
+    InvalidEntry,
 };
 
 /// Stable lower-case token for logs and tests.
@@ -115,6 +122,18 @@ enum class Outcome : u8 {
     Unsupported, ///< This JIT cannot translate ahead: stop for good
 };
 
+/// Disjoint outcomes for loaded hints, except mismatch_attempts (includes retries).
+struct OutcomeCounts {
+    u32 loaded{};
+    u32 compiled{};
+    u32 already_present{};
+    u32 rejected_mismatch{};
+    u32 no_space{};
+    u32 unsupported{};
+    u32 pending{};
+    u64 mismatch_attempts{};
+};
+
 struct Policy {
     u32 max_sweeps = 3;        ///< Passes over the blocks that mismatched, the first pass included
     u64 retry_gap_ms = 2000;   ///< Between the end of a pass and the next one over its mismatches
@@ -154,6 +173,7 @@ public:
     [[nodiscard]] u32 Present() const noexcept {
         return present_;
     }
+    [[nodiscard]] OutcomeCounts WarmOutcomes() const noexcept;
 
 private:
     Policy policy_;
@@ -168,6 +188,8 @@ private:
     bool finished_{false};
     u32 compiled_{0};
     u32 present_{0};
+    u64 mismatch_attempts_{0};
+    std::optional<Outcome> stopped_by_;
 };
 
 enum class RunResult : u8 {
@@ -202,9 +224,17 @@ public:
         return {recorded_.get(), RecordedCount()};
     }
 
+    /// Read only after the CPU owner has stopped; nullopt until the helper publishes its list.
+    [[nodiscard]] std::optional<OutcomeCounts> WarmOutcomes() const noexcept;
+    void LogWarmOutcomes(std::size_t core_index) const;
+
     // --- Owner core thread ---
+    [[nodiscard]] bool CanRecord() const noexcept {
+        return !closed_.load(std::memory_order_relaxed) &&
+               recorded_count_.load(std::memory_order_relaxed) < record_capacity_;
+    }
     /// The JIT translated a block because the guest reached it.
-    void Record(u64 location, u64 guest_hash) noexcept;
+    void Record(u64 location, u64 guest_hash, u32 word_count) noexcept;
 
     /// Translates entries until `stop` is set, the list is done or something must wait.
     /// `now()` is a monotonic millisecond clock; `compile(const Entry&)` returns an Outcome.

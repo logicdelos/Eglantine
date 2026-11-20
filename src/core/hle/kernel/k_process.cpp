@@ -1281,14 +1281,24 @@ Result KProcess::LoadFromMetadata(KernelCore& kernel, const FileSys::ProgramMeta
 
 void KProcess::LoadModule(KernelCore& kernel, CodeSet code_set, KProcessAddress base_addr) {
     const auto ReprotectSegment = [&](const CodeSet::Segment& segment, Svc::MemoryPermission permission) {
-        m_page_table.SetProcessMemoryPermission(segment.addr + base_addr, segment.size, permission);
+        return m_page_table.SetProcessMemoryPermission(segment.addr + base_addr, segment.size,
+                                                       permission);
     };
 
     this->GetMemory().WriteBlock(base_addr, code_set.memory.data(), code_set.memory.size());
 
-    ReprotectSegment(code_set.CodeSegment(), Svc::MemoryPermission::ReadExecute);
+    const Result code_result =
+        ReprotectSegment(code_set.CodeSegment(), Svc::MemoryPermission::ReadExecute);
     ReprotectSegment(code_set.RODataSegment(), Svc::MemoryPermission::Read);
     ReprotectSegment(code_set.DataSegment(), Svc::MemoryPermission::ReadWrite);
+
+    // The text of an initial-image module is the only bytes a block hint may name, and only once
+    // the loader actually made it executable: a failed permission change must not publish bytes
+    // the JIT would then read as code. The other results keep their previous fate.
+    if (code_result.IsSuccess()) {
+        const CodeSet::Segment& code_segment = code_set.CodeSegment();
+        AddInitialCodeRange(code_segment.addr + base_addr, code_segment.size);
+    }
 
 #ifdef HAS_NCE
     const auto& patch = code_set.PatchSegment();
@@ -1311,6 +1321,30 @@ void KProcess::LoadModule(KernelCore& kernel, CodeSet code_set, KProcessAddress 
         }
     }
 #endif
+}
+
+void KProcess::AddInitialCodeRange(KProcessAddress begin, size_t size) noexcept {
+    if (size == 0) {
+        return;
+    }
+    const u64 begin_value = GetInteger(begin);
+    const u64 end_value = begin_value + size;
+    if (end_value < begin_value) {
+        return;
+    }
+    const u32 index = m_initial_code_range_count.load(std::memory_order_relaxed);
+    if (index >= MaxInitialCodeRanges) {
+        // Not published: blocks there are not offered as hints, which is the safe direction.
+        return;
+    }
+    m_initial_code_ranges[index] = InitialCodeSpan{begin_value, end_value};
+    m_initial_code_range_count.store(index + 1, std::memory_order_release);
+}
+
+bool KProcess::ContainsInitialCode(u64 address, size_t size) const noexcept {
+    const u32 count = m_initial_code_range_count.load(std::memory_order_acquire);
+    const std::span<const InitialCodeSpan> spans{m_initial_code_ranges.data(), count};
+    return IsInsideInitialCode(spans, address, size);
 }
 
 void KProcess::InitializeInterfaces(KernelCore& kernel) {

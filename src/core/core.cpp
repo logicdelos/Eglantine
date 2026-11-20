@@ -19,10 +19,12 @@
 #include "common/adpf.h"
 #include "common/nx2_bottleneck.h"
 #include "common/nx2_sampler.h"
+#include "common/run_outcome.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "common/string_util.h"
 #include "common/thread.h"
+#include "core/arm/arm_interface.h"
 #include "core/arm/exclusive_monitor.h"
 #include "core/core.h"
 
@@ -619,6 +621,15 @@ struct System::Impl {
         host1x_core.reset();
         perf_stats.reset();
         cpu_manager.Shutdown();
+        if (const auto* process = kernel.ApplicationProcess(); process && Common::RunOutcome::Active()) {
+            // Retained kernel references can keep the JIT alive past shutdown. Read it here while
+            // the application still exists and its owner threads have joined.
+            for (std::size_t i = 0; i < Hardware::NUM_CPU_CORES; ++i) {
+                if (const auto* cpu = process->GetArmInterface(i)) {
+                    cpu->LogPrewarmOutcomes();
+                }
+            }
+        }
         debugger.reset();
         kernel.Shutdown();
         stop_event = {};

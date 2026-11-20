@@ -9,11 +9,15 @@
  * SPDX-License-Identifier: 0BSD
  */
 
+#include <array>
 #include <chrono>
 #include <cstring>
+#include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 
 #include <boost/icl/interval_set.hpp>
 #include "common/assert.h"
@@ -66,31 +70,28 @@ static Optimization::PolyfillOptions GenPolyfillOptions(const BlockOfCode& code)
 
 namespace {
 
-/// Hash of the instruction words one translation reads: a block compiled ahead of the guest is only
-/// kept when the guest code is still the code the block was recorded from. A word that cannot be
-/// read is folded as a value no word can have a reason to share and flagged: such a block is
-/// neither recorded nor accepted.
-struct CodeFold {
-    static constexpr u64 Seed = 0xcbf29ce484222325ULL;
-    static constexpr u64 Unreadable = 0x9e3779b97f4a7c15ULL;
+constexpr u64 HashSeed = 0xcbf29ce484222325ULL;
 
-    u64 hash = Seed;
-    bool unreadable = false;
+u64 FoldCodeWord(u64 hash, u32 word) {
+    hash = (hash ^ word) * 0x100000001b3ULL;
+    return hash ^ (hash >> 29);
+}
 
-    void Add(u64 word) {
-        hash = (hash ^ word) * 0x100000001b3ULL;
-        hash ^= hash >> 29;
-    }
+// The disk hint describes a contiguous span. Observe demand fetches, never change or limit them.
+struct CodeCapture {
+    u64 start;
+    u64 hash = HashSeed;
+    u32 word_count = 0;
 
-    std::optional<u32> Read(A64::UserCallbacks* callbacks, u64 vaddr) {
-        const std::optional<u32> word = callbacks->MemoryReadCode(vaddr);
-        if (word) {
-            Add(*word);
+    void Observe(u64 pc, std::optional<u32> word) {
+        if (word && word_count < MaxPrecompileWords && pc >= start &&
+            pc <= (std::numeric_limits<u64>::max)() - sizeof(u32) &&
+            pc - start == word_count * sizeof(u32)) {
+            hash = FoldCodeWord(hash, *word);
+            ++word_count;
         } else {
-            unreadable = true;
-            Add(Unreadable);
+            word_count = MaxPrecompileWords + 1;
         }
-        return word;
     }
 };
 
@@ -307,12 +308,22 @@ private:
         if (phase_hook) {
             phase_hook(JitPhase::MemoryCommit, to_ns(commit_start), to_ns(compile_start));
         }
-        CodeFold fold;
-        const auto get_code = [this, &fold](u64 vaddr) { return fold.Read(conf.callbacks, vaddr); };
+        const auto read_code = [this](u64 pc) { return conf.callbacks->MemoryReadCode(pc); };
         // LocationDescriptor ctor() does important ops (like tflags) do not skip
         auto const arch_descriptor = A64::LocationDescriptor{descriptor};
         ir_block.Reset(arch_descriptor);
-        A64::Translate(ir_block, arch_descriptor, get_code, {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
+        const TranslationOptions options{conf.define_unpredictable_behaviour, conf.wall_clock_cntpct};
+        CodeCapture capture{arch_descriptor.PC()};
+        if (block_compiled_callback && !arch_descriptor.SingleStepping() && capture.start % sizeof(u32) == 0) {
+            const auto record_code = [&](u64 pc) {
+                const auto word = read_code(pc);
+                capture.Observe(pc, word);
+                return word;
+            };
+            A64::Translate(ir_block, arch_descriptor, std::cref(record_code), options);
+        } else {
+            A64::Translate(ir_block, arch_descriptor, read_code, options);
+        }
         Optimization::Optimize(ir_block, conf, polyfill_options);
         const CodePtr entrypoint = emitter.Emit(ir_block).entrypoint;
         const auto compile_end = std::chrono::steady_clock::now();
@@ -325,14 +336,14 @@ private:
         if (phase_hook) {
             phase_hook(JitPhase::Compile, to_ns(compile_start), to_ns(compile_end));
         }
-        if (block_compiled_callback && !fold.unreadable && !arch_descriptor.SingleStepping()) {
-            block_compiled_callback(block_compiled_user, descriptor.Value(), fold.hash);
+        if (capture.word_count != 0 && capture.word_count <= MaxPrecompileWords) {
+            block_compiled_callback(block_compiled_user, descriptor.Value(), capture.hash, capture.word_count);
         }
         return entrypoint;
     }
 
 public:
-    PrecompileResult PrecompileBlock(u64 location, u64 expected_guest_hash) {
+    PrecompileResult PrecompileBlock(u64 location, u64 expected_guest_hash, u32 word_count) {
         if (is_executing) {
             return PrecompileResult::Busy;
         }
@@ -341,6 +352,19 @@ public:
         PerformRequestedCacheInvalidation(static_cast<HaltReason>(Atomic::Load(&jit_state.halt_reason)));
 
         const IR::LocationDescriptor descriptor{location};
+        const A64::LocationDescriptor arch_descriptor{descriptor};
+        const u64 start = arch_descriptor.PC();
+        if (word_count == 0 || word_count > MaxPrecompileWords || start % sizeof(u32) != 0 ||
+            arch_descriptor.SingleStepping() || arch_descriptor.UniqueHash() != location) {
+            return PrecompileResult::CodeMismatch;
+        }
+        // Reject an address wrap or a jump across the descriptor's sign-extension boundary.
+        const auto last_offset = static_cast<int>((word_count - 1) * sizeof(u32));
+        const u64 last = arch_descriptor.AdvancePC(last_offset).PC();
+        if (last < start || last - start != static_cast<u64>(last_offset) ||
+            last > (std::numeric_limits<u64>::max)() - sizeof(u32)) {
+            return PrecompileResult::CodeMismatch;
+        }
         if (emitter.GetBasicBlock(descriptor)) {
             return PrecompileResult::AlreadyCompiled;
         }
@@ -351,12 +375,33 @@ public:
             return PrecompileResult::NoSpace;
         }
 
-        CodeFold fold;
-        const auto get_code = [this, &fold](u64 vaddr) { return fold.Read(conf.callbacks, vaddr); };
-        auto const arch_descriptor = A64::LocationDescriptor{descriptor};
+        const auto words = std::span{precompile_words}.first(word_count);
+        if (!conf.callbacks->MemoryReadCodeForPrecompile(start, words)) {
+            return PrecompileResult::CodeMismatch;
+        }
+        u64 hash = HashSeed;
+        for (const u32 word : words) {
+            hash = FoldCodeWord(hash, word);
+        }
+        if (hash != expected_guest_hash) {
+            return PrecompileResult::CodeMismatch;
+        }
+
+        // Address-based lookup supports every aligned read in the validated span, including
+        // repeated reads. Never fall back to live guest memory for a different instruction.
+        bool outside_span = false;
+        const auto get_code = [&](u64 pc) -> std::optional<u32> {
+            if (pc < start || pc > last || pc % sizeof(u32) != 0) {
+                outside_span = true;
+                return std::nullopt;
+            }
+            return words[(pc - start) / sizeof(u32)];
+        };
         ir_block.Reset(arch_descriptor);
-        A64::Translate(ir_block, arch_descriptor, get_code, {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
-        if (fold.unreadable || fold.hash != expected_guest_hash) {
+        A64::Translate(ir_block, arch_descriptor, std::cref(get_code),
+                       {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
+        const auto expected_end = arch_descriptor.AdvancePC(static_cast<int>(words.size_bytes()));
+        if (outside_span || A64::LocationDescriptor{ir_block.EndLocation()}.PC() != expected_end.PC()) {
             return PrecompileResult::CodeMismatch;
         }
         if (!block_of_code.EnsureMemoryCommitted(1 * 1024 * 1024, Backend::X64::CodeCommit::Optional)) {
@@ -397,6 +442,7 @@ private:
     }
 
     IR::Block ir_block = {LocationDescriptor(0, FP::FPCR(0), false)};
+    std::array<u32, MaxPrecompileWords> precompile_words;
     const UserConfig conf;
     A64JitState jit_state;
     BlockOfCode block_of_code;
@@ -415,8 +461,8 @@ Jit::Jit(UserConfig conf)
 
 Jit::~Jit() = default;
 
-PrecompileResult Jit::PrecompileBlock(u64 location, u64 expected_guest_hash) {
-    return impl->PrecompileBlock(location, expected_guest_hash);
+PrecompileResult Jit::PrecompileBlock(u64 location, u64 expected_guest_hash, u32 word_count) {
+    return impl->PrecompileBlock(location, expected_guest_hash, word_count);
 }
 
 void Jit::SetBlockCompiledCallback(BlockCompiledCallback callback, void* user) {

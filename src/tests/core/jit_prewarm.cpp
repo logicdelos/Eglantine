@@ -33,7 +33,7 @@ constexpr u64 SplitMix(u64 x) {
 
 Entry MakeEntry(u64 core, u64 index) {
     return Entry{0x0000007100000000ULL + core * 0x1000000ULL + index * 4,
-                 SplitMix((core << 40) | index)};
+                 SplitMix((core << 40) | index), static_cast<u32>(1 + index % 17)};
 }
 
 std::vector<Entry> MakeList(u64 core, std::size_t count) {
@@ -154,11 +154,11 @@ void ExpectWait(Cursor& cursor, u64 now_ms, u64 until_ms) {
     REQUIRE(step.wait_until_ms == until_ms);
 }
 
-/// Entries {i, 3 * i + 1}: the location of a call says which entry it was.
+/// Entries {i, 3 * i + 1, 1}: the location of a call says which entry it was.
 std::vector<Entry> IndexedList(std::size_t count) {
     std::vector<Entry> list;
     for (u64 i = 0; i < count; ++i) {
-        list.push_back(Entry{i, 3 * i + 1});
+        list.push_back(Entry{i, 3 * i + 1, 1});
     }
     return list;
 }
@@ -169,25 +169,28 @@ std::vector<Entry> IndexedList(std::size_t count) {
 
 TEST_CASE("JitPrewarm: the file layout is the documented one", "[jit_prewarm]") {
     const Identity identity = MakeIdentity(1);
-    const std::vector<std::vector<Entry>> lists{{Entry{0x7100001234ULL, 0xdeadbeefcafef00dULL}}};
+    // The location is an image byte offset, not a guest address; the record is 20 bytes as before.
+    const std::vector<std::vector<Entry>> lists{
+        {Entry{0x12344ULL, 0xdeadbeefcafef00dULL, 3}}};
     const std::vector<u8> bytes = Serialize(identity, lists);
 
-    REQUIRE(bytes.size() == HeaderBytes + 8 + 16);
+    REQUIRE(bytes.size() == HeaderBytes + 8 + 20);
     CHECK(std::memcmp(bytes.data(), "EGLJITH1", 8) == 0);
-    CHECK(Get(bytes, 8, 4) == 1);
+    CHECK(Get(bytes, 8, 4) == 3);
     CHECK(Get(bytes, 12, 4) == 1);
     CHECK(Get(bytes, 16, 8) == identity.build_id);
     CHECK(Get(bytes, 24, 8) == identity.content_stamp);
     CHECK(Get(bytes, 32, 8) == identity.title_id);
     CHECK(Get(bytes, 40, 4) == identity.game_version);
     CHECK(Get(bytes, 44, 4) == 0);
-    CHECK(Get(bytes, 48, 8) == 24);
-    CHECK(Get(bytes, 56, 8) == Fnv1a(bytes.data() + HeaderBytes, 24));
+    CHECK(Get(bytes, 48, 8) == 28);
+    CHECK(Get(bytes, 56, 8) == Fnv1a(bytes.data() + HeaderBytes, 28));
     CHECK(Get(bytes, 64, 8) == 1);
     CHECK(Get(bytes, 72, 8) == Fnv1a(bytes.data(), 72));
     CHECK(Get(bytes, 80, 8) == 1);
-    CHECK(Get(bytes, 88, 8) == 0x7100001234ULL);
+    CHECK(Get(bytes, 88, 8) == 0x12344ULL);
     CHECK(Get(bytes, 96, 8) == 0xdeadbeefcafef00dULL);
+    CHECK(Get(bytes, 104, 4) == 3);
 }
 
 TEST_CASE("JitPrewarm: a list survives a round trip", "[jit_prewarm]") {
@@ -197,13 +200,74 @@ TEST_CASE("JitPrewarm: a list survives a round trip", "[jit_prewarm]") {
 
     std::size_t body = 6 * 8;
     for (const auto& list : lists) {
-        body += list.size() * 16;
+        body += list.size() * 20;
     }
     CHECK(bytes.size() == HeaderBytes + body);
 
     const Parsed parsed = ParseVector(bytes, identity);
     CHECK(parsed.reject == Reject::None);
     CHECK(parsed.per_core == lists);
+}
+
+TEST_CASE("JitPrewarm: a list of an earlier format is rejected, not read as this one",
+          "[jit_prewarm]") {
+    const Identity identity = MakeIdentity(1);
+    std::vector<u8> bytes = Serialize(identity, MakeLists({2}));
+    REQUIRE(ParseVector(bytes, identity).reject == Reject::None);
+
+    SECTION("version 1, the 16-byte record") {
+        Put(bytes, 8, 1, 4); // today's records under an older version: the checksums are valid
+        Seal(bytes);
+        CHECK(ParseVector(bytes, identity).reject == Reject::BadVersion);
+    }
+    SECTION("version 2, guest addresses instead of image offsets") {
+        Put(bytes, 8, 2, 4);
+        Seal(bytes);
+        CHECK(ParseVector(bytes, identity).reject == Reject::BadVersion);
+    }
+}
+
+TEST_CASE("JitPrewarm: a word count a block cannot have is rejected", "[jit_prewarm]") {
+    const Identity identity = MakeIdentity(1);
+    const std::vector<std::vector<Entry>> one{
+        {Entry{0x12344ULL, 0xdeadbeefcafef00dULL, 1}}};
+    const std::vector<u8> good = Serialize(identity, one);
+    REQUIRE(ParseVector(good, identity).reject == Reject::None);
+
+    // The record is the location, the hash and then the word count, after the list count.
+    constexpr std::size_t WordCountAt = HeaderBytes + 8 + 16;
+
+    SECTION("zero words") {
+        std::vector<u8> bytes = good;
+        Put(bytes, WordCountAt, 0, 4);
+        Seal(bytes);
+        CHECK(ParseVector(bytes, identity).reject == Reject::InvalidEntry);
+    }
+    SECTION("more words than a block may have") {
+        std::vector<u8> bytes = good;
+        Put(bytes, WordCountAt, 1025, 4);
+        Seal(bytes);
+        CHECK(ParseVector(bytes, identity).reject == Reject::InvalidEntry);
+    }
+    SECTION("the largest count a block may have is accepted") {
+        std::vector<u8> bytes = good;
+        Put(bytes, WordCountAt, 1024, 4);
+        Seal(bytes);
+        const Parsed parsed = ParseVector(bytes, identity);
+        CHECK(parsed.reject == Reject::None);
+        REQUIRE(parsed.per_core.size() == 1);
+        REQUIRE(parsed.per_core[0].size() == 1);
+        CHECK(parsed.per_core[0][0].word_count == 1024);
+    }
+    SECTION("a later entry is checked too") {
+        const std::vector<std::vector<Entry>> lists{
+            {Entry{1, 2, 1}, Entry{3, 4, 1}}};
+        std::vector<u8> bytes = Serialize(identity, lists);
+        REQUIRE(ParseVector(bytes, identity).reject == Reject::None);
+        Put(bytes, WordCountAt + 20, 0, 4);
+        Seal(bytes);
+        CHECK(ParseVector(bytes, identity).reject == Reject::InvalidEntry);
+    }
 }
 
 TEST_CASE("JitPrewarm: the core count of the identity is the core count of the lists",
@@ -311,7 +375,7 @@ TEST_CASE("JitPrewarm: a file whose checksums are right but whose lists are not 
     }
     SECTION("a list that claims more entries than the file holds") {
         std::vector<u8> bytes = good;
-        Put(bytes, HeaderBytes, 4, 8); // four entries are 64 bytes; the body has 56 after the count
+        Put(bytes, HeaderBytes, 4, 8); // four entries are 80 bytes; the body has 68 after the count
         Seal(bytes);
         CHECK(ParseVector(bytes, identity).reject == Reject::BodySize);
         bytes = good;
@@ -327,7 +391,7 @@ TEST_CASE("JitPrewarm: a file whose checksums are right but whose lists are not 
     }
     SECTION("bytes after the last list") {
         std::vector<u8> bytes = good;
-        bytes.resize(bytes.size() + 16);
+        bytes.resize(bytes.size() + 20);
         Seal(bytes);
         CHECK(ParseVector(bytes, identity).reject == Reject::BodySize);
     }
@@ -392,6 +456,7 @@ TEST_CASE("JitPrewarm: reasons have distinct stable names", "[jit_prewarm]") {
         {Reject::BodySize, "body_size"},
         {Reject::BodyChecksum, "body_checksum"},
         {Reject::TooManyEntries, "too_many_entries"},
+        {Reject::InvalidEntry, "invalid_entry"},
     };
     std::set<std::string> seen;
     for (const auto& [reject, name] : names) {
@@ -404,12 +469,12 @@ TEST_CASE("JitPrewarm: reasons have distinct stable names", "[jit_prewarm]") {
 // --- The list to write ---
 
 TEST_CASE("JitPrewarm: the written list drops the stale and adds the new", "[jit_prewarm]") {
-    const Entry a{1, 10};
-    const Entry b{2, 20};
-    const Entry c{3, 30};
-    const Entry d{4, 40};
-    const Entry e{5, 50};
-    const Entry f{6, 60};
+    const Entry a{1, 10, 2};
+    const Entry b{2, 20, 1};
+    const Entry c{3, 30, 4};
+    const Entry d{4, 40, 1};
+    const Entry e{5, 50, 3};
+    const Entry f{6, 60, 2};
     const std::vector<Entry> loaded{a, b, c, d};
     const std::vector<u32> stale{1, 3};
     const std::vector<Entry> recorded{e, a, f, e};
@@ -435,10 +500,10 @@ TEST_CASE("JitPrewarm: the written list is cut at the cap, keeping the older ent
 }
 
 TEST_CASE("JitPrewarm: one address with two checksums is two entries", "[jit_prewarm]") {
-    const std::vector<Entry> loaded{Entry{7, 1}, Entry{7, 2}};
-    const std::vector<Entry> recorded{Entry{7, 2}, Entry{7, 3}};
+    const std::vector<Entry> loaded{Entry{7, 1, 1}, Entry{7, 2, 2}};
+    const std::vector<Entry> recorded{Entry{7, 2, 2}, Entry{7, 3, 1}};
     CHECK(MergeForWrite(loaded, {}, recorded, 10) ==
-          std::vector<Entry>{Entry{7, 1}, Entry{7, 2}, Entry{7, 3}});
+          std::vector<Entry>{Entry{7, 1, 1}, Entry{7, 2, 2}, Entry{7, 3, 1}});
 }
 
 TEST_CASE("JitPrewarm: a large merge keeps the order and has no repeat", "[jit_prewarm]") {
@@ -809,26 +874,26 @@ TEST_CASE("JitPrewarm: a core records the blocks it is told of, up to its capaci
           "[jit_prewarm]") {
     CoreState state{Policy{}, 3};
     CHECK(state.RecordedCount() == 0);
-    state.Record(10, 1);
-    state.Record(20, 2);
+    state.Record(10, 1, 2);
+    state.Record(20, 2, 5);
     CHECK(state.Recorded().size() == 2);
-    state.Record(30, 3);
-    state.Record(40, 4); // beyond the capacity
+    state.Record(30, 3, 1);
+    state.Record(40, 4, 1); // beyond the capacity
     CHECK(state.RecordedCount() == 3);
     const std::span<const Entry> recorded = state.Recorded();
     REQUIRE(recorded.size() == 3);
-    CHECK(recorded[0] == Entry{10, 1});
-    CHECK(recorded[1] == Entry{20, 2});
-    CHECK(recorded[2] == Entry{30, 3});
+    CHECK(recorded[0] == Entry{10, 1, 2});
+    CHECK(recorded[1] == Entry{20, 2, 5});
+    CHECK(recorded[2] == Entry{30, 3, 1});
 }
 
 TEST_CASE("JitPrewarm: nothing is recorded after the recording is closed", "[jit_prewarm]") {
     CoreState state{Policy{}, 10};
-    state.Record(1, 1);
+    state.Record(1, 1, 4);
     state.CloseRecording();
-    state.Record(2, 2);
+    state.Record(2, 2, 4);
     CHECK(state.RecordedCount() == 1);
-    CHECK(state.Recorded()[0] == Entry{1, 1});
+    CHECK(state.Recorded()[0] == Entry{1, 1, 4});
 }
 
 TEST_CASE("JitPrewarm: a reader sees only complete entries while the core records",
@@ -837,7 +902,7 @@ TEST_CASE("JitPrewarm: a reader sees only complete entries while the core record
     CoreState state{Policy{}, Count};
     std::thread core{[&state] {
         for (u64 i = 0; i < Count; ++i) {
-            state.Record(i, i * 7 + 1);
+            state.Record(i, i * 7 + 1, static_cast<u32>(1 + i % 1024));
         }
     }};
     std::size_t torn = 0;
@@ -845,7 +910,8 @@ TEST_CASE("JitPrewarm: a reader sees only complete entries while the core record
     while (seen < Count) {
         const std::span<const Entry> recorded = state.Recorded();
         for (; seen < recorded.size(); ++seen) {
-            if (!(recorded[seen] == Entry{seen, seen * 7 + 1})) {
+            if (!(recorded[seen] ==
+                  Entry{seen, seen * 7 + 1, static_cast<u32>(1 + seen % 1024)})) {
                 ++torn;
             }
         }
@@ -869,4 +935,64 @@ TEST_CASE("JitPrewarm: a core the guest does not have gets no state", "[jit_prew
     const int process_key = 0;
     CHECK(!Attach(0x0123456789abcdefULL, &process_key, Core::Hardware::NUM_CPU_CORES)
                .has_value());
+}
+
+TEST_CASE("JitPrewarm: shutdown outcomes partition loaded hints, not attempts or demand",
+          "[jit_prewarm]") {
+    CoreState state{Policy{2, 1}, 8};
+    CHECK_FALSE(state.WarmOutcomes().has_value());
+    state.Publish(IndexedList(5));
+    REQUIRE(state.WarmOutcomes().has_value());
+    CHECK(state.WarmOutcomes()->pending == 5); // never polled
+    std::atomic<bool> stop{false};
+    u64 clock = 0;
+    const auto now = [&] { return clock; };
+    const auto compile = [&](const Entry& entry) {
+        if (entry.location == 0) {
+            return Outcome::Present;
+        }
+        if (entry.location == 1 && clock != 0) {
+            stop.store(true); // interrupt on the last mismatch, before Next() finalizes the sweep
+        }
+        if (entry.location == 1 || (entry.location == 2 && clock == 0)) {
+            return Outcome::Mismatch;
+        }
+        return Outcome::Compiled;
+    };
+    REQUIRE(state.Run(stop, now, compile) == RunResult::Poll);
+    CHECK(state.WarmOutcomes()->rejected_mismatch == 0);
+    CHECK(state.WarmOutcomes()->pending == 2); // both mismatches can still be retried
+    ++clock;
+    REQUIRE(state.Run(stop, now, compile) == RunResult::Poll);
+    CHECK(state.WarmOutcomes()->rejected_mismatch == 1);
+    CHECK(state.WarmOutcomes()->pending == 1);
+    stop.store(false);
+    REQUIRE(state.Run(stop, now, compile) == RunResult::Finished);
+    const auto totals = *state.WarmOutcomes();
+    CHECK(totals.loaded == 5);
+    CHECK(totals.compiled == 3);
+    CHECK(totals.already_present == 1);
+    CHECK(totals.rejected_mismatch == 1);
+    CHECK(totals.mismatch_attempts == 3);
+    CHECK(totals.no_space == 0);
+    CHECK(totals.unsupported == 0);
+    CHECK(totals.pending == 0);
+    CHECK(state.RecordedCount() == 0);
+}
+
+TEST_CASE("JitPrewarm: stopping on one hint does not reject the untried suffix", "[jit_prewarm]") {
+    for (const auto reason : {Outcome::NoSpace, Outcome::Unsupported}) {
+        CoreState state{Policy{}, 0};
+        state.Publish(IndexedList(4));
+        const auto compile = [reason](const Entry& entry) {
+            return entry.location == 0 ? Outcome::Compiled : reason;
+        };
+        std::atomic<bool> stop{false};
+        REQUIRE(state.Run(stop, [] { return u64{0}; }, compile) == RunResult::Finished);
+        const auto totals = *state.WarmOutcomes();
+        CHECK(totals.compiled == 1);
+        CHECK(totals.no_space == (reason == Outcome::NoSpace ? 1 : 0));
+        CHECK(totals.unsupported == (reason == Outcome::Unsupported ? 1 : 0));
+        CHECK(totals.pending == 2);
+    }
 }

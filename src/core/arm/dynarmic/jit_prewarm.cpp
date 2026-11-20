@@ -18,6 +18,8 @@
 #include "common/logging.h"
 #include "core/arm/dynarmic/jit_prewarm.h"
 #include "core/hardware_properties.h"
+#include "dynarmic/frontend/A64/a64_location_descriptor.h"
+#include "dynarmic/interface/A64/a64.h"
 #include "video_core/cache_envelope.h"
 
 namespace Core::JitPrewarm {
@@ -27,7 +29,7 @@ namespace {
 constexpr char Magic[8] = {'E', 'G', 'L', 'J', 'I', 'T', 'H', '1'};
 constexpr std::size_t MagicBytes = sizeof(Magic);
 constexpr std::size_t ChecksummedHeaderBytes = HeaderBytes - sizeof(u64);
-constexpr std::size_t EntryBytes = sizeof(Entry);
+constexpr std::size_t EntryBytes = 2 * sizeof(u64) + sizeof(u32); // wire size, not host stride
 
 constexpr const char* FileName = "jit_blocks.mythos.bin";
 constexpr std::chrono::seconds IdentityWait{60};
@@ -78,7 +80,36 @@ struct EntryHash {
     }
 };
 
+std::optional<u64> RebaseLocation(u64 location, u32 word_count, u64 from, u64 to, u64 size) noexcept {
+    using Descriptor = Dynarmic::A64::LocationDescriptor;
+    constexpr u64 AddressLimit = u64{1} << (Descriptor::pc_bit_count - 1);
+    const u64 base = (std::max)(from, to);
+    const Descriptor descriptor{Dynarmic::IR::LocationDescriptor{location}};
+    if (base >= AddressLimit || size > AddressLimit - base || base % sizeof(u32) != 0 ||
+        word_count == 0 || word_count > Dynarmic::A64::MaxPrecompileWords ||
+        descriptor.SingleStepping() || descriptor.UniqueHash() != location) {
+        return std::nullopt;
+    }
+    const u64 pc = descriptor.PC();
+    if (pc < from || pc % sizeof(u32) != 0) {
+        return std::nullopt;
+    }
+    const u64 offset = pc - from;
+    if (offset >= size || u64{word_count} * sizeof(u32) > size - offset) {
+        return std::nullopt;
+    }
+    return descriptor.SetPC(to + offset).UniqueHash();
+}
+
 } // namespace
+
+std::optional<u64> CodeImage::ToRelative(u64 location, u32 word_count) const noexcept {
+    return RebaseLocation(location, word_count, base, 0, size);
+}
+
+std::optional<u64> CodeImage::ToAbsolute(u64 location, u32 word_count) const noexcept {
+    return RebaseLocation(location, word_count, 0, base, size);
+}
 
 const char* RejectName(Reject reject) noexcept {
     switch (reject) {
@@ -108,6 +139,8 @@ const char* RejectName(Reject reject) noexcept {
         return "body_checksum";
     case Reject::TooManyEntries:
         return "too_many_entries";
+    case Reject::InvalidEntry:
+        return "invalid_entry";
     }
     return "unknown";
 }
@@ -128,6 +161,7 @@ std::vector<u8> Serialize(Identity identity, std::span<const std::vector<Entry>>
         for (const Entry& entry : list) {
             Store64(cursor, entry.location);
             Store64(cursor + sizeof(u64), entry.guest_hash);
+            Store32(cursor + 2 * sizeof(u64), entry.word_count);
             cursor += EntryBytes;
         }
     }
@@ -205,6 +239,10 @@ Parsed Parse(std::span<const u8> bytes, const Identity& expected) {
         for (Entry& entry : list) {
             entry.location = Load64(body.data() + offset);
             entry.guest_hash = Load64(body.data() + offset + sizeof(u64));
+            entry.word_count = Load32(body.data() + offset + 2 * sizeof(u64));
+            if (entry.word_count == 0 || entry.word_count > Dynarmic::A64::MaxPrecompileWords) {
+                return reject(Reject::InvalidEntry);
+            }
             offset += EntryBytes;
         }
         total += count;
@@ -335,15 +373,33 @@ void Cursor::Report(u32 index, Outcome outcome) {
         break;
     case Outcome::Mismatch:
         retry_.push_back(index);
+        ++mismatch_attempts_;
         ++pos_;
         break;
     case Outcome::NoSpace:
     case Outcome::Unsupported:
+        stopped_by_ = outcome;
         finished_ = true;
         break;
     case Outcome::Busy:
         break;
     }
+}
+
+OutcomeCounts Cursor::WarmOutcomes() const noexcept {
+    // On the final sweep an interrupt can stop us before Next() moves retry_ into stale_.
+    const auto final_pass_mismatches = pass_ + 1 == policy_.max_sweeps ? retry_.size() : 0;
+    const u32 rejected = static_cast<u32>(stale_.size() + final_pass_mismatches);
+    const u32 no_space = stopped_by_ == Outcome::NoSpace;
+    const u32 unsupported = stopped_by_ == Outcome::Unsupported;
+    return {.loaded = count_,
+            .compiled = compiled_,
+            .already_present = present_,
+            .rejected_mismatch = rejected,
+            .no_space = no_space,
+            .unsupported = unsupported,
+            .pending = count_ - compiled_ - present_ - rejected - no_space - unsupported,
+            .mismatch_attempts = mismatch_attempts_};
 }
 
 // --- CoreState ---
@@ -369,12 +425,35 @@ bool CoreState::GetStale(std::vector<u32>& out) const {
     return true;
 }
 
-void CoreState::Record(u64 location, u64 guest_hash) noexcept {
+std::optional<OutcomeCounts> CoreState::WarmOutcomes() const noexcept {
+    if (state_.load(std::memory_order_acquire) == Pending) {
+        return std::nullopt;
+    }
+    if (cursor_) {
+        return cursor_->WarmOutcomes();
+    }
+    const auto loaded = static_cast<u32>(loaded_.size());
+    return OutcomeCounts{.loaded = loaded, .pending = loaded};
+}
+
+void CoreState::LogWarmOutcomes(std::size_t core_index) const {
+    if (const auto counts = WarmOutcomes()) {
+        LOG_INFO(Core_ARM, "JIT prewarm outcomes: core={} loaded={} compiled={} already_present={} "
+                 "rejected_mismatch={} no_space={} unsupported={} pending={} mismatch_attempts={}",
+                 core_index, counts->loaded, counts->compiled, counts->already_present,
+                 counts->rejected_mismatch, counts->no_space, counts->unsupported, counts->pending,
+                 counts->mismatch_attempts);
+    } else {
+        LOG_INFO(Core_ARM, "JIT prewarm outcomes: core={} list=not_published", core_index);
+    }
+}
+
+void CoreState::Record(u64 location, u64 guest_hash, u32 word_count) noexcept {
     const std::size_t count = recorded_count_.load(std::memory_order_relaxed);
     if (count >= record_capacity_ || closed_.load(std::memory_order_relaxed)) {
         return;
     }
-    recorded_[count] = Entry{location, guest_hash};
+    recorded_[count] = Entry{location, guest_hash, word_count};
     recorded_count_.store(count + 1, std::memory_order_release);
 }
 

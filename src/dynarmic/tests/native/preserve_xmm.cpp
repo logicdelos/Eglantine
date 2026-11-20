@@ -5,6 +5,10 @@
 #include <oaknut/oaknut.hpp>
 #include <immintrin.h>
 
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+
 #include "dynarmic/tests/A64/testenv.h"
 #include "dynarmic/tests/native/testenv.h"
 #include "dynarmic/common/fp/fpsr.h"
@@ -69,31 +73,191 @@ TEST_CASE("X86: Preserve XMM regs", "[x86]") {
     CHECK(jit.GetVector(9) == vectors[9]);
 }
 
-TEST_CASE("X86: a stale translation hint leaves the block available for a matching hint", "[x86][jit_prewarm]") {
-    A64TestEnv env;
-    env.code_mem = {0x14000000};  // B .
+namespace {
+
+/// Counts the guest instruction words the JIT reads, and can make the words from an address on
+/// unreadable, so a hint can be checked without a crashing guest instruction.
+class HintEnv final : public A64TestEnv {
+public:
+    std::size_t code_reads{};
+    std::optional<std::uint64_t> unreadable_from{};
+
+    std::optional<std::uint32_t> MemoryReadCode(u64 vaddr) override {
+        ++code_reads;
+        if (unreadable_from && vaddr >= *unreadable_from) {
+            return std::nullopt;
+        }
+        return A64TestEnv::MemoryReadCode(vaddr);
+    }
+};
+
+/// What the JIT reported for a block the guest reached: the hint a later launch would carry.
+struct RecordedHint {
+    std::uint64_t location{};
+    std::uint64_t hash{};
+    std::uint32_t word_count{};
+    unsigned recordings{};
+};
+
+void RecordHint(void* user, std::uint64_t location, std::uint64_t hash,
+                std::uint32_t word_count) {
+    auto& hint = *static_cast<RecordedHint*>(user);
+    hint = {location, hash, word_count, hint.recordings + 1};
+}
+
+/// Runs the guest from `pc`; the block takes as many ticks as `code_mem` has words.
+void RunGuest(A64::Jit& jit, HintEnv& env, std::uint64_t pc) {
+    jit.SetPC(pc);
+    env.ticks_left = env.code_mem.size();
+    CheckedRun([&] { jit.Run(); });
+}
+
+} // namespace
+
+TEST_CASE("X86: a stale translation hint is rejected before the frontend reads the block",
+          "[x86][jit_prewarm]") {
+    HintEnv env;
+    // Eight NOPs, and the read past the end answers `B .`: a translation started here reads nine
+    // words. A hint taken when this block was one word long is stale; it must be judged after the
+    // one word it claims, without the frontend reading the block the guest now has.
+    env.code_mem.assign(8, 0xd503201f);
     A64::UserConfig conf{};
     conf.callbacks = &env;
     A64::Jit jit{conf};
-    struct Hint {
-        std::uint64_t location;
-        std::uint64_t hash;
-        unsigned recordings;
-    } hint{};
-    jit.SetBlockCompiledCallback([](void* user, std::uint64_t location, std::uint64_t hash) {
-        auto& result = *static_cast<Hint*>(user);
-        result = {location, hash, result.recordings + 1};
-    }, &hint);
-    jit.SetPC(0);
-    env.ticks_left = 1;
-    CheckedRun([&] { jit.Run(); });
+    RecordedHint hint{};
+    jit.SetBlockCompiledCallback(&RecordHint, &hint);
+
+    RunGuest(jit, env, 0);
     REQUIRE(hint.recordings == 1);
+    REQUIRE(hint.location == 0);
+    REQUIRE(hint.word_count == 9);
+
+    jit.ClearCache();
+    env.code_reads = 0;
+    CHECK(jit.PrecompileBlock(hint.location, hint.hash ^ 1, 1) ==
+          A64::PrecompileResult::CodeMismatch);
+    CHECK(env.code_reads == 1); // not nine: the frontend never ran on a stale hint
+
+    // Nothing was kept: the same hint compiles once the code matches it again.
+    env.code_reads = 0;
+    CHECK(jit.PrecompileBlock(hint.location, hint.hash, hint.word_count) ==
+          A64::PrecompileResult::Compiled);
+    CHECK(env.code_reads == hint.word_count);
+}
+
+TEST_CASE("X86: a valid translation hint compiles the block and reads each word once",
+          "[x86][jit_prewarm]") {
+    HintEnv env;
+    env.code_mem = {0xd2800540, 0x14000000}; // MOV X0, #42; B .
+    A64::UserConfig conf{};
+    conf.callbacks = &env;
+    A64::Jit jit{conf};
+    RecordedHint hint{};
+    jit.SetBlockCompiledCallback(&RecordHint, &hint);
+
+    RunGuest(jit, env, 0);
+    REQUIRE(hint.recordings == 1);
+    REQUIRE(hint.word_count == 2);
+
+    jit.ClearCache();
+    env.code_reads = 0;
+    CHECK(jit.PrecompileBlock(hint.location, hint.hash, hint.word_count) ==
+          A64::PrecompileResult::Compiled);
+    CHECK(env.code_reads == hint.word_count); // one validating read of each word
+    CHECK(hint.recordings == 1);              // compiling ahead is not a guest block
+
+    env.code_reads = 0;
+    CHECK(jit.PrecompileBlock(hint.location, hint.hash, hint.word_count) ==
+          A64::PrecompileResult::AlreadyCompiled);
+    CHECK(env.code_reads == 0); // a cached block is not read again
+
+    RunGuest(jit, env, 0);
+    CHECK(jit.GetRegister(0) == 42);
+    CHECK(hint.recordings == 1);
+}
+
+TEST_CASE("X86: a hint that cannot be validated is refused without reading the guest",
+          "[x86][jit_prewarm]") {
+    HintEnv env;
+    env.code_mem = {0xd2800540}; // MOV X0, #42
+    A64::UserConfig conf{};
+    conf.callbacks = &env;
+    A64::Jit jit{conf};
+
+    constexpr std::uint64_t location = 0;
+    constexpr std::uint64_t hash = 0x0123456789abcdefULL;
+    const auto refused = [&](std::uint64_t at, std::uint32_t words) {
+        env.code_reads = 0;
+        CHECK(jit.PrecompileBlock(at, hash, words) == A64::PrecompileResult::CodeMismatch);
+        CHECK(env.code_reads == 0);
+    };
+
+    SECTION("no words") {
+        refused(location, 0);
+    }
+    SECTION("more words than a block may have") {
+        refused(location, A64::MaxPrecompileWords + 1);
+    }
+    SECTION("a misaligned block") {
+        refused(location + 2, 1);
+    }
+    SECTION("a single-stepping block") {
+        refused(location | (std::uint64_t{1} << 57), 1);
+    }
+}
+
+TEST_CASE("X86: a hint over an unreadable word is refused and keeps nothing",
+          "[x86][jit_prewarm]") {
+    HintEnv env;
+    env.code_mem = {0xd2800540, 0x14000000}; // MOV X0, #42; B .
+    A64::UserConfig conf{};
+    conf.callbacks = &env;
+    A64::Jit jit{conf};
+    RecordedHint hint{};
+    jit.SetBlockCompiledCallback(&RecordHint, &hint);
+
+    RunGuest(jit, env, 0);
+    REQUIRE(hint.recordings == 1);
+    REQUIRE(hint.word_count == 2);
     jit.ClearCache();
 
-    CHECK(jit.PrecompileBlock(hint.location, hint.hash ^ 1) == A64::PrecompileResult::CodeMismatch);
-    CHECK(jit.PrecompileBlock(hint.location, hint.hash) == A64::PrecompileResult::Compiled);
-    CHECK(jit.PrecompileBlock(hint.location, hint.hash) == A64::PrecompileResult::AlreadyCompiled);
-    CHECK(hint.recordings == 1);
+    env.unreadable_from = env.code_mem_start_address + 4; // the second word only
+    env.code_reads = 0;
+    CHECK(jit.PrecompileBlock(hint.location, hint.hash, hint.word_count) ==
+          A64::PrecompileResult::CodeMismatch);
+    CHECK(env.code_reads <= hint.word_count); // never more than the hint's words
+
+    env.unreadable_from.reset();
+    env.code_reads = 0;
+    CHECK(jit.PrecompileBlock(hint.location, hint.hash, hint.word_count) ==
+          A64::PrecompileResult::Compiled);
+    CHECK(env.code_reads == hint.word_count);
+}
+
+TEST_CASE("X86: a valid hint whose block crosses a page boundary is accepted",
+          "[x86][jit_prewarm]") {
+    HintEnv env;
+    env.code_mem_start_address = 0x0ffc;      // the second word is at 0x1000
+    env.code_mem = {0xd2800540, 0x14000000}; // MOV X0, #42; B .
+    A64::UserConfig conf{};
+    conf.callbacks = &env;
+    A64::Jit jit{conf};
+    RecordedHint hint{};
+    jit.SetBlockCompiledCallback(&RecordHint, &hint);
+
+    RunGuest(jit, env, env.code_mem_start_address);
+    REQUIRE(hint.recordings == 1);
+    REQUIRE(hint.location == env.code_mem_start_address);
+    REQUIRE(hint.word_count == 2);
+
+    jit.ClearCache();
+    env.code_reads = 0;
+    CHECK(jit.PrecompileBlock(hint.location, hint.hash, hint.word_count) ==
+          A64::PrecompileResult::Compiled);
+    CHECK(env.code_reads == 2);
+
+    RunGuest(jit, env, env.code_mem_start_address);
+    CHECK(jit.GetRegister(0) == 42);
 }
 
 #ifdef _WIN32

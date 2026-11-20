@@ -17,6 +17,7 @@ add_executable(tests
     core/builtin_patches.cpp
     core/launch_params.cpp
     core/jit_prewarm.cpp
+    core/jit_prewarm_rebase.cpp
     core/gpu_dirty_memory_manager.cpp
     video_core/macro_dma_forward.cpp
     video_core/gpu_timestamp.cpp

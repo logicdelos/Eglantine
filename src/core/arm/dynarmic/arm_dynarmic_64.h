@@ -44,6 +44,7 @@ public:
     u64 MemoryRead(u64 vaddr, size_t size) override;
     Dynarmic::A64::Vector MemoryRead128(u64 vaddr) override;
     std::optional<u32> MemoryReadCode(u64 vaddr) override;
+    bool MemoryReadCodeForPrecompile(u64 vaddr, std::span<u32> words) override;
     void InstructionSynchronizationBarrierRaised() override {
         last_code_addr = u64(-1); //reset back, force refetch
     }
@@ -104,6 +105,11 @@ public:
     void ClearInstructionCache() override;
     void InvalidateCacheRange(u64 addr, std::size_t size) override;
     PrewarmState PrewarmIdle(const std::atomic<bool>& stop) override;
+    void LogPrewarmOutcomes() const override {
+        if (m_prewarm) {
+            m_prewarm->State().LogWarmOutcomes(m_core_index);
+        }
+    }
 
 protected:
     const Kernel::DebugWatchpoint* HaltedWatchpoint() const override;
@@ -117,9 +123,9 @@ private:
     friend class DynarmicCallbacks64;
 
     void MakeJit(Common::PageTable* page_table, std::size_t address_space_bits);
-    static void OnBlockCompiled(void* user, u64 location, u64 guest_hash);
+    static void OnBlockCompiled(void* user, u64 location, u64 guest_hash, u32 word_count);
 
-    // Before m_jit: the JIT's callback points into it.
+    // Keep the per-core hint session alive until after m_jit is destroyed.
     std::optional<JitPrewarm::Handle> m_prewarm{};
     std::optional<DynarmicCallbacks64> m_cb{};
     std::size_t m_core_index{};

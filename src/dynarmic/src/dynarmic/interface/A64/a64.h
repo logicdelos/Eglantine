@@ -31,11 +31,14 @@ enum class PrecompileResult : std::uint8_t {
     Unsupported,     ///< This backend cannot compile ahead.
 };
 
-/// Called once for every block the Jit compiled because the guest reached it (not for blocks made by
-/// PrecompileBlock), on the compiling thread, after the block is in the code cache. location is the
-/// value PrecompileBlock takes; guest_hash is the hash of the instruction words the translator read
-/// (see PrecompileBlock). Must not throw, block or call back into the Jit.
-using BlockCompiledCallback = void (*)(void* user, std::uint64_t location, std::uint64_t guest_hash);
+/// Bounds speculative reads and scratch space only; demand translation has no such limit.
+inline constexpr std::uint32_t MaxPrecompileWords = 1024;
+
+/// Reports demand-compiled, non-single-step blocks with a readable, contiguous instruction span
+/// of 1..MaxPrecompileWords words. Called on the compiling thread after emission; must not throw,
+/// block or call back into the Jit.
+using BlockCompiledCallback = void (*)(void* user, std::uint64_t location, std::uint64_t guest_hash,
+                                       std::uint32_t word_count);
 
 class Jit final {
 public:
@@ -141,15 +144,16 @@ public:
     /**
      * Compiles the block at `location` (the unique value of an A64 location descriptor: pc, FPCR
      * bits and the single-step flag) before the guest reaches it. Must be called on the thread that
-     * calls Run, while Run is not executing; returns Busy otherwise. The block is translated from
-     * the guest memory as it is now, by the same path a block the guest reaches takes, and is only
-     * kept when the hash of the instruction words the translator read equals `expected_guest_hash`
-     * (the value BlockCompiledCallback was given for it): a changed or unreadable word gives
-     * CodeMismatch. Pending cache invalidations are applied first and invalidate a precompiled block
-     * like any other. Never clears the code cache to make room (NoSpace), and does not count in
-     * g_jit_stats or call g_jit_phase_hook: it is not time the guest waited for.
+     * calls Run, while Run is not executing; returns Busy otherwise. On a miss, the recorded
+     * `word_count` instruction words are read and hashed before translation. Only a matching
+     * snapshot is given to the translator, without rereading guest memory. Invalid spans, missing
+     * words and stale hashes give CodeMismatch. Pending cache invalidations are applied first and
+     * invalidate a precompiled block like any other. Never clears the code cache to make room
+     * (NoSpace), and does not count in g_jit_stats or call g_jit_phase_hook: it is not time the
+     * guest waited for.
      */
-    PrecompileResult PrecompileBlock(std::uint64_t location, std::uint64_t expected_guest_hash);
+    PrecompileResult PrecompileBlock(std::uint64_t location, std::uint64_t expected_guest_hash,
+                                     std::uint32_t word_count);
 
     /// Sets the callback described at BlockCompiledCallback (null: none). Call it before Run, from
     /// the thread that calls Run. Only the x86-64 backend compiles ahead and reports blocks; the

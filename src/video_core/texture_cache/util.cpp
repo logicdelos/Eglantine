@@ -19,7 +19,10 @@
 #include <numeric>
 #include <optional>
 #include <span>
+#include <string>
 #include <vector>
+
+#include <fmt/format.h>
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -868,8 +871,10 @@ constexpr s64 SlowTextureNs = 8'000'000;
 
 class SlowTextureLog {
 public:
-    SlowTextureLog(const char* what_, bool recording_, const ImageInfo& info_, u64 amount_)
-        : what{what_}, recording{recording_}, info{info_}, amount{amount_} {
+    // gpu_addr is the guest address the conversion read from, 0 where the caller has none.
+    SlowTextureLog(const char* what_, bool recording_, const ImageInfo& info_, u64 amount_,
+                   GPUVAddr gpu_addr_ = 0)
+        : what{what_}, recording{recording_}, info{info_}, amount{amount_}, gpu_addr{gpu_addr_} {
         if (recording) {
             begin = std::chrono::steady_clock::now();
         }
@@ -882,11 +887,16 @@ public:
                            std::chrono::steady_clock::now() - begin)
                            .count();
         if (ns >= SlowTextureNs) {
+            // The address tells two lines of one shape apart: the same address twice in a frame
+            // is one image converted twice, two addresses are two images.
+            const std::string address =
+                gpu_addr != 0 ? fmt::format(", address {:#x}", gpu_addr) : std::string{};
             LOG_INFO(HW_GPU,
                      "Slow texture {}: {:.1f} ms, {} {} {}, {} levels, {} layers, block height {}, "
-                     "amount {}",
+                     "amount {}{}",
                      what, static_cast<double>(ns) / 1e6, info.type, info.format, info.size,
-                     info.resources.levels, info.resources.layers, info.block.height, amount);
+                     info.resources.levels, info.resources.layers, info.block.height, amount,
+                     address);
         }
     }
     SlowTextureLog(const SlowTextureLog&) = delete;
@@ -897,6 +907,7 @@ private:
     bool recording;
     const ImageInfo& info;
     u64 amount;
+    GPUVAddr gpu_addr;
     std::chrono::steady_clock::time_point begin{};
 };
 } // Anonymous namespace
@@ -911,7 +922,7 @@ boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(Tegra::Memory
     const VideoCommon::Nx2Spikes::SpanScope unswizzle_span{VideoCommon::Nx2Spikes::Cause::Texture,
                                                            0, guest_size_bytes};
     const SlowTextureLog slow_log{"unswizzle", unswizzle_span.Token().Valid(), info,
-                                  guest_size_bytes};
+                                  guest_size_bytes, gpu_addr};
     const u32 bpp_log2 = BytesPerBlockLog2(info.format);
     const Extent2D tile_size = DefaultBlockSize(info.format);
     const Extent3D size = info.size;

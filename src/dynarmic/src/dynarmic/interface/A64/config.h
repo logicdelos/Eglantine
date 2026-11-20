@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 
 #include "dynarmic/interface/optimization_flags.h"
 
@@ -94,6 +95,20 @@ struct UserCallbacks {
     // Memory must be interpreted as little endian.
     virtual std::optional<std::uint32_t> MemoryReadCode(VAddr vaddr) {
         return std::uint32_t(MemoryRead(vaddr, sizeof(std::uint32_t)));
+    }
+
+    // Snapshot an aligned instruction span for speculative translation. Return false if any word
+    // is unreadable. Hosts with a demand-side fetch cache can read the current mapping directly.
+    virtual bool MemoryReadCodeForPrecompile(VAddr vaddr, std::span<std::uint32_t> words) {
+        for (auto& word : words) {
+            const auto fetched = MemoryReadCode(vaddr);
+            if (!fetched) {
+                return false;
+            }
+            word = *fetched;
+            vaddr += sizeof(word);
+        }
+        return true;
     }
 
     // Reads through these callbacks may not be aligned.

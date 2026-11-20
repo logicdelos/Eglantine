@@ -30,6 +30,7 @@
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/loader/loader.h"
+#include "dynarmic/frontend/A64/a64_location_descriptor.h"
 #include "dynarmic/interface/A64/config.h"
 #include "dynarmic/interface/jit_stats.h"
 #include "video_core/nx2_spikes.h"
@@ -83,6 +84,13 @@ std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
         cached_code_generation = generation;
     }
     return cached_code_page.inst[(vaddr & Core::Memory::YUZU_PAGEMASK) / sizeof(u32)];
+}
+
+bool DynarmicCallbacks64::MemoryReadCodeForPrecompile(u64 vaddr, std::span<u32> words) {
+    // A previous hint's cached page may predate this mapping. Read only this hint's words and
+    // check the copy itself: an unmapped ReadBlock zero-fills and reports failure.
+    return m_memory.IsValidVirtualAddressRange(vaddr, words.size_bytes()) &&
+           m_memory.ReadBlock(vaddr, words.data(), words.size_bytes());
 }
 
 void DynarmicCallbacks64::MemoryWrite(Dynarmic::A64::VAddr vaddr, u64 value, std::size_t size) {
@@ -505,26 +513,47 @@ void SyncJitPhaseHook() {
     }
 }
 
+JitPrewarm::CodeImage InitialImage(const Kernel::KProcess& process) {
+    return {GetInteger(process.GetEntryPoint()), process.GetInitialCodeSize()};
+}
+
+bool IsMappedInitialCode(const DynarmicCallbacks64& cb, u64 location, u32 word_count) {
+    const u64 pc = location & Dynarmic::A64::LocationDescriptor::pc_mask;
+    const u64 bytes = u64{word_count} * sizeof(u32);
+    return cb.m_process->ContainsInitialCode(pc, bytes) &&
+           cb.m_memory.IsValidVirtualAddressRange(pc, bytes);
+}
+
 } // namespace
 
-void ArmDynarmic64::OnBlockCompiled(void* user, u64 location, u64 guest_hash) {
-    static_cast<JitPrewarm::CoreState*>(user)->Record(location, guest_hash);
+void ArmDynarmic64::OnBlockCompiled(void* user, u64 location, u64 guest_hash, u32 word_count) {
+    const auto& self = *static_cast<ArmDynarmic64*>(user);
+    auto& state = self.m_prewarm->State();
+    if (!state.CanRecord()) {
+        return;
+    }
+    const auto relative = InitialImage(*self.m_cb->m_process).ToRelative(location, word_count);
+    if (relative && IsMappedInitialCode(*self.m_cb, location, word_count)) {
+        state.Record(*relative, guest_hash, word_count);
+    }
 }
 
 PrewarmState ArmDynarmic64::PrewarmIdle(const std::atomic<bool>& stop) {
     if (!m_prewarm) {
         return PrewarmState::Finished;
     }
-    // The page of guest code the callbacks keep serves the translations of the guest: none of ours
-    // may read from it, and none of theirs may find a page of ours in it.
-    m_cb->last_code_addr = u64(-1);
     const auto now_ms = [] {
         return static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(
                                     std::chrono::steady_clock::now().time_since_epoch())
                                     .count());
     };
     const auto translate = [this](const JitPrewarm::Entry& entry) -> JitPrewarm::Outcome {
-        switch (m_jit->PrecompileBlock(entry.location, entry.guest_hash)) {
+        const auto location =
+            InitialImage(*m_cb->m_process).ToAbsolute(entry.location, entry.word_count);
+        if (!location || !IsMappedInitialCode(*m_cb, *location, entry.word_count)) {
+            return JitPrewarm::Outcome::Mismatch;
+        }
+        switch (m_jit->PrecompileBlock(*location, entry.guest_hash, entry.word_count)) {
         case Dynarmic::A64::PrecompileResult::Compiled:
             return JitPrewarm::Outcome::Compiled;
         case Dynarmic::A64::PrecompileResult::AlreadyCompiled:
@@ -600,7 +629,7 @@ ArmDynarmic64::ArmDynarmic64(System& system, bool uses_wall_clock, Kernel::KProc
     if (process->IsApplication()) {
         m_prewarm = JitPrewarm::Attach(process->GetProgramId(), process, core_index);
         if (m_prewarm) {
-            m_jit->SetBlockCompiledCallback(&OnBlockCompiled, &m_prewarm->State());
+            m_jit->SetBlockCompiledCallback(&OnBlockCompiled, this);
         }
     }
 #endif

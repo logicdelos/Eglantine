@@ -20,6 +20,12 @@ How to let the command-line build run a game by itself, get a machine-readable r
 - The report destination is checked before anything is launched: the file must not exist, and its folder must be there. Both are 64. A temporary file `<name>.<pid>.tmp` is created next to the destination before the launch, so a destination that cannot be written is refused now rather than after a long run; that is 74. A second temporary file, `<name>.<pid>.crash.tmp`, is kept empty for a crash report and is removed when the run ends normally.
 - The report is written to the temporary name, then renamed to the destination in one step. It is never written over an existing file, and nothing is written while the run is going.
 
+### Reading JIT prewarm outcomes
+
+On x86-64 with prewarm enabled, look for `JIT prewarm outcomes:` in the `Core_ARM` info log at orderly shutdown. Each core reports how its `loaded` hints ended: newly `compiled`, `already_present`, `rejected_mismatch` after the last retry, `no_space` or `unsupported` for the single hint that stopped the sweep, and `pending` for the rest. These six counts sum to `loaded`. The separate `mismatch_attempts` includes retries; do not add it to that total. `list=not_published` means the helper had not handed that core a list when the CPU stopped.
+
+The counts describe precompilation, not blocks demanded or executed by the guest. If a crash or forced exit bypasses teardown, a missing line is not a zero.
+
 ## Exit codes
 
 | Code | Reason | Meaning |
