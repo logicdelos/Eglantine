@@ -1262,7 +1262,8 @@ def verify_effect_ledgers(
             ordinal = row["ordinal"]
             kind = row["kind"]
             if fid not in indexed:
-                raise InvalidInputError(f"{where}: frame_id {fid} is not in frames.jsonl")
+                raise InvalidInputError(
+                    f"{where}: frame_id {fid} is outside the declared window {window}")
             pair = (fid, ordinal)
             triple = (fid, ordinal, kind)
             if pair in seen_pairs:
@@ -1286,12 +1287,16 @@ def verify_effect_ledgers(
 
     expected, expected_problems = index(expected_path, expected_rows)
     observed, observed_problems = index(observed_path, observed_rows)
-    all_ids = set(frames)
+    all_ids = set(window)
     for name, path, indexed, problems in (
         ("expected", expected_path, expected, expected_problems),
         ("observed", observed_path, observed, observed_problems),
     ):
-        missing_frames = [fid for fid in sorted(all_ids) if not indexed[fid]]
+        missing_frames = [
+            fid for fid in sorted(all_ids)
+            if not indexed[fid] and (preroll.get(fid) or
+                                     (fid in frames and frames[fid]["effect_count"]))
+        ]
         for fid in missing_frames:
             message = f"{path.name}: frame {fid}: no {name} effect rows"
             frame_failures[fid].append(message)
@@ -1300,10 +1305,10 @@ def verify_effect_ledgers(
             failures.append(problem)
 
     equivalence_reasons: list[str] = []
-    for fid in sorted(frames):
+    for fid in window:
         expected_seq = expected[fid]
         observed_seq = observed[fid]
-        declared = frames[fid]["effect_count"]
+        declared = frames[fid]["effect_count"] if fid in frames else preroll.get(fid)
         if declared is not None:
             if declared != len(expected_seq):
                 message = (
@@ -1362,7 +1367,7 @@ def verify_effect_ledgers(
                 )
 
     for fid, problems in frame_failures.items():
-        if problems:
+        if problems and fid in frames:
             frames[fid]["passed"] = False
 
     equivalent = (
