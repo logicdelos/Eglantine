@@ -49,6 +49,27 @@
     "unmatched_returns": 0
   },
   "final": true,
+  "frame_id_basis": "closing_accepted_present",
+  "frame_rows": [
+    [
+      1,
+      [
+        [
+          7,
+          5
+        ]
+      ]
+    ],
+    [
+      2,
+      [
+        [
+          7,
+          5
+        ]
+      ]
+    ]
+  ],
   "frames": {
     "closed": 2,
     "presents": 3,
@@ -108,7 +129,7 @@
     "failed": false
   },
   "run_complete": true,
-  "schema": 2,
+  "schema": 3,
   "stop": {
     "clean": true,
     "reason": "frame_limit"

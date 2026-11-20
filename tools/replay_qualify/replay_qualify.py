@@ -11,10 +11,13 @@ portably on Windows and Linux without any game binary, save, key, firmware, or G
 Commands:
     python tools/replay_qualify/replay_qualify.py --write-fixture <dir>
     python tools/replay_qualify/replay_qualify.py --verify <dir> \\
-        [--expected-effects <expected_effects.jsonl>] [--require-equivalent]
-    python tools/replay_qualify/replay_qualify.py --verify-replay <game-free-witness-dir>
+        [--expected-effects <expected_effects.jsonl>] [--require-equivalent] \\
+        [--capture <finalized.egcap> [--run-report <replay report.json>]]
+    python tools/replay_qualify/replay_qualify.py --verify-replay <game-free-witness-dir> \\
+        --capture <finalized.egcap> [--run-report <replay report.json>]
     python tools/replay_qualify/replay_qualify.py --compare-runs <dir-a> <dir-b> \\
-        [--witness-only] [--expected-effects <expected_effects.jsonl>] [--require-equivalent]
+        [--witness-only] [--expected-effects <expected_effects.jsonl>] [--require-equivalent] \\
+        [--capture <finalized.egcap>]
     python tools/replay_qualify/replay_qualify.py --verify-images <replay-images-dir>
     python tools/replay_qualify/replay_qualify.py --reconcile-census <census.json>
     python tools/replay_qualify/replay_qualify.py --selftest
@@ -69,6 +72,25 @@ IMAGE_LIMITS = {
 FIXTURE_SCHEMA = 3
 FRAME_SCHEMA = 2
 EFFECT_SCHEMA = 1
+TITLE_CENSUS_SCHEMA = 3
+TITLE_CENSUS_FRAME_ID_BASIS = "closing_accepted_present"
+CAPTURE_MAGIC = b"EGLCAP\x00\x00"
+CAPTURE_FORMAT_MAJOR = 2
+CAPTURE_HEADER_BYTES = 256
+CAPTURE_CHUNK_HEADER_BYTES = 64
+CAPTURE_INDEX_ENTRY_BYTES = 32
+CAPTURE_FRAME_ENTRY_BYTES = 40
+CAPTURE_MAX_BYTES = 16 << 30
+CAPTURE_HEADER_COMPLETE = 1 << 0
+CAPTURE_CHUNK_FRAME_END = 12
+CAPTURE_CHUNK_INDEX = 13
+CAPTURE_CHUNK_COMPLETE = 14
+CAPTURE_KEEP_PAYLOAD = frozenset({CAPTURE_CHUNK_FRAME_END, CAPTURE_CHUNK_INDEX,
+                                  CAPTURE_CHUNK_COMPLETE})
+CAPTURE_FRAME_PREROLL = 1 << 1
+CAPTURE_KNOWN_FRAME_FLAGS = 0x7
+FNV_OFFSET = 0xCBF29CE484222325
+FNV_PRIME = 0x100000001B3
 OPAQUE_CLASSIFICATIONS = frozenset({"unsupported", "unobservable"})
 LOSS_COUNTERS = (
     "role_conflicts", "probe_table_full", "target_table_full", "pending_overflow",
@@ -403,7 +425,7 @@ def write_synthetic_fixture(out_dir: Path, width: int = 32, height: int = 32) ->
                     "identical": True,
                     "semantic_mismatches": 0,
                     "replay_ns": 0,
-                    "call_count": 12 + frame_id,
+                    "call_count": 5,
                     "effect_count": len(effects),
                 },
                 sort_keys=True,
@@ -434,7 +456,7 @@ def write_synthetic_fixture(out_dir: Path, width: int = 32, height: int = 32) ->
     outputs["manifest.json"] = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()
 
     census = {
-        "schema": 2,
+        "schema": TITLE_CENSUS_SCHEMA,
         "kind": "nvn_call_census",
         "final": True,
         "run_complete": True,
@@ -465,6 +487,8 @@ def write_synthetic_fixture(out_dir: Path, width: int = 32, height: int = 32) ->
             "streams": [{"path": "nx2_vi2", "stream": "0x1", "token": "0x1", "tokens": 1,
                          "ambiguous": False, "presents": 3}],
         },
+        "frame_rows": [[frame_id, [[7, 5]]] for frame_id in frame_ids],
+        "frame_id_basis": TITLE_CENSUS_FRAME_ID_BASIS,
     }
     outputs["census.json"] = (json.dumps(census, indent=2, sort_keys=True) + "\n").encode()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -478,6 +502,100 @@ def write_synthetic_fixture(out_dir: Path, width: int = 32, height: int = 32) ->
         with (out_dir / name).open("xb") as out:
             out.write(data)
     return out_dir
+
+
+def _capture_chunk(ctype: int, seq: int, frame_id: int, payload: bytes,
+                   flags: int = 0) -> bytes:
+    checksum = fnv1a64(payload)
+    header = struct.pack(
+        "<IHHQQQQQQQ", ctype, 1, flags, seq, frame_id, len(payload), len(payload), checksum, 0, 0)
+    header = header[:56] + struct.pack("<Q", fnv1a64(header[:56]))
+    return header + payload
+
+
+def _capture_header(*, index_offset: int, chunk_count: int, file_length: int,
+                    first_frame: int, requested: int, finalized: int,
+                    preroll: int) -> bytes:
+    header = bytearray(CAPTURE_HEADER_BYTES)
+    header[:8] = CAPTURE_MAGIC
+    struct.pack_into("<HHIQ", header, 8, CAPTURE_FORMAT_MAJOR, 0, CAPTURE_HEADER_BYTES, 1)
+    struct.pack_into("<II", header, 32, CAPTURE_HEADER_COMPLETE, 1)
+    struct.pack_into("<QQQ", header, 40, index_offset, chunk_count, file_length)
+    struct.pack_into("<QIII", header, 64, first_frame, requested, finalized, preroll)
+    struct.pack_into("<Q", header, 240, fnv1a64(bytes(header[:240])))
+    return bytes(header)
+
+
+def write_test_capture(path: Path, *, first_frame: int, preroll: int,
+                       selected_ids: list[int], effect_counts: dict[int, int],
+                       call_counts: dict[int, int] | None = None,
+                       omit_last_frame: bool = False) -> dict:
+    """Emit a minimal valid EGLCAP flow so verifier controls run without a GPU."""
+    call_counts = call_counts or {}
+    stored_ids = list(range(first_frame - preroll, first_frame + len(selected_ids)))
+    emitted = stored_ids[:-1] if omit_last_frame else stored_ids
+    body: list[bytes] = []
+    frame_records = []
+    sequence = 0
+    body.append(_capture_chunk(1, sequence, 0, b""))
+    sequence += 1
+    for fid in emitted:
+        flags = CAPTURE_FRAME_PREROLL if fid < first_frame else 0
+        payload = struct.pack("<QIIQQQQQI", fid, flags, 0, 0, sequence, sequence, 0,
+                              call_counts.get(fid, 0), effect_counts[fid])
+        body.append(_capture_chunk(CAPTURE_CHUNK_FRAME_END, sequence, fid, payload))
+        frame_records.append(struct.pack("<QQQIIQ", fid, sequence, sequence, flags, 0, 0))
+        sequence += 1
+
+    offsets = []
+    offset = CAPTURE_HEADER_BYTES
+    for chunk in body:
+        offsets.append(offset)
+        offset += len(chunk)
+    index_payload = bytearray(struct.pack("<QQ", len(body), len(frame_records)))
+    for chunk, chunk_offset in zip(body, offsets):
+        ctype, _version, cflags = struct.unpack_from("<IHH", chunk, 0)
+        seq, frame_id, stored = struct.unpack_from("<QQQ", chunk, 8)
+        index_payload += struct.pack("<IHHQQQ", ctype, 1, cflags, chunk_offset, frame_id, stored)
+    index_payload += b"".join(frame_records)
+    index_offset = offset
+    body.append(_capture_chunk(CAPTURE_CHUNK_INDEX, sequence, 0, bytes(index_payload)))
+    sequence += 1
+    chain = FNV_OFFSET
+    for chunk in body[:-1]:
+        checksum = struct.unpack_from("<Q", chunk, 56)[0]
+        for shift in range(0, 64, 8):
+            chain = ((chain ^ ((checksum >> shift) & 0xFF)) * FNV_PRIME) & 0xFFFFFFFFFFFFFFFF
+    complete_payload = struct.pack(
+        "<IIQQQQQQQQQIIIIII", 1, 0, chain, len(frame_records), len(body) + 1,
+        CAPTURE_HEADER_BYTES + sum(len(chunk) for chunk in body) + 64 + 136,
+        0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0)
+    complete_payload += bytes(32)
+    body.append(_capture_chunk(CAPTURE_CHUNK_COMPLETE, sequence, 0, complete_payload))
+    total_size = CAPTURE_HEADER_BYTES + sum(len(chunk) for chunk in body)
+    header = _capture_header(
+        index_offset=index_offset, chunk_count=len(body), file_length=total_size,
+        first_frame=first_frame, requested=len(selected_ids), finalized=len(selected_ids),
+        preroll=preroll)
+    path.write_bytes(header + b"".join(body))
+    return read_capture(path)
+
+
+def write_test_report(path: Path, capture: dict, *, frames_replayed: int | None = None,
+                      guest_calls: int = 0, chain_digest: str | None = None) -> None:
+    replay = {
+        "status": "complete",
+        "run_complete": True,
+        "frames_expected": capture["finalized"],
+        "frames_replayed": capture["finalized"] if frames_replayed is None else frames_replayed,
+        "pictures_written": capture["finalized"],
+        "preroll_frames_executed": capture["preroll_frames"],
+        "replay_guest_call_count": guest_calls,
+        "capture_chain_digest": chain_digest or f"{capture['chain_digest']:016x}",
+        "error": "",
+    }
+    path.write_text(json.dumps({"replay": replay}, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8")
 
 
 def compare_image_pair(
@@ -557,8 +675,10 @@ def evaluate_census_completeness(census: dict[str, Any]) -> dict[str, Any]:
     """Re-derive all 11 completeness conditions matching nvn_census_verdict.h."""
     if not isinstance(census, dict):
         raise InvalidInputError("census JSON must be an object")
-    if census.get("schema") != 2 or census.get("kind") != "nvn_call_census":
-        raise InvalidInputError("expected schema=2 nvn_call_census document")
+    if census.get("schema") != TITLE_CENSUS_SCHEMA or census.get("kind") != "nvn_call_census":
+        raise InvalidInputError(
+            f"expected schema={TITLE_CENSUS_SCHEMA} nvn_call_census document"
+        )
 
     def section(key: str) -> dict:
         return field(census, key, dict, "census")
@@ -598,8 +718,6 @@ def evaluate_census_completeness(census: dict[str, Any]) -> dict[str, Any]:
         and parts == executed == number(acct, "executed_total")
         and not number(acct, "mismatched_functions")
     )
-    threads = field(census, "guest_threads", list, "census")
-    tolerance = len(threads)
     # Early schema-2 writers omitted mismatched_calls (the per-function figures are sufficient).
     reported_shortfall = number(audit, "mismatched_calls") if "mismatched_calls" in audit else shortfall
     enabled = field(audit, "enabled", bool, "census.audit")
@@ -634,8 +752,10 @@ def evaluate_census_completeness(census: dict[str, Any]) -> dict[str, Any]:
          f"unknown_calls={audit.get('unknown_calls')} unaudited={errors['unaudited_entries']}"),
         ("audit_matches_counts", enabled and field(audit, "region_known", bool, "audit")
          and audited == number(audit, "known_entries") and audited > 0
-         and shortfall == reported_shortfall and shortfall <= tolerance,
-         f"audited={audited} shortfall={shortfall} tolerance={tolerance}"),
+         and shortfall == 0 and audited <= executed
+         and shortfall == reported_shortfall,
+         f"audited={audited} executed={executed} shortfall={shortfall} "
+         f"reported={reported_shortfall}"),
         ("frame_accounting_exact", accounting_exact and not number(acct, "late_calls")
          and not number(errors, "late_calls"), f"parts={parts} executed={executed}"),
         ("one_present_stream", identity_ok, f"paths={used} streams={len(streams)}"),
@@ -714,6 +834,273 @@ def read_ledger(path: Path) -> list[tuple[str, dict]]:
         optional(row, "reason", str, where)
         rows.append((where, row))
     return rows
+
+
+def fnv1a64(data: bytes) -> int:
+    digest = FNV_OFFSET
+    for byte in data:
+        digest = ((digest ^ byte) * FNV_PRIME) & 0xFFFFFFFFFFFFFFFF
+    return digest
+
+
+def read_capture(path: Path) -> dict:
+    """Validate a finalized EGLCAP v2 stream and return its trusted frame window.
+
+    The verifier never trusts an adapter-side frames.jsonl window or a manifest count on its
+    own: the selected and pre-roll frame ids and each frame's live call/effect counts come from
+    this stream.
+    """
+    where = str(path)
+    if path.name.endswith(".partial") or path.suffix != ".egcap":
+        raise InvalidInputError(f"{where}: not a finalized .egcap capture")
+
+    def fail(message: str) -> None:
+        raise InvalidInputError(f"{where}: {message}")
+
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise InvalidInputError(f"{where}: {exc}") from exc
+    if size < CAPTURE_HEADER_BYTES + CAPTURE_CHUNK_HEADER_BYTES:
+        fail("shorter than one header and one chunk")
+    if size > CAPTURE_MAX_BYTES:
+        fail(f"file length {size} exceeds the 16 GiB capture limit")
+
+    with path.open("rb") as stream:
+        def read_at(offset: int, length: int) -> bytes:
+            stream.seek(offset)
+            data = stream.read(length)
+            if len(data) != length:
+                fail(f"truncated at offset {offset} (wanted {length} bytes)")
+            return data
+
+        header = read_at(0, CAPTURE_HEADER_BYTES)
+        if header[:8] != CAPTURE_MAGIC:
+            fail("bad magic")
+        major, _minor, header_length = struct.unpack_from("<HHI", header, 8)
+        if major != CAPTURE_FORMAT_MAJOR:
+            fail(f"format major {major} is not {CAPTURE_FORMAT_MAJOR}")
+        if header_length != CAPTURE_HEADER_BYTES:
+            fail(f"header length {header_length}")
+        required_features = struct.unpack_from("<Q", header, 16)[0]
+        if required_features & ~0x1:
+            fail(f"unsupported required feature bits 0x{required_features & ~0x1:x}")
+        flags, checksum_algorithm = struct.unpack_from("<II", header, 32)
+        if checksum_algorithm != 1:
+            fail(f"checksum algorithm {checksum_algorithm}")
+        if flags & ~0x1F:
+            fail(f"undefined header flag bits 0x{flags & ~0x1F:x}")
+        if not flags & CAPTURE_HEADER_COMPLETE:
+            fail("capture is not complete")
+        index_offset, chunk_count, file_length = struct.unpack_from("<QQQ", header, 40)
+        first_frame, requested, finalized, preroll = struct.unpack_from("<QIII", header, 64)
+        if struct.unpack_from("<I", header, 84)[0]:
+            fail("header reserved field is nonzero")
+        if fnv1a64(header[:240]) != struct.unpack_from("<Q", header, 240)[0]:
+            fail("header checksum mismatch")
+        if struct.unpack_from("<Q", header, 248)[0]:
+            fail("trailing reserved header field is nonzero")
+        if file_length != size:
+            fail(f"header file length {file_length} != on-disk {size}")
+        if first_frame < 1:
+            fail(f"first_frame {first_frame}")
+        if not 1 <= requested <= 120:
+            fail(f"requested_frames {requested}")
+        if finalized > requested:
+            fail(f"finalized_frames {finalized} > requested {requested}")
+        if preroll > 2048 or preroll + finalized > 2048:
+            fail(f"pre-roll {preroll} + selected {finalized} exceeds the frame bound")
+        if first_frame - preroll < 1:
+            fail(f"pre-roll starts below frame 1 ({first_frame} - {preroll})")
+        if not CAPTURE_HEADER_BYTES <= index_offset < file_length:
+            fail(f"index_offset {index_offset}")
+        if not 2 <= chunk_count <= 1 << 20:
+            fail(f"chunk_count {chunk_count}")
+
+        chunks: list[dict] = []
+        frame_ends: list[dict] = []
+        frame_ranges: dict[int, list[int]] = {}
+        digest = FNV_OFFSET
+        offset = CAPTURE_HEADER_BYTES
+        sequence = 0
+        previous_frame = 0
+        while offset < index_offset:
+            head = read_at(offset, CAPTURE_CHUNK_HEADER_BYTES)
+            ctype, version, cflags = struct.unpack_from("<IHH", head, 0)
+            seq, frame_id, stored, uncompressed, payload_sum = struct.unpack_from(
+                "<QQQQQ", head, 8)
+            reserved, header_sum = struct.unpack_from("<QQ", head, 48)
+            if header_sum != fnv1a64(head[:56]):
+                fail(f"chunk at {offset}: header checksum mismatch")
+            if cflags & ~0x3:
+                fail(f"chunk at {offset}: undefined flag bits")
+            if cflags & 0x2:
+                fail(f"chunk at {offset}: compressed payloads are not supported")
+            if reserved:
+                fail(f"chunk at {offset}: reserved field is nonzero")
+            if version != 1:
+                fail(f"chunk at {offset}: payload version {version} is not 1")
+            if seq != sequence:
+                fail(f"chunk at {offset}: sequence {seq} != {sequence}")
+            if frame_id < previous_frame:
+                fail(f"chunk at {offset}: frame id {frame_id} after {previous_frame}")
+            if stored > 64 << 20:
+                fail(f"chunk at {offset}: stored length {stored} exceeds the chunk limit")
+            if uncompressed != stored:
+                fail(f"chunk at {offset}: compressed length {uncompressed} != {stored}")
+            end = offset + CAPTURE_CHUNK_HEADER_BYTES + stored
+            if end > index_offset:
+                fail(f"chunk at {offset}: payload runs into the INDEX chunk")
+            if ctype in CAPTURE_KEEP_PAYLOAD:
+                payload = read_at(offset + CAPTURE_CHUNK_HEADER_BYTES, stored)
+                if fnv1a64(payload) != payload_sum:
+                    fail(f"chunk at {offset}: payload checksum mismatch")
+                if ctype == CAPTURE_CHUNK_FRAME_END:
+                    if stored < 60:
+                        fail(f"FRAME_END at {offset}: payload {stored} bytes")
+                    (end_frame, end_flags, output_count, gpu_words, first_seq, last_seq,
+                     output_id, call_count, effect_count) = struct.unpack_from(
+                        "<QIIQQQQQI", payload, 0)
+                    if end_frame != frame_id:
+                        fail(f"FRAME_END at {offset}: names frame {end_frame} in a chunk of "
+                             f"{frame_id}")
+                    if end_flags & ~CAPTURE_KNOWN_FRAME_FLAGS:
+                        fail(f"FRAME_END {frame_id}: undefined flags 0x{end_flags:x}")
+                    if bool(end_flags & CAPTURE_FRAME_PREROLL) != (frame_id < first_frame):
+                        fail(f"FRAME_END {frame_id}: pre-roll flag disagrees with the window")
+                    if last_seq < first_seq or last_seq > seq:
+                        fail(f"FRAME_END {frame_id}: bad sequence range {first_seq}..{last_seq}")
+                    if not first_frame - preroll <= frame_id < first_frame + finalized:
+                        fail(f"FRAME_END {frame_id}: outside the declared window")
+                    if frame_ends and frame_id != frame_ends[-1]["frame_id"] + 1:
+                        fail(f"FRAME_END {frame_id}: frames are not gapless")
+                    frame_ends.append({"frame_id": frame_id, "flags": end_flags,
+                                       "first_seq": first_seq, "last_seq": last_seq,
+                                       "output_id": output_id, "call_count": call_count,
+                                       "effect_count": effect_count})
+            chunks.append({"type": ctype, "version": version, "flags": cflags,
+                           "offset": offset, "stored": stored, "frame_id": frame_id})
+            if frame_id:
+                previous_frame = frame_id
+                if frame_id not in frame_ranges:
+                    frame_ranges[frame_id] = [seq, seq]
+                frame_ranges[frame_id][1] = seq
+            for shift in range(0, 64, 8):
+                digest = ((digest ^ ((header_sum >> shift) & 0xFF)) * FNV_PRIME) & \
+                    0xFFFFFFFFFFFFFFFF
+            offset = end
+            sequence += 1
+
+        if offset != index_offset:
+            fail(f"chunk walk ended at {offset}, not the INDEX offset {index_offset}")
+
+        index_head = read_at(index_offset, CAPTURE_CHUNK_HEADER_BYTES)
+        ctype, version, cflags = struct.unpack_from("<IHH", index_head, 0)
+        seq, frame_id, stored, uncompressed, payload_sum = struct.unpack_from(
+            "<QQQQQ", index_head, 8)
+        reserved, header_sum = struct.unpack_from("<QQ", index_head, 48)
+        if ctype != CAPTURE_CHUNK_INDEX or frame_id != 0 or version != 1 or cflags != 0:
+            fail("INDEX chunk header is wrong")
+        if reserved or header_sum != fnv1a64(index_head[:56]):
+            fail("INDEX chunk header checksum/reserved field is wrong")
+        if seq != sequence:
+            fail(f"INDEX sequence {seq} != {sequence}")
+        if uncompressed != stored or stored > 64 << 20:
+            fail("INDEX length fields are wrong")
+        index_payload = read_at(index_offset + CAPTURE_CHUNK_HEADER_BYTES, stored)
+        if fnv1a64(index_payload) != payload_sum:
+            fail("INDEX payload checksum mismatch")
+        if len(index_payload) < 16:
+            fail("INDEX payload is truncated")
+        entry_count, frame_count = struct.unpack_from("<QQ", index_payload, 0)
+        if entry_count != len(chunks):
+            fail(f"INDEX lists {entry_count} chunks, stream has {len(chunks)}")
+        if frame_count != preroll + finalized:
+            fail(f"INDEX lists {frame_count} frames, window declares {preroll + finalized}")
+        expected_index_bytes = (16 + entry_count * CAPTURE_INDEX_ENTRY_BYTES +
+                                frame_count * CAPTURE_FRAME_ENTRY_BYTES)
+        if len(index_payload) != expected_index_bytes:
+            fail(f"INDEX payload {len(index_payload)} != {expected_index_bytes}")
+        cursor = 16
+        for chunk in chunks:
+            entry = struct.unpack_from("<IHHQQQ", index_payload, cursor)
+            cursor += CAPTURE_INDEX_ENTRY_BYTES
+            if entry != (chunk["type"], chunk["version"], chunk["flags"], chunk["offset"],
+                         chunk["frame_id"], chunk["stored"]):
+                fail(f"INDEX entry at offset {chunk['offset']} disagrees with the chunk")
+        for (frame_record, packed) in zip(frame_ends, struct.iter_unpack(
+                "<QQQIIQ", index_payload[cursor:])):
+            first_chunk_seq, last_chunk_seq = frame_ranges[frame_record["frame_id"]]
+            if packed[4] != 0 or packed != (
+                    frame_record["frame_id"], first_chunk_seq, last_chunk_seq,
+                    frame_record["flags"], 0, frame_record["output_id"]):
+                fail(f"INDEX frame record for {frame_record['frame_id']} disagrees with the "
+                     "chunk sequence it indexes")
+
+        complete_offset = index_offset + CAPTURE_CHUNK_HEADER_BYTES + stored
+        complete_head = read_at(complete_offset, CAPTURE_CHUNK_HEADER_BYTES)
+        ctype, version, cflags = struct.unpack_from("<IHH", complete_head, 0)
+        seq, frame_id, complete_stored, uncompressed, payload_sum = struct.unpack_from(
+            "<QQQQQ", complete_head, 8)
+        reserved, header_sum = struct.unpack_from("<QQ", complete_head, 48)
+        if ctype != CAPTURE_CHUNK_COMPLETE or frame_id != 0 or version != 1 or cflags != 0:
+            fail("COMPLETE chunk header is wrong")
+        if reserved or header_sum != fnv1a64(complete_head[:56]):
+            fail("COMPLETE chunk header checksum/reserved field is wrong")
+        if seq != sequence + 1:
+            fail(f"COMPLETE sequence {seq} != {sequence + 1}")
+        if uncompressed != complete_stored or complete_stored < 136:
+            fail("COMPLETE length fields are wrong")
+        if complete_offset + CAPTURE_CHUNK_HEADER_BYTES + complete_stored != size:
+            fail("COMPLETE is not the last chunk in the file")
+        complete_payload = read_at(complete_offset + CAPTURE_CHUNK_HEADER_BYTES,
+                                   complete_stored)
+        if fnv1a64(complete_payload) != payload_sum:
+            fail("COMPLETE payload checksum mismatch")
+        (status, reasons, chain_digest, total_frames, total_chunks, total_bytes, _gpu_words,
+         _library_calls, _initial_bytes, _delta_bytes, _dedup_bytes, dependency_complete,
+         library_ready, unsupported_schemas, unresolved_resources, overflow_events,
+         dropped_events) = struct.unpack_from("<IIQQQQQQQQQIIIIII", complete_payload, 0)
+        if any(complete_payload[104:136]):
+            fail("COMPLETE reserved bytes are nonzero")
+        if status != 1 or reasons:
+            fail(f"COMPLETE status {status} reasons 0x{reasons:x} is not a clean finish")
+        if dependency_complete > 1 or library_ready > 1:
+            fail("COMPLETE boolean fields are out of range")
+        if unsupported_schemas or unresolved_resources or overflow_events or dropped_events:
+            fail("COMPLETE reports unsupported schemas or unresolved resources")
+        if chain_digest != digest:
+            fail("COMPLETE chain digest does not match the chunk headers")
+        if total_frames != preroll + finalized:
+            fail(f"COMPLETE total_frames {total_frames} != {preroll + finalized}")
+        if total_chunks != chunk_count:
+            fail(f"COMPLETE total_chunks {total_chunks} != header {chunk_count}")
+        if total_bytes != size:
+            fail(f"COMPLETE total_bytes {total_bytes} != file length {size}")
+        if len(chunks) + 2 != chunk_count:
+            fail(f"header chunk_count {chunk_count} != {len(chunks) + 2} walked chunks")
+        if len(frame_ends) != preroll + finalized:
+            fail(f"stream has {len(frame_ends)} FRAME_END chunks, window declares "
+                 f"{preroll + finalized}")
+
+    return {
+        "path": path,
+        "requested": requested,
+        "finalized": finalized,
+        "preroll_frames": preroll,
+        "selected_ids": list(range(first_frame, first_frame + finalized)),
+        "preroll_ids": list(range(first_frame - preroll, first_frame)),
+        "frames": {
+            end["frame_id"]: {
+                "call_count": end["call_count"],
+                "effect_count": end["effect_count"],
+                "preroll": bool(end["flags"] & CAPTURE_FRAME_PREROLL),
+            }
+            for end in frame_ends
+        },
+        "chain_digest": digest,
+        "chunks": chunk_count,
+    }
 
 
 def verify_frames(
@@ -836,20 +1223,36 @@ def compare_effect_pair(fid: int, expected: dict, observed: dict) -> list[str]:
 
 
 def verify_effect_ledgers(
-    expected_path: Path, observed_path: Path, frames: dict[int, dict]
+    expected_path: Path,
+    observed_path: Path,
+    frames: dict[int, dict],
+    *,
+    preroll: dict[int, int] | None = None,
+    observed_preroll: Path | None = None,
 ) -> tuple[dict[str, Any], list[str], bool, list[str]]:
-    """Reconcile ordered live/expected against replay/observed effects per frame."""
+    """Reconcile ordered live/expected against replay/observed effects per frame.
+
+    The window is the selected frames plus the pre-roll frames the capture declares. Pre-roll
+    rows are not pictures; their effect counts still come from the stream/sidecar, so an effect
+    cannot be dropped there either.
+    """
+    preroll = preroll or {}
     expected_rows = read_ledger(expected_path)
     observed_rows = read_ledger(observed_path)
+    if observed_preroll is not None:
+        if not observed_preroll.is_file():
+            raise InvalidInputError(f"{observed_preroll}: missing pre-roll observed ledger")
+        observed_rows = read_ledger(observed_preroll) + observed_rows
 
     counts = {cls: {"expected": 0, "observed": 0} for cls in sorted(VALID_CLASSIFICATIONS)}
-    frame_failures: dict[int, list[str]] = {fid: [] for fid in frames}
+    window = sorted(set(frames) | set(preroll))
+    frame_failures: dict[int, list[str]] = {fid: [] for fid in window}
     failures: list[str] = []
 
     def index(
         path: Path, rows: list[tuple[str, dict]]
     ) -> tuple[dict[int, list[tuple[str, dict]]], list[str]]:
-        indexed: dict[int, list[tuple[str, dict]]] = {fid: [] for fid in frames}
+        indexed: dict[int, list[tuple[str, dict]]] = {fid: [] for fid in window}
         seen_pairs: set[tuple[int, int]] = set()
         seen_triples: set[tuple[int, int, str]] = set()
         problems: list[str] = []
@@ -859,7 +1262,8 @@ def verify_effect_ledgers(
             ordinal = row["ordinal"]
             kind = row["kind"]
             if fid not in indexed:
-                raise InvalidInputError(f"{where}: frame_id {fid} is not in frames.jsonl")
+                raise InvalidInputError(
+                    f"{where}: frame_id {fid} is outside the declared window {window}")
             pair = (fid, ordinal)
             triple = (fid, ordinal, kind)
             if pair in seen_pairs:
@@ -883,12 +1287,16 @@ def verify_effect_ledgers(
 
     expected, expected_problems = index(expected_path, expected_rows)
     observed, observed_problems = index(observed_path, observed_rows)
-    all_ids = set(frames)
+    all_ids = set(window)
     for name, path, indexed, problems in (
         ("expected", expected_path, expected, expected_problems),
         ("observed", observed_path, observed, observed_problems),
     ):
-        missing_frames = [fid for fid in sorted(all_ids) if not indexed[fid]]
+        missing_frames = [
+            fid for fid in sorted(all_ids)
+            if not indexed[fid] and (preroll.get(fid) or
+                                     (fid in frames and frames[fid]["effect_count"]))
+        ]
         for fid in missing_frames:
             message = f"{path.name}: frame {fid}: no {name} effect rows"
             frame_failures[fid].append(message)
@@ -897,10 +1305,10 @@ def verify_effect_ledgers(
             failures.append(problem)
 
     equivalence_reasons: list[str] = []
-    for fid in sorted(frames):
+    for fid in window:
         expected_seq = expected[fid]
         observed_seq = observed[fid]
-        declared = frames[fid]["effect_count"]
+        declared = frames[fid]["effect_count"] if fid in frames else preroll.get(fid)
         if declared is not None:
             if declared != len(expected_seq):
                 message = (
@@ -959,7 +1367,7 @@ def verify_effect_ledgers(
                 )
 
     for fid, problems in frame_failures.items():
-        if problems:
+        if problems and fid in frames:
             frames[fid]["passed"] = False
 
     equivalent = (
@@ -977,6 +1385,152 @@ def verify_effect_ledgers(
     return report, failures, equivalent, equivalence_reasons
 
 
+def read_title_census(path: Path) -> dict[int, int]:
+    """Per-frame live call totals from a #5 census report's `frame_rows`."""
+    document = read_json(path)
+    if not isinstance(document, dict):
+        raise InvalidInputError(f"{path}: census must be a JSON object")
+    convention = document.get("frame_id_basis")
+    schema = document.get("schema")
+    if schema != TITLE_CENSUS_SCHEMA or convention != TITLE_CENSUS_FRAME_ID_BASIS:
+        raise InvalidInputError(
+            f"{path}: frame_rows requires schema {TITLE_CENSUS_SCHEMA} and "
+            f"frame_id_basis={TITLE_CENSUS_FRAME_ID_BASIS!r}; "
+            f"got schema={schema!r} frame_id_basis={convention!r}"
+        )
+    rows = document.get("frame_rows")
+    if not isinstance(rows, list) or not rows:
+        raise InvalidInputError(f"{path}: no frame_rows; not a live census report")
+    totals: dict[int, int] = {}
+    for row in rows:
+        if not isinstance(row, list) or len(row) != 2:
+            raise InvalidInputError(f"{path}: frame_rows entry {row!r} is not [frame_id, counts]")
+        frame_id, entries = row
+        if type(frame_id) is not int or frame_id < 0:
+            raise InvalidInputError(
+                f"{path}: frame id {frame_id!r} is not a non-negative integer"
+            )
+        if not isinstance(entries, list):
+            raise InvalidInputError(f"{path}: frame {frame_id} counts are not a list")
+        total = 0
+        for entry in entries:
+            if not (isinstance(entry, list) and len(entry) == 2):
+                raise InvalidInputError(
+                    f"{path}: frame {frame_id} count {entry!r} is not [target, calls]"
+                )
+            target, calls = entry
+            if type(target) is not int or type(calls) is not int or calls < 0:
+                raise InvalidInputError(
+                    f"{path}: frame {frame_id} count {entry!r} is not non-negative integers"
+                )
+            total += calls
+        if frame_id in totals:
+            raise InvalidInputError(f"{path}: duplicate frame id {frame_id} in frame_rows")
+        totals[frame_id] = total
+    return totals
+
+
+def resolve_title_census(fixture_dir: Path, explicit: Path | None) -> Path | None:
+    """The explicit report wins; otherwise an in-directory census with frame_rows."""
+    if explicit is not None:
+        return explicit
+    candidate = fixture_dir / "census.json"
+    if not candidate.is_file():
+        return None
+    try:
+        document = read_json(candidate)
+    except (InvalidInputError, OSError, ValueError):
+        return None
+    if isinstance(document, dict) and isinstance(document.get("frame_rows"), list):
+        return candidate
+    return None
+
+
+def verify_run_report(path: Path, capture: dict) -> tuple[dict[str, Any], list[str]]:
+    """A capture is only qualified together with the replay run that consumed it."""
+    document = read_json(path)
+    if not isinstance(document, dict) or not isinstance(document.get("replay"), dict):
+        raise InvalidInputError(f"{path}: missing replay section")
+    replay = document["replay"]
+    failures: list[str] = []
+    if replay.get("status") != "complete" or replay.get("run_complete") is not True:
+        failures.append(f"{path}: replay did not complete (status={replay.get('status')!r}, "
+                        f"run_complete={replay.get('run_complete')!r}, "
+                        f"error={replay.get('error')!r})")
+    for key, expected in (("frames_expected", capture["finalized"]),
+                          ("frames_replayed", capture["finalized"]),
+                          ("preroll_frames_executed", capture["preroll_frames"])):
+        value = replay.get(key)
+        if type(value) is not int or value != expected:
+            failures.append(f"{path}: replay.{key}={value!r} != capture {expected}")
+    written = replay.get("pictures_written")
+    if type(written) is not int or written < 0 or written > capture["finalized"]:
+        failures.append(f"{path}: replay.pictures_written={written!r} is outside 0.."
+                        f"{capture['finalized']}")
+    guest_calls = replay.get("replay_guest_call_count")
+    if type(guest_calls) is not int or guest_calls != 0:
+        failures.append(f"{path}: replay.replay_guest_call_count={guest_calls!r} is not zero")
+    digest = replay.get("capture_chain_digest")
+    if isinstance(digest, str):
+        try:
+            digest = int(digest, 16)
+        except ValueError:
+            failures.append(f"{path}: capture_chain_digest {digest!r} is not hexadecimal")
+            digest = None
+    if digest != capture["chain_digest"]:
+        failures.append(f"{path}: capture_chain_digest={digest!r} != stream "
+                        f"{capture['chain_digest']:016x}")
+    return {
+        "scope": "replay_report",
+        "path": str(path),
+        "required": True,
+        "frames_replayed": replay.get("frames_replayed"),
+        "preroll_frames_executed": replay.get("preroll_frames_executed"),
+        "pictures_written": written,
+        "guest_call_count": guest_calls,
+        "reconciled": not failures,
+    }, failures
+
+
+def read_preroll_frames(path: Path | None, capture: dict) -> dict[int, int]:
+    """Declared per-frame effect counts for the pre-roll frames replay must execute."""
+    if not capture["preroll_ids"]:
+        if path is not None and path.is_file() and path.stat().st_size:
+            raise InvalidInputError(f"{path}: rows for a capture with no pre-roll frames")
+        return {}
+    if path is None or not path.is_file():
+        raise InvalidInputError(
+            f"pre-roll window {capture['preroll_ids']} declared by the capture but "
+            "preroll_frames.jsonl is missing"
+        )
+    declared: dict[int, int] = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise InvalidInputError(f"{path}: {exc}") from exc
+    for number, line in enumerate(lines, 1):
+        if not line.strip():
+            continue
+        where = f"{path}:{number}"
+        try:
+            row = json.loads(line)
+        except ValueError as exc:
+            raise InvalidInputError(f"{where}: {exc}") from exc
+        if not isinstance(row, dict):
+            raise InvalidInputError(f"{where}: expected a JSON object")
+        fid = field(row, "frame_id", int, where)
+        if fid not in capture["preroll_ids"]:
+            raise InvalidInputError(f"{where}: frame_id {fid} is not a declared pre-roll frame "
+                                    f"{capture['preroll_ids']}")
+        if fid in declared:
+            raise InvalidInputError(f"{where}: duplicate pre-roll frame_id {fid}")
+        declared[fid] = field(row, "effect_count", int, where)
+    missing = [fid for fid in capture["preroll_ids"] if fid not in declared]
+    if missing:
+        raise InvalidInputError(f"{path}: missing pre-roll frame(s) {missing}")
+    return declared
+
+
 def verify_fixture_dir(
     fixture_dir: Path,
     *,
@@ -984,6 +1538,9 @@ def verify_fixture_dir(
     expected_effects: Path | None = None,
     require_equivalent: bool = False,
     witness_only: bool = False,
+    title_census: Path | None = None,
+    capture: Path | None = None,
+    run_report: Path | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Raw replay image evidence alone is not an effect ledger or census certificate."""
     try:
@@ -993,6 +1550,9 @@ def verify_fixture_dir(
             "standalone_replay_witness" if witness_only
             else "standalone_replay_qualification_fixture"
         )
+        capture_info: dict | None = None
+        preroll_counts: dict[int, int] = {}
+        report_info: dict[str, Any] | None = None
         if not images_only:
             manifest = read_json(fixture_dir / "manifest.json")
             if (field(manifest, "schema", int, "manifest.json") != FIXTURE_SCHEMA or
@@ -1015,24 +1575,98 @@ def verify_fixture_dir(
                 )
             if field(manifest, "expected_frames", int, "manifest.json") != len(expected_ids):
                 raise InvalidInputError("manifest.json: expected_frames disagrees with expected_frame_ids")
+            if capture is not None or witness_only or \
+                    manifest.get("kind") == "standalone_replay_witness":
+                if capture is None:
+                    raise InvalidInputError(
+                        f"{fixture_dir}: a replay witness needs --capture <finalized.egcap>; "
+                        "manifest counts and adapter sidecars are not trusted evidence"
+                    )
+                capture_info = read_capture(capture)
+                if capture_info["selected_ids"] != expected_ids:
+                    raise InvalidInputError(
+                        f"{capture}: selected frames {capture_info['selected_ids']} != "
+                        f"manifest expected_frame_ids {expected_ids}"
+                    )
         frames, failures = verify_frames(
             fixture_dir,
             envelope,
             counts_required=not images_only,
             expected_ids=expected_ids,
         )
-        if witness_only:
+        if capture_info is not None:
+            for fid in capture_info["selected_ids"]:
+                declared = capture_info["frames"][fid]
+                if declared["preroll"]:
+                    failures.append(f"{capture}: selected frame {fid} is marked pre-roll")
+                for key in ("call_count", "effect_count"):
+                    if frames[fid][key] != declared[key]:
+                        failures.append(
+                            f"frame {fid}: frames.jsonl {key}={frames[fid][key]} != capture "
+                            f"FRAME_END {key}={declared[key]}"
+                        )
+                        frames[fid]["passed"] = False
+            preroll_counts = read_preroll_frames(fixture_dir / "preroll_frames.jsonl",
+                                                 capture_info)
+            report_path = run_report or (fixture_dir / "report.json")
+            if not report_path.is_file():
+                raise InvalidInputError(
+                    f"{report_path}: missing replay report for {capture}; pass --run-report"
+                )
+            report_info, report_failures = verify_run_report(report_path, capture_info)
+            failures.extend(report_failures)
+            result_capture = {
+                "path": str(capture),
+                "selected_frames": len(capture_info["selected_ids"]),
+                "preroll_frames": capture_info["preroll_frames"],
+                "chunks": capture_info["chunks"],
+                "chain_digest": f"{capture_info['chain_digest']:016x}",
+                "report": report_info,
+            }
+        else:
+            result_capture = {"scope": "not_present", "required": False}
+        title_path = None if images_only else resolve_title_census(fixture_dir, title_census)
+        call_report: dict[str, Any] = {"scope": "not_present", "required": False}
+        if title_path is not None:
+            totals = read_title_census(title_path)
+            call_failures: list[str] = []
             for fid in sorted(frames):
-                if frames[fid]["call_count"] != 0:
-                    message = (
-                        f"frame {fid}: game-free replay declares call_count="
-                        f"{frames[fid]['call_count']}, expected 0"
+                declared = frames[fid]["call_count"]
+                if fid not in totals:
+                    call_failures.append(
+                        f"{title_path}: frame {fid} is missing; replay declares call_count={declared}"
                     )
-                    failures.append(message)
+                elif totals[fid] != declared:
+                    call_failures.append(
+                        f"{title_path}: frame {fid} live calls {totals[fid]} != "
+                        f"replay call_count {declared}"
+                    )
+            failures.extend(call_failures)
+            if call_failures:
+                for fid in frames:
+                    if fid not in totals or totals[fid] != frames[fid]["call_count"]:
+                        frames[fid]["passed"] = False
+            call_report = {
+                "scope": "title_census",
+                "required": True,
+                "path": str(title_path),
+                "frames": len(totals),
+                "reconciled": not call_failures,
+            }
+        elif any(frames[fid]["call_count"] for fid in frames):
+            for fid in sorted(frames):
+                if frames[fid]["call_count"]:
+                    failures.append(
+                        f"frame {fid}: call_count={frames[fid]['call_count']} is unreconciled; "
+                        "pass --title-census <live census.json>"
+                    )
                     frames[fid]["passed"] = False
+            call_report = {"scope": "unreconciled", "required": True}
         result: dict[str, Any] = {
             "scope": "images" if images_only else ("replay_witness" if witness_only else "fixture"),
             "frames": list(frames.values()),
+            "title_census": call_report,
+            "capture": result_capture,
             "failures": failures,
         }
         code = EXIT_FAIL if failures else EXIT_PASS
@@ -1053,7 +1687,10 @@ def verify_fixture_dir(
                     "pass --expected-effects"
                 )
             effects, bad_effects, equivalent, equivalence_reasons = verify_effect_ledgers(
-                Path(expected_path), observed_path, frames
+                Path(expected_path), observed_path, frames,
+                preroll=preroll_counts,
+                observed_preroll=(fixture_dir / "preroll_effects.jsonl"
+                                  if preroll_counts else None),
             )
             failures.extend(bad_effects)
             result["effect_reconciliation"] = effects
@@ -1100,6 +1737,8 @@ def compare_runs(
     expected_effects: Path | None = None,
     require_equivalent: bool = False,
     witness_only: bool = False,
+    title_census: Path | None = None,
+    capture: Path | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Two standalone replays are identical only if every witness and image agrees."""
     code_a, result_a = verify_fixture_dir(
@@ -1107,12 +1746,16 @@ def compare_runs(
         expected_effects=expected_effects,
         require_equivalent=require_equivalent,
         witness_only=witness_only,
+        title_census=title_census,
+        capture=capture,
     )
     code_b, result_b = verify_fixture_dir(
         run_b,
         expected_effects=expected_effects,
         require_equivalent=require_equivalent,
         witness_only=witness_only,
+        title_census=title_census,
+        capture=capture,
     )
     if code_a == EXIT_INVALID or code_b == EXIT_INVALID:
         return EXIT_INVALID, {
@@ -1185,6 +1828,32 @@ def run_selftest() -> int:
 
     def frame_rows(scene: Path) -> list[dict]:
         return [row for _, row in read_records(scene / "frames.jsonl")]
+
+    def attach_capture(scene: Path) -> Path:
+        """Emit the minimal stream + terminal report that a witness run must carry."""
+        rows = frame_rows(scene)
+        ids = [row["frame_id"] for row in rows]
+        path = scene / "capture.egcap"
+        capture = write_test_capture(
+            path, first_frame=ids[0], preroll=0, selected_ids=ids,
+            effect_counts={row["frame_id"]: row["effect_count"] for row in rows},
+            call_counts={row["frame_id"]: row["call_count"] for row in rows},
+        )
+        write_test_report(scene / "report.json", capture)
+        return path
+
+    def make_witness(name: str) -> Path:
+        scene = write_synthetic_fixture(root / name)
+        manifest = read_json(scene / "manifest.json")
+        manifest["kind"] = "standalone_replay_witness"
+        (scene / "manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        rows = frame_rows(scene)
+        for row in rows:
+            row["call_count"] = 0
+        write_rows(scene / "frames.jsonl", rows)
+        (scene / "census.json").unlink()
+        return scene
 
     with tempfile.TemporaryDirectory(prefix="replay_qualify_selftest_") as tmp:
         root = Path(tmp)
@@ -1421,12 +2090,14 @@ def run_selftest() -> int:
             row["call_count"] = 0
         write_rows(witness / "frames.jsonl", rows)
         (witness / "census.json").unlink()
-        code, result = verify_fixture_dir(witness, witness_only=True)
+        capture = attach_capture(witness)
+        code, result = verify_fixture_dir(witness, witness_only=True, capture=capture)
         checks.append(("game_free_witness_pass", EXIT_PASS, code))
         checks.append(("game_free_witness_census_scope", False, result["census"]["required"]))
         rows[0]["call_count"] = 1
         write_rows(witness / "frames.jsonl", rows)
-        code, _ = verify_fixture_dir(witness, witness_only=True)
+        attach_capture(witness)
+        code, _ = verify_fixture_dir(witness, witness_only=True, capture=capture)
         checks.append(("game_free_witness_nonzero_calls_reject", EXIT_FAIL, code))
         code, _ = verify_fixture_dir(witness)
         checks.append(("witness_cannot_use_census_mode", EXIT_INVALID, code))
@@ -1452,7 +2123,9 @@ def run_selftest() -> int:
             row["effect_count"] = 7
         write_rows(equivalent / "frames.jsonl", rows)
         (equivalent / "census.json").unlink()
-        code, _ = verify_fixture_dir(equivalent, witness_only=True, require_equivalent=True)
+        equivalent_capture = attach_capture(equivalent)
+        code, _ = verify_fixture_dir(
+            equivalent, witness_only=True, require_equivalent=True, capture=equivalent_capture)
         checks.append(("game_free_equivalent_pass", EXIT_PASS, code))
 
         opaque_witness = write_synthetic_fixture(root / "case_witness_opaque")
@@ -1466,8 +2139,177 @@ def run_selftest() -> int:
             row["call_count"] = 0
         write_rows(opaque_witness / "frames.jsonl", rows)
         (opaque_witness / "census.json").unlink()
-        code, _ = verify_fixture_dir(opaque_witness, witness_only=True, require_equivalent=True)
+        opaque_capture = attach_capture(opaque_witness)
+        code, _ = verify_fixture_dir(
+            opaque_witness, witness_only=True, require_equivalent=True, capture=opaque_capture)
         checks.append(("game_free_opaque_require_incomplete", EXIT_INCOMPLETE, code))
+
+        # 20c. Nonzero guest calls reconcile against the live census and are never rewritten.
+        counted = write_synthetic_fixture(root / "case_counted_witness")
+        manifest = read_json(counted / "manifest.json")
+        manifest["kind"] = "standalone_replay_witness"
+        (counted / "manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        (counted / "census.json").unlink()
+        counted_capture = attach_capture(counted)
+        code, _ = verify_fixture_dir(counted, witness_only=True, capture=counted_capture)
+        checks.append(("unreconciled_calls_fail", EXIT_FAIL, code))
+
+        title_census = write_synthetic_fixture(root / "case_title_census") / "census.json"
+        code, _ = verify_fixture_dir(
+            counted, witness_only=True, title_census=title_census, capture=counted_capture)
+        checks.append(("title_census_reconciled_pass", EXIT_PASS, code))
+
+        in_dir = root / "case_counted_in_dir"
+        shutil.copytree(counted, in_dir)
+        shutil.copyfile(title_census, in_dir / "census.json")
+        code, _ = verify_fixture_dir(in_dir, witness_only=True, capture=in_dir / "capture.egcap")
+        checks.append(("in_dir_title_census_pass", EXIT_PASS, code))
+
+        undeclared = root / "case_title_census_undeclared.json"
+        census_doc = read_json(title_census)
+        del census_doc["frame_id_basis"]
+        undeclared.write_text(json.dumps(census_doc), encoding="utf-8")
+        code, _ = verify_fixture_dir(
+            counted, witness_only=True, title_census=undeclared, capture=counted_capture)
+        checks.append(("title_census_undeclared_invalid", EXIT_INVALID, code))
+
+        wrong_convention = root / "case_title_census_wrong_basis.json"
+        census_doc["frame_id_basis"] = "frame_index"
+        wrong_convention.write_text(json.dumps(census_doc), encoding="utf-8")
+        code, _ = verify_fixture_dir(
+            counted, witness_only=True, title_census=wrong_convention, capture=counted_capture)
+        checks.append(("title_census_wrong_basis_invalid", EXIT_INVALID, code))
+
+        old_schema = root / "case_title_census_schema2.json"
+        census_doc["frame_id_basis"] = TITLE_CENSUS_FRAME_ID_BASIS
+        census_doc["schema"] = 2
+        old_schema.write_text(json.dumps(census_doc), encoding="utf-8")
+        code, _ = verify_fixture_dir(
+            counted, witness_only=True, title_census=old_schema, capture=counted_capture)
+        checks.append(("title_census_schema2_invalid", EXIT_INVALID, code))
+
+        off_by_one = root / "case_title_census_off_by_one.json"
+        census_doc = read_json(title_census)
+        census_doc["frame_rows"][0][1] = [[7, 4]]
+        off_by_one.write_text(json.dumps(census_doc), encoding="utf-8")
+        code, _ = verify_fixture_dir(
+            counted, witness_only=True, title_census=off_by_one, capture=counted_capture)
+        checks.append(("title_census_off_by_one_fail", EXIT_FAIL, code))
+
+        missing_frame = root / "case_title_census_missing_frame.json"
+        census_doc = read_json(title_census)
+        census_doc["frame_rows"] = census_doc["frame_rows"][:1]
+        missing_frame.write_text(json.dumps(census_doc), encoding="utf-8")
+        code, _ = verify_fixture_dir(
+            counted, witness_only=True, title_census=missing_frame, capture=counted_capture)
+        checks.append(("title_census_missing_frame_fail", EXIT_FAIL, code))
+
+        code, _ = compare_runs(
+            counted, counted, witness_only=True, title_census=title_census,
+            capture=counted_capture)
+        checks.append(("title_census_compare_pass", EXIT_PASS, code))
+        code, _ = compare_runs(counted, counted, witness_only=True, capture=counted_capture)
+        checks.append(("title_census_compare_absent_fail", EXIT_FAIL, code))
+
+        # 20d. Witness qualification is anchored to a finalized capture and its report.
+        uncaptured = make_witness("case_witness_no_capture")
+        code, _ = verify_fixture_dir(uncaptured, witness_only=True)
+        checks.append(("witness_without_capture_invalid", EXIT_INVALID, code))
+
+        windowed = make_witness("case_witness_wrong_window")
+        wrong_window = write_test_capture(
+            root / "case_wrong_window.egcap", first_frame=2, preroll=0, selected_ids=[2],
+            effect_counts={2: 4})
+        write_test_report(root / "case_wrong_window_report.json", wrong_window)
+        code, _ = verify_fixture_dir(
+            windowed, witness_only=True, capture=root / "case_wrong_window.egcap",
+            run_report=root / "case_wrong_window_report.json")
+        checks.append(("capture_window_mismatch_invalid", EXIT_INVALID, code))
+
+        counted_frames = make_witness("case_witness_count_mismatch")
+        good_capture = attach_capture(counted_frames)
+        rows = frame_rows(counted_frames)
+        rows[0]["effect_count"] += 1
+        write_rows(counted_frames / "frames.jsonl", rows)
+        code, _ = verify_fixture_dir(counted_frames, witness_only=True, capture=good_capture)
+        checks.append(("frame_effect_count_mismatch_fail", EXIT_FAIL, code))
+
+        truncated = make_witness("case_witness_truncated")
+        truncated_capture = attach_capture(truncated)
+        truncated_capture.write_bytes(truncated_capture.read_bytes()[:-10])
+        code, _ = verify_fixture_dir(truncated, witness_only=True, capture=truncated_capture)
+        checks.append(("truncated_capture_invalid", EXIT_INVALID, code))
+
+        report_case = make_witness("case_witness_report")
+        report_capture = attach_capture(report_case)
+        (report_case / "report.json").unlink()
+        code, _ = verify_fixture_dir(report_case, witness_only=True, capture=report_capture)
+        checks.append(("missing_run_report_invalid", EXIT_INVALID, code))
+
+        bad_report = write_test_capture(
+            root / "case_report_ok.egcap", first_frame=1, preroll=0, selected_ids=[1, 2],
+            effect_counts={1: 4, 2: 4})
+        write_test_report(root / "case_report_short.json", bad_report, frames_replayed=1)
+        write_test_report(root / "case_report_calls.json", bad_report, guest_calls=1)
+        write_test_report(root / "case_report_digest.json", bad_report, chain_digest="0" * 16)
+        for label, path in (("short", root / "case_report_short.json"),
+                            ("calls", root / "case_report_calls.json"),
+                            ("digest", root / "case_report_digest.json")):
+            code, _ = verify_fixture_dir(
+                report_case, witness_only=True, capture=report_capture, run_report=path)
+            checks.append((f"run_report_{label}_fail", EXIT_FAIL, code))
+
+        # 20e. Preroll frames reconcile through their own declared and observed ledgers.
+        preroll = make_witness("case_witness_preroll")
+        rows = frame_rows(preroll)
+        selected_rows = [row for row in rows if row["frame_id"] == 2]
+        write_rows(preroll / "frames.jsonl", selected_rows)
+        manifest = read_json(preroll / "manifest.json")
+        manifest["expected_frame_ids"] = [2]
+        manifest["expected_frames"] = 1
+        (preroll / "manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        all_effects = ledger(preroll)
+        preroll_effects = [row for row in all_effects if row["frame_id"] == 1]
+        write_rows(preroll / "effects.jsonl", [row for row in all_effects if row["frame_id"] == 2])
+        write_rows(preroll / "preroll_effects.jsonl", preroll_effects)
+        (preroll / "preroll_frames.jsonl").write_text(
+            json.dumps({"frame_id": 1, "effect_count": len(preroll_effects)}, sort_keys=True) + "\n",
+            encoding="utf-8")
+        for name in ("live_00000001.png", "replay_00000001.png"):
+            (preroll / name).unlink()
+        preroll_capture = write_test_capture(
+            preroll / "capture.egcap", first_frame=2, preroll=1, selected_ids=[2],
+            effect_counts={1: len(preroll_effects), 2: selected_rows[0]["effect_count"]})
+        write_test_report(preroll / "report.json", preroll_capture)
+        code, _ = verify_fixture_dir(preroll, witness_only=True, capture=preroll / "capture.egcap")
+        checks.append(("preroll_reconciled_pass", EXIT_PASS, code))
+        kept = ledger(preroll, "preroll_effects.jsonl")
+        write_rows(preroll / "preroll_effects.jsonl", kept[:-1])
+        code, _ = verify_fixture_dir(preroll, witness_only=True, capture=preroll / "capture.egcap")
+        checks.append(("preroll_observed_count_fail", EXIT_FAIL, code))
+        write_rows(preroll / "preroll_effects.jsonl", kept)
+        expected = [row for _, row in read_records(preroll / "expected_effects.jsonl")
+                    if row["frame_id"] != 1]
+        write_rows(preroll / "expected_effects.jsonl", expected)
+        code, _ = verify_fixture_dir(preroll, witness_only=True, capture=preroll / "capture.egcap")
+        checks.append(("preroll_expected_count_fail", EXIT_FAIL, code))
+
+        # 20f. A producer-reported audit mismatch cannot hide a one-entry shortfall.
+        shortfall = write_synthetic_fixture(root / "case_census_shortfall")
+        census_doc = read_json(shortfall / "census.json")
+        census_doc["functions"][0].update(calls=7, startup_calls=2, frame_calls=5)
+        census_doc["functions"][1].update(calls=5, startup_calls=0, frame_calls=5)
+        census_doc["accounting"].update(executed_total=12, closed_frame_calls=10)
+        census_doc["guest_threads"][0]["calls"] = 12
+        census_doc["audit"]["mismatched_calls"] = 1
+        (shortfall / "census.json").write_text(json.dumps(census_doc), encoding="utf-8")
+        code, result = verify_fixture_dir(shortfall)
+        checks.append(("census_audit_shortfall_incomplete", EXIT_INCOMPLETE, code))
+        checks.append(("census_audit_shortfall_named", True,
+                       "audit_matches_counts" in result["census"]["failed"]))
 
         # 21. Independent expected ledger supplied from the capture directory.
         external = write_synthetic_fixture(root / "case_external")
@@ -1536,7 +2378,7 @@ def main(argv: list[str] | None = None) -> int:
     group.add_argument("--verify", type=Path,
                        help="Verify qualification fixture in DIR (images + ledgers + census)")
     group.add_argument("--verify-replay", type=Path,
-                       help="Verify a game-free replay witness in DIR (zero guest calls, no census)")
+                       help="Verify a replay witness in DIR (effects + images; guest calls reconciled)")
     group.add_argument("--compare-runs", type=Path, nargs=2, metavar=("RUN_A", "RUN_B"),
                        help="Verify two replay runs independently, then require identical witnesses")
     group.add_argument("--verify-images", type=Path,
@@ -1545,6 +2387,12 @@ def main(argv: list[str] | None = None) -> int:
     group.add_argument("--selftest", action="store_true", help="Run positive & negative controls")
     parser.add_argument("--expected-effects", type=Path,
                         help="Capture-side expected_effects.jsonl when it is not inside the run directory")
+    parser.add_argument("--title-census", type=Path,
+                        help="Schema-3 live census JSON; every captured frame's call_count must match its frame_rows")
+    parser.add_argument("--capture", type=Path,
+                        help="Finalized .egcap whose INDEX/FRAME_END define the trusted frame window")
+    parser.add_argument("--run-report", type=Path,
+                        help="Replay report.json for --capture when it is not inside the run directory")
     parser.add_argument("--witness-only", action="store_true",
                         help="With --compare-runs, treat both runs as game-free replay witnesses")
     parser.add_argument("--require-equivalent", action="store_true",
@@ -1577,6 +2425,8 @@ def main(argv: list[str] | None = None) -> int:
             expected_effects=args.expected_effects,
             require_equivalent=args.require_equivalent,
             witness_only=args.witness_only,
+            title_census=args.title_census,
+            capture=args.capture,
         )
     elif args.verify_replay is not None:
         code, summary = verify_fixture_dir(
@@ -1584,6 +2434,9 @@ def main(argv: list[str] | None = None) -> int:
             expected_effects=args.expected_effects,
             require_equivalent=args.require_equivalent,
             witness_only=True,
+            title_census=args.title_census,
+            capture=args.capture,
+            run_report=args.run_report,
         )
     else:
         code, summary = verify_fixture_dir(
@@ -1591,6 +2444,9 @@ def main(argv: list[str] | None = None) -> int:
             images_only=args.verify_images is not None,
             expected_effects=args.expected_effects,
             require_equivalent=args.require_equivalent,
+            title_census=args.title_census,
+            capture=args.capture,
+            run_report=args.run_report,
         )
     print(json.dumps(summary, indent=2, sort_keys=True))
     return code
