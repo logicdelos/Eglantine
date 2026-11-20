@@ -44,6 +44,7 @@ extern char** environ;
 #include "common/test_frame_delay.h"
 #include "yuzu_cmd/run_control.h"
 #include "yuzu_cmd/run_report.h"
+#include "video_core/replay/result.h"
 
 // After the others: windows.h defines min and max.
 #ifdef _WIN32
@@ -424,6 +425,7 @@ ReportParts Document(State& state, Common::RunOutcome::Reason reason, int code,
             {"env_error", delay.error.empty() ? Json(nullptr) : Json(delay.error)},
         };
     }
+    VideoCore::Replay::AddReportSections(document);
 
     ReportParts parts;
     // Invalid UTF-8 (a detail quoting a game string) must not cost the whole report.

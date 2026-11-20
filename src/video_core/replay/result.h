@@ -43,7 +43,7 @@ namespace VideoCore::Replay {
 
 inline constexpr u32 ReportSectionVersion = 1;
 inline constexpr u32 CensusSchemaVersion = 2;
-inline constexpr u32 ReplayFrameLineSchema = 1;
+inline constexpr u32 ReplayFrameLineSchema = 2;
 inline constexpr u32 FrameTimingLineSchema = 1;
 
 enum class SectionStatus : u32 { Off = 0, Complete = 1, Incomplete = 2, Failed = 3 };
@@ -122,6 +122,9 @@ struct ReplayFrameRecord {
     u64 replay_checksum = 0;
     u32 semantic_mismatches = 0;
     u64 replay_ns = 0;
+    // The FRAME_END declarations of the captured frame.
+    u64 call_count = 0;
+    u32 effect_count = 0;
 };
 
 // The counters of the call census (plan 5.1). Slice D fills them; the criteria below are pure
@@ -231,9 +234,8 @@ struct TestHookReport {
 [[nodiscard]] std::string LivePictureName(u64 frame_id);
 [[nodiscard]] std::string ReplayPictureName(u64 frame_id);
 
-// Slices B, C and D publish their result once, when their mode ends; thread-safe, last write
-// wins. Slice E's two sections are not published: AddReportSections reads them from
-// Common::FrameTiming::GetSummary() and Common::TestHooks::GetFrameDelaySnapshot().
+// The capture, replay and census modes publish their result once, when their mode ends;
+// thread-safe, last write wins.
 void PublishCaptureReport(const CaptureReport& report);
 void PublishReplayReport(const ReplayReport& report);
 void PublishCensusReport(const CensusReport& report);
@@ -243,11 +245,9 @@ void PublishCensusReport(const CensusReport& report);
 // Forgets every published result (tests only).
 void ClearPublishedReports();
 
-// The one-line hook of the run report (report_sections.cpp): adds "capture", "replay", "census"
-// for every mode that published, "frame_timing" when a timing log was started and "test_hooks"
-// when a frame-delay variable was present, to `document`. Adds nothing for a mode that did not
-// run. Kept out of report_json.cpp so the formatters link without slice E's sources; only code
-// that calls it needs them.
+// The one-line hook of the run report (report_sections.cpp): adds "capture", "replay" and "census"
+// for every mode that published to `document`, and nothing for a mode that did not run. The run
+// report writes "test_hooks" itself (common/test_frame_delay.h).
 void AddReportSections(nlohmann::json& document);
 
 } // namespace VideoCore::Replay

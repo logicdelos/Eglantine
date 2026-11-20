@@ -39,6 +39,10 @@ add_library(video_core STATIC
     replay/memory_capture.cpp
     replay/memory_capture.h
     replay/memory_restore.h
+    replay/options.cpp
+    replay/options.h
+    replay/report_json.cpp
+    replay/report_sections.cpp
     replay/result.h
     replay/run_state.h
     replay/staging_writer.cpp

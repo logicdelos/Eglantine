@@ -105,6 +105,8 @@ add_executable(tests
     video_core/replay_codec.cpp
     video_core/replay_format.cpp
     video_core/replay_memory.cpp
+    video_core/replay_options.cpp
+    video_core/replay_report.cpp
     ../yuzu_cmd/report_schema2.cpp
     video_core/h264_packet.cpp
     video_core/vertex_repack.cpp
