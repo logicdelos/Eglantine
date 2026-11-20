@@ -1,18 +1,18 @@
-{"classification": "supported", "detail": "pushbuffer list queued on channel 1", "fence_id": 100, "frame_id": 1, "kind": "submit", "reconciled": true, "seq": 1, "syncpoint_value": 10}
-{"classification": "supported", "detail": "DmaPusher consumed 128 pushbuffer words", "fence_id": 100, "frame_id": 1, "kind": "consume", "reconciled": true, "seq": 2, "syncpoint_value": 10}
-{"classification": "supported", "detail": "Maxwell3D indexed draw 64 vertices", "fence_id": 100, "frame_id": 1, "kind": "draw", "reconciled": true, "seq": 3, "syncpoint_value": 10}
-{"classification": "fallback", "detail": "native compute dispatch routed via fallback", "fence_id": 100, "frame_id": 1, "kind": "compute_dispatch", "reconciled": true, "seq": 4, "syncpoint_value": 10}
-{"classification": "supported", "detail": "syncpoint incremented to 10", "fence_id": 100, "frame_id": 1, "kind": "syncpoint_increment", "reconciled": true, "seq": 5, "syncpoint_value": 10}
-{"classification": "supported", "detail": "host fence 100 signaled", "fence_id": 100, "frame_id": 1, "kind": "fence_signal", "reconciled": true, "seq": 6, "syncpoint_value": 10}
-{"classification": "unobservable", "detail": "transient scratch unmapped before read", "fence_id": 100, "frame_id": 1, "kind": "readback_visibility", "reconciled": true, "seq": 7, "syncpoint_value": 10}
-{"classification": "unsupported", "detail": "debug marker method retired as no-op", "fence_id": 100, "frame_id": 1, "kind": "draw", "reconciled": true, "seq": 8, "syncpoint_value": 10}
-{"classification": "supported", "detail": "offscreen composite emitted RGBA8 frame", "fence_id": 100, "frame_id": 1, "kind": "present_compose", "reconciled": true, "seq": 9, "syncpoint_value": 10}
-{"classification": "supported", "detail": "pushbuffer list queued on channel 1", "fence_id": 200, "frame_id": 2, "kind": "submit", "reconciled": true, "seq": 1, "syncpoint_value": 20}
-{"classification": "supported", "detail": "DmaPusher consumed 128 pushbuffer words", "fence_id": 200, "frame_id": 2, "kind": "consume", "reconciled": true, "seq": 2, "syncpoint_value": 20}
-{"classification": "supported", "detail": "Maxwell3D indexed draw 64 vertices", "fence_id": 200, "frame_id": 2, "kind": "draw", "reconciled": true, "seq": 3, "syncpoint_value": 20}
-{"classification": "fallback", "detail": "native compute dispatch routed via fallback", "fence_id": 200, "frame_id": 2, "kind": "compute_dispatch", "reconciled": true, "seq": 4, "syncpoint_value": 20}
-{"classification": "supported", "detail": "syncpoint incremented to 20", "fence_id": 200, "frame_id": 2, "kind": "syncpoint_increment", "reconciled": true, "seq": 5, "syncpoint_value": 20}
-{"classification": "supported", "detail": "host fence 200 signaled", "fence_id": 200, "frame_id": 2, "kind": "fence_signal", "reconciled": true, "seq": 6, "syncpoint_value": 20}
-{"classification": "unobservable", "detail": "transient scratch unmapped before read", "fence_id": 200, "frame_id": 2, "kind": "readback_visibility", "reconciled": true, "seq": 7, "syncpoint_value": 20}
-{"classification": "unsupported", "detail": "debug marker method retired as no-op", "fence_id": 200, "frame_id": 2, "kind": "draw", "reconciled": true, "seq": 8, "syncpoint_value": 20}
-{"classification": "supported", "detail": "offscreen composite emitted RGBA8 frame", "fence_id": 200, "frame_id": 2, "kind": "present_compose", "reconciled": true, "seq": 9, "syncpoint_value": 20}
+{"classification": "supported", "frame_id": 1, "kind": "submit", "ordinal": 0, "outcome": "queued on channel 1", "payload": {"channel": 1, "pushbuffer_words": 128}, "schema": 1}
+{"classification": "supported", "frame_id": 1, "kind": "consume", "ordinal": 1, "outcome": "pushbuffer consumed", "payload": {"channel": 1, "consumed_words": 128}, "schema": 1}
+{"classification": "supported", "frame_id": 1, "kind": "draw", "ordinal": 2, "outcome": "draw executed", "payload": {"indexed": true, "primitive": "triangles", "vertices": 64}, "schema": 1}
+{"classification": "fallback", "frame_id": 1, "kind": "compute_dispatch", "ordinal": 3, "outcome": "dispatch executed", "payload": {"groups": [4, 2, 1], "path": "legacy launch register"}, "reason": "native compute routed through the legacy launch register", "schema": 1}
+{"classification": "supported", "frame_id": 1, "kind": "syncpoint_increment", "ordinal": 4, "outcome": "syncpoint incremented", "payload": {"syncpoint": 10, "value": 10}, "schema": 1}
+{"classification": "supported", "frame_id": 1, "kind": "fence_signal", "ordinal": 5, "outcome": "fence signaled", "payload": {"fence": 100}, "schema": 1}
+{"classification": "unobservable", "frame_id": 1, "kind": "readback_visibility", "ordinal": 6, "reason": "transient scratch is unmapped before any readback", "schema": 1}
+{"classification": "unsupported", "frame_id": 1, "kind": "draw", "ordinal": 7, "reason": "debug marker method is retired as a no-op in the replay renderer", "schema": 1}
+{"classification": "supported", "frame_id": 1, "kind": "present_compose", "ordinal": 8, "outcome": "frame composed", "payload": {"format": "RGBA8", "height": 32, "width": 32}, "schema": 1}
+{"classification": "supported", "frame_id": 2, "kind": "submit", "ordinal": 0, "outcome": "queued on channel 1", "payload": {"channel": 1, "pushbuffer_words": 128}, "schema": 1}
+{"classification": "supported", "frame_id": 2, "kind": "consume", "ordinal": 1, "outcome": "pushbuffer consumed", "payload": {"channel": 1, "consumed_words": 128}, "schema": 1}
+{"classification": "supported", "frame_id": 2, "kind": "draw", "ordinal": 2, "outcome": "draw executed", "payload": {"indexed": true, "primitive": "triangles", "vertices": 64}, "schema": 1}
+{"classification": "fallback", "frame_id": 2, "kind": "compute_dispatch", "ordinal": 3, "outcome": "dispatch executed", "payload": {"groups": [4, 2, 1], "path": "legacy launch register"}, "reason": "native compute routed through the legacy launch register", "schema": 1}
+{"classification": "supported", "frame_id": 2, "kind": "syncpoint_increment", "ordinal": 4, "outcome": "syncpoint incremented", "payload": {"syncpoint": 20, "value": 20}, "schema": 1}
+{"classification": "supported", "frame_id": 2, "kind": "fence_signal", "ordinal": 5, "outcome": "fence signaled", "payload": {"fence": 200}, "schema": 1}
+{"classification": "unobservable", "frame_id": 2, "kind": "readback_visibility", "ordinal": 6, "reason": "transient scratch is unmapped before any readback", "schema": 1}
+{"classification": "unsupported", "frame_id": 2, "kind": "draw", "ordinal": 7, "reason": "debug marker method is retired as a no-op in the replay renderer", "schema": 1}
+{"classification": "supported", "frame_id": 2, "kind": "present_compose", "ordinal": 8, "outcome": "frame composed", "payload": {"format": "RGBA8", "height": 32, "width": 32}, "schema": 1}

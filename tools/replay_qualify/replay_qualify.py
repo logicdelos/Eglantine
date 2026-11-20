@@ -10,16 +10,30 @@ portably on Windows and Linux without any game binary, save, key, firmware, or G
 
 Commands:
     python tools/replay_qualify/replay_qualify.py --write-fixture <dir>
-    python tools/replay_qualify/replay_qualify.py --verify <dir>
+    python tools/replay_qualify/replay_qualify.py --verify <dir> \\
+        [--expected-effects <expected_effects.jsonl>] [--require-equivalent]
+    python tools/replay_qualify/replay_qualify.py --compare-runs <dir-a> <dir-b> \\
+        [--expected-effects <expected_effects.jsonl>] [--require-equivalent]
     python tools/replay_qualify/replay_qualify.py --verify-images <replay-images-dir>
     python tools/replay_qualify/replay_qualify.py --reconcile-census <census.json>
     python tools/replay_qualify/replay_qualify.py --selftest
 
+Event identity in a replay witness is (frame_id, ordinal, kind). Ordinals are zero-based in
+recorded order and must be contiguous, unique and reproduced in that order. effects.jsonl is
+the replay/observed ledger; expected_effects.jsonl is the independent live/recorder ledger.
+Per frame, the stream FRAME_END effect_count (frames.jsonl) must equal both ledgers' row
+counts, so deleting an effect from both sidecars is still rejected. Supported and fallback
+effects require equal payload and outcome. Unobservable and unsupported effects must carry an
+explicit reason, never a fabricated payload/outcome; they are reported and the replay is not
+called equivalent while any remain.
+
 Exit codes:
-    0  PASS (all checks for the requested scope passed)
-    1  FAIL (pixel envelope violation, sync/effect mismatch, or unreconciled call/effect)
-    2  INVALID (malformed/missing/extra inputs or dimension/format mismatch)
-    3  INCOMPLETE (census completeness gate failed)
+    0  PASS (inputs valid, images within envelope, every effect accounted and reconciled)
+    1  FAIL (missing/extra/duplicate/reordered/mismatched effect, count/frame gap, or
+             image envelope/checksum violation)
+    2  INVALID (malformed/missing/extra inputs, schema or dimension mismatch)
+    3  INCOMPLETE (census completeness gate failed, or --require-equivalent and opaque
+                   effects mean replay equivalence is not established)
 """
 
 from __future__ import annotations
@@ -27,6 +41,7 @@ from __future__ import annotations
 import argparse
 import binascii
 import json
+import shutil
 import struct
 import sys
 import tempfile
@@ -48,10 +63,10 @@ IMAGE_LIMITS = {
     "outlier_delta_threshold": 2,
     "max_alpha_delta": 0,
 }
-FIXTURE_EFFECTS = [
-    "submit", "consume", "draw", "compute_dispatch", "syncpoint_increment",
-    "fence_signal", "readback_visibility", "draw", "present_compose",
-]
+FIXTURE_SCHEMA = 3
+FRAME_SCHEMA = 2
+EFFECT_SCHEMA = 1
+OPAQUE_CLASSIFICATIONS = frozenset({"unsupported", "unobservable"})
 LOSS_COUNTERS = (
     "role_conflicts", "probe_table_full", "target_table_full", "pending_overflow",
     "returns_not_observed", "rendezvous_timeouts", "name_read_failures", "late_modules",
@@ -92,6 +107,20 @@ def read_json(path: Path) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))
     except (ValueError, OSError) as exc:
         raise InvalidInputError(f"{path}: {exc}") from exc
+
+
+def canonical(value: Any) -> str:
+    """Strict JSON form so 1 and true never compare equal in a payload."""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def optional(row: dict, key: str, cls: type, where: str) -> Any:
+    value = row.get(key)
+    if value is None:
+        return None
+    if type(value) is not cls:
+        raise InvalidInputError(f"{where}.{key}: expected {cls.__name__}, got {value!r}")
+    return value
 
 
 def _png_chunk(tag: bytes, data: bytes) -> bytes:
@@ -279,12 +308,67 @@ def make_synthetic_rgba(width: int, height: int, frame_id: int) -> bytes:
     return bytes(out)
 
 
+def effects_for_frame(
+    frame_id: int, width: int, height: int
+) -> list[tuple[str, str, dict | None, str | None, str | None]]:
+    """Declared ordered effects for one synthetic frame, independent of either writer."""
+    syncpoint = frame_id * 10
+    fence = frame_id * 100
+    return [
+        ("submit", "supported",
+         {"channel": 1, "pushbuffer_words": 128}, "queued on channel 1", None),
+        ("consume", "supported",
+         {"channel": 1, "consumed_words": 128}, "pushbuffer consumed", None),
+        ("draw", "supported",
+         {"primitive": "triangles", "vertices": 64, "indexed": True}, "draw executed", None),
+        ("compute_dispatch", "fallback",
+         {"groups": [4, 2, 1], "path": "legacy launch register"}, "dispatch executed",
+         "native compute routed through the legacy launch register"),
+        ("syncpoint_increment", "supported",
+         {"syncpoint": syncpoint, "value": syncpoint}, "syncpoint incremented", None),
+        ("fence_signal", "supported",
+         {"fence": fence}, "fence signaled", None),
+        ("readback_visibility", "unobservable", None, None,
+         "transient scratch is unmapped before any readback"),
+        ("draw", "unsupported", None, None,
+         "debug marker method is retired as a no-op in the replay renderer"),
+        ("present_compose", "supported",
+         {"format": "RGBA8", "width": width, "height": height}, "frame composed", None),
+    ]
+
+
+def effect_row(
+    frame_id: int,
+    ordinal: int,
+    kind: str,
+    classification: str,
+    payload: dict | None,
+    outcome: str | None,
+    reason: str | None,
+) -> dict[str, Any]:
+    row = {
+        "schema": EFFECT_SCHEMA,
+        "frame_id": frame_id,
+        "ordinal": ordinal,
+        "kind": kind,
+        "classification": classification,
+    }
+    if payload is not None:
+        row["payload"] = payload
+    if outcome is not None:
+        row["outcome"] = outcome
+    if reason is not None:
+        row["reason"] = reason
+    return row
+
+
 def write_synthetic_fixture(out_dir: Path, width: int = 32, height: int = 32) -> Path:
     """Write a complete, redistributable original replay + census fixture into out_dir."""
     outputs = {}
     frame_ids = [1, 2]
     frame_lines: list[str] = []
-    effect_lines: list[str] = []
+    expected_lines: list[str] = []
+    observed_lines: list[str] = []
 
     for frame_id in frame_ids:
         pixels = make_synthetic_rgba(width, height, frame_id)
@@ -294,12 +378,18 @@ def write_synthetic_fixture(out_dir: Path, width: int = 32, height: int = 32) ->
         png_bytes = encode_rgba_png(width, height, pixels)
         outputs[live_name] = outputs[replay_name] = png_bytes
 
-        syncpoint_val = frame_id * 10
-        fence_id = frame_id * 100
+        effects = effects_for_frame(frame_id, width, height)
+        for ordinal, (kind, cls_name, payload, outcome, reason) in enumerate(effects):
+            row = effect_row(frame_id, ordinal, kind, cls_name, payload, outcome, reason)
+            line = json.dumps(row, sort_keys=True)
+            expected_lines.append(line)
+            # The replay witness reproduces the same identity, classification and evidence.
+            observed_lines.append(line)
+
         frame_lines.append(
             json.dumps(
                 {
-                    "schema": 1,
+                    "schema": FRAME_SCHEMA,
                     "frame_id": frame_id,
                     "width": width,
                     "height": height,
@@ -310,52 +400,26 @@ def write_synthetic_fixture(out_dir: Path, width: int = 32, height: int = 32) ->
                     "identical": True,
                     "semantic_mismatches": 0,
                     "replay_ns": 0,
+                    "call_count": 12 + frame_id,
+                    "effect_count": len(effects),
                 },
                 sort_keys=True,
             )
         )
 
-        # Complete GPU/host call and effect reconciliation for this frame.
-        frame_effects = [
-            (1, "submit", "supported", "pushbuffer list queued on channel 1"),
-            (2, "consume", "supported", "DmaPusher consumed 128 pushbuffer words"),
-            (3, "draw", "supported", "Maxwell3D indexed draw 64 vertices"),
-            (4, "compute_dispatch", "fallback", "native compute dispatch routed via fallback"),
-            (5, "syncpoint_increment", "supported", f"syncpoint incremented to {syncpoint_val}"),
-            (6, "fence_signal", "supported", f"host fence {fence_id} signaled"),
-            (7, "readback_visibility", "unobservable", "transient scratch unmapped before read"),
-            (8, "draw", "unsupported", "debug marker method retired as no-op"),
-            (9, "present_compose", "supported", "offscreen composite emitted RGBA8 frame"),
-        ]
-        for seq, kind, cls_name, detail in frame_effects:
-            effect_lines.append(
-                json.dumps(
-                    {
-                        "frame_id": frame_id,
-                        "seq": seq,
-                        "kind": kind,
-                        "classification": cls_name,
-                        "reconciled": True,
-                        "syncpoint_value": syncpoint_val,
-                        "fence_id": fence_id,
-                        "detail": detail,
-                    },
-                    sort_keys=True,
-                )
-            )
-
     outputs["frames.jsonl"] = ("\n".join(frame_lines) + "\n").encode()
-    outputs["effects.jsonl"] = ("\n".join(effect_lines) + "\n").encode()
+    outputs["expected_effects.jsonl"] = ("\n".join(expected_lines) + "\n").encode()
+    outputs["effects.jsonl"] = ("\n".join(observed_lines) + "\n").encode()
 
     manifest = {
-        "schema": 2,
+        "schema": FIXTURE_SCHEMA,
         "kind": "standalone_replay_qualification_fixture",
         "origin": "synthetic_procedural_original",
         "envelope": IMAGE_LIMITS,
-        "expected_effects": {
-            str(fid): {"kinds": FIXTURE_EFFECTS, "syncpoint_value": fid * 10, "fence_id": fid * 100}
-            for fid in frame_ids
-        },
+        "effects_schema": EFFECT_SCHEMA,
+        "event_identity": "frame_id/ordinal/kind",
+        "expected_frame_ids": frame_ids,
+        "expected_frames": len(frame_ids),
         "runner_invocation": (
             "eden-cli --replay <capture.egcap> --replay-images <out_dir> --report <report.json>"
         ),
@@ -363,7 +427,6 @@ def write_synthetic_fixture(out_dir: Path, width: int = 32, height: int = 32) ->
             "eden-cli --baseline -g <owned_title_path> --nvn-census <census.json> "
             "--nvn-census-audit --run-seconds 300 --report <report.json>"
         ),
-        "expected_frames": len(frame_ids),
     }
     outputs["manifest.json"] = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()
 
@@ -627,14 +690,48 @@ def read_records(path: Path):
             yield where, record
 
 
-def verify_frames(root: Path, envelope: dict) -> tuple[dict, list[str]]:
-    frames = {}
-    failures = []
+def read_ledger(path: Path) -> list[tuple[str, dict]]:
+    """Read one effect ledger; reject unknown schema, kind or classification."""
+    rows: list[tuple[str, dict]] = []
+    for where, row in read_records(path):
+        if field(row, "schema", int, where) != EFFECT_SCHEMA:
+            raise InvalidInputError(
+                f"{where}: expected effect ledger schema {EFFECT_SCHEMA}; regenerate old sidecars"
+            )
+        field(row, "frame_id", int, where)
+        field(row, "ordinal", int, where)
+        kind = field(row, "kind", str, where)
+        cls_name = field(row, "classification", str, where)
+        if kind not in VALID_EFFECT_KINDS:
+            raise InvalidInputError(f"{where}: unknown effect kind {kind!r}")
+        if cls_name not in VALID_CLASSIFICATIONS:
+            raise InvalidInputError(f"{where}: unknown classification {cls_name!r}")
+        optional(row, "payload", dict, where)
+        optional(row, "outcome", str, where)
+        optional(row, "reason", str, where)
+        rows.append((where, row))
+    return rows
+
+
+def verify_frames(
+    root: Path,
+    envelope: dict,
+    *,
+    counts_required: bool = True,
+    expected_ids: list[int] | None = None,
+) -> tuple[dict[int, dict], list[str]]:
+    frames: dict[int, dict] = {}
+    failures: list[str] = []
     listed = set()
     previous = -1
     for where, rec in read_records(root / "frames.jsonl"):
-        if field(rec, "schema", int, where) != 1:
-            raise InvalidInputError(f"{where}: expected replay frame schema 1")
+        schema = field(rec, "schema", int, where)
+        if counts_required and schema != FRAME_SCHEMA:
+            raise InvalidInputError(
+                f"{where}: expected replay frame schema {FRAME_SCHEMA} with stream call/effect counts"
+            )
+        if schema not in (1, FRAME_SCHEMA):
+            raise InvalidInputError(f"{where}: unsupported replay frame schema {schema}")
         fid = field(rec, "frame_id", int, where)
         if fid in frames:
             raise InvalidInputError(f"{where}: duplicate frame_id {fid}")
@@ -660,117 +757,448 @@ def verify_frames(root: Path, envelope: dict) -> tuple[dict, list[str]]:
             failures.append(f"{where}: identical disagrees with PNG pair")
         if field(rec, "semantic_mismatches", int, where):
             failures.append(f"{where}: semantic_mismatches={rec['semantic_mismatches']}")
-        frames[fid] = {"frame_id": fid, "image": metrics, "passed": len(failures) == before}
+        call_count = effect_count = None
+        if counts_required:
+            call_count = field(rec, "call_count", int, where)
+            effect_count = field(rec, "effect_count", int, where)
+        frames[fid] = {
+            "frame_id": fid,
+            "image": metrics,
+            "call_count": call_count,
+            "effect_count": effect_count,
+            "passed": len(failures) == before,
+        }
     if not frames:
         raise InvalidInputError("frames.jsonl is empty")
+    if expected_ids is not None:
+        missing = [fid for fid in expected_ids if fid not in frames]
+        extra = [fid for fid in sorted(frames) if fid not in expected_ids]
+        if missing:
+            failures.append(f"frames.jsonl: missing declared frame(s) {missing}")
+        if extra:
+            failures.append(f"frames.jsonl: undeclared frame(s) {extra}")
+        for fid in missing + extra:
+            if fid in frames:
+                frames[fid]["passed"] = False
     for p in root.glob("*.png"):
         if p.name not in listed:
             raise InvalidInputError(f"unlisted PNG: {p.name}")
     return frames, failures
 
 
-def verify_effects(root: Path, expected: dict, frames: dict) -> tuple[dict, list[str]]:
-    if set(expected) != {str(fid) for fid in frames}:
-        raise InvalidInputError("manifest.json: expected_effects frame IDs differ from frames.jsonl")
-    counts = dict.fromkeys(sorted(VALID_CLASSIFICATIONS), 0)
-    rows = {fid: [] for fid in frames}
-    failures = []
-    prev = -1
-    for where, row in read_records(root / "effects.jsonl"):
-        fid = field(row, "frame_id", int, where)
-        if fid not in rows:
-            raise InvalidInputError(f"{where}: unknown frame_id {fid}")
-        if fid < prev:
-            failures.append(f"{where}: frame {fid} after {prev}")
-            frames[fid]["passed"] = False
-        prev = fid
-        cls = field(row, "classification", str, where)
-        if cls not in counts or field(row, "kind", str, where) not in VALID_EFFECT_KINDS:
-            raise InvalidInputError(f"{where}: invalid classification or effect kind")
-        counts[cls] += 1
-        rows[fid].append((where, row))
-    last_sync = last_fence = -1
-    total_expected = 0
-    for fid, records in rows.items():
-        where = f"manifest.json:expected_effects.{fid}"
-        spec = expected[str(fid)]
-        kinds = field(spec, "kinds", list, where)
-        order = ("submit", "consume", "syncpoint_increment", "fence_signal", "present_compose")
-        if (not all(isinstance(k, str) and k in VALID_EFFECT_KINDS for k in kinds)
-                or not all(k in kinds for k in order)
-                or [kinds.index(k) for k in order] != sorted(kinds.index(k) for k in order)):
-            raise InvalidInputError(f"{where}: invalid ordered effect denominator")
-        total_expected += len(kinds)
-        sync = field(spec, "syncpoint_value", int, where)
-        fence = field(spec, "fence_id", int, where)
-        before = len(failures)
-        if sync <= last_sync or fence <= last_fence:
-            failures.append(f"{where}: non-monotonic syncpoint or fence")
-        last_sync, last_fence = sync, fence
-        if [row["kind"] for _, row in records] != kinds:
-            failures.append(f"effects.jsonl: frame {fid}: effects do not match expected order/count")
-        for seq, (where, row) in enumerate(records, 1):
-            if (field(row, "seq", int, where) != seq or not field(row, "reconciled", bool, where)
-                    or field(row, "syncpoint_value", int, where) != sync
-                    or field(row, "fence_id", int, where) != fence):
-                failures.append(f"{where}: expected reconciled seq={seq} syncpoint={sync} fence={fence}")
-        if len(failures) != before:
-            frames[fid]["passed"] = False
-    return {"total": sum(counts.values()), "expected": total_expected,
-            "by_classification": counts, "reconciled": not failures}, failures
+def compare_effect_pair(fid: int, expected: dict, observed: dict) -> list[str]:
+    ident = f"frame {fid} effect #{expected['ordinal']} {expected['kind']}"
+    failures: list[str] = []
+    expected_cls = expected["classification"]
+    observed_cls = observed["classification"]
+    if expected_cls != observed_cls:
+        return [f"{ident}: classification {expected_cls} != observed {observed_cls}"]
+
+    expected_payload = expected.get("payload")
+    observed_payload = observed.get("payload")
+    expected_outcome = expected.get("outcome")
+    observed_outcome = observed.get("outcome")
+    if expected_cls in OPAQUE_CLASSIFICATIONS:
+        if (expected_payload is not None or observed_payload is not None
+                or expected_outcome is not None or observed_outcome is not None):
+            failures.append(f"{ident}: {expected_cls} effect must not fabricate a payload/outcome")
+        if not (expected.get("reason") or "").strip():
+            failures.append(f"{ident}: expected {expected_cls} effect has no reason")
+        if not (observed.get("reason") or "").strip():
+            failures.append(f"{ident}: observed {expected_cls} effect has no reason")
+        return failures
+
+    if expected_payload is None or expected_outcome is None:
+        failures.append(f"{ident}: expected {expected_cls} effect declares no payload/outcome")
+    if observed_payload is None or observed_outcome is None:
+        failures.append(f"{ident}: observed {expected_cls} effect declares no payload/outcome")
+    if (expected_payload is not None and observed_payload is not None
+            and canonical(expected_payload) != canonical(observed_payload)):
+        failures.append(
+            f"{ident}: payload mismatch expected={canonical(expected_payload)} "
+            f"observed={canonical(observed_payload)}"
+        )
+    if (expected_outcome is not None and observed_outcome is not None
+            and expected_outcome != observed_outcome):
+        failures.append(
+            f"{ident}: outcome mismatch expected={expected_outcome!r} observed={observed_outcome!r}"
+        )
+    if expected_cls == "fallback" and not (expected.get("reason") or "").strip():
+        failures.append(f"{ident}: fallback effect requires a reason")
+    return failures
 
 
-def verify_fixture_dir(fixture_dir: Path, *, images_only: bool = False) -> tuple[int, dict[str, Any]]:
+def verify_effect_ledgers(
+    expected_path: Path, observed_path: Path, frames: dict[int, dict]
+) -> tuple[dict[str, Any], list[str], bool, list[str]]:
+    """Reconcile ordered live/expected against replay/observed effects per frame."""
+    expected_rows = read_ledger(expected_path)
+    observed_rows = read_ledger(observed_path)
+
+    counts = {cls: {"expected": 0, "observed": 0} for cls in sorted(VALID_CLASSIFICATIONS)}
+    frame_failures: dict[int, list[str]] = {fid: [] for fid in frames}
+    failures: list[str] = []
+
+    def index(
+        path: Path, rows: list[tuple[str, dict]]
+    ) -> tuple[dict[int, list[tuple[str, dict]]], list[str]]:
+        indexed: dict[int, list[tuple[str, dict]]] = {fid: [] for fid in frames}
+        seen_pairs: set[tuple[int, int]] = set()
+        seen_triples: set[tuple[int, int, str]] = set()
+        problems: list[str] = []
+        previous: tuple[int, int] | None = None
+        for where, row in rows:
+            fid = row["frame_id"]
+            ordinal = row["ordinal"]
+            kind = row["kind"]
+            if fid not in indexed:
+                raise InvalidInputError(f"{where}: frame_id {fid} is not in frames.jsonl")
+            pair = (fid, ordinal)
+            triple = (fid, ordinal, kind)
+            if pair in seen_pairs:
+                problems.append(
+                    f"{where}: duplicate effect identity frame={fid} ordinal={ordinal}"
+                )
+            elif triple in seen_triples:
+                problems.append(
+                    f"{where}: duplicate effect kind at frame={fid} ordinal={ordinal} kind={kind}"
+                )
+            if previous is not None and pair < previous:
+                problems.append(
+                    f"{where}: ledger row frame={fid} ordinal={ordinal} after "
+                    f"frame={previous[0]} ordinal={previous[1]}"
+                )
+            seen_pairs.add(pair)
+            seen_triples.add(triple)
+            previous = pair
+            indexed[fid].append((where, row))
+        return indexed, problems
+
+    expected, expected_problems = index(expected_path, expected_rows)
+    observed, observed_problems = index(observed_path, observed_rows)
+    all_ids = set(frames)
+    for name, path, indexed, problems in (
+        ("expected", expected_path, expected, expected_problems),
+        ("observed", observed_path, observed, observed_problems),
+    ):
+        missing_frames = [fid for fid in sorted(all_ids) if not indexed[fid]]
+        for fid in missing_frames:
+            message = f"{path.name}: frame {fid}: no {name} effect rows"
+            frame_failures[fid].append(message)
+            failures.append(message)
+        for problem in problems:
+            failures.append(problem)
+
+    equivalence_reasons: list[str] = []
+    for fid in sorted(frames):
+        expected_seq = expected[fid]
+        observed_seq = observed[fid]
+        declared = frames[fid]["effect_count"]
+        if declared is not None:
+            if declared != len(expected_seq):
+                message = (
+                    f"frame {fid}: stream effect_count={declared} but expected ledger has "
+                    f"{len(expected_seq)} (silent omission)"
+                )
+                frame_failures[fid].append(message)
+                failures.append(message)
+            if declared != len(observed_seq):
+                message = (
+                    f"frame {fid}: stream effect_count={declared} but observed ledger has "
+                    f"{len(observed_seq)} (missing or extra effect)"
+                )
+                frame_failures[fid].append(message)
+                failures.append(message)
+
+        for side, seq in (("expected", expected_seq), ("observed", observed_seq)):
+            ordinals = [row["ordinal"] for _, row in seq]
+            if ordinals != list(range(len(ordinals))):
+                message = f"{side} ledger frame {fid}: ordinals {ordinals} are not contiguous from 0"
+                frame_failures[fid].append(message)
+                failures.append(message)
+            for _, row in seq:
+                counts[row["classification"]][side] += 1
+
+        expected_ids = [(row["ordinal"], row["kind"]) for _, row in expected_seq]
+        observed_ids = [(row["ordinal"], row["kind"]) for _, row in observed_seq]
+        if expected_ids != observed_ids:
+            missing = [item for item in expected_ids if item not in observed_ids]
+            extra = [item for item in observed_ids if item not in expected_ids]
+            if missing:
+                message = f"frame {fid}: missing effects {missing}"
+                frame_failures[fid].append(message)
+                failures.append(message)
+            if extra:
+                message = f"frame {fid}: extra effects {extra}"
+                frame_failures[fid].append(message)
+                failures.append(message)
+            if not missing and not extra:
+                message = f"frame {fid}: effects reordered"
+                frame_failures[fid].append(message)
+                failures.append(message)
+        else:
+            for (_, expected_row), (_, observed_row) in zip(expected_seq, observed_seq):
+                pair_failures = compare_effect_pair(fid, expected_row, observed_row)
+                if pair_failures:
+                    frame_failures[fid].extend(pair_failures)
+                    failures.extend(pair_failures)
+
+        for _, row in expected_seq:
+            if row["classification"] in OPAQUE_CLASSIFICATIONS:
+                reason = (row.get("reason") or "").strip()
+                equivalence_reasons.append(
+                    f"frame {fid} effect #{row['ordinal']} {row['kind']}: "
+                    f"{row['classification']} ({reason or 'no reason'})"
+                )
+
+    for fid, problems in frame_failures.items():
+        if problems:
+            frames[fid]["passed"] = False
+
+    equivalent = (
+        not failures
+        and counts["unsupported"]["expected"] == 0
+        and counts["unobservable"]["expected"] == 0
+    )
+    report = {
+        "total_expected": len(expected_rows),
+        "total_observed": len(observed_rows),
+        "by_classification": counts,
+        "replay_equivalent": equivalent,
+        "reconciled": not failures,
+    }
+    return report, failures, equivalent, equivalence_reasons
+
+
+def verify_fixture_dir(
+    fixture_dir: Path,
+    *,
+    images_only: bool = False,
+    expected_effects: Path | None = None,
+    require_equivalent: bool = False,
+    witness_only: bool = False,
+) -> tuple[int, dict[str, Any]]:
     """Raw replay image evidence alone is not an effect ledger or census certificate."""
     try:
         envelope = IMAGE_LIMITS
+        expected_ids = None
+        expected_kind = (
+            "standalone_replay_witness" if witness_only
+            else "standalone_replay_qualification_fixture"
+        )
         if not images_only:
             manifest = read_json(fixture_dir / "manifest.json")
-            if (field(manifest, "schema", int, "manifest.json") != 2 or
-                    manifest.get("kind") != "standalone_replay_qualification_fixture"):
-                raise InvalidInputError("manifest.json: expected qualification manifest schema 2; regenerate old fixtures")
+            if (field(manifest, "schema", int, "manifest.json") != FIXTURE_SCHEMA or
+                    manifest.get("kind") != expected_kind):
+                raise InvalidInputError(
+                    f"manifest.json: expected qualification manifest schema {FIXTURE_SCHEMA} "
+                    f"kind {expected_kind!r}; regenerate old fixtures"
+                )
             envelope = field(manifest, "envelope", dict, "manifest.json")
             for key, limit in IMAGE_LIMITS.items():
                 value = envelope.get(key)
                 if (type(value) not in (int, float) or not 0 <= value <= limit
                         or (type(limit) is int and type(value) is not int)):
                     raise InvalidInputError(f"manifest.json: {key}={value!r} outside allowed 0..{limit}")
-        frames, failures = verify_frames(fixture_dir, envelope)
-        result = {"scope": "images" if images_only else "fixture", "frames": list(frames.values()),
-                  "failures": failures}
+            expected_ids = field(manifest, "expected_frame_ids", list, "manifest.json")
+            if (not expected_ids or not all(type(fid) is int and fid >= 0 for fid in expected_ids)
+                    or expected_ids != sorted(set(expected_ids))):
+                raise InvalidInputError(
+                    "manifest.json: expected_frame_ids must be unique ascending integers"
+                )
+            if field(manifest, "expected_frames", int, "manifest.json") != len(expected_ids):
+                raise InvalidInputError("manifest.json: expected_frames disagrees with expected_frame_ids")
+        frames, failures = verify_frames(
+            fixture_dir,
+            envelope,
+            counts_required=not images_only,
+            expected_ids=expected_ids,
+        )
+        if witness_only:
+            for fid in sorted(frames):
+                if frames[fid]["call_count"] != 0:
+                    message = (
+                        f"frame {fid}: game-free replay declares call_count="
+                        f"{frames[fid]['call_count']}, expected 0"
+                    )
+                    failures.append(message)
+                    frames[fid]["passed"] = False
+        result: dict[str, Any] = {
+            "scope": "images" if images_only else ("replay_witness" if witness_only else "fixture"),
+            "frames": list(frames.values()),
+            "failures": failures,
+        }
         code = EXIT_FAIL if failures else EXIT_PASS
         if not images_only:
-            n = field(manifest, "expected_frames", int, "manifest.json")
-            if len(frames) != n:
-                raise InvalidInputError(f"frames.jsonl: {len(frames)} frames, manifest expects {n}")
-            expected = field(manifest, "expected_effects", dict, "manifest.json")
-            effects, bad_effects = verify_effects(fixture_dir, expected, frames)
-            result["effect_reconciliation"] = effects
+            observed_path = fixture_dir / "effects.jsonl"
+            if not observed_path.is_file():
+                alternative = fixture_dir / "observed_effects.jsonl"
+                if alternative.is_file():
+                    observed_path = alternative
+            if not observed_path.is_file():
+                raise InvalidInputError(
+                    f"{fixture_dir}/effects.jsonl: missing observed (replay) effect ledger"
+                )
+            expected_path = expected_effects or (fixture_dir / "expected_effects.jsonl")
+            if not expected_path.is_file():
+                raise InvalidInputError(
+                    f"{expected_path}: missing independent expected (live) effect ledger; "
+                    "pass --expected-effects"
+                )
+            effects, bad_effects, equivalent, equivalence_reasons = verify_effect_ledgers(
+                Path(expected_path), observed_path, frames
+            )
             failures.extend(bad_effects)
-            census = evaluate_census_completeness(read_json(fixture_dir / "census.json"))
-            result["census"] = census
-            code = EXIT_FAIL if failures else EXIT_PASS if census["complete"] else EXIT_INCOMPLETE
-            failures.extend(census["reasons"])
-        result.update(exit_code=code, status={0: "PASS", 1: "FAIL", 3: "INCOMPLETE"}[code])
+            result["effect_reconciliation"] = effects
+            result["replay_equivalent"] = equivalent
+            result["equivalence_reasons"] = equivalence_reasons[:64]
+            census_complete = True
+            if witness_only:
+                result["census"] = {
+                    "scope": "game_free_replay_no_guest_census",
+                    "required": False,
+                }
+            else:
+                census = evaluate_census_completeness(read_json(fixture_dir / "census.json"))
+                result["census"] = census
+                census_complete = census["complete"]
+            if failures:
+                code = EXIT_FAIL
+            elif not census_complete or (require_equivalent and not equivalent):
+                code = EXIT_INCOMPLETE
+            else:
+                code = EXIT_PASS
+        result.update(
+            exit_code=code,
+            status={0: "PASS", 1: "FAIL", 2: "INVALID", 3: "INCOMPLETE"}[code],
+        )
         return code, result
     except (InvalidInputError, OSError, ValueError) as exc:
         return EXIT_INVALID, {"status": "INVALID", "exit_code": EXIT_INVALID, "failures": [str(exc)]}
 
 
+def observed_digest(run_dir: Path) -> list[str]:
+    path = run_dir / "effects.jsonl"
+    if not path.is_file():
+        path = run_dir / "observed_effects.jsonl"
+    rows = read_ledger(path)
+    keys = ("frame_id", "ordinal", "kind", "classification", "payload", "outcome", "reason")
+    return [canonical({key: row[key] for key in keys if key in row}) for _, row in rows]
+
+
+def compare_runs(
+    run_a: Path,
+    run_b: Path,
+    *,
+    expected_effects: Path | None = None,
+    require_equivalent: bool = False,
+    witness_only: bool = False,
+) -> tuple[int, dict[str, Any]]:
+    """Two standalone replays are identical only if every witness and image agrees."""
+    code_a, result_a = verify_fixture_dir(
+        run_a,
+        expected_effects=expected_effects,
+        require_equivalent=require_equivalent,
+        witness_only=witness_only,
+    )
+    code_b, result_b = verify_fixture_dir(
+        run_b,
+        expected_effects=expected_effects,
+        require_equivalent=require_equivalent,
+        witness_only=witness_only,
+    )
+    if code_a == EXIT_INVALID or code_b == EXIT_INVALID:
+        return EXIT_INVALID, {
+            "status": "INVALID",
+            "exit_code": EXIT_INVALID,
+            "runs": {"a": result_a, "b": result_b},
+            "failures": ["one or both replays are invalid; nothing to compare"],
+        }
+
+    divergences: list[str] = []
+    frames_a = {frame["frame_id"]: frame for frame in result_a["frames"]}
+    frames_b = {frame["frame_id"]: frame for frame in result_b["frames"]}
+    if set(frames_a) != set(frames_b):
+        divergences.append(
+            f"frame set differs: a={sorted(frames_a)} b={sorted(frames_b)}"
+        )
+    for fid in sorted(set(frames_a) & set(frames_b)):
+        for key in ("live_checksum", "replay_checksum"):
+            if frames_a[fid]["image"][key] != frames_b[fid]["image"][key]:
+                divergences.append(
+                    f"frame {fid}: {key} {frames_a[fid]['image'][key]} != {frames_b[fid]['image'][key]}"
+                )
+    try:
+        digest_a = observed_digest(run_a)
+        digest_b = observed_digest(run_b)
+    except (InvalidInputError, OSError, ValueError) as exc:
+        return EXIT_INVALID, {
+            "status": "INVALID",
+            "exit_code": EXIT_INVALID,
+            "runs": {"a": result_a, "b": result_b},
+            "failures": [str(exc)],
+        }
+    if digest_a != digest_b:
+        first = next(
+            (i for i, (left, right) in enumerate(zip(digest_a, digest_b)) if left != right),
+            min(len(digest_a), len(digest_b)),
+        )
+        divergences.append(
+            f"observed effects differ at row {first} "
+            f"(a rows={len(digest_a)}, b rows={len(digest_b)})"
+        )
+
+    failed = bool(divergences) or code_a == EXIT_FAIL or code_b == EXIT_FAIL
+    if failed:
+        code = EXIT_FAIL
+    elif code_a == EXIT_INCOMPLETE or code_b == EXIT_INCOMPLETE:
+        code = EXIT_INCOMPLETE
+    else:
+        code = EXIT_PASS
+    return code, {
+        "status": {0: "PASS", 1: "FAIL", 3: "INCOMPLETE"}[code],
+        "exit_code": code,
+        "runs": {"a": result_a, "b": result_b},
+        "divergences": divergences,
+        "identical": code == EXIT_PASS,
+    }
+
+
 def run_selftest() -> int:
     """Run positive and intentional mismatch-rejection controls in a temporary directory."""
-    checks: list[tuple[str, int, int]] = []
+    checks: list[tuple[str, Any, Any]] = []
+
+    def write_rows(path: Path, rows: list[dict]) -> None:
+        path.write_text(
+            "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows), encoding="utf-8"
+        )
+
+    def ledger(scene: Path, name: str = "effects.jsonl") -> list[dict]:
+        return [row for _, row in read_records(scene / name)]
+
+    def frame_rows(scene: Path) -> list[dict]:
+        return [row for _, row in read_records(scene / "frames.jsonl")]
 
     with tempfile.TemporaryDirectory(prefix="replay_qualify_selftest_") as tmp:
         root = Path(tmp)
 
-        # 1. Exact synthetic fixture -> PASS (0)
+        # 1. Exact synthetic fixture -> PASS (0), and an unchanged regeneration is allowed.
         exact_dir = write_synthetic_fixture(root / "case_exact")
-        write_synthetic_fixture(exact_dir)  # an unchanged second generation is allowed
-        code, _ = verify_fixture_dir(exact_dir)
+        write_synthetic_fixture(exact_dir)
+        code, result = verify_fixture_dir(exact_dir)
         checks.append(("exact_fixture_pass", EXIT_PASS, code))
 
-        # 2. Within-envelope 1-LSB perturbation on replay frame 1 -> PASS (0)
+        # 2. Every classification is counted; opaque effects are not called equivalence.
+        counts = result["effect_reconciliation"]["by_classification"]
+        checks.append(("classification_counts", {
+            "supported": 12, "fallback": 2, "unsupported": 2, "unobservable": 2,
+        }, {name: counts[name]["expected"] for name in counts}))
+        checks.append(("opaque_not_equivalent", False, result["replay_equivalent"]))
+        checks.append(("opaque_reasons_reported", True, len(result["equivalence_reasons"]) == 4))
+        code, _ = verify_fixture_dir(exact_dir, require_equivalent=True)
+        checks.append(("require_equivalent_incomplete", EXIT_INCOMPLETE, code))
+
+        # 3. Within-envelope 1-LSB perturbation passes only with updated checksums.
         env_dir = write_synthetic_fixture(root / "case_within_envelope")
         w, h, px = decode_rgba_png(env_dir / "replay_00000001.png")
         mutated = bytearray(px)
@@ -778,26 +1206,26 @@ def run_selftest() -> int:
         (env_dir / "replay_00000001.png").write_bytes(encode_rgba_png(w, h, bytes(mutated)))
         code, _ = verify_fixture_dir(env_dir)
         checks.append(("stale_checksum_reject", EXIT_FAIL, code))
-        rows = [r for _, r in read_records(env_dir / "frames.jsonl")]
+        rows = frame_rows(env_dir)
         rows[0].update(replay_checksum=picture_checksum(mutated), identical=False)
-        (env_dir / "frames.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+        write_rows(env_dir / "frames.jsonl", rows)
         code, _ = verify_fixture_dir(env_dir)
         checks.append(("within_envelope_1lsb_pass", EXIT_PASS, code))
 
-        # 3. Pixel mismatch exceeding envelope -> FAIL (1)
+        # 4. Pixel mismatch exceeding envelope -> FAIL (1)
         bad_px_dir = write_synthetic_fixture(root / "case_bad_pixels")
         w, h, px = decode_rgba_png(bad_px_dir / "replay_00000002.png")
         mutated = bytearray(px)
         for i in range(0, len(mutated), 4):
             mutated[i] = (mutated[i] + 40) & 0xFF
         (bad_px_dir / "replay_00000002.png").write_bytes(encode_rgba_png(w, h, bytes(mutated)))
-        rows = [r for _, r in read_records(bad_px_dir / "frames.jsonl")]
+        rows = frame_rows(bad_px_dir)
         rows[1].update(replay_checksum=picture_checksum(mutated), identical=False)
-        (bad_px_dir / "frames.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+        write_rows(bad_px_dir / "frames.jsonl", rows)
         code, _ = verify_fixture_dir(bad_px_dir)
         checks.append(("pixel_envelope_reject", EXIT_FAIL, code))
 
-        # 4. Dimension mismatch -> INVALID (2)
+        # 5. Dimension mismatch -> INVALID (2)
         bad_dim_dir = write_synthetic_fixture(root / "case_bad_dim")
         (bad_dim_dir / "replay_00000001.png").write_bytes(
             encode_rgba_png(16, 16, make_synthetic_rgba(16, 16, 1))
@@ -805,92 +1233,137 @@ def run_selftest() -> int:
         code, _ = verify_fixture_dir(bad_dim_dir)
         checks.append(("dimension_mismatch_reject", EXIT_INVALID, code))
 
-        # 5. Out-of-order syncpoint / fence after present -> FAIL (1)
-        bad_sync_dir = write_synthetic_fixture(root / "case_bad_sync")
-        eff_lines = [
-            json.loads(line)
-            for line in (bad_sync_dir / "effects.jsonl").read_text(encoding="utf-8").splitlines()
-        ]
-        for eff in eff_lines:
-            if eff["frame_id"] == 1 and eff["kind"] == "fence_signal":
-                eff["seq"] = 99  # signaled after present_compose (seq 9)
-        (bad_sync_dir / "effects.jsonl").write_text(
-            "\n".join(json.dumps(e, sort_keys=True) for e in eff_lines) + "\n",
-            encoding="utf-8",
-        )
-        code, _ = verify_fixture_dir(bad_sync_dir)
-        checks.append(("sync_order_reject", EXIT_FAIL, code))
-
         # 6. Non-zero semantic output mismatch -> FAIL (1)
         bad_sem_dir = write_synthetic_fixture(root / "case_bad_semantic")
-        frm_lines = [
-            json.loads(line)
-            for line in (bad_sem_dir / "frames.jsonl").read_text(encoding="utf-8").splitlines()
-        ]
-        frm_lines[0]["semantic_mismatches"] = 2
-        (bad_sem_dir / "frames.jsonl").write_text(
-            "\n".join(json.dumps(f, sort_keys=True) for f in frm_lines) + "\n",
-            encoding="utf-8",
-        )
+        rows = frame_rows(bad_sem_dir)
+        rows[0]["semantic_mismatches"] = 2
+        write_rows(bad_sem_dir / "frames.jsonl", rows)
         code, _ = verify_fixture_dir(bad_sem_dir)
         checks.append(("semantic_mismatch_reject", EXIT_FAIL, code))
 
-        # 7. Unreconciled effect entry (silent omission) -> FAIL (1)
-        unrec_dir = write_synthetic_fixture(root / "case_unreconciled")
-        eff_lines = [
-            json.loads(line)
-            for line in (unrec_dir / "effects.jsonl").read_text(encoding="utf-8").splitlines()
-        ]
-        eff_lines[3]["reconciled"] = False
-        (unrec_dir / "effects.jsonl").write_text(
-            "\n".join(json.dumps(e, sort_keys=True) for e in eff_lines) + "\n",
-            encoding="utf-8",
-        )
-        code, _ = verify_fixture_dir(unrec_dir)
-        checks.append(("unreconciled_effect_reject", EXIT_FAIL, code))
+        # 7. Missing frame declared by the manifest -> FAIL (1)
+        missing_frame = write_synthetic_fixture(root / "case_missing_frame")
+        write_rows(missing_frame / "frames.jsonl",
+                   [r for r in frame_rows(missing_frame) if r["frame_id"] != 2])
+        for side in ("live", "replay"):
+            (missing_frame / f"{side}_00000002.png").unlink()
+        for name in ("expected_effects.jsonl", "effects.jsonl"):
+            write_rows(missing_frame / name,
+                       [r for r in ledger(missing_frame, name) if r["frame_id"] != 2])
+        code, result = verify_fixture_dir(missing_frame)
+        checks.append(("missing_frame_reject", EXIT_FAIL, code))
 
-        # 8. Incomplete census (unknown dispatch + capture_failed pollution) -> INCOMPLETE (3)
-        inc_dir = write_synthetic_fixture(root / "case_incomplete_census")
-        census = json.loads((inc_dir / "census.json").read_text(encoding="utf-8"))
-        census["audit"]["unknown_targets"] = 2
-        census["audit"]["unknown_calls"] = 14
-        census["run_complete"] = False
-        census["stop"] = {"reason": "capture_failed", "clean": False}
-        (inc_dir / "census.json").write_text(json.dumps(census, indent=2) + "\n", encoding="utf-8")
-        code, _ = verify_fixture_dir(inc_dir)
-        checks.append(("incomplete_census_reject", EXIT_INCOMPLETE, code))
+        # 8. Missing observed effect -> FAIL (1)
+        missing_eff = write_synthetic_fixture(root / "case_missing_effect")
+        rows = ledger(missing_eff)
+        rows.pop(2)
+        write_rows(missing_eff / "effects.jsonl", rows)
+        code, result = verify_fixture_dir(missing_eff)
+        checks.append(("missing_effect_reject", EXIT_FAIL, code))
+        checks.append(("missing_effect_unreconciled", False,
+                       result["effect_reconciliation"]["reconciled"]))
 
-        # 9. Orphan effect row referencing an unlisted frame_id -> INVALID (2)
+        # 9. Extra observed effect -> FAIL (1)
+        extra_eff = write_synthetic_fixture(root / "case_extra_effect")
+        rows = ledger(extra_eff)
+        rows.append(effect_row(1, 9, "draw", "supported", {"extra": True}, "executed", None))
+        write_rows(extra_eff / "effects.jsonl", rows)
+        code, _ = verify_fixture_dir(extra_eff)
+        checks.append(("extra_effect_reject", EXIT_FAIL, code))
+
+        # 10. Duplicate ordinal / identity -> FAIL (1)
+        dup_eff = write_synthetic_fixture(root / "case_duplicate")
+        rows = ledger(dup_eff)
+        rows[2]["ordinal"] = 1
+        write_rows(dup_eff / "effects.jsonl", rows)
+        code, _ = verify_fixture_dir(dup_eff)
+        checks.append(("duplicate_ordinal_reject", EXIT_FAIL, code))
+
+        # 11. Reordered observed effects -> FAIL (1)
+        reorder = write_synthetic_fixture(root / "case_reorder")
+        rows = ledger(reorder)
+        rows[2], rows[3] = rows[3], rows[2]
+        write_rows(reorder / "effects.jsonl", rows)
+        code, _ = verify_fixture_dir(reorder)
+        checks.append(("reordered_effect_reject", EXIT_FAIL, code))
+
+        # 12. Mismatched payload, outcome and classification -> FAIL (1)
+        for label, change in (
+            ("payload", lambda r: r[0]["payload"].update(pushbuffer_words=129)),
+            ("outcome", lambda r: r[1].update(outcome="dropped")),
+            ("classification", lambda r: r[3].update(classification="supported")),
+        ):
+            scene = write_synthetic_fixture(root / f"case_mismatch_{label}")
+            rows = ledger(scene)
+            change(rows)
+            write_rows(scene / "effects.jsonl", rows)
+            code, _ = verify_fixture_dir(scene)
+            checks.append((f"mismatched_{label}_reject", EXIT_FAIL, code))
+
+        # 13. Deleted from BOTH sidecars, caught by the stream's declared effect_count.
+        both_deleted = write_synthetic_fixture(root / "case_both_deleted")
+        for name in ("expected_effects.jsonl", "effects.jsonl"):
+            rows = ledger(both_deleted, name)
+            rows.pop(2)
+            write_rows(both_deleted / name, rows)
+        code, result = verify_fixture_dir(both_deleted)
+        checks.append(("both_sidecars_deleted_reject", EXIT_FAIL, code))
+        checks.append(("stream_count_caught_deletion", True,
+                       any("silent omission" in failure or "effect_count" in failure
+                           for failure in result["failures"])))
+
+        # 14. Stream count that disagrees with intact ledgers -> FAIL (1)
+        bad_count = write_synthetic_fixture(root / "case_bad_count")
+        rows = frame_rows(bad_count)
+        rows[0]["effect_count"] += 1
+        write_rows(bad_count / "frames.jsonl", rows)
+        code, _ = verify_fixture_dir(bad_count)
+        checks.append(("stream_count_mismatch_reject", EXIT_FAIL, code))
+
+        # 15. Expected ledger missing a whole frame -> FAIL (1)
+        bad_expected = write_synthetic_fixture(root / "case_expected_frame")
+        write_rows(bad_expected / "expected_effects.jsonl",
+                   [r for r in ledger(bad_expected, "expected_effects.jsonl") if r["frame_id"] != 2])
+        code, _ = verify_fixture_dir(bad_expected)
+        checks.append(("expected_ledger_missing_frame_reject", EXIT_FAIL, code))
+
+        # 16. Opaque effect without a reason or with a fabricated payload -> FAIL (1)
+        for label, change in (
+            ("no_reason", lambda r: (r[6].pop("reason"), r[6])),
+            ("fabricated", lambda r: (r[6].update(payload={"guessed": True}), r[6])),
+        ):
+            scene = write_synthetic_fixture(root / f"case_opaque_{label}")
+            rows = ledger(scene)
+            change(rows)
+            write_rows(scene / "effects.jsonl", rows)
+            code, _ = verify_fixture_dir(scene)
+            checks.append((f"opaque_{label}_reject", EXIT_FAIL, code))
+
+        # 17. Orphan effect row referencing an undeclared frame -> INVALID (2)
         orphan_dir = write_synthetic_fixture(root / "case_orphan_effect")
-        orphan_eff = {
-            "frame_id": 999,
-            "seq": 1,
-            "kind": "draw",
-            "classification": "supported",
-            "reconciled": True,
-            "syncpoint_value": 9990,
-            "fence_id": 99900,
-            "detail": "orphan frame entry",
-        }
         with (orphan_dir / "effects.jsonl").open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(orphan_eff, sort_keys=True) + "\n")
+            handle.write(json.dumps(
+                effect_row(999, 0, "draw", "supported", {"vertices": 3}, "drawn", None),
+                sort_keys=True,
+            ) + "\n")
         code, _ = verify_fixture_dir(orphan_dir)
         checks.append(("orphan_effect_frame_reject", EXIT_INVALID, code))
 
-        for label, change in (
-            ("omitted_draw", lambda r: r.pop(2)),
-            ("duplicate_seq", lambda r: r[2].update(seq=2)),
-            ("wrong_sync", lambda r: r[4].update(syncpoint_value=11)),
-            ("wrong_fence", lambda r: r[5].update(fence_id=99)),
-        ):
-            scene = write_synthetic_fixture(root / label)
-            rows = [r for _, r in read_records(scene / "effects.jsonl")]
-            change(rows)
-            (scene / "effects.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
-            code, result = verify_fixture_dir(scene)
-            checks.append((label, EXIT_FAIL, code))
-            checks.append((label + "_unreconciled", False, result["effect_reconciliation"]["reconciled"]))
+        # 18. Missing stream call_count or stale manifest schema -> INVALID (2)
+        no_calls = write_synthetic_fixture(root / "case_no_call_count")
+        rows = frame_rows(no_calls)
+        rows[0].pop("call_count")
+        write_rows(no_calls / "frames.jsonl", rows)
+        code, _ = verify_fixture_dir(no_calls)
+        checks.append(("missing_stream_count_invalid", EXIT_INVALID, code))
+        old_manifest = write_synthetic_fixture(root / "case_old_manifest")
+        manifest = read_json(old_manifest / "manifest.json")
+        manifest["schema"] = 2
+        (old_manifest / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        code, _ = verify_fixture_dir(old_manifest)
+        checks.append(("old_manifest_schema_reject", EXIT_INVALID, code))
 
+        # 19. Incomplete census controls.
         for label, change, expected in (
             ("lost_probe", lambda c: c["errors"].update(probe_table_full=1), EXIT_INCOMPLETE),
             ("unclean_stop", lambda c: c["stop"].update(clean=False), EXIT_INCOMPLETE),
@@ -899,26 +1372,82 @@ def run_selftest() -> int:
             ("capture_independent", lambda c: c["replay_capture"].update(failed=True), EXIT_PASS),
         ):
             scene = write_synthetic_fixture(root / label)
-            c = read_json(scene / "census.json")
-            change(c)
-            (scene / "census.json").write_text(json.dumps(c), encoding="utf-8")
+            census = read_json(scene / "census.json")
+            change(census)
+            (scene / "census.json").write_text(json.dumps(census), encoding="utf-8")
             code, _ = verify_fixture_dir(scene)
             checks.append((label, expected, code))
 
-        # The standalone runner emits no synthetic manifest, effect ledger or census.
-        for name in ("manifest.json", "effects.jsonl", "census.json"):
-            (exact_dir / name).unlink()
-        code, _ = verify_fixture_dir(exact_dir, images_only=True)
+        # 20. Game-free replay witness: zero guest calls, no census, distinct kind.
+        witness = write_synthetic_fixture(root / "case_witness")
+        manifest = read_json(witness / "manifest.json")
+        manifest["kind"] = "standalone_replay_witness"
+        (witness / "manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        rows = frame_rows(witness)
+        for row in rows:
+            row["call_count"] = 0
+        write_rows(witness / "frames.jsonl", rows)
+        (witness / "census.json").unlink()
+        code, result = verify_fixture_dir(witness, witness_only=True)
+        checks.append(("game_free_witness_pass", EXIT_PASS, code))
+        checks.append(("game_free_witness_census_scope", False, result["census"]["required"]))
+        rows[0]["call_count"] = 1
+        write_rows(witness / "frames.jsonl", rows)
+        code, _ = verify_fixture_dir(witness, witness_only=True)
+        checks.append(("game_free_witness_nonzero_calls_reject", EXIT_FAIL, code))
+        code, _ = verify_fixture_dir(witness)
+        checks.append(("witness_cannot_use_census_mode", EXIT_INVALID, code))
+
+        # 21. Independent expected ledger supplied from the capture directory.
+        external = write_synthetic_fixture(root / "case_external")
+        external_expected = root / "capture_expected_effects.jsonl"
+        shutil.copyfile(external / "expected_effects.jsonl", external_expected)
+        (external / "expected_effects.jsonl").unlink()
+        code, _ = verify_fixture_dir(external, expected_effects=external_expected)
+        checks.append(("external_expected_ledger_pass", EXIT_PASS, code))
+        code, _ = verify_fixture_dir(external)
+        checks.append(("missing_expected_ledger_invalid", EXIT_INVALID, code))
+
+        # 22. Two replays must agree on images and observed effects.
+        run_a = write_synthetic_fixture(root / "case_run_a")
+        run_b = root / "case_run_b"
+        shutil.copytree(run_a, run_b)
+        code, _ = compare_runs(run_a, run_b)
+        checks.append(("dual_run_identical_pass", EXIT_PASS, code))
+        rows = ledger(run_b)
+        rows[3]["reason"] = "conflicting witness note"
+        write_rows(run_b / "effects.jsonl", rows)
+        code, _ = compare_runs(run_a, run_b)
+        checks.append(("dual_run_ledger_divergence_reject", EXIT_FAIL, code))
+        rows[3]["reason"] = ledger(run_a)[3].get("reason")
+        write_rows(run_b / "effects.jsonl", rows)
+        w, h, px = decode_rgba_png(run_b / "replay_00000001.png")
+        mutated = bytearray(px)
+        mutated[0] = mutated[0] + 1 if mutated[0] < 255 else 254
+        (run_b / "replay_00000001.png").write_bytes(encode_rgba_png(w, h, bytes(mutated)))
+        rows = frame_rows(run_b)
+        rows[0].update(replay_checksum=picture_checksum(mutated), identical=False)
+        write_rows(run_b / "frames.jsonl", rows)
+        code, _ = compare_runs(run_a, run_b)
+        checks.append(("dual_run_image_divergence_reject", EXIT_FAIL, code))
+
+        # 23. The standalone runner emits images and semantics only.
+        runner_dir = write_synthetic_fixture(root / "case_runner")
+        for name in ("manifest.json", "effects.jsonl", "expected_effects.jsonl", "census.json"):
+            (runner_dir / name).unlink()
+        code, _ = verify_fixture_dir(runner_dir, images_only=True)
         checks.append(("runner_images_without_sidecars", EXIT_PASS, code))
-        (exact_dir / "frames.jsonl").write_text("[]\n", encoding="utf-8")
-        code, _ = verify_fixture_dir(exact_dir, images_only=True)
+        (runner_dir / "frames.jsonl").write_text("[]\n", encoding="utf-8")
+        code, _ = verify_fixture_dir(runner_dir, images_only=True)
         checks.append(("malformed_runner_row", EXIT_INVALID, code))
         try:
-            write_synthetic_fixture(exact_dir)
+            write_synthetic_fixture(runner_dir)
         except InvalidInputError:
             pass
         checks.append(("real_evidence_not_overwritten", True,
-                       (exact_dir / "frames.jsonl").read_text(encoding="utf-8") == "[]\n"))
+                       (runner_dir / "frames.jsonl").read_text(encoding="utf-8") == "[]\n"))
 
     failed = [(name, exp, got) for name, exp, got in checks if exp != got]
     for name, exp, got in checks:
@@ -930,13 +1459,27 @@ def run_selftest() -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--write-fixture", type=Path, help="Write original synthetic fixture to DIR")
-    group.add_argument("--verify", type=Path, help="Verify replay + effects + census in DIR")
-    group.add_argument("--verify-images", type=Path, help="Verify actual --replay-images output (images and semantics only)")
+    group.add_argument("--verify", type=Path,
+                       help="Verify qualification fixture in DIR (images + ledgers + census)")
+    group.add_argument("--verify-replay", type=Path,
+                       help="Verify a game-free replay witness in DIR (zero guest calls, no census)")
+    group.add_argument("--compare-runs", type=Path, nargs=2, metavar=("RUN_A", "RUN_B"),
+                       help="Verify two replay runs independently, then require identical witnesses")
+    group.add_argument("--verify-images", type=Path,
+                       help="Verify actual --replay-images output (images and semantics only)")
     group.add_argument("--reconcile-census", type=Path, help="Evaluate schema-2 census JSON")
     group.add_argument("--selftest", action="store_true", help="Run positive & negative controls")
+    parser.add_argument("--expected-effects", type=Path,
+                        help="Capture-side expected_effects.jsonl when it is not inside the run directory")
+    parser.add_argument("--witness-only", action="store_true",
+                        help="With --compare-runs, treat both runs as game-free replay witnesses")
+    parser.add_argument("--require-equivalent", action="store_true",
+                        help="Exit 3 unless every effect is observable and matched")
     args = parser.parse_args(argv)
 
     if args.selftest:
@@ -958,8 +1501,28 @@ def main(argv: list[str] | None = None) -> int:
             return EXIT_INVALID
         print(json.dumps(verdict, indent=2, sort_keys=True))
         return EXIT_PASS if verdict["complete"] else EXIT_INCOMPLETE
-
-    code, summary = verify_fixture_dir(args.verify_images or args.verify, images_only=args.verify_images is not None)
+    if args.compare_runs is not None:
+        code, summary = compare_runs(
+            args.compare_runs[0],
+            args.compare_runs[1],
+            expected_effects=args.expected_effects,
+            require_equivalent=args.require_equivalent,
+            witness_only=args.witness_only,
+        )
+    elif args.verify_replay is not None:
+        code, summary = verify_fixture_dir(
+            args.verify_replay,
+            expected_effects=args.expected_effects,
+            require_equivalent=args.require_equivalent,
+            witness_only=True,
+        )
+    else:
+        code, summary = verify_fixture_dir(
+            args.verify_images or args.verify,
+            images_only=args.verify_images is not None,
+            expected_effects=args.expected_effects,
+            require_equivalent=args.require_equivalent,
+        )
     print(json.dumps(summary, indent=2, sort_keys=True))
     return code
 
