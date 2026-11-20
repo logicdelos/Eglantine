@@ -21,6 +21,7 @@
 #include "video_core/replay/checkpoint.h"
 #include "video_core/replay/events.h"
 #include "video_core/replay/format.h"
+#include "video_core/replay/present_extent.h"
 #include "video_core/replay/format_io.h"
 #include "video_core/replay/library_call.h"
 
@@ -397,7 +398,7 @@ void Add(R::CaptureWriter& writer, R::ChunkType type, u64 frame, const Bytes& pa
 // Two frames (10 and 11) with the whole chunk grammar. With `clean` false the capture is
 // finalized as interrupted, which leaves the partial file in place.
 Built Build(const TempDir& dir, const std::string& name, LibraryMode mode, bool clean = true,
-            u64 mapped_bytes = 32) {
+            u64 mapped_bytes = 32, u64 present_bytes = 65536) {
     Built built;
     built.path = dir.File(name + ".egcap");
     const bool library = mode != LibraryMode::None;
@@ -422,7 +423,22 @@ Built Build(const TempDir& dir, const std::string& name, LibraryMode mode, bool 
 
     // Frame 10.
     const u64 blob10 = writer.NextSequence();
-    Add(writer, R::ChunkType::MemoryBlob, 10, Enc(MakeBlob()));
+    auto initial = MakeBlob();
+    initial.allocation_size += present_bytes;
+    R::MemoryRange pixels{};
+    pixels.offset = 64;
+    pixels.length = present_bytes;
+    pixels.kind = R::RangeKind::Zero;
+    initial.ranges.push_back(pixels);
+    Add(writer, R::ChunkType::MemoryBlob, 10, Enc(initial));
+    const auto present = [](u64 frame) {
+        auto value = MakePresent(frame);
+        auto& layer = value.layers.front();
+        layer.width = layer.stride = 128;
+        layer.height = 65;
+        layer.alloc_offset = 64;
+        return value;
+    };
     auto maps = MakeMaps();
     maps.front().size = mapped_bytes;
     Add(writer, R::ChunkType::Map, 10, EncMaps(maps));
@@ -436,14 +452,16 @@ Built Build(const TempDir& dir, const std::string& name, LibraryMode mode, bool 
         calls.Add(R::CallKind::Return, 1, 1, 10, R::LinkKind::None, 0, {Obj(1, 1)});
         Add(writer, R::ChunkType::LibraryEvent, 10, calls.Payload());
     }
-    Add(writer, R::ChunkType::Present, 10, Enc(MakePresent(10)));
+    Add(writer, R::ChunkType::Present, 10, Enc(present(10)));
     Add(writer, R::ChunkType::EndPicture, 10, Enc(MakePicture(10)));
     Add(writer, R::ChunkType::FrameEnd, 10,
         Enc(MakeFrameEnd(10, first10, writer.NextSequence())));
 
     // Frame 11.
     const u64 first11 = writer.NextSequence();
-    Add(writer, R::ChunkType::MemoryBlob, 11, Enc(MakeDeltaBlob(static_cast<u32>(blob10))));
+    auto delta = MakeDeltaBlob(static_cast<u32>(blob10));
+    delta.allocation_size = initial.allocation_size;
+    Add(writer, R::ChunkType::MemoryBlob, 11, Enc(delta));
     Add(writer, R::ChunkType::GpuEvent, 11, EncEvents(MakeEvents(2)));
     if (library) {
         RecordList calls;
@@ -454,7 +472,7 @@ Built Build(const TempDir& dir, const std::string& name, LibraryMode mode, bool 
         }
         Add(writer, R::ChunkType::LibraryEvent, 11, calls.Payload());
     }
-    Add(writer, R::ChunkType::Present, 11, Enc(MakePresent(11)));
+    Add(writer, R::ChunkType::Present, 11, Enc(present(11)));
     Add(writer, R::ChunkType::EndPicture, 11, Enc(MakePicture(11)));
     Add(writer, R::ChunkType::FrameEnd, 11,
         Enc(MakeFrameEnd(11, first11, writer.NextSequence())));
@@ -1555,4 +1573,21 @@ TEST_CASE("Uncaptured mapped bytes refuse an otherwise complete stream before re
     REQUIRE(reader.Next(chunk, end, detail) == R::ReadError::NotComplete);
     REQUIRE(reader.Validate(detail) == R::ReadError::BadMapping);
     REQUIRE(reader.Next(chunk, end, detail) == R::ReadError::NotComplete);
+}
+
+TEST_CASE("PRESENT proves the tiled framebuffer span before exposing any chunk", "[replay][memory]") {
+    CHECK(R::PresentBackingBytes(128, 65, 128, 1) == 65536);
+    CHECK(R::PresentBackingBytes(128, 65, 128, 4) == 32768);
+    CHECK_FALSE(R::PresentBackingBytes(128, 65, 127, 1));
+    CHECK_FALSE(R::PresentBackingBytes(128, 65, 128, 0));
+    TempDir dir;
+    const auto built = Build(dir, "short-present", LibraryMode::None, true, 32, 36 * 1024);
+    R::CaptureReader reader;
+    std::string detail;
+    REQUIRE(reader.Open(built.path, detail) == R::ReadError::None);
+    REQUIRE(reader.Validate(detail) == R::ReadError::BadMapping);
+    CHECK(detail.find("PRESENT") != std::string::npos);
+    R::ChunkView chunk;
+    bool end = false;
+    CHECK(reader.Next(chunk, end, detail) == R::ReadError::NotComplete);
 }

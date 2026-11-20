@@ -27,6 +27,7 @@
 #include "video_core/cache_types.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/pte_kind.h"
+#include "video_core/replay/cut_publication.h"
 
 namespace VideoCore {
 class RasterizerInterface;
@@ -47,6 +48,11 @@ public:
                            u64 address_space_bits_ = 40, GPUVAddr split_address = 1ULL << 34,
                            u64 big_page_bits_ = 16, u64 page_bits_ = 12);
     ~MemoryManager();
+
+    // Attached once, before this address space is published to guest channels.
+    void SetCutPublication(VideoCore::Replay::CutPublication& publication) {
+        cut_publication = &publication;
+    }
 
     // Switch 2: GPU address of the read-only syncpoint shim (u32 per syncpoint); 0 = none.
     void SetNativeSyncpointShim(GPUVAddr address);
@@ -182,10 +188,8 @@ public:
     };
     /// Calls `visit` for every mapped or reserved run: first the big-page runs, then the small-page
     /// runs not covered by a big page (the order GpuToCpuAddress resolves them), each ascending.
-    /// Reports runs, not pages. Page table changes are made by the thread that processes the
-    /// channel's map operations (the GPU thread, or the guest thread before the GPU starts): call
-    /// this only on that thread or while it is idle (the replay capture calls it at its
-    /// checkpoint cut after the GPU drained). Takes `guard` only for the kind lookups.
+    /// Reports runs, not pages. The caller must exclude table changes. Capture walks under the
+    /// GPU's cut-publication lock at a quiescent point; `guard` alone protects only kind lookups.
     void ForEachMapping(const std::function<void(const MappingRun&)>& visit) const;
 
     GPUVAddr Map(GPUVAddr gpu_addr, DAddr dev_addr, std::size_t size,
@@ -342,6 +346,10 @@ private:
     std::map<GPUVAddr, ContinuousRun> continuous_runs;
     mutable std::shared_ptr<const MappingSnapshot> snapshot;
     mutable u64 snapshot_serial{};
+    VideoCore::Replay::CutPublication* cut_publication{};
+    [[nodiscard]] std::unique_lock<std::mutex> LockMappingPublication() const {
+        return cut_publication ? cut_publication->Lock() : std::unique_lock<std::mutex>{};
+    }
     mutable std::mutex runs_guard;
 
     static constexpr size_t continuous_bits = 64;

@@ -9,3 +9,14 @@ Each recorded present closes exactly one logical frame (including marked preroll
 INDEX and COMPLETE close the file. Never qualify a partial file, an abnormal stop or a nonzero incompleteness reason/counter. Only publish the final name after an intact, flushed tail; never replace an existing capture. Limits and unsupported required features fail closed. Format 1 frames lack independent counts and are rejected, not silently upgraded. Baseline settings hashes are independent of this file version.
 
 The staging sink is in `staging_writer.cpp`; slice D must **not** port its original definitions or anonymous staging helpers from `capture.cpp`.
+
+A live cut holds the GPU between lists and excludes guest channel allocation, binding,
+initialization and mapping publication until the initial snapshot has been staged. The engine
+and mapping walks use the same ID-ordered, owning channel snapshot; each initialized channel
+keeps its address space alive. Arm capture before GPU start; late attachment is refused.
+
+PRESENT backing is the block-linear source the raw renderer would read, not the composed
+picture or a tightly packed `stride * height` image. `PresentBackingBytes` checks dimensions
+and format, then aligns row bytes to a 64-byte GOB and height to 128 rows. RGBA8888, RGBX8888,
+BGRA8888 and RGBA1010102 use four bytes per pixel; RGB565 uses two. Recorder, validator and
+replayer must require the entire range from `alloc_offset + framebuffer_offset`.

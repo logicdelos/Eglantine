@@ -180,7 +180,7 @@ void nvhost_as_gpu::Nx2Map(u64 gpu_address, u64 cpu_address, u64 size) {
     // On the GPU thread, like unmaps: a GMMU map takes the texture cache lock, and the callers hold
     // nx2:gpu locks that the GPU thread takes under that lock (sparse blocks backed on write).
     system.GPU().MapInOrder(
-        gpu_address, size, [gmmu = gmmu.get(), gpu_address, device_address, size] {
+        gpu_address, size, [gmmu = this->gmmu, gpu_address, device_address, size] {
             gmmu->SettleIssuedReleases(gpu_address, size);
             gmmu->Map(gpu_address, device_address, size, Tegra::PTEKind::PITCH, false);
         });
@@ -194,7 +194,7 @@ void nvhost_as_gpu::Nx2Unmap(u64 gpu_address, u64 size) {
         return;
     }
     // The GPU thread may still be running command lists that use the range.
-    system.GPU().RunInOrder([gmmu = gmmu.get(), gpu_address, size] {
+    system.GPU().RunInOrder([gmmu = this->gmmu, gpu_address, size] {
         gmmu->SettleIssuedReleases(gpu_address, size);
         gmmu->Unmap(gpu_address, size);
     });
@@ -245,7 +245,7 @@ void nvhost_as_gpu::Nx2Sparse(u64 gpu_address, u64 size, bool create) {
         const DAddr device_address = it->second.second;
         nx2_sparse_ranges.erase(it);
         // After the command lists that may still use it.
-        system.GPU().RunInOrder([gmmu = gmmu.get(), &smmu, gpu_address, size, device_address,
+        system.GPU().RunInOrder([gmmu = this->gmmu, &smmu, gpu_address, size, device_address,
                                  device_size] {
             gmmu->SettleIssuedReleases(gpu_address, size);
             gmmu->Unmap(gpu_address, size);
@@ -263,7 +263,7 @@ void nvhost_as_gpu::Nx2Sparse(u64 gpu_address, u64 size, bool create) {
     nx2_sparse_ranges[gpu_address] = {size, device_address};
     // On the GPU thread, as in Nx2Map.
     system.GPU().MapInOrder(
-        gpu_address, size, [gmmu = gmmu.get(), gpu_address, device_address, size] {
+        gpu_address, size, [gmmu = this->gmmu, gpu_address, device_address, size] {
             gmmu->SettleIssuedReleases(gpu_address, size);
             gmmu->Map(gpu_address, device_address, size, Tegra::PTEKind::PITCH, false);
         });
@@ -309,7 +309,7 @@ void nvhost_as_gpu::Nx2SparseTile(u64 gpu_address, u64 cpu_address, u64 size) {
                                : std::nullopt;
     auto& smmu = system.Host1x().MemoryManager();
     system.GPU().MapInOrder(
-        gpu_address, size, [&smmu, memory = gmmu.get(), device, cpu_address, size, gpu_address,
+        gpu_address, size, [&smmu, memory = gmmu, device, cpu_address, size, gpu_address,
                            canonical, asid = session->asid] {
             memory->SettleIssuedReleases(gpu_address, size);
             if (canonical) {
@@ -407,7 +407,7 @@ NvResult nvhost_as_gpu::AllocAsEx(IoctlAllocAsEx& params) {
         vm.big_page_size_bits)};
     vm.big_page_allocator.emplace(start_big_pages, end_big_pages);
 
-    gmmu = std::make_unique<Tegra::MemoryManager>(system, max_big_page_bits, vm.va_range_split, vm.big_page_size_bits, VM::PAGE_SIZE_BITS);
+    gmmu = std::make_shared<Tegra::MemoryManager>(system, max_big_page_bits, vm.va_range_split, vm.big_page_size_bits, VM::PAGE_SIZE_BITS);
     system.GPU().InitAddressSpace(*gmmu);
     vm.initialised = true;
 
@@ -684,7 +684,7 @@ NvResult nvhost_as_gpu::BindChannel(IoctlBindChannel& params) {
     LOG_DEBUG(Service_NVDRV, "called, fd={:X}", params.fd);
 
     auto gpu_channel_device = module.GetDevice<nvhost_gpu>(params.fd);
-    gpu_channel_device->channel_state->memory_manager = gmmu.get();
+    system.GPU().BindAddressSpace(*gpu_channel_device->channel_state, gmmu);
     return NvResult::Success;
 }
 

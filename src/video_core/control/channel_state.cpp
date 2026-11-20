@@ -83,7 +83,8 @@ ChannelState::ChannelState(s32 bind_id_)
 void ChannelState::Init(Core::System& system, u64 program_id_) {
     ASSERT(memory_manager);
     program_id = program_id_;
-    payload.emplace(system, *memory_manager, *this);
+    engine_memory = memory_manager;
+    payload.emplace(system, *engine_memory, *this);
     BindNvkDefaultSubchannels(*payload);
     if (g_nx2_ampere) {
         // Switch 2 command streams use Ampere classes with Turing+ (MME64) macros, and its

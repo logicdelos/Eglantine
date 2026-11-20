@@ -72,7 +72,7 @@ struct Backing {
 struct ChannelRef {
     std::shared_ptr<Tegra::Control::ChannelState> owner;  // set for channels the replay created
     Tegra::Control::ChannelState* state = nullptr;
-    Tegra::MemoryManager* memory = nullptr;
+    std::shared_ptr<Tegra::MemoryManager> memory;
     u32 space = 0;  // the capture's address space id of `memory`
 };
 
@@ -477,7 +477,7 @@ private:
         if (channels_.count(create.channel_id) != 0) {
             return Fail("channel " + std::to_string(create.channel_id) + " is created twice");
         }
-        Tegra::MemoryManager* memory = host_.address_space(*system_, create.address_space_id);
+        auto memory = host_.address_space(*system_, create.address_space_id);
         if (memory == nullptr) {
             return Fail("channel names address space " + std::to_string(create.address_space_id) +
                         " that does not exist");
@@ -488,7 +488,7 @@ private:
         ref.state = ref.owner.get();
         ref.memory = memory;
         ref.space = create.address_space_id;
-        ref.state->memory_manager = memory;
+        gpu_->BindAddressSpace(*ref.state, std::move(memory));
         gpu_->InitChannel(*ref.state, 0);
         if (!ref.state->payload.has_value()) {
             return Fail("a new channel has no pusher");
@@ -651,7 +651,7 @@ private:
         if (!MapFlagsReplayable(map.flags)) {
             return Fail("reserved mappings cannot be replayed");
         }
-        Tegra::MemoryManager* memory = host_.address_space(*system_, map.address_space_id);
+        auto memory = host_.address_space(*system_, map.address_space_id);
         if (memory == nullptr) {
             return Fail("map names address space " + std::to_string(map.address_space_id) +
                         " that does not exist");
@@ -689,7 +689,7 @@ private:
             unmap.size > GpuAddressLimit - unmap.gpu_va) {
             return Fail("unmap range is empty or outside the GPU address space");
         }
-        Tegra::MemoryManager* memory = host_.address_space(*system_, unmap.address_space_id);
+        auto memory = host_.address_space(*system_, unmap.address_space_id);
         if (memory == nullptr) {
             return Fail("unmap names address space " + std::to_string(unmap.address_space_id) +
                         " that does not exist");

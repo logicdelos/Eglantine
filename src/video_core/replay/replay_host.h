@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -44,7 +45,7 @@ struct ReplayHostFns {
     // Captured channel id and address-space id to the objects RestoreGpuCheckpoint created.
     // Defined by the capture slice, which owns the restore.
     Tegra::Control::ChannelState* (*channel)(Core::System& system, u32 channel_id) = nullptr;
-    Tegra::MemoryManager* (*address_space)(Core::System& system, u32 address_space_id) = nullptr;
+    std::shared_ptr<Tegra::MemoryManager> (*address_space)(Core::System& system, u32 address_space_id) = nullptr;
 
     // A fresh, zero-filled device allocation of `size` bytes for one capture allocation id and
     // generation. `host_bytes` is writable for the whole size and stays valid until teardown.
