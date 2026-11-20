@@ -59,12 +59,12 @@
 ## Connections
 
 - Called by: the loaders (`AppLoader::Load` calls `RegisterProcess`), `aoc` (`ListEntriesFilter`, `ListBootContent`), `core.cpp` (`SetBootContent({})` on reset), the frontends (`frontend_common/content_manager.h` calls `VerifyIntegrity`; GUI install and `nup_writer`). Other service callers of `ContentProvider` (`ncm`, `es`) were not opened.
-- Calls out to: `Common::FS` (host files), `Core::Crypto::KeyManager` (NCA key derivation), OpenSSL (`EVP_Digest`), zstd, `Settings::values`, `Core::System::ApplicationProcess` (`IsSwitch2` for the throttle), `Kernel::KProcess` for process id lookups.
+- Calls out to: `Common::FS` (host files), `Core::Crypto::KeyManager` (NCA key derivation), OpenSSL (`EVP_Digest`), zstd, `Settings::values`, `Kernel::KProcess` for process id lookups.
 
 ## Settings and switches
 
 - `Settings::values.enable_fs_access_log` (fs access logging), `external_content_dirs` (extra registered caches), `dump_exefs`, `disabled_addons` (per title; "DLC" key checked by the NUP loader and `aoc`), `use_dev_keys` (selects dev.keys vs prod.keys), `use_debug_asserts` (makes ASSERT_MSG break).
-- Environment: `EDEN_NX2_FS_READ_MBPS` (`IStorage` throttle in MB/s; 0 disables; unset = 40 MB/s, or 100 MB/s for Switch 2 processes).
+- Environment: `EDEN_NX2_FS_READ_MBPS` (`IStorage` throttle in MB/s; 0 disables; unset = 100 MB/s for every title).
 - Windows: `yuzu/main.cpp` raises the CRT stdio limit (`_setmaxstdio` 2048 then 8192) and `RealVfsFilesystem::MaxOpenFiles()` derives its handle cap from it.
 
 ## Invariants
