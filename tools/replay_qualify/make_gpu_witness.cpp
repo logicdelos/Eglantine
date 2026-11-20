@@ -46,10 +46,14 @@ std::vector<u8> Pixels(u32 bytes, u8 gray) {
     return data;
 }
 
-void Make(const std::filesystem::path& path, bool omit_page, bool lost_effect) {
+void Make(const std::filesystem::path& path, std::string_view mode) {
     R::FileHeader h;
-    h.first_frame = 1;
-    h.requested_frames = 2;
+    const bool omit_page = mode == "--missing-page";
+    const bool lost_effect = mode == "--lost-effect";
+    const bool preroll = mode == "--preroll";
+    h.first_frame = preroll ? 2 : 1;
+    h.preroll_frames = preroll ? 1 : 0;
+    h.requested_frames = preroll ? 1 : 2;
     h.flags = R::HeaderHasLivePictures;
     h.optional_features = R::OptionalLivePictures;
     h.gpu_architecture = static_cast<u32>(R::GpuArchitecture::Maxwell);
@@ -94,21 +98,26 @@ void Make(const std::filesystem::path& path, bool omit_page, bool lost_effect) {
         append(R::ChunkType::Fence, frame, std::array{R::FenceEntry{R::FenceKind::SemaphoreWrite, 1, Fence, frame}});
         R::PresentRecord present{.path = R::PresentPath::LegacyBufferQueue, .present_id = frame,
                                  .output_id = frame};
+        if (mode == "--unmet-present-fence" && frame == 2) {
+            present.fence_id = 3;
+            present.fence_value = 1; // No syncpoint raise was captured; GPU idle cannot satisfy it.
+        }
         present.layers.push_back({.alloc_id = 1, .generation = 1, .width = Width, .height = Height,
                                   .stride = Width, .pixel_format = 1, .layer_stack_mask = 1});
         append(R::ChunkType::Present, frame, present);
         R::EndPicture image{.frame_id = frame, .width = Width, .height = Height, .stride_bytes = Width * 4};
         image.pixels = Pixels(Width * Height * 4, gray);
         image.pixel_checksum = R::Fnv1a64(image.pixels);
-        append(R::ChunkType::EndPicture, frame, image);
-        R::FrameEndRecord end{.frame_id = frame, .flags = R::FrameComplete | R::FrameHasLivePicture,
+        const bool warmup = preroll && frame == 1;
+        if (!warmup) append(R::ChunkType::EndPicture, frame, image);
+        R::FrameEndRecord end{.frame_id = frame, .flags = R::FrameComplete | (warmup ? R::FramePreroll : R::FrameHasLivePicture),
                               .gpu_words = 1, .first_sequence = first, .last_sequence = out.NextSequence(),
                               .output_id = frame, .call_count = 0,
                               .effect_count = lost_effect && frame == 2 ? 5U : 4U};
         end.outputs.push_back({R::SemanticKind::SemaphoreValue, Fence, frame, 0, R::SpaceTag(0)});
         append(R::ChunkType::FrameEnd, frame, end);
     }
-    h.finalized_frames = 2;
+    h.finalized_frames = h.requested_frames;
     R::CompleteRecord complete{.status = R::CompleteStatus::Complete, .gpu_words = 2,
                                .initial_backing_bytes = AllocationSize, .delta_bytes = TiledBytes,
                                .dependency_complete = 1};
@@ -124,11 +133,12 @@ void Make(const std::filesystem::path& path, bool omit_page, bool lost_effect) {
 
 int main(int argc, char** argv) try {
     const std::string_view mode = argc == 3 ? argv[2] : "";
-    if (argc < 2 || argc > 3 || (!mode.empty() && mode != "--missing-page" && mode != "--lost-effect")) {
-        std::cerr << "usage: make_gpu_witness OUTPUT.egcap [--missing-page | --lost-effect]\n";
+    if (argc < 2 || argc > 3 || (!mode.empty() && mode != "--missing-page" && mode != "--lost-effect" &&
+                                 mode != "--preroll" && mode != "--unmet-present-fence")) {
+        std::cerr << "usage: make_gpu_witness OUTPUT.egcap [--missing-page | --lost-effect | --preroll | --unmet-present-fence]\n";
         return 2;
     }
-    Make(argv[1], mode == "--missing-page", mode == "--lost-effect");
+    Make(argv[1], mode);
     return 0;
 } catch (const std::exception& e) {
     std::cerr << e.what() << '\n';

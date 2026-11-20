@@ -4,6 +4,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include "video_core/replay/replay_internal.h"
 #include "video_core/replay/result.h"
 
 namespace R = VideoCore::Replay;
@@ -143,7 +144,12 @@ TEST_CASE("Replay report: section documents", "[video_core][replay]") {
     R::ReplayReport replay;
     replay.status = R::SectionStatus::Complete;
     replay.capture_session_id = 0xABCDULL;
+    REQUIRE(R::ToJson(replay)["replay_guest_call_count"].is_null());
+    replay.replay_guest_call_count = 0;
+    replay.capture_chain_digest = 0x12ab;
     const nlohmann::json replay_json = R::ToJson(replay);
+    REQUIRE(replay_json["replay_guest_call_count"] == 0);
+    REQUIRE(replay_json["capture_chain_digest"] == "00000000000012ab");
     REQUIRE(replay_json["capture_session_id"] == "000000000000abcd");
 
     R::FrameTimingReport timing;
@@ -174,6 +180,17 @@ TEST_CASE("Replay report: frame line and picture names", "[video_core][replay]")
     REQUIRE(parsed["schema"] == 2);
     REQUIRE(parsed["call_count"] == (u64{1} << 40) + 3);
     REQUIRE(parsed["effect_count"] == 2);
+    REQUIRE(parsed["replay_guest_call_count"] == 0); // independent of the nonzero live count
+    const auto pre = nlohmann::json::parse(R::ReplayPrerollFrameLine(record, 37));
+    REQUIRE(pre["schema"] == 1);
+    REQUIRE(pre["frame_id"] == 42);
+    REQUIRE(pre["output_id"] == 37);
+    REQUIRE(pre["effect_count"] == 2);
+    REQUIRE(pre["call_count"] == parsed["call_count"]);
+    REQUIRE(pre["replay_guest_call_count"] == 0);
+    REQUIRE(pre["has_live_picture"] == false);
+    REQUIRE(pre["replay_checksum"] == "0000000000001234");
+    REQUIRE_FALSE(pre.contains("live_checksum"));
     REQUIRE(parsed["frame_id"] == 42);
     REQUIRE(parsed["identical"] == true);
     REQUIRE(parsed["live_checksum"] == "0000000000001234");
@@ -197,4 +214,22 @@ TEST_CASE("Replay report: published sections", "[video_core][replay]") {
     REQUIRE_FALSE(R::PublishedReplayReport().has_value());
     R::ClearPublishedReports();
     REQUIRE_FALSE(R::PublishedCaptureReport().has_value());
+}
+
+TEST_CASE("replay refuses an idle GPU with an unsatisfied external display fence", "[video_core][replay]") {
+    R::PresentRecord present;
+    present.fence_id = 3;
+    present.fence_value = 5;
+    CHECK_FALSE(R::PresentFenceReady(present, [](u32 id) { return id == 3 ? 4U : 100U; }));
+    CHECK(R::PresentFenceReady(present, [](u32 id) { return id == 3 ? 5U : 0U; }));
+    u32 reads = 0;
+    const auto count_read = [&](u32) { ++reads; return 0U; };
+    present.fence_id = R::SyncpointLimit;
+    CHECK_FALSE(R::PresentFenceReady(present, count_read));
+    present.fence_id = 0;
+    present.fence_value = 0;
+    CHECK(R::PresentFenceReady(present, count_read));
+    present.fence_value = u64{1} << 32;
+    CHECK_FALSE(R::PresentFenceReady(present, count_read));
+    CHECK(reads == 0);
 }

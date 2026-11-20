@@ -1055,6 +1055,10 @@ u64 KernelCore::CreateNewUserProcessID() {
     return impl->next_user_process_id++;
 }
 
+bool KernelCore::HasCreatedUserProcess() const {
+    return impl->next_user_process_id.load(std::memory_order_relaxed) != KProcess::ProcessIdMin;
+}
+
 void KernelCore::RegisterCoreThread(std::size_t core_id) {
     impl->RegisterCoreThread(core_id);
 }

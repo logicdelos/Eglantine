@@ -1115,6 +1115,13 @@ inline void PopCompleteSubmits(std::deque<PendingSubmit>& queue) {
 }
 
 inline constexpr u32 SyncpointLimit = 192;
+// No recorded raise means an unsatisfied display dependency, even if the command queue is idle.
+// Check bounds before reading the guest syncpoint table. A zero threshold is already satisfied.
+[[nodiscard]] inline bool PresentFenceReady(const PresentRecord& present, auto&& guest_value) {
+    return present.fence_id < SyncpointLimit && present.fence_value <= UINT32_MAX &&
+           (present.fence_value == 0 || guest_value(static_cast<u32>(present.fence_id)) >= present.fence_value);
+}
+
 inline constexpr u32 SemaphoreBytes = 4;
 inline constexpr u32 QueryBytes = 8;
 

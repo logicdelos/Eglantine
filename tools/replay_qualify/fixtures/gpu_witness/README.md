@@ -21,3 +21,14 @@ compares the stream bytes, qualifies two independently rendered image directorie
 compares them, and checks that an unmapped final backing page and an extra declared
 but unreproduced effect are rejected for their respective reasons. Reports and PNGs
 remain in that directory; reference PNGs are never copied into observed output.
+
+`--preroll` converts the first frame into a validated warmup: its four effect rows and
+composed dimensions/checksum belong exclusively in `preroll_effects.jsonl` and
+`preroll_frames.jsonl`. No live comparison or selected PNG is generated for that frame.
+`--unmet-present-fence` adds an external threshold to frame 2 without a captured
+syncpoint raise. An idle GPU is insufficient: standalone replay must fail before composition.
+Exercise both with:
+
+```sh
+python -I -B tools/replay_qualify/test_gpu_boundaries.py --producer /tmp/make_gpu_witness --cli /path/to/eden-cli
+```

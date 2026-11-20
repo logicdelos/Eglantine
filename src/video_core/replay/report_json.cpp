@@ -117,6 +117,8 @@ Json ToJson(const ReplayReport& report) {
     json["format_minor"] = report.format_minor;
     json["capture_session_id"] = Hex(report.capture_session_id);
     json["capture_build_id"] = Hex(report.capture_build_id);
+    json["capture_chain_digest"] = Hex(report.capture_chain_digest);
+    json["replay_guest_call_count"] = report.replay_guest_call_count ? Json(*report.replay_guest_call_count) : Json(nullptr);
     json["settings_hash"] = Hex(report.settings_hash);
     json["frames_expected"] = report.frames_expected;
     json["frames_replayed"] = report.frames_replayed;
@@ -225,13 +227,22 @@ std::string ReplayFrameLine(const ReplayFrameRecord& record) {
     return fmt::format(
         "{{\"schema\":{},\"frame_id\":{},\"width\":{},\"height\":{},\"live_checksum\":\"{}\","
         "\"replay_checksum\":\"{}\",\"identical\":{},\"semantic_mismatches\":{},"
-        "\"replay_ns\":{},\"call_count\":{},\"effect_count\":{},\"live_png\":\"{}\","
+        "\"replay_ns\":{},\"call_count\":{},\"effect_count\":{},\"replay_guest_call_count\":{},\"live_png\":\"{}\","
         "\"replay_png\":\"{}\"}}",
         ReplayFrameLineSchema, record.frame_id, record.width, record.height,
         Hex(record.live_checksum), Hex(record.replay_checksum),
         record.live_checksum == record.replay_checksum ? "true" : "false",
         record.semantic_mismatches, record.replay_ns, record.call_count, record.effect_count,
-        LivePictureName(record.frame_id), ReplayPictureName(record.frame_id));
+        record.replay_guest_call_count, LivePictureName(record.frame_id), ReplayPictureName(record.frame_id));
+}
+
+// Preroll has a composed replay picture but no expected live picture or equivalence verdict.
+std::string ReplayPrerollFrameLine(const ReplayFrameRecord& record, u64 output_id) {
+    return Json{{"schema", 1}, {"frame_id", record.frame_id}, {"output_id", output_id},
+                {"width", record.width}, {"height", record.height},
+                {"has_live_picture", false}, {"replay_checksum", Hex(record.replay_checksum)},
+                {"call_count", record.call_count}, {"effect_count", record.effect_count},
+                {"replay_guest_call_count", record.replay_guest_call_count}}.dump();
 }
 
 void PublishCaptureReport(const CaptureReport& report) {

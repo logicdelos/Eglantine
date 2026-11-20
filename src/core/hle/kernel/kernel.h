@@ -133,6 +133,9 @@ public:
     /// Retrieves a const pointer to the application process.
     const KProcess* ApplicationProcess() const;
 
+    /// Includes processes that already exited; reset only by kernel shutdown.
+    [[nodiscard]] bool HasCreatedUserProcess() const;
+
     /// Retrieves the process with the given process ID, or a null object.
     KScopedAutoObject<KProcess> GetProcessByProcessId(u64 process_id);
 

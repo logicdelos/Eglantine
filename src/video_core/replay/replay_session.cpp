@@ -27,6 +27,7 @@
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/core.h"
+#include "core/hle/kernel/kernel.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/dma_pusher.h"
 #include "video_core/framebuffer_config.h"
@@ -36,7 +37,7 @@
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/replay/effect.h"
-#include "video_core/textures/decoders.h"
+#include "video_core/replay/present_extent.h"
 #include "video_core/replay/format_io.h"
 #include "video_core/replay/options.h"
 #include "video_core/replay/replay_host.h"
@@ -139,12 +140,14 @@ public:
             std::scoped_lock lock{effect_mutex_};
             active_ = nullptr;
         });
-        const bool ok = Replay(start);
+        const bool ok = Replay(start) && VerifyNoGuestExecution();
         report_.replay_ms = MillisecondsSince(start) - report_.setup_ms;
         if (frames_file_.is_open()) {
             frames_file_.close();
             effects_file_.close();
-            if (!frames_file_ || !effects_file_) {
+            preroll_frames_file_.close();
+            preroll_effects_file_.close();
+            if (!frames_file_ || !effects_file_ || !preroll_frames_file_ || !preroll_effects_file_) {
                 return Fail(std::string(ReportIoPrefix) + "cannot finalize replay ledgers");
             }
         }
@@ -190,18 +193,30 @@ private:
         }
     }
 
+    bool VerifyNoGuestExecution() {
+        // Both KProcess initialization paths allocate a user-process ID before any guest can run.
+        // Unlike checking ApplicationProcess(), this also detects a process that already exited.
+        if (system_->Kernel().HasCreatedUserProcess()) {
+            report_.replay_guest_call_count.reset();
+            return Fail("cannot attest zero guest execution: a guest process was created");
+        }
+        report_.replay_guest_call_count = 0;
+        return true;
+    }
+
     bool CloseEffects(const FrameEndRecord& end, bool preroll) {
         std::scoped_lock lock{effect_mutex_};
         if (effects_failed_) {
             return Fail("observed effect ledger overflow");
         }
-        if (!preroll && effects_file_.is_open()) {
+        auto& ledger = preroll ? preroll_effects_file_ : effects_file_;
+        if (ledger.is_open()) {
             for (u32 i = 0; i < effects_.size(); ++i) {
-                effects_file_ << EffectRow(end.frame_id, i, effects_[i]).dump() << '\n';
+                ledger << EffectRow(end.frame_id, i, effects_[i]).dump() << '\n';
             }
-            effects_file_.flush();
-            if (!effects_file_) {
-                return Fail(std::string(ReportIoPrefix) + "cannot write effects.jsonl");
+            ledger.flush();
+            if (!ledger) {
+                return Fail(std::string(ReportIoPrefix) + "cannot write replay effects ledger");
             }
         }
         if (effects_.size() != end.effect_count) {
@@ -249,6 +264,11 @@ private:
         }
         if (!MarkDirectoryPrivate(dir, error)) {
             return Fail(std::string(ReportIoPrefix) + error);
+        }
+        preroll_frames_file_.open(dir / "preroll_frames.jsonl", std::ios::binary | std::ios::trunc);
+        preroll_effects_file_.open(dir / "preroll_effects.jsonl", std::ios::binary | std::ios::trunc);
+        if (!preroll_frames_file_ || !preroll_effects_file_) {
+            return Fail(std::string(ReportIoPrefix) + "cannot create preroll ledgers");
         }
         effects_file_.open(dir / "effects.jsonl", std::ios::binary | std::ios::trunc);
         if (!effects_file_) {
@@ -794,11 +814,14 @@ private:
             return Fail("accepted present " + std::to_string(counted) + " is not capture present " +
                         std::to_string(present.present_id));
         }
-        // The GPU is idle before the compose reads the pictures. Idle is stronger than the
-        // producing fence and does not depend on the replay's syncpoint values starting where
-        // the live run's did.
+        // Drain submitted GPU work; external display dependencies must independently be ready.
         gpu_->WaitForIdle();
         gpu_dirty_ = false;
+
+        const auto& syncpoints = system_->Host1x().GetSyncpointManager();
+        if (!PresentFenceReady(present, [&](u32 id) { return syncpoints.GetGuestSyncpointValue(id); })) {
+            return Fail("PRESENT guest syncpoint fence was not satisfied", ReadError::UnsupportedState);
+        }
 
         std::vector<Tegra::FramebufferConfig> layers;
         layers.reserve(present.layers.size());
@@ -807,14 +830,11 @@ private:
             if (backing == backings_.end()) {
                 return Fail("present layer names an allocation that has no backing");
             }
-            using Format = Service::android::PixelFormat;
-            const auto format = static_cast<Format>(layer.pixel_format);
-            if (format != Format::Rgba8888 && format != Format::Rgbx8888 &&
-                format != Format::Bgra8888 && format != Format::Rgb565 && format != Format::Rgba1010102) {
-                return Fail("unsupported present pixel format", ReadError::UnsupportedState);
+            const auto tiled = PresentBackingBytes(layer.width, layer.height, layer.stride, layer.pixel_format);
+            if (!tiled) {
+                return Fail("unsupported present layout or pixel format", ReadError::UnsupportedState);
             }
-            if (layer.stride < layer.width || layer.stride > MaxPictureDimension ||
-                layer.alloc_offset > backing->second.size ||
+            if (layer.alloc_offset > backing->second.size ||
                 layer.framebuffer_offset > backing->second.size - layer.alloc_offset ||
                 layer.crop_left < 0 || layer.crop_top < 0 ||
                 layer.crop_right > static_cast<s32>(layer.width) ||
@@ -823,10 +843,8 @@ private:
             }
             // Layer::UpdateRawImage reads the block-linear padded allocation, not just the
             // visible rows. Undefined padding cannot be silently sourced from the host heap.
-            const u64 tiled = Tegra::Texture::CalculateSize(true, format == Format::Rgb565 ? 2 : 4,
-                                                            layer.stride, layer.height, 1, 4, 0);
             if (!backing->second.log.UnchangedSince(layer.alloc_offset + layer.framebuffer_offset,
-                                                    tiled, UINT64_MAX)) {
+                                                    *tiled, UINT64_MAX)) {
                 return Fail("present requires undefined tiled backing");
             }
             Tegra::FramebufferConfig config;
@@ -969,26 +987,56 @@ private:
         if (!have_present_) {
             return Fail("frame " + std::to_string(frame_id) + " has no present");
         }
-        const bool preroll = FrameIsPreroll(end.flags);
+        const u64 ordinal = report_.preroll_frames_executed + report_.frames_replayed;
+        const auto& index = reader_.Index().frames;
+        if (ordinal >= index.size() || index[ordinal].frame_id != frame_id ||
+            index[ordinal].flags != end.flags || index[ordinal].output_id != end.output_id) {
+            return Fail("frame end differs from the validated frame index", ReadError::BadIndex);
+        }
+        const bool preroll = FrameIsPreroll(index[ordinal].flags);
         Quiesce();
         gpu_->WaitForIdle();
         const u64 work_ns = static_cast<u64>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - frame_start_)
                 .count());
-        if (!CloseEffects(end, preroll)) {
+        if (!VerifyNoGuestExecution() || !CloseEffects(end, preroll)) {
             return false;
         }
-        if (preroll) {
-            ++report_.preroll_frames_executed;
-            ResetFrame();
-            return true;
+        if (!preroll) {
+            Common::FrameTiming::Record(frame_id);
         }
-        Common::FrameTiming::Record(frame_id);
         ReplayFrameRecord record;
         record.frame_id = frame_id;
         record.replay_ns = work_ns;
         record.call_count = end.call_count;
         record.effect_count = end.effect_count;
+        record.replay_guest_call_count = *report_.replay_guest_call_count;
+        std::vector<u8> bgra;
+        if (!config_.benchmark && (!preroll || preroll_frames_file_.is_open())) {
+            std::string error;
+            if (!host_.read_picture(record.width, record.height, bgra, error)) {
+                return Fail(std::string(StartupPrefix) + "picture readback failed: " + error);
+            }
+            const auto sum = PictureChecksum(bgra, record.width, record.height, record.width * 4U);
+            if (!sum.ok || bgra.size() != u64{record.width} * record.height * 4U) {
+                return Fail("invalid replay picture on frame " + std::to_string(frame_id));
+            }
+            record.replay_checksum = sum.hash;
+        }
+        if (preroll) {
+            if (preroll_frames_file_.is_open()) {
+                if (live_ || (end.flags & FrameHasLivePicture) != 0) {
+                    return Fail("preroll has an unexpected live reference picture");
+                }
+                preroll_frames_file_ << ReplayPrerollFrameLine(record, end.output_id) << '\n';
+                if (!preroll_frames_file_) {
+                    return Fail(std::string(ReportIoPrefix) + "cannot write preroll_frames.jsonl");
+                }
+            }
+            ++report_.preroll_frames_executed;
+            ResetFrame();
+            return true;
+        }
         const std::vector<SemanticOutput> observed = Observe(end.outputs);
         record.semantic_mismatches = static_cast<u32>(CompareSemantics(end.outputs, observed));
         report_.semantic_mismatches += record.semantic_mismatches;
@@ -1001,27 +1049,17 @@ private:
             if (!ValidateLivePicture(*live_, frame_id, error)) {
                 return Fail(error);
             }
-            u32 width = 0;
-            u32 height = 0;
-            std::vector<u8> bgra;
-            if (!host_.read_picture(width, height, bgra, error)) {
-                return Fail(std::string(StartupPrefix) + "picture readback failed: " + error);
+            if (record.width != live_->width || record.height != live_->height) {
+                return Fail("replay picture of frame " + std::to_string(frame_id) +
+                            " has another size than the live picture");
             }
-            const ChecksumResult replay = PictureChecksum(bgra, width, height, width * 4U);
-            const ChecksumResult live =
-                PictureChecksum(live_->pixels, live_->width, live_->height, live_->stride_bytes);
-            if (!replay.ok || !live.ok || bgra.size() != u64{width} * height * 4U) {
-                return Fail("a picture of frame " + std::to_string(frame_id) +
-                            " cannot be checksummed");
-            }
-            record.width = live_->width;
-            record.height = live_->height;
-            record.live_checksum = live.hash;
-            record.replay_checksum = replay.hash;
+            // The stream checksum includes row padding; the comparison checksum does not.
+            record.live_checksum = live_->stride_bytes == record.width * 4U ? live_->pixel_checksum :
+                PictureChecksum(live_->pixels, record.width, record.height, live_->stride_bytes).hash;
             if (!config_.images_dir.empty()) {
                 if (!WritePicture(LivePictureName(frame_id), live_->pixels, live_->width,
                                   live_->height, live_->stride_bytes) ||
-                    !WritePicture(ReplayPictureName(frame_id), bgra, width, height, width * 4U)) {
+                    !WritePicture(ReplayPictureName(frame_id), bgra, record.width, record.height, record.width * 4U)) {
                     return false;
                 }
                 report_.pictures_written += PicturesWritten(1);
@@ -1030,10 +1068,6 @@ private:
                 if (!frames_file_) {
                     return Fail(std::string(ReportIoPrefix) + "cannot write frames.jsonl");
                 }
-            }
-            if (width != live_->width || height != live_->height) {
-                return Fail("replay picture of frame " + std::to_string(frame_id) +
-                            " has another size than the live picture");
             }
             if (record.replay_checksum == record.live_checksum) {
                 ++report_.identical_frames;
@@ -1090,6 +1124,8 @@ private:
     std::vector<WrittenRange> written_;
     std::vector<LiveEffect> effects_;
     bool effects_failed_ = false;
+    std::ofstream preroll_frames_file_;
+    std::ofstream preroll_effects_file_;
     std::ofstream effects_file_;
     std::ofstream frames_file_;
 };
@@ -1273,6 +1309,7 @@ ReplayReport ReplaySession::Run(Core::System& system, Core::Frontend::EmuWindow&
     report.format_minor = s.header.format_minor;
     report.capture_session_id = s.header.session_id;
     report.capture_build_id = s.header.build_id;
+    report.capture_chain_digest = s.complete.chain_digest;
     report.settings_hash = s.header.settings_hash;
     report.dependency_complete = s.complete.dependency_complete == 1;
     report.frames_expected = FramesAsked(s.selection.selected, s.config.max_frames);
