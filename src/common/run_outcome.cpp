@@ -58,6 +58,8 @@ std::atomic<u64> frames_seen{};
 /// 0 when there is no frame limit.
 std::atomic<u64> frame_target{};
 std::atomic<u32> reason_bits{static_cast<u32>(Reason::None)};
+/// The reason CaptureFailed replaced; written with reason_bits, under record_lock.
+std::atomic<u32> displaced_bits{static_cast<u32>(Reason::None)};
 std::atomic<CrashReportWriter> crash_writer{};
 std::atomic_flag crash_reported;
 std::atomic<bool> crash_report_failed{};
@@ -94,6 +96,7 @@ constexpr u32 Rank(Reason reason) noexcept {
     case Reason::FrameLimit:
         return 1;
     case Reason::Restart:
+    case Reason::CaptureFailed:
         return 2;
     case Reason::Timeout:
         return 3;
@@ -200,6 +203,8 @@ std::string_view ReasonName(Reason reason) noexcept {
         return "host_crash";
     case Reason::ReportIoError:
         return "report_io_error";
+    case Reason::CaptureFailed:
+        return "capture_failed";
     }
     return "none";
 }
@@ -232,6 +237,8 @@ int ExitCode(Reason reason) noexcept {
         return 64;
     case Reason::ReportIoError:
         return 74;
+    case Reason::CaptureFailed:
+        return 76;
     }
     return 1;
 }
@@ -286,7 +293,11 @@ void Request(Reason reason, std::string_view detail) noexcept {
     }
     {
         const RecordGuard guard;
-        if (Rank(reason) > Rank(static_cast<Reason>(reason_bits.load(std::memory_order_relaxed)))) {
+        const auto current = static_cast<Reason>(reason_bits.load(std::memory_order_relaxed));
+        if (Rank(reason) > Rank(current)) {
+            displaced_bits.store(static_cast<u32>(reason == Reason::CaptureFailed ? current
+                                                                                  : Reason::None),
+                                 std::memory_order_relaxed);
             reason_bits.store(static_cast<u32>(reason), std::memory_order_relaxed);
             detail_size = (std::min)(detail.size(), DetailCapacity - 1);
             if (detail_size != 0) {
@@ -329,6 +340,12 @@ u64 FramesPresented() noexcept {
 
 Reason CurrentReason() noexcept {
     return static_cast<Reason>(reason_bits.load(std::memory_order_acquire));
+}
+
+Recorded CurrentRecord() noexcept {
+    const RecordGuard guard;
+    return {static_cast<Reason>(reason_bits.load(std::memory_order_relaxed)),
+            static_cast<Reason>(displaced_bits.load(std::memory_order_relaxed))};
 }
 
 std::string Detail() {

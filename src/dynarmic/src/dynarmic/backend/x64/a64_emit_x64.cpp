@@ -658,7 +658,7 @@ bool EmitTerminalImpl(A64EmitX64& e, IR::Term::ReturnToDispatch, IR::LocationDes
 
 bool EmitTerminalImpl(A64EmitX64& e, IR::Term::LinkBlock terminal, IR::LocationDescriptor, bool is_single_step) {
     // Used for patches and linking
-    if (e.conf.HasOptimization(OptimizationFlag::BlockLinking) && !is_single_step) {
+    if (e.conf.HasOptimization(OptimizationFlag::BlockLinking) && !is_single_step && !terminal.force_dispatch) {
         if (e.conf.enable_cycle_counting) {
             e.code.cmp(qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_remaining)], 0);
             e.AddPatchLocation(terminal.next, EmitX64::PatchKind::Jg);

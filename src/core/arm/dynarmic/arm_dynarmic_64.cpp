@@ -28,6 +28,7 @@
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
 #include "core/core.h"
 #include "core/core_timing.h"
+#include "core/hle/guest_call/nvn_census.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/loader/loader.h"
 #include "dynarmic/frontend/A64/a64_location_descriptor.h"
@@ -298,6 +299,11 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
             config.page_table_sign_extension = std::uint8_t(Common::PageTable::SIGN_BIT);
         }
     }
+
+    // NVN census (EDEN_NX2_NVN_CENSUS): null, so nothing is emitted, unless it is on and this is the game.
+    // Only a JIT with probes records its run slices (the census waits for them when it installs probes).
+    config.probes = m_cb->m_process->IsApplication() ? NvnCensus::Probes() : nullptr;
+    m_tracks_runs = config.probes != nullptr;
 
     // Multi-process state
     config.processor_id = std::uint8_t(m_core_index);
@@ -583,11 +589,19 @@ HaltReason ArmDynarmic64::RunThread(Kernel::KThread* thread) {
         SnapshotGuestModules(m_system);
     }
     m_jit->ClearExclusiveState();
+    if (m_tracks_runs) [[unlikely]] {
+        const ScopedRun run{RunState(), thread != nullptr ? thread->GetThreadId() : 0};
+        return TranslateHaltReason(m_jit->Run());
+    }
     return TranslateHaltReason(m_jit->Run());
 }
 
 HaltReason ArmDynarmic64::StepThread(Kernel::KThread* thread) {
     m_jit->ClearExclusiveState();
+    if (m_tracks_runs) [[unlikely]] {
+        const ScopedRun run{RunState(), thread != nullptr ? thread->GetThreadId() : 0};
+        return TranslateHaltReason(m_jit->Step());
+    }
     return TranslateHaltReason(m_jit->Step());
 }
 

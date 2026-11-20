@@ -21,6 +21,7 @@ class Block;
 namespace A64 {
 
 class LocationDescriptor;
+class InstructionProbes;
 
 using MemoryReadCodeFuncType = std::function<std::optional<u32>(u64 vaddr)>;
 
@@ -38,6 +39,9 @@ struct TranslationOptions {
     /// If this is false, we treat the instruction as a NOP.
     /// If this is true, we emit an ExceptionRaised instruction.
     bool hook_hint_instructions = true;
+
+    /// When set, the host calls this observer asks for are emitted before the instructions it names.
+    const InstructionProbes* probes = nullptr;
 };
 
 /**
