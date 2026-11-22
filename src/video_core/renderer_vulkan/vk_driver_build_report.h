@@ -105,6 +105,9 @@ enum class SkipReason : u8 {
     GeometryConsistency, ///< "geometry-consistency": ready depth-only pass of skipped geometry
     ConfigureFailed,     ///< "configure-failed": the pipeline's resources could not be set up
     MeshDisabled,        ///< "mesh-disabled": task/mesh draw without mesh support
+    WorkerPipelineMissing, ///< "worker-pipeline-missing": no pipeline handle when the draw was bound
+    VertexCountLimit,    ///< "vertex-count-limit": more vertices than the vertex buffer path takes
+    IndirectMeshDraw,    ///< "indirect-mesh-draw": an indirect draw of a mesh pipeline
     ComputeNoShader,     ///< "compute-no-shader": no compute program resolved
     ComputeNoPipeline,   ///< "compute-no-pipeline": the compute pipeline could not be created
     ComputeConfigureFailed, ///< "compute-configure-failed"
@@ -115,8 +118,9 @@ enum class SkipReason : u8 {
 
 /// A draw or dispatch was dropped. Counted per reason: the "Shader builds:" line carries the
 /// counts since its last line, "Skipped work:" lines the ones nothing else reported (every 10 s),
-/// and LogSkipSummary the session's.
-void NoteDrawSkipped(SkipReason reason);
+/// and LogSkipSummary the session's. A draw also names its programs (the addresses of its vertex
+/// and fragment shaders, 0 when unknown): the lines name the 3 that lost the most draws.
+void NoteDrawSkipped(SkipReason reason, u64 vs = 0, u64 ps = 0);
 
 /// Logs the skips of the whole session (at shutdown), by reason.
 void LogSkipSummary(const char* when);

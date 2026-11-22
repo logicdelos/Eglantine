@@ -26,14 +26,18 @@ namespace Nx2Sampler {
 inline thread_local std::uint64_t dependency_ipc_thread{};
 
 // EDEN_NX2_SAMPLE=<thread names>: a sampling profiler for named host threads (Windows only).
-// Names are comma separated; a name ending in '*' matches by prefix (CPUCore_*). From
+// Names are comma separated; a name ending in '*' matches by prefix (CPUCore_*), and a bare name
+// also matches its numbered threads (CPUCore is CPUCore_0, CPUCore_1, ...). From
 // EDEN_NX2_SAMPLE_START seconds (default 60) for EDEN_NX2_SAMPLE_SECONDS (default 30), each
 // thread is paused about 1000 times a second and its call stack recorded; the counts per
 // function (where the thread is, and everything on its stack) and the 25 most frequent full
-// stacks go to EDEN_NX2_SAMPLE_OUT
-// (default nx2_samples.txt). <out>.timeline lists every sample and present with its QPC time.
+// stacks go to EDEN_NX2_SAMPLE_OUT (default nx2_samples.txt in the log directory; a run where no
+// thread matches writes the names that exist there instead). <out>.timeline lists every sample
+// and present with its QPC time.
 // JIT samples are also split by guest block, module and region (see g_track_guest), and
 // CPUCore threads get a "cpu split:" line.
+// Called once by the command line and by the Qt frontend's main(), before any guest code exists
+// (a second call does nothing).
 void StartFromEnvironment();
 
 /// Guest attribution of JIT samples. Set from EDEN_NX2_SAMPLE (or EDEN_NX2_SAMPLE_GUEST=1) before
@@ -68,6 +72,13 @@ void SetGuestMemoryPointer(std::function<const void*(std::uint64_t)> pointer);
 /// Samples the named threads for `seconds` now (blocking), writes the report to `out` (and
 /// the folded stacks to `out`.folded) and returns the report.
 std::string Sample(const char* names, double seconds, const std::string& out);
+
+/// A one-shot sample of the first thread named by one of `thread_names` (exact names, or a name
+/// before "_": "CPUCore" is CPUCore_0, CPUCore_1, ...): the report goes to `out` as for Sample and
+/// the result is one line, "<n> host samples; where it is: <top 3 functions>; commonest stack:
+/// <6 frames>". When no thread matches the line says so and lists the thread names.
+std::string SampleBrief(const std::vector<std::string>& thread_names, double seconds,
+                        const std::string& out);
 
 /// Records a guest present while sampling, so `out`.timeline can place samples in frames.
 void NotePresent();

@@ -8,6 +8,7 @@
 #include <QThread>
 #include "common/common_types.h"
 #include "common/logging.h"
+#include "common/nx2_diagnostics.h"
 #include "common/thread.h"
 
 namespace Core {
@@ -63,6 +64,7 @@ public:
      */
     void ForceStop() {
         LOG_WARNING(Frontend, "Force stopping EmuThread");
+        Nx2Bottleneck::WriteStopSummary("force stop");
         m_stop_source.request_stop();
     }
 

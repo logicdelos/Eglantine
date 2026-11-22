@@ -11,7 +11,8 @@
 namespace Service::FileSystem {
 
 IFile::IFile(Core::System& system_, FileSys::VirtualFile file_)
-    : ServiceFramework{system_, "IFile"}, backend{std::make_unique<FileSys::Fsa::IFile>(file_)} {
+    : ServiceFramework{system_, "IFile"}, file{file_},
+      backend{std::make_unique<FileSys::Fsa::IFile>(file_)} {
     // clang-format off
     static const FunctionInfo functions[] = {
         {0, D<&IFile::Read>, "Read"},
@@ -36,8 +37,13 @@ Result IFile::Read(
     R_UNLESS(size >= 0 && static_cast<u64>(size) <= out_buffer.size(), FileSys::ResultInvalidSize);
 
     // Read the data from the Storage backend
-    R_RETURN(
-        backend->Read(reinterpret_cast<size_t*>(out_size.Get()), offset, out_buffer.data(), size));
+    const Result result =
+        backend->Read(reinterpret_cast<size_t*>(out_size.Get()), offset, out_buffer.data(), size);
+    if (result.IsSuccess()) {
+        attribution.Note(Common::ReadAttribution::Kind::File, static_cast<u64>(*out_size),
+                         [this] { return file->GetFullPath(); });
+    }
+    R_RETURN(result);
 }
 
 Result IFile::Write(

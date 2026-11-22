@@ -11,7 +11,10 @@
 
 #include <chrono>
 #include <algorithm>
+#include <cstddef>
+#include <string>
 #include <string_view>
+#include <vector>
 #include <type_traits>
 #include <fmt/ranges.h>
 #include "common/swap.h"
@@ -168,5 +171,23 @@ struct LogCounts {
     u64 critical{};
 };
 [[nodiscard]] LogCounts GetLogCounts() noexcept;
+
+/// One distinct Error or Critical source line: where it was logged, the text of its latest message
+/// (cut to 199 bytes), how many times it came and when the latest one did (seconds since the log
+/// started). Fixed buffers, so the crash handler can read them. A line that repeats keeps one slot.
+inline constexpr std::size_t RecentErrorSlots = 5;
+struct RecentError {
+    char site[64]{}; // "file.cpp:123"
+    char message[200]{};
+    u64 count{};
+    double last_seconds{};
+    u64 stamp{}; // 0: the slot is unused; a later error has a larger one
+    bool critical{};
+};
+
+/// Copies the last `max` (at most RecentErrorSlots) distinct Error/Critical source lines to `out`,
+/// oldest first, and returns how many. Errors are rare, so the tap takes a lock; nothing below
+/// Error does. `lock` false reads without it, for a crash handler that may have crashed inside it.
+std::size_t GetRecentErrors(RecentError* out, std::size_t max, bool lock = true) noexcept;
 
 } // namespace Common::Log

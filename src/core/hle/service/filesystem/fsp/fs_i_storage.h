@@ -10,7 +10,9 @@
 #pragma once
 
 #include <chrono>
+#include <string>
 
+#include "common/read_attribution.h"
 #include "core/file_sys/vfs/vfs.h"
 #include "core/hle/service/cmif_types.h"
 #include "core/hle/service/filesystem/filesystem.h"
@@ -20,10 +22,13 @@ namespace Service::FileSystem {
 
 class IStorage final : public ServiceFramework<IStorage> {
 public:
-    explicit IStorage(Core::System& system_, FileSys::VirtualFile backend_);
+    /// `label` names the storage in the read report; the backend's own name when empty.
+    explicit IStorage(Core::System& system_, FileSys::VirtualFile backend_, std::string label_ = {});
 
 private:
     FileSys::VirtualFile backend;
+    std::string label;
+    Common::ReadAttribution::Source attribution;
 
     static constexpr s64 ReadBytesPerSecond = 100'000'000;
     static constexpr s64 MaxChargedReadSize = 64 * 1024;

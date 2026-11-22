@@ -91,6 +91,11 @@ bool Matches(const std::string& thread_name, const std::vector<std::string>& pat
             }
         } else if (thread_name == pattern) {
             return true;
+        } else if (thread_name.size() > pattern.size() &&
+                   thread_name.compare(0, pattern.size(), pattern) == 0 &&
+                   thread_name[pattern.size()] == '_') {
+            // "CPUCore" is the threads "CPUCore_0", "CPUCore_1", ...
+            return true;
         }
     }
     return false;
@@ -732,7 +737,7 @@ std::string CpuSplit(Symbolizer& symbolizer, const std::vector<Sample>& samples,
 }
 
 std::string Report(const std::vector<Target>& targets, const std::vector<Sample>& samples,
-                   const char* path) {
+                   const char* path, std::string* brief = nullptr) {
     Symbolizer symbolizer;
     std::string text;
     JitStats jit_stats;
@@ -843,6 +848,33 @@ std::string Report(const std::vector<Target>& targets, const std::vector<Sample>
                                 ranked[i].second);
         }
         text += "\n";
+        if (brief != nullptr && thread == 0) {
+            std::vector<std::pair<unsigned, std::string>> top_self;
+            for (const auto& [name, count] : self) {
+                top_self.emplace_back(count, name);
+            }
+            std::sort(top_self.rbegin(), top_self.rend());
+            *brief = fmt::format("{} host samples; where it is:", total);
+            for (size_t i = 0; i < (std::min<size_t>)(3, top_self.size()); ++i) {
+                *brief += fmt::format("{} {} {:.0f}%", i == 0 ? "" : ",", top_self[i].second,
+                                      100.0 * top_self[i].first / (std::max)(total, 1U));
+            }
+            if (!ranked.empty()) {
+                // The commonest stack, innermost frame first, six frames of it.
+                *brief += "; commonest stack:";
+                const std::string& stack = ranked[0].second;
+                size_t begin = 0;
+                for (unsigned shown = 0; shown < 6 && begin < stack.size(); ++shown) {
+                    size_t end = stack.find('\n', begin);
+                    end = end == std::string::npos ? stack.size() : end;
+                    const size_t first = stack.find_first_not_of(' ', begin);
+                    if (first != std::string::npos && first < end) {
+                        *brief += (shown == 0 ? " " : " <- ") + stack.substr(first, end - first);
+                    }
+                    begin = end + 1;
+                }
+            }
+        }
     }
     if (std::FILE* const file = std::fopen(path, "w")) {
         std::fwrite(text.data(), 1, text.size(), file);
@@ -897,14 +929,33 @@ std::string Report(const std::vector<Target>& targets, const std::vector<Sample>
 }
 
 std::string SampleThreads(const std::vector<std::string>& patterns, double seconds,
-                          const std::string& out) {
+                          const std::string& out, std::string* brief = nullptr) {
     const std::string completion_path = out + ".complete";
     std::remove(completion_path.c_str());
     const std::vector<Target> targets = FindThreads(patterns);
     std::fprintf(stderr, "nx2 sampler: %zu threads match, sampling %.0f s\n", targets.size(),
                  seconds);
     if (targets.empty()) {
-        return "no thread matches";
+        // A file and a log line instead of nothing: which names exist is what the caller needs.
+        std::string text = "no thread matches";
+        for (const std::string& pattern : patterns) {
+            text += " \"" + pattern + "\"";
+        }
+        text += "; threads seen:";
+        for (const Target& seen : FindThreads({"*"})) {
+            text += " \"" + seen.name + "\"";
+            CloseHandle(seen.handle);
+        }
+        text += "\n";
+        if (std::FILE* const file = std::fopen(out.c_str(), "w")) {
+            std::fwrite(text.data(), 1, text.size(), file);
+            std::fclose(file);
+        }
+        LOG_WARNING(Common, "Sampler: {}", text);
+        if (brief != nullptr) {
+            *brief = text;
+        }
+        return text;
     }
     std::vector<Sample> samples;
     samples.reserve(static_cast<size_t>(seconds * 1100.0) * targets.size() + 16);
@@ -955,7 +1006,7 @@ std::string SampleThreads(const std::vector<std::string>& patterns, double secon
         CloseHandle(timer);
     }
     QueryPerformanceCounter(&end_qpc);
-    std::string text = Report(targets, samples, out.c_str());
+    std::string text = Report(targets, samples, out.c_str(), brief);
     if (std::FILE* complete = std::fopen(completion_path.c_str(), "w")) {
         std::fprintf(complete,
                      "{\"start_qpc\":%lld,\"end_qpc\":%lld,\"qpc_frequency\":%lld,"
@@ -1059,6 +1110,13 @@ std::string Sample(const char* names, double seconds, const std::string& out) {
     return SampleThreads(SplitNames(names), seconds, out);
 }
 
+std::string SampleBrief(const std::vector<std::string>& thread_names, double seconds,
+                        const std::string& out) {
+    std::string brief;
+    SampleThreads(thread_names, seconds, out, &brief);
+    return brief;
+}
+
 void NotePresent() {
     if (!recording_presents.load(std::memory_order_relaxed)) {
         return;
@@ -1094,22 +1152,32 @@ void SetGuestMemoryPointer(std::function<const void*(u64)> pointer) {
 }
 
 void StartFromEnvironment() {
-    const char* names = std::getenv("EDEN_NX2_SAMPLE");
-    const char* guest = std::getenv("EDEN_NX2_SAMPLE_GUEST");
-    const bool sampling = names != nullptr && *names != '\0';
-    // Decided here, before any JIT exists: blocks emitted earlier cannot be attributed.
-    g_track_guest.store(guest != nullptr ? *guest != '\0' && *guest != '0' : sampling,
-                        std::memory_order_relaxed);
-    if (!sampling) {
-        return;
-    }
-    const char* out = std::getenv("EDEN_NX2_SAMPLE_OUT");
-    std::thread{[patterns = SplitNames(names), start = EnvSeconds("EDEN_NX2_SAMPLE_START", 60.0),
-                 seconds = EnvSeconds("EDEN_NX2_SAMPLE_SECONDS", 30.0),
-                 out = std::string{out != nullptr ? out : "nx2_samples.txt"}] {
-        std::this_thread::sleep_for(std::chrono::duration<double>(start));
-        SampleThreads(patterns, seconds, out);
-    }}.detach();
+    static std::once_flag started;
+    std::call_once(started, [] {
+        const char* names = std::getenv("EDEN_NX2_SAMPLE");
+        const char* guest = std::getenv("EDEN_NX2_SAMPLE_GUEST");
+        const bool sampling = names != nullptr && *names != '\0';
+        // Decided here, before any JIT exists: blocks emitted earlier cannot be attributed.
+        g_track_guest.store(guest != nullptr ? *guest != '\0' && *guest != '0' : sampling,
+                            std::memory_order_relaxed);
+        if (!sampling) {
+            return;
+        }
+        const char* out = std::getenv("EDEN_NX2_SAMPLE_OUT");
+        std::thread{[patterns = SplitNames(names),
+                     start = EnvSeconds("EDEN_NX2_SAMPLE_START", 60.0),
+                     seconds = EnvSeconds("EDEN_NX2_SAMPLE_SECONDS", 30.0),
+                     out = std::string{out != nullptr ? out : ""}] {
+            std::this_thread::sleep_for(std::chrono::duration<double>(start));
+            // Next to the log unless told otherwise: the working directory of the GUI is
+            // wherever the shortcut points, and may not be writable.
+            SampleThreads(patterns, seconds,
+                          !out.empty() ? out
+                                       : Common::FS::GetEdenPathString(
+                                             Common::FS::EdenPath::LogDir) +
+                                             "/nx2_samples.txt");
+        }}.detach();
+    });
 }
 
 void NoteGuestFrame() {
@@ -1148,6 +1216,9 @@ std::string CurrentStack(unsigned skip) {
 
 namespace Nx2Sampler {
 void StartFromEnvironment() {}
+std::string SampleBrief(const std::vector<std::string>&, double, const std::string&) {
+    return {};
+}
 std::string Sample(const char*, double, const std::string&) {
     return "the sampler is Windows only";
 }

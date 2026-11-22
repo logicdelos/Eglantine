@@ -16,6 +16,7 @@
 #include <dbghelp.h>
 
 #include "common/logging.h"
+#include "common/nx2_diagnostics.h"
 #include "common/run_outcome.h"
 #include "common/system_log.h"
 #include "common/windows/crash_handler.h"
@@ -214,6 +215,9 @@ void Report(EXCEPTION_POINTERS* pointers, const char* fail_fast) {
     }
 
     WriteMinidump(pointers);
+
+    // What the session had logged, from fixed buffers and without waiting on a lock.
+    Nx2Bottleneck::WriteCrashSummary(+[](const char* line) { LOG_CRASH("{}", line); });
 
     // Last, and best effort: the tail of the system event ring, written without allocation and
     // only if the ring's mutex is free at once.

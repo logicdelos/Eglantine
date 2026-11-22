@@ -117,6 +117,8 @@ add_library(
     key_script.cpp
     key_script.h
     literals.h
+    log_retention.cpp
+    log_retention.h
     log_ring.h
     logging.cpp
     logging.h
@@ -130,6 +132,8 @@ add_library(
     multi_level_page_table.h
     nx2_bottleneck.cpp
     nx2_bottleneck.h
+    nx2_diagnostics.cpp
+    nx2_diagnostics.h
     nx2_sampler.cpp
     nx2_sampler.h
     overflow.h
@@ -143,6 +147,8 @@ add_library(
     range_mutex.h
     range_sets.h
     range_sets.inc
+    read_attribution.cpp
+    read_attribution.h
     ring_buffer.h
     run_outcome.cpp
     run_outcome.h

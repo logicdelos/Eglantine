@@ -19,6 +19,7 @@
 
 #include "common/assert.h"
 #include "common/cityhash.h"
+#include "common/nx2_diagnostics.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
 #include "shader_recompiler/exception.h"
 #include "shader_recompiler/object_pool.h"
@@ -249,6 +250,7 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
     static std::unordered_set<std::string> logged;
     if (logged.insert(error.what()).second) {
         LOG_ERROR(HW_GPU, "Native graphics shader rejected: {}", error.what());
+        Nx2Bottleneck::NoteShaderRejection(error.what());
     }
     // Once: show what the vertex stage has bound, to find where an unbound bank's data lives.
     static std::vector<std::string> dumped_errors;
@@ -291,8 +293,9 @@ const ShaderInfo* ShaderCache::ComputeShader() {
         const ShaderInfo* const shader = MakeShaderInfo(env, *cpu_shader_addr);
         CacheResolved(shader_addr, memory_id, map_serial, inv_serial, shader);
         return shader;
-    } catch (const Shader::Exception&) {
+    } catch (const Shader::Exception& error) {
         RememberRejection(*cpu_shader_addr);
+        Nx2Bottleneck::NoteShaderRejection(error.what());
         throw;
     }
 }

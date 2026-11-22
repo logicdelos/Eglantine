@@ -111,7 +111,9 @@ void EmuThread::run() {
         }
     }
 
-    // Shutdown the main emulated process
+    // Shutdown the main emulated process. The stop summary comes first, while the report state
+    // is intact (a force stop already wrote it).
+    Nx2Bottleneck::WriteStopSummary("stopped");
     QtCommon::system->DetachDebugger();
     QtCommon::system->ShutdownMainProcess();
     if (game_run) {

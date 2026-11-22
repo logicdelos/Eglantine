@@ -15,6 +15,7 @@
 #include <QMessageBox>
 
 #include "common/driver_shader_cache.h"
+#include "common/nx2_sampler.h"
 #include "common/fs/fs_paths.h"
 #include "common/fs/path_util.h"
 #include "common/settings.h"
@@ -295,6 +296,9 @@ int main(int argc, char* argv[]) {
 #endif
 
     QApplication app(argc, argv);
+
+    // EDEN_NX2_SAMPLE: the command line frontend starts it, and so must this one.
+    Nx2Sampler::StartFromEnvironment();
 
 #ifdef _WIN32
     OverrideWindowsFont();

@@ -36,6 +36,7 @@
 
 #include "common/assert.h"
 #include "common/nx2_bottleneck.h"
+#include "common/nx2_diagnostics.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/exception.h"
 #include "common/logging.h"
@@ -832,6 +833,13 @@ void DiagRecordDraw(Tegra::Engines::Maxwell3D& maxwell3d, Tegra::MemoryManager& 
             std::exchange(g_diag_query, -1), vs, ps);
     }
 }
+
+/// The addresses of the vertex and fragment programs of the current draw, as the skip lines name
+/// them (0 when none is set).
+std::pair<u64, u64> DrawPrograms(const Maxwell& regs) {
+    return {(u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1],
+            (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1]};
+}
 } // namespace
 
 template <typename Func>
@@ -857,6 +865,11 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     if (frame_dump.Capturing()) {
         frame_dump.DrainIfFull();
     }
+    // The colour target of this draw, for the scene change detector (a compare with the last).
+    if (const auto& regs = maxwell3d->regs; regs.rt_control.count > 0) {
+        Nx2Bottleneck::NoteDrawTarget(regs.rt[0].width, regs.rt[0].height,
+                                      static_cast<u32>(regs.rt[0].format));
+    }
 
     const char* diag_outcome = "drawn";
     const auto report_failure = [&](std::string_view reason) {
@@ -864,15 +877,16 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
                        : reason == "configure failed" ? "configure-failed" : "mesh-disabled";
         // The one place a dropped draw is counted, whatever dropped it: PipelineCache only
         // names the reason (its nested lookups for dynamic state must not count).
-        DriverBuildReport::NoteDrawSkipped(
-            reason == "no pipeline"          ? pipeline_cache.GraphicsSkipReason()
-            : reason == "configure failed" ? DriverBuildReport::SkipReason::ConfigureFailed
-                                           : DriverBuildReport::SkipReason::MeshDisabled);
         static std::set<std::tuple<u64, u64, std::string_view>> seen;
         static size_t async_logged{};
         const auto& regs = maxwell3d->regs;
         const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
         const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1];
+        DriverBuildReport::NoteDrawSkipped(
+            reason == "no pipeline"          ? pipeline_cache.GraphicsSkipReason()
+            : reason == "configure failed" ? DriverBuildReport::SkipReason::ConfigureFailed
+                                           : DriverBuildReport::SkipReason::MeshDisabled,
+            vs, ps);
         // Say why, and keep the expected asynchronous-shader skips from using up the line budget.
         const std::string_view miss = reason == "no pipeline" ? diag_outcome : reason;
         const bool async_miss = miss == "async-build";
@@ -1294,6 +1308,9 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
         const u64 count = is_indexed ? state.index_buffer.count : state.vertex_buffer.count;
         constexpr u64 MaxVertices = u64{1} << 24;
         if (first + count > MaxVertices) {
+            const auto [vs, ps] = DrawPrograms(maxwell3d->regs);
+            DriverBuildReport::NoteDrawSkipped(DriverBuildReport::SkipReason::VertexCountLimit, vs,
+                                               ps);
             static std::atomic<u32> skipped{};
             if (skipped.fetch_add(1, std::memory_order_relaxed) < 16) {
                 LOG_WARNING(HW_GPU, "Draw skipped: {} {} from {} (vertex/index count past {})",
@@ -1450,6 +1467,8 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                 // With a task program the distribution pass wrote the vertex count.
                 scheduler.Record([this, indirect = mesh_emulation_indirect](vk::CommandBuffer cmdbuf) {
                     if (scheduler.GraphicsPipelineMissing()) {
+                        DriverBuildReport::NoteDrawSkipped(
+                            DriverBuildReport::SkipReason::WorkerPipelineMissing);
                         return;
                     }
                     cmdbuf.DrawIndirect(indirect.buffer,
@@ -1461,6 +1480,8 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
             }
             scheduler.Record([this, vertices](vk::CommandBuffer cmdbuf) {
                 if (scheduler.GraphicsPipelineMissing()) {
+                    DriverBuildReport::NoteDrawSkipped(
+                        DriverBuildReport::SkipReason::WorkerPipelineMissing);
                     return;
                 }
                 cmdbuf.Draw(vertices, 1, 0, 0);
@@ -1470,6 +1491,8 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
         if (mesh_draw) {
             scheduler.Record([this, groups = draw_params.num_vertices](vk::CommandBuffer cmdbuf) {
                 if (scheduler.GraphicsPipelineMissing()) {
+                    DriverBuildReport::NoteDrawSkipped(
+                        DriverBuildReport::SkipReason::WorkerPipelineMissing);
                     return;
                 }
                 cmdbuf.DrawMeshTasksEXT(groups, 1, 1);
@@ -1478,6 +1501,8 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
         }
         scheduler.Record([this, draw_params](vk::CommandBuffer cmdbuf) {
             if (scheduler.GraphicsPipelineMissing()) {
+                DriverBuildReport::NoteDrawSkipped(
+                    DriverBuildReport::SkipReason::WorkerPipelineMissing);
                 return;
             }
             if (draw_params.is_indexed) {
@@ -1550,6 +1575,9 @@ void RasterizerVulkan::DrawIndirect() {
     PrepareDraw(params.is_indexed, [this, &params] {
         if (mesh_draw) {
             // Indirect task/mesh draws would need vkCmdDrawMeshTasksIndirectEXT's layout.
+            const auto [vs, ps] = DrawPrograms(maxwell3d->regs);
+            DriverBuildReport::NoteDrawSkipped(DriverBuildReport::SkipReason::IndirectMeshDraw, vs,
+                                               ps);
             static bool logged{};
             if (!std::exchange(logged, true)) {
                 LOG_WARNING(Render_Vulkan, "Indirect task/mesh draw skipped");
@@ -1563,6 +1591,8 @@ void RasterizerVulkan::DrawIndirect() {
             scheduler.Record([this, buffer_obj = buffer->Handle(), offset,
                               stride = params.stride](vk::CommandBuffer cmdbuf) {
                 if (scheduler.GraphicsPipelineMissing()) {
+                    DriverBuildReport::NoteDrawSkipped(
+                        DriverBuildReport::SkipReason::WorkerPipelineMissing);
                     return;
                 }
                 cmdbuf.DrawIndirectByteCountEXT(1, 0, buffer_obj, offset, 0,
@@ -1578,6 +1608,8 @@ void RasterizerVulkan::DrawIndirect() {
                               buffer_obj = buffer->Handle(), offset_base, offset,
                               params](vk::CommandBuffer cmdbuf) {
                 if (scheduler.GraphicsPipelineMissing()) {
+                    DriverBuildReport::NoteDrawSkipped(
+                        DriverBuildReport::SkipReason::WorkerPipelineMissing);
                     return;
                 }
                 if (params.is_indexed) {
@@ -1594,6 +1626,8 @@ void RasterizerVulkan::DrawIndirect() {
         }
         scheduler.Record([this, buffer_obj = buffer->Handle(), offset, params](vk::CommandBuffer cmdbuf) {
             if (scheduler.GraphicsPipelineMissing()) {
+                DriverBuildReport::NoteDrawSkipped(
+                    DriverBuildReport::SkipReason::WorkerPipelineMissing);
                 return;
             }
             if (params.is_indexed) {
@@ -2596,6 +2630,7 @@ void RasterizerVulkan::FlushCommands() {
 
 void RasterizerVulkan::TickFrame() {
     draw_counter = 0;
+    Nx2Bottleneck::NoteSceneFrame();
     // Debug server requests (docs/nx2/debug-mcp.md), taken between frames on the owning thread.
     if (VideoCore::Nx2Debug::HasRequests()) {
         if (auto capture = VideoCore::Nx2Debug::TakeCapture()) {

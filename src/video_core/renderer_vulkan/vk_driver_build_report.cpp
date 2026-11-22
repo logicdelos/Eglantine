@@ -11,11 +11,13 @@
 #include <string>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 #include <fmt/format.h>
 
 #include "common/common_types.h"
 #include "common/logging.h"
+#include "common/nx2_diagnostics.h"
 #include "video_core/nx2_spikes.h"
 #include "video_core/renderer_vulkan/vk_driver_build_report.h"
 
@@ -168,6 +170,84 @@ std::string FormatSkips(const SkipCounts& counts, const char* when) {
     return text;
 }
 
+// Which programs lost the most draws. A fixed table that a skipped draw adds to without a lock or
+// an allocation: a slot is claimed by compare-and-swap on its key (a hash of the vertex and
+// fragment program addresses, never 0), and a draw whose probe finds no slot is counted in
+// `skip_programs_dropped`. The report takes the top 3 and empties the table.
+constexpr size_t ProgramSlots = 32;
+constexpr size_t ProgramProbes = 8;
+struct ProgramSlot {
+    std::atomic<u64> key{};
+    std::atomic<u64> vs{};
+    std::atomic<u64> ps{};
+    std::atomic<u64> count{};
+};
+std::array<ProgramSlot, ProgramSlots> skip_programs{};
+std::atomic<u64> skip_programs_dropped{};
+
+void NoteSkipProgram(u64 vs, u64 ps) {
+    if (vs == 0 && ps == 0) {
+        return;
+    }
+    u64 key = (vs * 0x9E3779B97F4A7C15ULL) ^ ((ps + 0x632BE59BD9B4E019ULL) * 0xC2B2AE3D27D4EB4FULL);
+    key = (key ^ (key >> 31)) | 1;
+    const size_t home = static_cast<size_t>(key % ProgramSlots);
+    for (size_t probe = 0; probe < ProgramProbes; ++probe) {
+        ProgramSlot& slot = skip_programs[(home + probe) % ProgramSlots];
+        u64 seen = slot.key.load(std::memory_order_relaxed);
+        if (seen == 0 && slot.key.compare_exchange_strong(seen, key, std::memory_order_relaxed)) {
+            slot.vs.store(vs, std::memory_order_relaxed);
+            slot.ps.store(ps, std::memory_order_relaxed);
+            seen = key;
+        }
+        if (seen == key) {
+            slot.count.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+    skip_programs_dropped.fetch_add(1, std::memory_order_relaxed);
+}
+
+struct ProgramSkips {
+    u64 vs{};
+    u64 ps{};
+    u64 count{};
+};
+
+/// The programs that lost the most draws since the last call, most first (3 at most), and empties
+/// the table. Called under the mutex.
+std::vector<ProgramSkips> TakeSkipPrograms() {
+    std::vector<ProgramSkips> taken;
+    for (ProgramSlot& slot : skip_programs) {
+        const u64 count = slot.count.exchange(0, std::memory_order_relaxed);
+        if (count == 0) {
+            continue;
+        }
+        taken.push_back({slot.vs.load(std::memory_order_relaxed),
+                         slot.ps.load(std::memory_order_relaxed), count});
+        slot.key.store(0, std::memory_order_relaxed);
+    }
+    skip_programs_dropped.store(0, std::memory_order_relaxed);
+    std::sort(taken.begin(), taken.end(),
+              [](const ProgramSkips& a, const ProgramSkips& b) { return a.count > b.count; });
+    if (taken.size() > 3) {
+        taken.resize(3);
+    }
+    return taken;
+}
+
+/// The counts of the period as one text, with "; top programs: vs=0x.. ps=0x.. 900, ..." for the
+/// programs that lost the most draws. Takes (and resets) both.
+std::string TakeSkipText(const char* when) {
+    std::string text = FormatSkips(TakeSkips(), when);
+    const std::vector<ProgramSkips> programs = TakeSkipPrograms();
+    for (size_t i = 0; i < programs.size(); ++i) {
+        text += fmt::format("{}vs={:#x} ps={:#x} {}", i == 0 ? "; most skipped programs: " : ", ",
+                            programs[i].vs, programs[i].ps, programs[i].count);
+    }
+    return text;
+}
+
 double Ms(Duration d) {
     return std::chrono::duration<double, std::milli>(d).count();
 }
@@ -207,7 +287,7 @@ void EmitPeriod(Clock::time_point now, const char* when) {
              Ms(p.queued_max), wall_ns > 0.0 ? busy_ns / wall_ns : 0.0, builder_threads,
              Ms(p.longest), p.gpu_waits, Ms(p.gpu_wait), p.duplicates, Ms(p.other), p.gpu_builds,
              Ms(p.gpu_build), p.submission_waits, Ms(p.submission_wait),
-             FormatSkips(TakeSkips(), when));
+             TakeSkipText(when));
     period = {};
     busy_ns = 0.0;
     last_change = now;
@@ -353,6 +433,10 @@ bool NoteStart(u64 hash) {
     const bool duplicate = !built_keys.insert(hash).second;
     period.duplicates += duplicate ? 1 : 0;
     period.from_disk += disk_thread ? 1 : 0;
+    if (!duplicate && !disk_thread) {
+        // A pipeline this session had not built, for the scene change detector.
+        Nx2Bottleneck::NoteNewPipeline();
+    }
     return duplicate;
 }
 
@@ -399,6 +483,12 @@ const char* SkipReasonName(SkipReason reason) noexcept {
         return "configure-failed";
     case SkipReason::MeshDisabled:
         return "mesh-disabled";
+    case SkipReason::WorkerPipelineMissing:
+        return "worker-pipeline-missing";
+    case SkipReason::VertexCountLimit:
+        return "vertex-count-limit";
+    case SkipReason::IndirectMeshDraw:
+        return "indirect-mesh-draw";
     case SkipReason::ComputeNoShader:
         return "compute-no-shader";
     case SkipReason::ComputeNoPipeline:
@@ -412,11 +502,12 @@ const char* SkipReasonName(SkipReason reason) noexcept {
     return "no-pipeline";
 }
 
-void NoteDrawSkipped(SkipReason reason) {
+void NoteDrawSkipped(SkipReason reason, u64 vs, u64 ps) {
     const size_t index = static_cast<size_t>(reason);
     skips_period[index].fetch_add(1, std::memory_order_relaxed);
     skips_session[index].fetch_add(1, std::memory_order_relaxed);
     skips_pending.fetch_add(1, std::memory_order_relaxed);
+    NoteSkipProgram(vs, ps);
 }
 
 void LogSkipSummary(const char* when) {
@@ -451,6 +542,7 @@ void BeginSession(size_t count) {
         skips_period[i].store(0, std::memory_order_relaxed);
         skips_session[i].store(0, std::memory_order_relaxed);
     }
+    TakeSkipPrograms();
     skips_pending.store(0, std::memory_order_relaxed);
     skips_window_open = false;
 }
@@ -488,7 +580,7 @@ void Tick(bool queues_idle) {
         skips_window_open = true;
         skips_window_start = now;
     } else if (now - skips_window_start >= ReportInterval) {
-        LOG_INFO(Render_Vulkan, "Skipped work: {}", FormatSkips(TakeSkips(), "last 10 s"));
+        LOG_INFO(Render_Vulkan, "Skipped work: {}", TakeSkipText("last 10 s"));
     }
 }
 

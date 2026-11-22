@@ -29,6 +29,8 @@
 #include "common/scm_rev.h"
 #include "common/settings.h"
 #include "core/core.h"
+#include "core/file_sys/game_file_identity.h"
+#include "core/file_sys/nup_integrity.h"
 #include "core/file_sys/patch_manager.h"
 #include "core/file_sys/registered_cache.h"
 #include "core/loader/loose_directory_rules.h"
@@ -865,14 +867,31 @@ inline void AddProvidedFile(HostIdentitySource& source, const FileSys::VirtualFi
     return source;
 }
 
+/// The "Game file: ..." line (path, size, modification time, add-ons, content stamp), then the
+/// background integrity check of the game file if it is a NUP.
+inline void LogGameFileIdentity(const HostIdentitySource& source, const HostIdentity& host) {
+    if (source.game_path.empty()) {
+        return;
+    }
+    const FileSys::GameFileIdentity::FileFacts facts =
+        FileSys::GameFileIdentity::Inspect(source.game_path);
+    LOG_INFO(Frontend, "{}",
+             FileSys::GameFileIdentity::FormatIdentity(
+                 facts, host.title_id, host.game_version,
+                 FileSys::GameFileIdentity::SummarizeAddons(source.labels), host.content_stamp));
+    if (facts.exists && !facts.directory) {
+        FileSys::NupIntegrity::Start(source.game_path);
+    }
+}
+
 /// Hands the identity of `title_id` to the caches (CacheEnvelope::SetHostIdentity) and starts the
 /// session of the interactive marker. Call before anything loads a cache or refreshes the warm
 /// file, for the first title and again for every title change.
 inline void PublishHostIdentity(Core::System& system, u64 title_id) {
     ManifestSummary summary;
-    const HostIdentity host = AssembleHostIdentity(
-        SourceFromSystem(system, title_id, PathFromText(system.GetCurrentApplicationFilePath())),
-        &summary);
+    const HostIdentitySource source =
+        SourceFromSystem(system, title_id, PathFromText(system.GetCurrentApplicationFilePath()));
+    const HostIdentity host = AssembleHostIdentity(source, &summary);
     VideoCommon::CacheEnvelope::SetHostIdentity(host);
     RecordManifest(summary);
     const std::string manifest_ms =
@@ -884,6 +903,7 @@ inline void PublishHostIdentity(Core::System& system, u64 title_id) {
              "settings={:016x} manifest_entries={} manifest_over_cap={} manifest_ms={}",
              host.title_id, host.game_version, host.build_id, host.content_stamp,
              host.settings_hash, summary.entries, summary.over_cap, manifest_ms);
+    LogGameFileIdentity(source, host);
     PublishSession(title_id);
 }
 

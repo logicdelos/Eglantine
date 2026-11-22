@@ -106,6 +106,11 @@ SourceId ClassifySource(Subsystem subsystem, EventKind kind) noexcept {
         return SourceId::InputSummary;
     case EventKind::HostCrash:
         return SourceId::CrashHandler;
+    case EventKind::SceneChange:
+        return SourceId::GpuAlways;
+    case EventKind::LowMemory:
+    case EventKind::NoProgress:
+        return SourceId::NativeLog;
     }
     switch (subsystem) {
     case Subsystem::Gpu:
@@ -1241,6 +1246,12 @@ const char* EventKindName(EventKind kind) noexcept {
         return "Marker";
     case EventKind::HostCrash:
         return "HostCrash";
+    case EventKind::SceneChange:
+        return "SceneChange";
+    case EventKind::LowMemory:
+        return "LowMemory";
+    case EventKind::NoProgress:
+        return "NoProgress";
     }
     return "Unknown";
 }

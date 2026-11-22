@@ -44,6 +44,7 @@
 #include "common/baseline_settings.h"
 #include "common/logging.h"
 #include "common/nx2_bottleneck.h"
+#include "common/nx2_diagnostics.h"
 #include "common/nx2_sampler.h"
 #include "common/run_outcome.h"
 #include "common/scm_rev.h"
@@ -1463,6 +1464,7 @@ extern "C" void SDL_AppQuit(void *appstate, SDL_AppResult result) {
     // --version): the kernel is uninitialised then, and Pause()/ShutdownMainProcess() would
     // dereference it.
     if (state->system.IsPoweredOn()) {
+        Nx2Bottleneck::WriteStopSummary(result == SDL_APP_FAILURE ? "stopped with failure" : "stopped");
         void(state->system.Pause());
         state->system.ShutdownMainProcess();
     }

@@ -18,6 +18,7 @@
 #include "common/logging.h"
 #include "common/adpf.h"
 #include "common/nx2_bottleneck.h"
+#include "common/nx2_diagnostics.h"
 #include "common/nx2_sampler.h"
 #include "common/run_outcome.h"
 #include "common/settings.h"
@@ -40,6 +41,7 @@
 #include "core/file_sys/content_archive.h"
 #include "core/file_sys/fs_filesystem.h"
 #include "core/file_sys/nup_container.h"
+#include "core/file_sys/nup_integrity.h"
 #include "core/file_sys/patch_manager.h"
 #include "core/file_sys/program_metadata.h"
 #include "core/file_sys/registered_cache.h"
@@ -236,6 +238,61 @@ std::string GuestThreadName(void* user, u64 id) {
         }
     }
     return {};
+}
+
+/// The no-progress probe's source: the guest program counter of `core` and the guest thread on it.
+/// A copy read from another host thread while the core runs: it can be a little stale, which is
+/// all a diagnostic sample needs.
+bool ReadGuestCore(void* user, size_t core, u64& pc, u64& thread_id) {
+    auto& system = *static_cast<System*>(user);
+    Kernel::KProcess* const process = system.Kernel().ApplicationProcess();
+    if (process == nullptr || core >= Hardware::NUM_CPU_CORES) {
+        return false;
+    }
+    const Core::ArmInterface* const arm = process->GetArmInterface(core);
+    if (arm == nullptr) {
+        return false;
+    }
+    Kernel::Svc::ThreadContext context{};
+    arm->GetContext(context);
+    pc = context.pc;
+    thread_id = 0;
+    if (const Kernel::KThread* const thread =
+            system.Kernel().Scheduler(core).GetSchedulerCurrentThread()) {
+        thread_id = thread->GetThreadId();
+    }
+    return true;
+}
+
+/// "module+0xoffset" of a guest address, or nothing. Called with the source's lock held and so by
+/// one thread at a time: the module list of the process is read once and kept.
+std::string LocateGuestCode(void* user, u64 pc) {
+    auto& system = *static_cast<System*>(user);
+    const Kernel::KProcess* const process = system.Kernel().ApplicationProcess();
+    if (process == nullptr) {
+        return {};
+    }
+    static const Kernel::KProcess* modules_of{};
+    static u64 modules_program{};
+    static Loader::AppLoader::Modules modules;
+    if (modules_of != process || modules_program != process->GetProgramId()) {
+        modules_of = process;
+        modules_program = process->GetProgramId();
+        modules.clear();
+        if (system.GetAppLoader().ReadNSOModules(modules) != Loader::ResultStatus::Success) {
+            modules.clear();
+        }
+    }
+    auto it = modules.upper_bound(pc);
+    if (it == modules.begin()) {
+        return {};
+    }
+    --it;
+    constexpr u64 MaxModuleSize = u64{256} << 20;
+    if (pc - it->first >= MaxModuleSize) {
+        return {};
+    }
+    return fmt::format("{}+{:#x}", it->second, pc - it->first);
 }
 
 } // namespace
@@ -577,6 +634,7 @@ struct System::Impl {
         cpu_manager.Initialize();
         VideoCommon::Nx2Spikes::SetGuestThreadSource({ReadGuestThreadTicks, GuestThreadName, &system});
         Nx2Bottleneck::SetSleepThreadNameSource(GuestThreadName, &system);
+        Nx2Bottleneck::SetGuestCoreSource({ReadGuestCore, LocateGuestCode, &system});
 
         // Initialize cheat engine
         if (cheat_engine) {
@@ -631,8 +689,11 @@ struct System::Impl {
         Nx2Sampler::SetGuestRunning(false);
         Nx2Sampler::SetGuestMemoryPointer({});
         Nx2Bottleneck::SetGuestRunning(false);
+        // The background NUP check reads the game file; it must not outlive the game.
+        FileSys::NupIntegrity::Stop();
         VideoCommon::Nx2Spikes::SetGuestThreadSource({});
         Nx2Bottleneck::SetSleepThreadNameSource(nullptr, nullptr);
+        Nx2Bottleneck::SetGuestCoreSource({});
         debug_service.reset();
         SetShuttingDown(true);
         Common::ADPF::Shutdown();

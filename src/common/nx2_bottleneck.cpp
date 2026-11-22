@@ -28,6 +28,8 @@
 #include "common/logging.h"
 #include "common/memory_accounting.h"
 #include "common/run_outcome.h"
+#include "common/nx2_diagnostics.h"
+#include "common/read_attribution.h"
 #include "common/system_log.h"
 #include "common/thread.h"
 
@@ -942,6 +944,7 @@ void Report(const Window& window) {
     add("; file reads: {} ({:.0f} ms, longest {:.0f} ms)", reads.count, reads.ms, reads.longest_ms);
     add("; audio underruns: {}{}", window.audio_underruns, memory);
     LOG_INFO(Core, "{}", text);
+    RememberReport(text);
     LOG_INFO(Core,
              "Frames: {} shown | late (> 1.5x the median interval) {} | longest {:.1f} ms | "
              "median {:.1f} ms | 99th {:.1f} ms",
@@ -1262,12 +1265,32 @@ void ReportLoop() {
                                    !whole || window.seconds < static_cast<double>(Period.count()) * 0.99);
             }
         }
+        OnReportTick();
         if (whole) {
             Report(window);
             ReportMemory();
+            Common::ReadAttribution::EmitWindowReport();
             if (MemoryMapEnabled() && ++memory_reports % 6 == 0) {
                 ReportMemoryMap();
             }
+            ProgressWindow progress;
+            progress.whole = true;
+            progress.seconds = window.seconds;
+            progress.frames = window.frames;
+            for (size_t core = 0; core < MaxCores; ++core) {
+                if (window.guest_run[core] > progress.busiest_core_run) {
+                    progress.busiest_core_run = window.guest_run[core];
+                    progress.busiest_core = core;
+                }
+            }
+            progress.file_reads = window.Waited(Wait::FileRead).count;
+            progress.empty_yields = window.empty_yields;
+            progress.svc_calls = window.svc_total;
+            OnReportWindow(progress);
+        } else {
+            // A window the guest was paused in ends an episode of no progress.
+            ProgressWindow paused;
+            OnReportWindow(paused);
         }
     }
 }
@@ -1328,11 +1351,17 @@ static u64 TestCrashAfterFrames() {
 }
 
 static std::atomic<u64> test_crash_frames{};
+static std::atomic<u64> frames_total{};
+
+u64 FramesPresented() noexcept {
+    return frames_total.load(std::memory_order_relaxed);
+}
 
 void NoteFrame() {
     const u64 now = Now();
     const u64 previous = last_frame.exchange(now, std::memory_order_relaxed);
     frames.fetch_add(1, std::memory_order_relaxed);
+    frames_total.fetch_add(1, std::memory_order_relaxed);
     Common::RunOutcome::NoteFrame();
     if (const u64 crash_after = TestCrashAfterFrames();
         crash_after != 0 &&
@@ -1518,6 +1547,12 @@ void SetSleepThreadNameSource(std::string (*source)(void*, u64), void* user) {
     std::scoped_lock lock{sleep_name_mutex};
     sleep_name_source = source;
     sleep_name_user = user;
+}
+
+std::string GuestThreadName(u64 thread_id) {
+    std::scoped_lock lock{sleep_name_mutex};
+    return sleep_name_source != nullptr ? sleep_name_source(sleep_name_user, thread_id)
+                                        : std::string{};
 }
 
 void ClearSleepThreadCounters() {

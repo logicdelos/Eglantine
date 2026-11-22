@@ -183,6 +183,29 @@ public:
     Loader::ResultStatus VerifyIntegrity(
         std::function<bool(std::size_t, std::size_t)> progress_callback) const;
 
+    struct BadMember {
+        std::string path;   ///< package-relative, e.g. "base/romfs/bdat.ard"
+        std::string reason; ///< "SHA-256 mismatch", "short read of the container", ...
+    };
+
+    struct MemberVerifyResult {
+        std::size_t members{};  ///< members in the container
+        std::size_t checked{};  ///< members that were read to the end (right or wrong)
+        u64 bytes_read{};       ///< bytes read from the container file
+        u64 bytes_hashed{};     ///< member bytes hashed (after decompression)
+        bool cancelled{};       ///< before_read returned false; the rest was not checked
+        std::vector<BadMember> bad;
+    };
+
+    /// VerifyIntegrity for a background job: every member in turn, in 1 MiB steps, memory bounded
+    /// to a few MiB (a zstd member is decompressed as a stream and never cached), a bad member is
+    /// recorded and the next one is checked. `before_read(n)` runs before each read of n bytes of
+    /// the container and returns false to cancel; it is the place to pace the reads.
+    MemberVerifyResult VerifyMembers(const std::function<bool(u64)>& before_read) const;
+
+    /// "base/romfs/x", "update-v65536/romfs/x", "addon-<title>/romfs/x" for each member index.
+    std::vector<std::string> MemberPaths() const;
+
     std::size_t GetFileCount() const {
         return files.size();
     }

@@ -504,7 +504,7 @@ Result FSP_SRV::OpenDataStorageByCurrentProcess(OutInterface<IStorage> out_inter
         romfs = current_romfs;
     }
 
-    *out_interface = std::make_shared<IStorage>(system, romfs);
+    *out_interface = std::make_shared<IStorage>(system, romfs, "data storage of the current process");
 
     R_SUCCEED();
 }
@@ -520,7 +520,8 @@ Result FSP_SRV::OpenDataStorageByDataId(OutInterface<IStorage> out_interface,
         const auto archive = FileSys::SystemArchive::SynthesizeSystemArchive(title_id);
 
         if (archive != nullptr) {
-            *out_interface = std::make_shared<IStorage>(system, archive);
+            *out_interface = std::make_shared<IStorage>(
+                system, archive, fmt::format("system archive {:016X}", title_id));
             R_SUCCEED();
         }
 
@@ -536,7 +537,8 @@ Result FSP_SRV::OpenDataStorageByDataId(OutInterface<IStorage> out_interface,
     auto base =
         romfs_controller->OpenBaseNca(title_id, storage_id, FileSys::ContentRecordType::Data);
     auto storage = std::make_shared<IStorage>(
-        system, pm.PatchRomFS(base.get(), std::move(data), FileSys::ContentRecordType::Data));
+        system, pm.PatchRomFS(base.get(), std::move(data), FileSys::ContentRecordType::Data),
+        fmt::format("data {:016X} on storage {:02X}", title_id, static_cast<u32>(storage_id)));
 
     *out_interface = std::move(storage);
     R_SUCCEED();
@@ -579,7 +581,9 @@ Result FSP_SRV::OpenDataStorageWithProgramIndex(OutInterface<IStorage> out_inter
         R_RETURN(ResultUnknown);
     }
 
-    *out_interface = std::make_shared<IStorage>(system, std::move(patched_romfs));
+    *out_interface = std::make_shared<IStorage>(
+        system, std::move(patched_romfs),
+        fmt::format("data storage of program index {} (title {:016X})", program_index, program_id));
 
     R_SUCCEED();
 }

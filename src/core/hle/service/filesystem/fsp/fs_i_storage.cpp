@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <thread>
 
+#include "common/read_attribution.h"
 #include "common/system_log.h"
 #include "core/core.h"
 #include "core/file_sys/errors.h"
@@ -22,8 +23,9 @@
 
 namespace Service::FileSystem {
 
-IStorage::IStorage(Core::System& system_, FileSys::VirtualFile backend_)
-    : ServiceFramework{system_, "IStorage"}, backend(std::move(backend_)) {
+IStorage::IStorage(Core::System& system_, FileSys::VirtualFile backend_, std::string label_)
+    : ServiceFramework{system_, "IStorage"}, backend(std::move(backend_)),
+      label(std::move(label_)) {
     static const FunctionInfo functions[] = {
         {0, D<&IStorage::Read>, "Read"},
         {1, nullptr, "Write"},
@@ -83,6 +85,13 @@ Result IStorage::Read(
                                   static_cast<u64>(length), read_us,
                                   static_cast<u64>(offset));
     }
+    attribution.Note(Common::ReadAttribution::Kind::Storage, static_cast<u64>(transferred), [this] {
+        if (!label.empty()) {
+            return label;
+        }
+        std::string name = backend->GetName();
+        return name.empty() ? std::string{"(unnamed storage)"} : name;
+    });
     if (transferred != static_cast<size_t>(length)) {
         // Preserve the existing guest reply. Record the mismatch without logging file contents
         // or flooding the log when a title retries an EOF read in a loop.

@@ -25,6 +25,7 @@
 #include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/memory_accounting.h"
+#include "common/read_attribution.h"
 #include "common/settings.h"
 #include "common/swap.h"
 #include "core/file_sys/vfs/vfs_offset.h"
@@ -209,6 +210,12 @@ public:
     }
 
     std::size_t Read(u8* data, std::size_t length, std::size_t offset) const override {
+        const std::size_t read = ReadMember(data, length, offset);
+        attribution.Note(Common::ReadAttribution::Kind::NupMember, read, [this] { return name; });
+        return read;
+    }
+
+    std::size_t ReadMember(u8* data, std::size_t length, std::size_t offset) const {
         if (offset >= uncompressed_size) {
             return 0;
         }
@@ -445,6 +452,38 @@ private:
     std::shared_ptr<NupDecompressCache> cache;
     std::size_t cache_index;
     bool cache_enabled;
+    Common::ReadAttribution::Source attribution;
+};
+
+/// A member stored as is: a window of the container, counted in the read report like a
+/// compressed one.
+class NupRawFile final : public OffsetVfsFile {
+public:
+    using OffsetVfsFile::OffsetVfsFile;
+
+    std::size_t Read(u8* data, std::size_t length, std::size_t offset) const override {
+        const std::size_t read = OffsetVfsFile::Read(data, length, offset);
+        attribution.Note(Common::ReadAttribution::Kind::NupMember, read,
+                         [this] { return GetName(); });
+        return read;
+    }
+
+    std::vector<u8> ReadBytes(std::size_t size, std::size_t offset) const override {
+        std::vector<u8> bytes = OffsetVfsFile::ReadBytes(size, offset);
+        attribution.Note(Common::ReadAttribution::Kind::NupMember, bytes.size(),
+                         [this] { return GetName(); });
+        return bytes;
+    }
+
+    std::vector<u8> ReadAllBytes() const override {
+        std::vector<u8> bytes = OffsetVfsFile::ReadAllBytes();
+        attribution.Note(Common::ReadAttribution::Kind::NupMember, bytes.size(),
+                         [this] { return GetName(); });
+        return bytes;
+    }
+
+private:
+    Common::ReadAttribution::Source attribution;
 };
 
 } // namespace
@@ -966,7 +1005,7 @@ VirtualFile NupContainer::OpenFileAs(std::size_t file_index, const std::string& 
         return std::make_shared<VectorVfsFile>(std::vector<u8>{}, name);
     }
     if (node.codec == CodecRaw) {
-        return std::make_shared<OffsetVfsFile>(
+        return std::make_shared<NupRawFile>(
             file, static_cast<std::size_t>(node.extent_size),
             static_cast<std::size_t>(node.extent_offset), name);
     }
@@ -1191,6 +1230,7 @@ std::vector<u8> NupContainer::ReadExtentRaw(const FileNode& node) const {
 
 Loader::ResultStatus NupContainer::VerifyIntegrity(
     std::function<bool(std::size_t, std::size_t)> progress_callback) const {
+    const Common::ReadAttribution::ScopedSuppress not_the_game;
     const std::size_t total = files.size();
     for (std::size_t i = 0; i < total; ++i) {
         const FileNode& node = files[i];
@@ -1218,6 +1258,156 @@ Loader::ResultStatus NupContainer::VerifyIntegrity(
         }
     }
     return Loader::ResultStatus::Success;
+}
+
+std::vector<std::string> NupContainer::MemberPaths() const {
+    std::vector<std::string> paths(files.size());
+    for (std::size_t i = 0; i < files.size(); ++i) {
+        paths[i] = files[i].name;
+    }
+    const auto walk = [&](const auto& self, u32 dir, const std::string& path, u32 depth) -> void {
+        if (dir >= dirs.size() || depth > MaxDirDepth) {
+            return;
+        }
+        const DirNode& node = dirs[dir];
+        const u64 end = std::min<u64>(static_cast<u64>(node.first_child) + node.child_count,
+                                      children.size());
+        for (u64 slot = node.first_child; slot < end; ++slot) {
+            const u32 child = children[slot];
+            if (child >= dirs.size()) {
+                const std::size_t index = child - dirs.size();
+                if (index < files.size()) {
+                    paths[index] = path + '/' + files[index].name;
+                }
+            } else {
+                self(self, child, path + '/' + dirs[child].name, depth + 1);
+            }
+        }
+    };
+    for (const PackageInfo& package : packages) {
+        std::string prefix;
+        switch (package.kind) {
+        case PackageKind::Base:
+            prefix = "base";
+            break;
+        case PackageKind::Update:
+            prefix = fmt::format("update-v{}", package.version);
+            break;
+        case PackageKind::Addon:
+            prefix = fmt::format("addon-{:016x}", package.title_id);
+            break;
+        }
+        walk(walk, package.root_dir, prefix, 0);
+    }
+    return paths;
+}
+
+NupContainer::MemberVerifyResult NupContainer::VerifyMembers(
+    const std::function<bool(u64)>& before_read) const {
+    constexpr std::size_t Chunk = 1024 * 1024;
+    MemberVerifyResult result;
+    result.members = files.size();
+    const std::vector<std::string> paths = MemberPaths();
+    const u64 container_size = file->GetSize();
+    const std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> digest{EVP_MD_CTX_new(),
+                                                                          &EVP_MD_CTX_free};
+    const std::unique_ptr<ZSTD_DCtx, decltype(&ZSTD_freeDCtx)> dctx{ZSTD_createDCtx(),
+                                                                    &ZSTD_freeDCtx};
+    std::vector<u8> in_buffer(Chunk);
+    std::vector<u8> out_buffer(std::max<std::size_t>(ZSTD_DStreamOutSize(), Chunk));
+    if (!digest || !dctx) {
+        result.bad.push_back({"(container)", "out of memory"});
+        return result;
+    }
+
+    for (std::size_t i = 0; i < files.size(); ++i) {
+        const FileNode& node = files[i];
+        const char* problem = nullptr;
+        u64 hashed = 0;
+        const auto update = [&](const u8* data, std::size_t size) {
+            EVP_DigestUpdate(digest.get(), data, size);
+            hashed += size;
+        };
+        if (EVP_DigestInit_ex(digest.get(), EVP_sha256(), nullptr) != 1) {
+            problem = "SHA-256 unavailable";
+        } else if (node.size == 0) {
+            // Nothing stored: the empty digest.
+        } else if (node.extent_size > container_size ||
+                   node.extent_offset > container_size - node.extent_size) {
+            problem = "extent outside the container";
+        } else if (node.codec == CodecRaw) {
+            if (node.extent_size != node.size) {
+                problem = "stored size differs from the member size";
+            }
+            for (u64 done = 0; !problem && done < node.size;) {
+                const auto length = static_cast<std::size_t>(std::min<u64>(Chunk, node.size - done));
+                if (before_read && !before_read(length)) {
+                    result.cancelled = true;
+                    return result;
+                }
+                if (file->Read(in_buffer.data(), length,
+                               static_cast<std::size_t>(node.extent_offset + done)) != length) {
+                    problem = "short read of the container";
+                    break;
+                }
+                result.bytes_read += length;
+                update(in_buffer.data(), length);
+                done += length;
+            }
+        } else {
+            ZSTD_DCtx_reset(dctx.get(), ZSTD_reset_session_and_parameters);
+            const ZSTD_bounds bounds = ZSTD_dParam_getBounds(ZSTD_d_windowLogMax);
+            if (!ZSTD_isError(bounds.error)) {
+                ZSTD_DCtx_setParameter(dctx.get(), ZSTD_d_windowLogMax, bounds.upperBound);
+            }
+            u64 consumed = 0;
+            bool frame_done = false;
+            while (!problem && !frame_done && consumed < node.extent_size) {
+                const auto length =
+                    static_cast<std::size_t>(std::min<u64>(Chunk, node.extent_size - consumed));
+                if (before_read && !before_read(length)) {
+                    result.cancelled = true;
+                    return result;
+                }
+                if (file->Read(in_buffer.data(), length,
+                               static_cast<std::size_t>(node.extent_offset + consumed)) != length) {
+                    problem = "short read of the container";
+                    break;
+                }
+                consumed += length;
+                result.bytes_read += length;
+                ZSTD_inBuffer input{in_buffer.data(), length, 0};
+                ZSTD_outBuffer output{};
+                do {
+                    output = {out_buffer.data(), out_buffer.size(), 0};
+                    const std::size_t code = ZSTD_decompressStream(dctx.get(), &output, &input);
+                    if (ZSTD_isError(code) || output.pos > node.size - hashed) {
+                        problem = "zstd data corrupt";
+                        break;
+                    }
+                    update(out_buffer.data(), output.pos);
+                    frame_done = code == 0;
+                } while (!frame_done && (input.pos < input.size || output.pos == output.size));
+            }
+            if (!problem && (!frame_done || hashed != node.size)) {
+                problem = "zstd data corrupt or of the wrong size";
+            }
+        }
+
+        std::array<u8, 0x20> hash{};
+        unsigned int length = 0;
+        const bool final_ok = EVP_DigestFinal_ex(digest.get(), hash.data(), &length) == 1 &&
+                              length == hash.size();
+        if (!problem && (!final_ok || hash != node.sha256)) {
+            problem = "SHA-256 mismatch";
+        }
+        result.bytes_hashed += hashed;
+        if (problem) {
+            result.bad.push_back({paths[i], problem});
+        }
+        ++result.checked;
+    }
+    return result;
 }
 
 } // namespace FileSys

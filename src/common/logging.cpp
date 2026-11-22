@@ -7,7 +7,10 @@
 // SPDX-FileCopyrightText: 2014 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
 #include <atomic>
+#include <cstring>
 #include <chrono>
 #include <climits>
 #include <cstdlib>
@@ -35,6 +38,7 @@
 #include "common/fs/fs_paths.h"
 #include "common/fs/path_util.h"
 #include "common/literals.h"
+#include "common/log_retention.h"
 #include "common/log_ring.h"
 #include "common/nx2_sampler.h"
 #include "common/polyfill_thread.h"
@@ -271,10 +275,13 @@ struct FileReentryGuard {
 /// @brief Backend that writes to a file passed into the constructor
 struct FileBackend final : public Backend {
     explicit FileBackend(const std::filesystem::path filename) noexcept {
-        // Move a log over its ".old.txt" copy. The rename replaces the copy atomically, and fails
-        // if the log is still open elsewhere (e.g. in an emulator process that hasn't exited yet).
-        // A log that can't even be checked counts as a failure, so it is never truncated.
-        const auto rotate = [](const std::filesystem::path& path) {
+        // Archive the previous session's log as eden_log.<stamp>.txt (the newest 5 are kept, see
+        // log_retention.h). The rename fails if the log is still open elsewhere (e.g. in an
+        // emulator process that hasn't exited yet). A log that can't even be checked counts as a
+        // failure, so it is never truncated. Android's share-log button reads the one fixed
+        // "<log>.old.txt" name, so there the previous scheme stays.
+        const auto rotate = [this](const std::filesystem::path& path) {
+#ifdef __ANDROID__
             std::error_code ec;
             if (!std::filesystem::exists(path, ec))
                 return !ec;
@@ -282,6 +289,31 @@ struct FileBackend final : public Backend {
             old_path += ".old.txt";
             std::filesystem::rename(path, old_path, ec);
             return !ec;
+#else
+            auto result = Retention::Rotate(path);
+            if (result.archived) {
+                retention_notes.push_back(fmt::format(
+                    "Log retention: previous session log kept as {}",
+                    result.archived->filename().string()));
+                needs_compression = true;
+            }
+            if (result.migrated) {
+                retention_notes.push_back(fmt::format(
+                    "Log retention: the old .old.txt log was renamed to {}",
+                    result.migrated->filename().string()));
+                needs_compression = true;
+            }
+            if (!result.deleted.empty()) {
+                std::string names;
+                for (const auto& deleted : result.deleted) {
+                    names += (names.empty() ? "" : ", ") + deleted.filename().string();
+                }
+                retention_notes.push_back(
+                    fmt::format("Log retention: kept the newest {} session logs, deleted {}",
+                                Retention::KeepArchives, names));
+            }
+            return result.ok;
+#endif
         };
         // If the log can't be moved, write this session to a second log (eden_log_2.txt) so that
         // the previous session is kept and this one still gets the full size limit. If that one
@@ -333,6 +365,11 @@ struct FileBackend final : public Backend {
         std::scoped_lock lock{write_mutex};
         FlushUnlocked();
     }
+
+    /// What the rotation at construction did (logged once the logger is up) and whether it left
+    /// archives that the retention thread should compress.
+    std::vector<std::string> retention_notes;
+    bool needs_compression = false;
     [[nodiscard]] const std::filesystem::path& Path() const noexcept {
         return log_path;
     }
@@ -517,6 +554,8 @@ struct Impl {
 #ifndef __OPENORBIS__
     // Last, so it stops before the file backend it flushes is destroyed.
     std::jthread file_flush_thread;
+    // After it: stops and is joined first, while the file backend its logging goes to still lives.
+    std::jthread retention_thread;
 #endif
 };
 } // Anonymous namespace
@@ -555,6 +594,81 @@ LogCounts GetLogCounts() noexcept {
             .critical = critical_log_count.load(std::memory_order_relaxed)};
 }
 
+namespace {
+struct RecentErrors {
+    std::mutex mutex;
+    std::array<RecentError, RecentErrorSlots> slots{};
+    u64 next_stamp{1};
+};
+// Leaked: messages are logged during static destruction too.
+RecentErrors& Recent() {
+    static auto* recent = new RecentErrors;
+    return *recent;
+}
+
+void Assign(char* destination, std::size_t capacity, std::string_view text) noexcept {
+    const std::size_t length = (std::min)(text.size(), capacity - 1);
+    std::memcpy(destination, text.data(), length);
+    destination[length] = '\0';
+}
+} // namespace
+
+/// Remembers an Error or Critical message for GetRecentErrors: one slot per source line.
+static void NoteRecentError(const Entry& e) {
+    std::string_view file = e.filename ? e.filename : "?";
+    if (const auto slash = file.find_last_of("/\\"); slash != std::string_view::npos) {
+        file.remove_prefix(slash + 1);
+    }
+    char site[sizeof(RecentError::site)];
+    const auto written = fmt::format_to_n(site, sizeof(site) - 1, "{}:{}", file, e.line_num);
+    const std::string_view key{site, (std::min)(written.size, sizeof(site) - 1)};
+    auto& recent = Recent();
+    std::scoped_lock lock{recent.mutex};
+    RecentError* slot = nullptr;
+    for (RecentError& candidate : recent.slots) {
+        if (candidate.stamp != 0 && key == candidate.site) {
+            slot = &candidate;
+            break;
+        }
+    }
+    if (slot == nullptr) {
+        // The oldest one (an unused slot has stamp 0) is replaced.
+        slot = &*std::min_element(
+            recent.slots.begin(), recent.slots.end(),
+            [](const RecentError& a, const RecentError& b) { return a.stamp < b.stamp; });
+        *slot = {};
+        Assign(slot->site, sizeof(slot->site), key);
+    }
+    Assign(slot->message, sizeof(slot->message), {e.message, e.message_len});
+    ++slot->count;
+    slot->last_seconds = static_cast<double>(e.timestamp.count()) / 1e6;
+    slot->critical = e.log_level == Level::Critical;
+    slot->stamp = recent.next_stamp++;
+}
+
+std::size_t GetRecentErrors(RecentError* out, std::size_t max, bool lock) noexcept {
+    auto& recent = Recent();
+    std::unique_lock guard{recent.mutex, std::defer_lock};
+    if (lock) {
+        guard.lock();
+    }
+    std::array<const RecentError*, RecentErrorSlots> used{};
+    std::size_t count = 0;
+    for (const RecentError& slot : recent.slots) {
+        if (slot.stamp != 0) {
+            used[count++] = &slot;
+        }
+    }
+    std::sort(used.begin(), used.begin() + count,
+              [](const RecentError* a, const RecentError* b) { return a->stamp < b->stamp; });
+    // The newest `max`, oldest first.
+    const std::size_t first = count > max ? count - max : 0;
+    for (std::size_t i = first; i < count; ++i) {
+        out[i - first] = *used[i];
+    }
+    return count - first;
+}
+
 void Initialize() {
     if (logging_instance) {
         LOG_WARNING(Log, "Reinitializing logging backend");
@@ -566,6 +680,23 @@ void Initialize() {
         const auto& log_dir = GetEdenPath(EdenPath::LogDir);
         void(CreateDir(log_dir));
         logging_instance->file_backend.emplace(log_dir / LOG_FILE);
+        for (const auto& note : logging_instance->file_backend->retention_notes)
+            LOG_INFO(Log, "{}", note);
+        if (logging_instance->file_backend->needs_compression) {
+            // Compress the older archives off the boot path, at background priority; the previous
+            // session's log stays plain text. Joined (and stopped between blocks) at exit.
+            logging_instance->retention_thread = std::jthread(
+                [log_path = logging_instance->file_backend->Path()](std::stop_token token) {
+                    Common::SetCurrentThreadName("LogRetention");
+#ifdef _WIN32
+                    ::SetThreadPriority(::GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+#endif
+                    const auto count = Retention::CompressOlderArchives(log_path, token);
+                    if (count != 0)
+                        LOG_INFO(Log, "Log retention: compressed {} older session log(s) to .zst",
+                                 count);
+                });
+        }
 #endif
     }
 }
@@ -731,6 +862,7 @@ void FmtLogMessageImpl(Class log_class, Level log_level, const char* filename, u
                 if (flush) backend.Flush();
             });
             if (sink) sink(GetLogClassName(log_class), log_level, {e.message, e.message_len});
+            if (log_level >= Level::Error) NoteRecentError(e);
         } else {
             std::string s = fmt::vformat(format, args);
             e.message = s.c_str();
@@ -740,6 +872,7 @@ void FmtLogMessageImpl(Class log_class, Level log_level, const char* filename, u
                 if (flush) backend.Flush();
             });
             if (sink) sink(GetLogClassName(log_class), log_level, s);
+            if (log_level >= Level::Error) NoteRecentError(e);
         }
         if (log_level >= Level::Warning) {
             // Only where the message came from, never its text: it can carry values and dumps

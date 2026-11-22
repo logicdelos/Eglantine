@@ -44,7 +44,10 @@ add_executable(tests
     common/fresh_profile.cpp
     core/launch_params_early.cpp
     common/speed_limit.cpp
+    common/log_retention.cpp
+    common/read_attribution.cpp
     common/system_log.cpp
+    common/nx2_diagnostics.cpp
     common/test_frame_delay.cpp
     common/ui_e_profile_migration.cpp
     common/ui_e_restore_eden_path.h
@@ -76,6 +79,7 @@ add_executable(tests
     core/ldn.cpp
     core/internal_network/socket_proxy.cpp
     core/nup_writer.cpp
+    core/nup_integrity.cpp
     core/nup_zstd_read.cpp
     core/nx2_debug_server.cpp
     core/nx2_movie_pacing.cpp
@@ -122,6 +126,7 @@ add_executable(tests
     video_core/virtual_range_cache.cpp
     video_core/query_copy.cpp
     video_core/ampere_lowering.cpp
+    video_core/ampere_capture_end.cpp
     video_core/spirv_software_matrix.cpp
     video_core/ampere_geometry.cpp
     video_core/ampere_i2f.cpp

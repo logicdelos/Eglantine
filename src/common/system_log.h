@@ -62,6 +62,9 @@ enum class EventKind : u16 {
     LogCritical,
     Marker,
     HostCrash,
+    SceneChange,
+    LowMemory,
+    NoProgress,
 };
 
 struct Event {
