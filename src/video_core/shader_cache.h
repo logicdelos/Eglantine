@@ -127,6 +127,10 @@ protected:
     bool last_shaders_valid = false;
     /// invalidation_serial read when the stages were last resolved.
     u64 refreshed_invalidation_serial{};
+    /// GPU map serial read when the stages were last resolved: a verdict that skips draws (an
+    /// unmapped or rejected program) is not kept across a map or unmap, which changes the
+    /// memory the program address reads.
+    u64 refreshed_map_serial{};
     /// Nx2Perf MacroReadWriterSet: Tegra::g_nx2_code_epoch read before shader_infos were last
     /// resolved (0: they are not valid), and the device code range of each program (size 0: none).
     u64 nx2_resolved_epoch{};
@@ -188,8 +192,26 @@ private:
     void RethrowIfRejected(VAddr addr);
     /// Whether a native program at this address was rejected.
     bool IsRejected(VAddr addr);
-    /// Remembers the exception being handled as this address's rejection.
+    /// Remembers the exception being handled as this address's rejection and registers the pages
+    /// its header and first instructions sit on for guest write tracking (RejectionWatchRange):
+    /// pages nothing else caches are not tracked, so without this the write that loads the
+    /// program's real code would never reach InvalidatePagesInRegion.
     void RememberRejection(VAddr addr);
+    /// Forgets every remembered rejection and stops watching their pages.
+    void ClearRejections();
+
+    /// How much of a program, from its start, decides whether it is accepted: the native header
+    /// (0x80 bytes) and the first instructions. A rejected program is re-examined once a write
+    /// lands on the pages that cover this.
+    static constexpr size_t RejectionWatchBytes = 0x100;
+    /// The device pages (begin, size) watched while the program at `addr` stays rejected.
+    static constexpr std::pair<VAddr, size_t> RejectionWatchRange(VAddr addr) noexcept {
+        constexpr VAddr page_mask = ::Core::DEVICE_PAGESIZE - 1;
+        const VAddr begin = addr & ~page_mask;
+        const VAddr end = (addr + RejectionWatchBytes + page_mask) & ~page_mask;
+        return {begin, static_cast<size_t>(end - begin)};
+    }
+
     /// Hash of the state task and mesh programs are translated with.
     u64 MeshStateHash() const;
 
@@ -202,10 +224,17 @@ private:
     std::vector<Entry*> marked_for_removal;
 
     /// Native programs the lowering rejected, by address, so each draw or dispatch rethrows the
-    /// first error instead of lowering again; dropped when guest memory there is written.
+    /// first error instead of lowering again; dropped when guest memory on the pages around the
+    /// program's header is written (the pages are write-tracked while it lives).
+    struct Rejection {
+        std::exception_ptr error;
+        VAddr watch_begin{}; ///< Pages registered with UpdatePagesCachedCount(+1) for it
+        size_t watch_size{};
+    };
     std::mutex rejected_mutex;
-    ::Common::unordered_map<u64, std::exception_ptr> rejected_native;
-    /// Bounds of every address ever rejected (never shrinks): a quick test for invalidations.
+    ::Common::unordered_map<u64, Rejection> rejected_native;
+    /// Bounds of every watched page run ever rejected, [lowest, highest) (never shrinks): a quick
+    /// test for invalidations.
     std::atomic<VAddr> rejected_lowest{~VAddr{}};
     std::atomic<VAddr> rejected_highest{};
 

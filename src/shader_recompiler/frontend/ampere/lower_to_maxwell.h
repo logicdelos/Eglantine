@@ -3680,8 +3680,19 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             if (target < 0 || target % 16) return fail(index, "native branch destination alignment");
             relocations.push_back({static_cast<u32>(result.instructions.size()), target / 16});
             emit(0xe24000000000000fULL | branch_predicate);
-            if (computed_branch && target == s64{index} * 16 && branch_predicate == (u64{7} << 16))
-                return finish(index); // the closing self-branch
+            if (target == s64{index} * 16 && branch_predicate == (u64{7} << 16)) {
+                // The closing self-branch ends the program: always after a jump table (its
+                // targets are not in the code), else when an EXIT came before it and nothing
+                // branches or calls past it (out-of-line blocks may follow the last EXIT, with
+                // no EXIT of their own).
+                const bool pending = std::any_of(relocations.begin(), relocations.end(),
+                    [&](const Relocation& relocation) { return relocation.target > index; });
+                const bool exited = std::any_of(code.begin(), code.begin() + index,
+                    [](const Instruction& prior) {
+                        return prior.Bits(0, 12) == 0x94d && prior.Bits(12, 4) == 7;
+                    });
+                if (computed_branch || (exited && !pending)) return finish(index);
+            }
             break;
         }
         case 0x324: case 0x924: { // OUT: geometry output (register or immediate stream).

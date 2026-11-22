@@ -85,8 +85,7 @@ void ShaderCache::RefreshDebugRejections(bool unrejected) {
         RemovePendingShaders();
     }
     if (unrejected) {
-        std::scoped_lock lock{rejected_mutex};
-        rejected_native.clear();
+        ClearRejections();
     }
     // shader_infos may point at removed programs: every channel must refresh its stages.
     for (const size_t id : active_channel_ids) {
@@ -140,7 +139,8 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
     // An invalidation frees ShaderInfos without touching the dirty flag, so shader_infos may
     // dangle: resolve again whenever the serial moved since the last refresh.
     if (!dirty[VideoCommon::Dirty::Shaders] &&
-        refreshed_invalidation_serial == invalidation_serial.load(std::memory_order_acquire)) {
+        refreshed_invalidation_serial == invalidation_serial.load(std::memory_order_acquire) &&
+        (last_shaders_valid || refreshed_map_serial == gpu_memory->GetMapSerial())) {
         return last_shaders_valid;
     }
     dirty[VideoCommon::Dirty::Shaders] = false;
@@ -152,6 +152,7 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
     const u64 map_serial = gpu_memory->GetMapSerial();
     const u64 inv_serial = invalidation_serial.load(std::memory_order_acquire);
     refreshed_invalidation_serial = inv_serial;
+    refreshed_map_serial = map_serial;
     // Read before anything is resolved: a program dropped meanwhile moved it on.
     const u64 code_epoch = Tegra::g_nx2_code_epoch.load(std::memory_order_acquire);
     nx2_resolved_epoch = 0;
@@ -299,7 +300,7 @@ const ShaderInfo* ShaderCache::ComputeShader() {
 void ShaderCache::RethrowIfRejected(VAddr addr) {
     std::scoped_lock lock{rejected_mutex};
     if (const auto it = rejected_native.find(addr); it != rejected_native.end()) {
-        std::rethrow_exception(it->second);
+        std::rethrow_exception(it->second.error);
     }
 }
 
@@ -309,14 +310,42 @@ bool ShaderCache::IsRejected(VAddr addr) {
 }
 
 void ShaderCache::RememberRejection(VAddr addr) {
+    const auto [watch_begin, watch_size] = RejectionWatchRange(addr);
     std::scoped_lock lock{rejected_mutex};
-    rejected_native.emplace(addr, std::current_exception());
+    if (rejected_native.contains(addr)) {
+        return; // already remembered, and its pages already watched
+    }
     // InnerInvalidation skips pages the filter never saw; a rewrite here must still drop this.
-    page_filter.Mark(addr, 1);
-    rejected_lowest.store((std::min)(rejected_lowest.load(std::memory_order_relaxed), addr),
+    page_filter.Mark(watch_begin, watch_size);
+    rejected_lowest.store((std::min)(rejected_lowest.load(std::memory_order_relaxed), watch_begin),
                           std::memory_order_relaxed);
-    rejected_highest.store((std::max)(rejected_highest.load(std::memory_order_relaxed), addr),
+    rejected_highest.store((std::max)(rejected_highest.load(std::memory_order_relaxed),
+                                      watch_begin + watch_size),
                            std::memory_order_relaxed);
+    // Nothing else need cache these pages (a program nobody could lower has no ShaderInfo, and
+    // the rest of the pool may hold no buffer or image), and a guest write to a page nobody
+    // tracks never reaches this cache: the rejection would outlive the bytes it was made on.
+    // Tracked before the rejection can be found, so the matching -1 cannot run ahead of this +1.
+    device_memory.UpdatePagesCachedCount(watch_begin, watch_size, 1);
+    rejected_native.emplace(addr, Rejection{std::current_exception(), watch_begin, watch_size});
+}
+
+void ShaderCache::ClearRejections() {
+    boost::container::small_vector<std::pair<VAddr, size_t>, 16> dropped;
+    {
+        std::scoped_lock lock{rejected_mutex};
+        dropped.reserve(rejected_native.size());
+        for (const auto& [addr, rejection] : rejected_native) {
+            dropped.emplace_back(rejection.watch_begin, rejection.watch_size);
+        }
+        rejected_native.clear();
+    }
+    for (const auto& [begin, size] : dropped) {
+        device_memory.UpdatePagesCachedCount(begin, size, -1);
+    }
+    if (!dropped.empty()) {
+        invalidation_serial.fetch_add(1, std::memory_order_release);
+    }
 }
 
 void ShaderCache::GetGraphicsEnvironments(GraphicsEnvironments& result,
@@ -414,12 +443,31 @@ void ShaderCache::InvalidatePagesInRegion(VAddr addr, size_t size) {
     const VAddr addr_end = addr + size;
     // Rejected programs are few and in a few places: look at them only for writes that can
     // reach them (this runs for every inline upload and pre-draw invalidation).
-    if (addr_end > rejected_lowest.load(std::memory_order_relaxed) &&
-        addr <= rejected_highest.load(std::memory_order_relaxed)) {
-        std::scoped_lock lock{rejected_mutex};
-        boost::unordered::erase_if(rejected_native, [&](const auto& rejected) {
-            return rejected.first >= addr && rejected.first < addr_end;
-        });
+    if (size != 0 && addr_end > rejected_lowest.load(std::memory_order_relaxed) &&
+        addr < rejected_highest.load(std::memory_order_relaxed)) {
+        boost::container::small_vector<std::pair<VAddr, size_t>, 4> dropped;
+        {
+            std::scoped_lock lock{rejected_mutex};
+            // Any write to a watched page: whether it changed the header or the first
+            // instructions is not known to pages, and re-examining a program costs one lowering.
+            boost::unordered::erase_if(rejected_native, [&](const auto& rejected) {
+                const Rejection& rejection = rejected.second;
+                if (addr_end <= rejection.watch_begin ||
+                    addr >= rejection.watch_begin + rejection.watch_size) {
+                    return false;
+                }
+                dropped.emplace_back(rejection.watch_begin, rejection.watch_size);
+                return true;
+            });
+        }
+        for (const auto& [begin, watched] : dropped) {
+            device_memory.UpdatePagesCachedCount(begin, watched, -1);
+        }
+        if (!dropped.empty()) {
+            // RefreshStages answers from its last verdict until the serial moves or a program
+            // register is written: a draw already bound to the rejected program must look again.
+            invalidation_serial.fetch_add(1, std::memory_order_release);
+        }
     }
     const u64 page_end = (addr_end + YUZU_PAGESIZE - 1) >> YUZU_PAGEBITS;
     for (u64 page = addr >> YUZU_PAGEBITS; page < page_end; ++page) {

@@ -36,9 +36,16 @@ struct ShaderCacheTestAccess {
         data->lowered_native = std::move(lowered);
         cache.Register(std::move(data), address, 0x100);
     }
+    /// Remembers a rejection the way RefreshStages does: while an exception is being handled.
     static void Reject(ShaderCache& cache, VAddr address) {
-        cache.rejected_native.emplace(address,
-                                      std::make_exception_ptr(std::runtime_error{"rejected"}));
+        try {
+            throw std::runtime_error{"rejected"};
+        } catch (...) {
+            cache.RememberRejection(address);
+        }
+    }
+    static u64 Serial(const ShaderCache& cache) {
+        return cache.invalidation_serial.load();
     }
     static bool IsRejected(ShaderCache& cache, VAddr address) {
         return cache.IsRejected(address);
@@ -140,6 +147,82 @@ TEST_CASE("Debug server rejections drop matching native programs", "[shader_inva
     REQUIRE_FALSE(ShaderCacheTestAccess::IsRejected(*cache, earlier));
     REQUIRE(VideoCore::Nx2Debug::RejectedHashes() == std::vector<u64>{0x22});
     VideoCore::Nx2Debug::EndSession();
+}
+
+TEST_CASE("A write to a rejected program's header drops the rejection", "[shader_invalidation]") {
+    Core::DeviceMemory memory;
+    Tegra::MaxwellDeviceMemoryManager device_memory{memory};
+    auto cache = ShaderCacheTestAccess::Create(device_memory);
+    // A program whose header (0x80 bytes) and first instructions sit inside page 0x6f92000.
+    constexpr VAddr program = 0x6f92b00;
+    ShaderCacheTestAccess::Reject(*cache, program);
+    ShaderCacheTestAccess::Reject(*cache, program); // already remembered: still one rejection
+    REQUIRE(ShaderCacheTestAccess::IsRejected(*cache, program));
+
+    // Writes next to the program's pages are not about it.
+    cache->InvalidateRegion(0x6f91000, 0x1000);
+    cache->InvalidateRegion(0x6f93000, 0x1000);
+    cache->InvalidateRegion(0x1000000, 0x1000);
+    REQUIRE(ShaderCacheTestAccess::IsRejected(*cache, program));
+
+    // The loader fills the header; the write does not start at the program's first byte.
+    cache->InvalidateRegion(program + 0x40, 4);
+    REQUIRE_FALSE(ShaderCacheTestAccess::IsRejected(*cache, program));
+
+    // Its first instructions are written, again past the first byte.
+    ShaderCacheTestAccess::Reject(*cache, program);
+    cache->InvalidateRegion(program + 0x80, 0x10);
+    REQUIRE_FALSE(ShaderCacheTestAccess::IsRejected(*cache, program));
+
+    // A write that starts before the program and ends inside it.
+    ShaderCacheTestAccess::Reject(*cache, program);
+    cache->InvalidateRegion(program - 0x80, 0x90);
+    REQUIRE_FALSE(ShaderCacheTestAccess::IsRejected(*cache, program));
+}
+
+TEST_CASE("A rejected program's head across a page boundary is watched on both pages",
+          "[shader_invalidation]") {
+    Core::DeviceMemory memory;
+    Tegra::MaxwellDeviceMemoryManager device_memory{memory};
+    auto cache = ShaderCacheTestAccess::Create(device_memory);
+    constexpr VAddr program = 0x6f94f80; // header ends at 0x6f95000, instructions on the next page
+    ShaderCacheTestAccess::Reject(*cache, program);
+    cache->InvalidateRegion(0x6f93000, 0x1000);
+    cache->InvalidateRegion(0x6f96000, 0x1000);
+    REQUIRE(ShaderCacheTestAccess::IsRejected(*cache, program));
+    cache->InvalidateRegion(0x6f95010, 4);
+    REQUIRE_FALSE(ShaderCacheTestAccess::IsRejected(*cache, program));
+}
+
+TEST_CASE("Dropping a rejection makes bound draws look at the program again",
+          "[shader_invalidation]") {
+    Core::DeviceMemory memory;
+    Tegra::MaxwellDeviceMemoryManager device_memory{memory};
+    auto cache = ShaderCacheTestAccess::Create(device_memory);
+    constexpr VAddr program = 0x6f92b00;
+    ShaderCacheTestAccess::Reject(*cache, program);
+    // RefreshStages answers from its previous verdict (a rejection included) until this moves.
+    const u64 rejected_serial = ShaderCacheTestAccess::Serial(*cache);
+    cache->InvalidateRegion(0x1000000, 0x1000);
+    REQUIRE(ShaderCacheTestAccess::Serial(*cache) == rejected_serial);
+    cache->InvalidateRegion(program, 4);
+    REQUIRE_FALSE(ShaderCacheTestAccess::IsRejected(*cache, program));
+    REQUIRE(ShaderCacheTestAccess::Serial(*cache) != rejected_serial);
+}
+
+TEST_CASE("Forgetting every rejection makes bound draws look again", "[shader_invalidation]") {
+    Core::DeviceMemory memory;
+    Tegra::MaxwellDeviceMemoryManager device_memory{memory};
+    auto cache = ShaderCacheTestAccess::Create(device_memory);
+    constexpr VAddr first = 0x6f92b00;
+    constexpr VAddr second = 0x7a10000;
+    ShaderCacheTestAccess::Reject(*cache, first);
+    ShaderCacheTestAccess::Reject(*cache, second);
+    const u64 rejected_serial = ShaderCacheTestAccess::Serial(*cache);
+    cache->RefreshDebugRejections(true);
+    REQUIRE_FALSE(ShaderCacheTestAccess::IsRejected(*cache, first));
+    REQUIRE_FALSE(ShaderCacheTestAccess::IsRejected(*cache, second));
+    REQUIRE(ShaderCacheTestAccess::Serial(*cache) != rejected_serial);
 }
 
 TEST_CASE("Shader invalidation CPU benchmark", "[.][cache_bench]") {

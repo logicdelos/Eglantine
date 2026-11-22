@@ -568,9 +568,16 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
         }
     }
 
-    Tegra::Memory::DeviceGuestMemoryScoped<u8, Tegra::Memory::GuestMemoryFlags::UnsafeReadWrite>
-        tmp(device_memory, *cpu_src_address, amount, &tmp_buffer);
-    tmp.SetAddressAndSize(*cpu_dest_address, amount);
+    {
+        Tegra::Memory::DeviceGuestMemoryScoped<u8, Tegra::Memory::GuestMemoryFlags::UnsafeReadWrite>
+            tmp(device_memory, *cpu_src_address, amount, &tmp_buffer);
+        tmp.SetAddressAndSize(*cpu_dest_address, amount);
+    }
+    // The mirror above writes guest memory with WriteBlockUnsafe, which tells no cache, while
+    // the generic DMA path and CPU stores do reach the shader cache: a program, or a rejection,
+    // made on the bytes just replaced would otherwise outlive them. The copy engine can stream
+    // program code into a pool.
+    gpu_memory->InvalidateRegion(dest_address, amount, CacheType::ShaderCache);
     return true;
 }
 
