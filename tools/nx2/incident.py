@@ -41,6 +41,11 @@ SCHEMA = 1
 LOG_NAMES = ("eden_log.txt", "eden_log_2.txt")
 # The only debug server tools this recorder will call: no guest or GPU memory, no input.
 ALLOWED_TOOLS = ("status", "mark", "log_tail", "system_events", "capture_frame", "sample")
+# System event rows kept per mark: this many before the mark's own row, then everything after it
+# up to the page bound (rows a page, pages a mark).
+SYS_ROWS_BEFORE = 1000
+SYS_PAGE_ROWS = 1000
+SYS_MAX_PAGES = 8
 # What the log already shows for a window is kept as counts and signal rows, never as text,
 # unless --raw-log asks for redacted text under private/.
 DISTINCT = {"report", "frames_summary", "ipc_summary", "mark_line", "log_file_limit", "host_crash",
@@ -521,6 +526,7 @@ class Mark:
         self.wall = wall
         self.present = None
         self.server_mark = None
+        self.system_seq = None
         self.log_byte = None
         self.notes = []
         self.pre_agg = None
@@ -1010,12 +1016,14 @@ class Recorder:
         correlation, uncertainty = "approximate", FLUSH_SLACK_S + self.cfg.poll
         present = None
         server_mark = None
+        system_seq = None
         if native is not None:
             correlation, uncertainty = "log_line", 0.0
         elif self.link is not None and self.server_ok:
             try:
                 result = self.link.call("mark", {}, timeout=5)
                 present = result.get("presents")
+                system_seq = result.get("system_event_seq") or None
                 if result.get("logged") and "native_seconds" in result:
                     native = result["native_seconds"]
                     correlation, uncertainty = "exact", 0.0
@@ -1038,6 +1046,7 @@ class Recorder:
                     self.wall())
         mark.present = present
         mark.server_mark = server_mark
+        mark.system_seq = system_seq
         mark.notes = notes
         mark.pre_agg = WindowAgg(native, self.cfg.raw_max_lines)
         mark.post_agg = WindowAgg(native, self.cfg.raw_max_lines)
@@ -1058,6 +1067,36 @@ class Recorder:
             reached = self.native_high is not None and self.native_high >= mark.native + mark.post
             if reached or now - mark.mono >= mark.post + self.cfg.grace or self.stopping:
                 self.close_mark(mark, now)
+
+    def fetch_system_events(self, mark):
+        """The system event rows around a mark, paged: (rows, info), or None without a reply.
+
+        The window starts SYS_ROWS_BEFORE rows before the mark's own row (its sequence number,
+        not the oldest row the ring still has) and runs to the newest, SYS_PAGE_ROWS rows a page
+        and at most SYS_MAX_PAGES pages. `lost` counts rows before the window start that the ring
+        had already evicted; `more` says rows were left unread when the page bound was reached."""
+        seq = mark.system_seq
+        after = max(0, seq - SYS_ROWS_BEFORE) if seq else 0
+        start = after
+        rows, pages, lost, reply, more = [], 0, 0, None, False
+        while pages < SYS_MAX_PAGES:
+            reply = self.link.call("system_events", {"after": after, "limit": SYS_PAGE_ROWS},
+                                   timeout=2.0)
+            if not isinstance(reply, dict) or "events" not in reply:
+                break
+            pages += 1
+            if pages == 1:
+                lost = reply.get("lost", 0)
+            rows += reply["events"]
+            more = bool(reply.get("more"))
+            following = reply.get("next", after)
+            if not more or following <= after:
+                break
+            after = following
+        if pages == 0:
+            return None
+        return rows, {"reply": reply, "mark_seq": seq, "window_after_seq": start, "pages": pages,
+                      "lost": lost, "more": more}
 
     def close_mark(self, mark, now):
         self.open_marks.remove(mark)
@@ -1121,14 +1160,14 @@ class Recorder:
         }
         sys_events_list = []
         if self.link is not None:
-            sys_reply = self.link.call("system_events", {"after": 0, "limit": 1000}, timeout=2.0)
-            if isinstance(sys_reply, dict) and "events" in sys_reply:
-                sys_events_list = sys_reply["events"]
+            fetched = self.fetch_system_events(mark)
+            if fetched is not None:
+                sys_events_list, info = fetched
                 sys_lines = [json.dumps(ev, separators=(",", ":")) for ev in sys_events_list]
                 self.store.write(f"marks/{mark.id:03d}/system_events.jsonl",
                                  ("\n".join(sys_lines) + "\n") if sys_lines else "")
-                sources = sys_reply.get("sources") or []
-                ring = sys_reply.get("ring") or {}
+                sources = info["reply"].get("sources") or []
+                ring = info["reply"].get("ring") or {}
                 window["system_log"] = {
                     "count": len(sys_lines),
                     "dropped_events": ring.get("dropped", 0),
@@ -1137,6 +1176,14 @@ class Recorder:
                         {"name": s.get("name"), "reason": s.get("missing_reason")}
                         for s in sources if not s.get("enabled")
                     ],
+                    # Where the rows were taken from: the mark's own sequence number (None when
+                    # the server gave none, then from the oldest row), the pages read, rows
+                    # already evicted before the window, and whether the page bound cut it short.
+                    "mark_seq": info["mark_seq"],
+                    "window_after_seq": info["window_after_seq"],
+                    "pages": info["pages"],
+                    "lost_rows": info["lost"],
+                    "more_rows_unread": info["more"],
                 }
         def agg_signal_counts(agg):
             counts = collections.Counter()

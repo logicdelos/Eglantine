@@ -4,10 +4,12 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -15,6 +17,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #else
+#include <fcntl.h>
 #include <pthread.h>
 #include <unistd.h>
 #endif
@@ -146,22 +149,83 @@ struct State {
     std::array<std::atomic<u64>, static_cast<std::size_t>(SourceId::Count)> source_dropped{};
 };
 
+/// Set once the state exists. The crash tail reads it instead of GetState(), whose function-local
+/// static would make a crash that interrupts the first use wait for that initialization.
+std::atomic<State*> published_state{nullptr};
+
 State& GetState() noexcept {
-    static State* state = new State();
+    static State* state = [] {
+        auto* created = new State();
+        published_state.store(created, std::memory_order_release);
+        return created;
+    }();
     return *state;
 }
 
-void CopyDetail(char (&dst)[96], std::string_view src) noexcept {
-    const std::size_t len = (std::min)(src.size(), sizeof(dst) - 1);
-    if (len > 0) {
-        std::memcpy(dst, src.data(), len);
+/// Length of the well-formed UTF-8 sequence starting at `p` (`avail` bytes remain), or 0.
+std::size_t Utf8SequenceLength(const unsigned char* p, std::size_t avail) noexcept {
+    const unsigned char c = p[0];
+    std::size_t len = 0;
+    if (c < 0x80) {
+        return 1;
+    } else if (c >= 0xC2 && c <= 0xDF) {
+        len = 2;
+    } else if ((c & 0xF0) == 0xE0) {
+        len = 3;
+    } else if (c >= 0xF0 && c <= 0xF4) {
+        len = 4;
+    } else {
+        return 0;
     }
-    dst[len] = '\0';
+    if (avail < len) {
+        return 0;
+    }
+    for (std::size_t i = 1; i < len; ++i) {
+        if ((p[i] & 0xC0) != 0x80) {
+            return 0;
+        }
+    }
+    if ((c == 0xE0 && p[1] < 0xA0) || (c == 0xED && p[1] >= 0xA0) ||
+        (c == 0xF0 && p[1] < 0x90) || (c == 0xF4 && p[1] >= 0x90)) {
+        return 0; // overlong, surrogate or above U+10FFFF
+    }
+    return len;
+}
+
+constexpr char ReplacementCharacter[] = "\xEF\xBF\xBD";
+
+/// Copies `src` as valid UTF-8 into `dst` (`cap` bytes, NUL-terminated): every invalid byte
+/// becomes U+FFFD, and the copy ends before the first character that would not fit whole.
+void CopyUtf8(char* dst, std::size_t cap, std::string_view src) noexcept {
+    std::size_t out = 0;
+    for (std::size_t i = 0; i < src.size();) {
+        const char* piece = src.data() + i;
+        std::size_t piece_len =
+            Utf8SequenceLength(reinterpret_cast<const unsigned char*>(piece), src.size() - i);
+        std::size_t consumed = piece_len;
+        if (piece_len == 0) {
+            piece = ReplacementCharacter;
+            piece_len = sizeof(ReplacementCharacter) - 1;
+            consumed = 1;
+        }
+        if (out + piece_len > cap - 1) {
+            break;
+        }
+        std::memcpy(dst + out, piece, piece_len);
+        out += piece_len;
+        i += consumed;
+    }
+    dst[out] = '\0';
+}
+
+void CopyDetail(char (&dst)[96], std::string_view src) noexcept {
+    CopyUtf8(dst, sizeof(dst), src);
 }
 
 void AppendJsonEscaped(std::string& out, std::string_view text) {
     out.push_back('"');
-    for (const unsigned char c : text) {
+    for (std::size_t i = 0; i < text.size();) {
+        const unsigned char c = static_cast<unsigned char>(text[i]);
         switch (c) {
         case '"':
             out += "\\\"";
@@ -189,60 +253,152 @@ void AppendJsonEscaped(std::string& out, std::string_view text) {
                 char buf[8];
                 std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned int>(c));
                 out += buf;
-            } else {
+            } else if (c < 0x80) {
                 out.push_back(static_cast<char>(c));
+            } else if (const std::size_t len = Utf8SequenceLength(
+                           reinterpret_cast<const unsigned char*>(text.data() + i), text.size() - i);
+                       len != 0) {
+                out.append(text.data() + i, len);
+                i += len;
+                continue;
+            } else {
+                out += ReplacementCharacter;
             }
             break;
         }
+        ++i;
     }
     out.push_back('"');
 }
 
-void WriteRawCrashBytes(
 #ifdef _WIN32
-    HANDLE handle,
-#else
-    int fd,
-#endif
-    const char* data, std::size_t len) noexcept {
-    if (len == 0) {
-        return;
-    }
-#ifdef _WIN32
+using RawFile = HANDLE;
+
+RawFile OpenRawFile(const wchar_t* path) noexcept {
+    return ::CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
+                         FILE_ATTRIBUTE_NORMAL, nullptr);
+}
+
+bool IsOpen(RawFile file) noexcept {
+    return file != INVALID_HANDLE_VALUE;
+}
+
+void CloseRawFile(RawFile file) noexcept {
+    ::CloseHandle(file);
+}
+
+void WriteRawBytes(RawFile file, const char* data, std::size_t len) noexcept {
     DWORD written = 0;
-    ::WriteFile(handle, data, static_cast<DWORD>(len), &written, nullptr);
+    if (len != 0) {
+        ::WriteFile(file, data, static_cast<DWORD>(len), &written, nullptr);
+    }
+}
 #else
+using RawFile = int;
+
+RawFile OpenRawFile(const char* path) noexcept {
+    return ::open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+}
+
+bool IsOpen(RawFile file) noexcept {
+    return file >= 0;
+}
+
+void CloseRawFile(RawFile file) noexcept {
+    ::close(file);
+}
+
+void WriteRawBytes(RawFile file, const char* data, std::size_t len) noexcept {
     std::size_t offset = 0;
     while (offset < len) {
-        const ssize_t n = ::write(fd, data + offset, len - offset);
+        const ssize_t n = ::write(file, data + offset, len - offset);
         if (n <= 0) {
             break;
         }
         offset += static_cast<std::size_t>(n);
     }
-#endif
 }
+#endif
 
-std::size_t AppendEscapedFixed(char* dst, std::size_t cap, std::size_t pos,
-                               const char* src) noexcept {
-    if (pos + 1 < cap) {
-        dst[pos++] = '"';
-    }
-    for (std::size_t i = 0; src[i] != '\0' && pos + 2 < cap; ++i) {
-        const unsigned char c = static_cast<unsigned char>(src[i]);
-        if (c == '"' || c == '\\') {
-            dst[pos++] = '\\';
-            dst[pos++] = static_cast<char>(c);
-        } else if (c < 0x20) {
-            dst[pos++] = ' ';
-        } else {
-            dst[pos++] = static_cast<char>(c);
+/// Text appended to a fixed buffer: no allocation and no C runtime formatting, for the crash tail.
+class RawLine {
+public:
+    RawLine(char* data_, std::size_t capacity_) noexcept : data{data_}, capacity{capacity_} {}
+
+    void Add(const char* text) noexcept {
+        while (*text != '\0' && size + 1 < capacity) {
+            data[size++] = *text++;
         }
     }
-    if (pos + 1 < cap) {
-        dst[pos++] = '"';
+
+    void AddUnsigned(u64 value) noexcept {
+        char digits[20];
+        std::size_t count = 0;
+        do {
+            digits[count++] = static_cast<char>('0' + value % 10);
+            value /= 10;
+        } while (value != 0);
+        while (count != 0 && size + 1 < capacity) {
+            data[size++] = digits[--count];
+        }
     }
-    return pos;
+
+    void AddSigned(s64 value) noexcept {
+        if (value < 0) {
+            Add("-");
+            AddUnsigned(0 - static_cast<u64>(value));
+        } else {
+            AddUnsigned(static_cast<u64>(value));
+        }
+    }
+
+    /// A JSON string; control characters become spaces. Never splits the closing quote off.
+    void AddQuoted(const char* text) noexcept {
+        Add("\"");
+        for (; *text != '\0' && size + 3 < capacity; ++text) {
+            const unsigned char c = static_cast<unsigned char>(*text);
+            if (c == '"' || c == '\\') {
+                data[size++] = '\\';
+                data[size++] = static_cast<char>(c);
+            } else {
+                data[size++] = c < 0x20 ? ' ' : static_cast<char>(c);
+            }
+        }
+        Add("\"");
+    }
+
+    char* data;
+    std::size_t capacity;
+    std::size_t size = 0;
+};
+
+/// One event row in the layout of WriteIncidentJsonl's, built with RawLine only.
+void FormatEventRow(RawLine& line, const Event& ev) noexcept {
+    line.Add("{\"type\":\"event\",\"seq\":");
+    line.AddUnsigned(ev.seq);
+    line.Add(",\"mono_ns\":");
+    line.AddUnsigned(ev.mono_ns);
+    line.Add(",\"present_id\":");
+    line.AddUnsigned(ev.present_id);
+    line.Add(",\"subsystem\":");
+    line.AddQuoted(SubsystemName(ev.subsystem));
+    line.Add(",\"severity\":");
+    line.AddQuoted(SeverityName(ev.severity));
+    line.Add(",\"kind\":");
+    line.AddQuoted(EventKindName(ev.kind));
+    line.Add(",\"thread_id\":");
+    line.AddUnsigned(ev.thread_id);
+    line.Add(",\"arg0\":");
+    line.AddUnsigned(ev.arg0);
+    line.Add(",\"arg1\":");
+    line.AddUnsigned(ev.arg1);
+    line.Add(",\"arg2\":");
+    line.AddUnsigned(ev.arg2);
+    line.Add(",\"arg3\":");
+    line.AddSigned(ev.arg3);
+    line.Add(",\"detail\":");
+    line.AddQuoted(ev.detail);
+    line.Add("}\n");
 }
 
 std::vector<SourceInfo> BuildSourcesSnapshot(const State& state) noexcept {
@@ -312,6 +468,9 @@ u64 Record(Subsystem subsystem, Severity severity, EventKind kind, u64 arg0, u64
     const u64 now_ns = MonoNsNow();
     const u32 tid = CurrentThreadIdFast();
     const SourceId src_id = ClassifySource(subsystem, kind);
+    // Validated and cut at a character boundary before the lock is taken.
+    char detail_copy[96]{};
+    CopyDetail(detail_copy, detail);
 
     std::scoped_lock lock{state.mutex};
     if (state.capacity == 0 || state.ring.empty()) {
@@ -344,44 +503,115 @@ u64 Record(Subsystem subsystem, Severity severity, EventKind kind, u64 arg0, u64
     ev.arg1 = arg1;
     ev.arg2 = arg2;
     ev.arg3 = arg3;
-    CopyDetail(ev.detail, detail);
+    std::memcpy(ev.detail, detail_copy, sizeof(detail_copy));
 
     state.source_recorded[static_cast<std::size_t>(src_id)].fetch_add(1, std::memory_order_relaxed);
     return seq;
 }
 
-SnapshotResult Snapshot(u64 after_seq, std::size_t max_events) noexcept {
+namespace {
+
+/// Rows are consecutive in the ring: the row at offset i from the head has seq oldest + i.
+/// `after_seq < seq <= through_seq`; when more rows match than `max_events`, the newest ones are
+/// kept if `newest_window`, the oldest otherwise. The sources are built after the lock is released.
+SnapshotResult SnapshotRange(u64 after_seq, u64 through_seq, std::size_t max_events,
+                             bool newest_window) noexcept {
     SnapshotResult result;
     State& state = GetState();
-    std::scoped_lock lock{state.mutex};
-
-    const u64 newest = state.next_seq - 1;
-    const u64 oldest = state.count == 0 ? state.next_seq : state.ring[state.head].seq;
-    result.status = RingStatus{
-        .capacity = state.capacity,
-        .newest = newest,
-        .oldest = oldest,
-        .evicted = state.evicted,
-        .dropped = state.dropped,
-        .diagnostic_mode = DiagnosticEnabled(),
-    };
-    result.sources = BuildSourcesSnapshot(state);
-
-    if (max_events == 0 || state.count == 0) {
-        return result;
-    }
-
-    result.events.reserve((std::min)(state.count, max_events));
-    for (std::size_t i = 0; i < state.count; ++i) {
-        const Event& ev = state.ring[(state.head + i) % state.capacity];
-        if (ev.seq > after_seq) {
-            result.events.push_back(ev);
-            if (result.events.size() >= max_events) {
-                break;
+    {
+        std::scoped_lock lock{state.mutex};
+        const u64 newest = state.next_seq - 1;
+        const u64 oldest = state.count == 0 ? state.next_seq : state.ring[state.head].seq;
+        result.status = RingStatus{
+            .capacity = state.capacity,
+            .newest = newest,
+            .oldest = oldest,
+            .evicted = state.evicted,
+            .dropped = state.dropped,
+            .diagnostic_mode = DiagnosticEnabled(),
+        };
+        if (!newest_window && after_seq < oldest - 1) {
+            result.lost = oldest - 1 - after_seq;
+        }
+        if (max_events != 0 && state.count != 0) {
+            const u64 first = after_seq >= newest ? newest + 1 : (std::max)(after_seq + 1, oldest);
+            const u64 last = (std::min)(through_seq, newest);
+            if (first <= last) {
+                const u64 total = last - first + 1;
+                const u64 take = (std::min)(total, static_cast<u64>(max_events));
+                result.omitted = total - take;
+                const u64 start = newest_window ? last - take + 1 : first;
+                result.events.reserve(static_cast<std::size_t>(take));
+                std::size_t slot = (state.head + static_cast<std::size_t>(start - oldest)) %
+                                   state.capacity;
+                for (u64 i = 0; i < take; ++i) {
+                    result.events.push_back(state.ring[slot]);
+                    slot = (slot + 1) % state.capacity;
+                }
             }
         }
     }
+    result.sources = BuildSourcesSnapshot(state);
     return result;
+}
+
+} // Anonymous namespace
+
+SnapshotResult Snapshot(u64 after_seq, std::size_t max_events) noexcept {
+    return SnapshotRange(after_seq, (std::numeric_limits<u64>::max)(), max_events, false);
+}
+
+SnapshotResult SnapshotThrough(u64 through_seq, std::size_t max_events) noexcept {
+    return SnapshotRange(0, through_seq, max_events, true);
+}
+
+EventPage QueryEvents(const EventQuery& query) noexcept {
+    EventPage page;
+    page.next = query.after_seq;
+    State& state = GetState();
+    {
+        std::scoped_lock lock{state.mutex};
+        const u64 newest = state.next_seq - 1;
+        const u64 oldest = state.count == 0 ? state.next_seq : state.ring[state.head].seq;
+        page.status = RingStatus{
+            .capacity = state.capacity,
+            .newest = newest,
+            .oldest = oldest,
+            .evicted = state.evicted,
+            .dropped = state.dropped,
+            .diagnostic_mode = DiagnosticEnabled(),
+        };
+        if (query.after_seq < oldest - 1) {
+            page.lost = oldest - 1 - query.after_seq;
+        }
+        if (state.count != 0 && query.after_seq < newest) {
+            const u64 first = (std::max)(query.after_seq + 1, oldest);
+            std::size_t slot =
+                (state.head + static_cast<std::size_t>(first - oldest)) % state.capacity;
+            page.events.reserve((std::min)(query.limit, state.count));
+            for (u64 seq = first; seq <= newest; ++seq) {
+                const Event& ev = state.ring[slot];
+                slot = (slot + 1) % state.capacity;
+                if ((query.filter_subsystem && ev.subsystem != query.subsystem) ||
+                    ev.severity < query.min_severity) {
+                    continue;
+                }
+                if (page.events.size() >= query.limit) {
+                    // The next page starts at this match; the rows skipped on the way are not
+                    // looked at again.
+                    page.more = true;
+                    page.next = seq - 1;
+                    break;
+                }
+                page.events.push_back(ev);
+            }
+            if (!page.more) {
+                page.next = newest;
+            }
+        }
+    }
+    page.sources = BuildSourcesSnapshot(state);
+    return page;
 }
 
 RingStatus GetStatus() noexcept {
@@ -419,21 +649,72 @@ void ResetForTests(std::size_t capacity) noexcept {
     }
 }
 
-bool WriteIncidentJsonl(const std::filesystem::path& path, std::string_view reason,
-                        u64 marker_id) noexcept {
+namespace {
+
+constexpr std::size_t IncidentMaxEvents = 4096;
+/// Marks whose aftermath file is waiting for its delay; a further request is refused, and the
+/// mark's summary says so.
+constexpr std::size_t MaxPendingAftermath = 8;
+
+/// A file whose every write and the close are checked: a full disk is a failure, not a "saved".
+class CheckedFile {
+public:
+    explicit CheckedFile(const std::filesystem::path& path) noexcept
+        : fp{
+#ifdef _WIN32
+              ::_wfopen(path.c_str(), L"wb")
+#else
+              std::fopen(path.c_str(), "wb")
+#endif
+          } {
+    }
+    ~CheckedFile() {
+        if (fp) {
+            std::fclose(fp);
+        }
+    }
+    CheckedFile(const CheckedFile&) = delete;
+    CheckedFile& operator=(const CheckedFile&) = delete;
+
+    [[nodiscard]] bool IsOpen() const noexcept {
+        return fp != nullptr;
+    }
+
+    void Write(const std::string& text) noexcept {
+        if (fp && ok && std::fwrite(text.data(), 1, text.size(), fp) != text.size()) {
+            ok = false;
+        }
+    }
+
+    /// True when the file is open and every write and the close succeeded.
+    [[nodiscard]] bool Close() noexcept {
+        if (!fp) {
+            return false;
+        }
+        const bool closed = std::fclose(fp) == 0;
+        fp = nullptr;
+        return ok && closed;
+    }
+
+private:
+    std::FILE* fp;
+    bool ok = true;
+};
+
+/// Writes `snap` as JSONL: a header (ring, sources, and the `window` the rows were selected by)
+/// and one row per event. `mode` names the selection: "newest_through_seq" (the newest
+/// `max_events` rows up to and including `anchor_seq`) or "after_seq" (the oldest `max_events` rows
+/// after `anchor_seq`).
+bool WriteIncidentFile(const std::filesystem::path& path, std::string_view reason, u64 marker_id,
+                       const SnapshotResult& snap, std::string_view mode, u64 anchor_seq,
+                       std::size_t max_events) noexcept {
     try {
-        const SnapshotResult snap = Snapshot(0, 4096);
         std::error_code ec;
         if (path.has_parent_path()) {
             std::filesystem::create_directories(path.parent_path(), ec);
         }
-        std::FILE* fp =
-#ifdef _WIN32
-            ::_wfopen(path.c_str(), L"wb");
-#else
-            std::fopen(path.c_str(), "wb");
-#endif
-        if (!fp) {
+        CheckedFile file{path};
+        if (!file.IsOpen()) {
             return false;
         }
 
@@ -446,6 +727,13 @@ bool WriteIncidentJsonl(const std::filesystem::path& path, std::string_view reas
                   ",\"evicted\":" + std::to_string(snap.status.evicted) +
                   ",\"dropped\":" + std::to_string(snap.status.dropped) +
                   ",\"diagnostic_mode\":" + (snap.status.diagnostic_mode ? "true" : "false") + "}";
+        header += ",\"window\":{\"mode\":";
+        AppendJsonEscaped(header, mode);
+        header += ",\"anchor_seq\":" + std::to_string(anchor_seq) +
+                  ",\"max_events\":" + std::to_string(max_events) +
+                  ",\"included\":" + std::to_string(snap.events.size()) +
+                  ",\"omitted\":" + std::to_string(snap.omitted) +
+                  ",\"lost\":" + std::to_string(snap.lost) + "}";
 
         header += ",\"sources\":[";
         std::string missing = "[";
@@ -479,7 +767,7 @@ bool WriteIncidentJsonl(const std::filesystem::path& path, std::string_view reas
         missing.push_back(']');
         header += "],\"missing_sources\":" + missing;
         header += ",\"dropped\":" + std::to_string(snap.status.dropped) + "}\n";
-        std::fwrite(header.data(), 1, header.size(), fp);
+        file.Write(header);
 
         std::string row;
         row.reserve(256);
@@ -500,14 +788,87 @@ bool WriteIncidentJsonl(const std::filesystem::path& path, std::string_view reas
                    ",\"arg3\":" + std::to_string(ev.arg3) + ",\"detail\":";
             AppendJsonEscaped(row, ev.detail);
             row += "}\n";
-            std::fwrite(row.data(), 1, row.size(), fp);
+            file.Write(row);
         }
+        return file.Close();
+    } catch (...) {
+        return false;
+    }
+}
 
-        std::fclose(fp);
+struct AftermathJob {
+    std::chrono::steady_clock::time_point due;
+    std::filesystem::path path;
+    u64 mark_id{};
+    u64 mark_seq{};
+};
+
+/// One worker thread serves every mark's delayed aftermath file, in due order, from a bounded
+/// queue. Never destroyed: the thread may still run at process exit.
+struct AftermathQueue {
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::vector<AftermathJob> jobs;
+    bool worker_started = false;
+};
+
+AftermathQueue& GetAftermathQueue() noexcept {
+    static AftermathQueue* queue = new AftermathQueue();
+    return *queue;
+}
+
+void AftermathWorker() noexcept {
+    AftermathQueue& queue = GetAftermathQueue();
+    std::unique_lock lock{queue.mutex};
+    for (;;) {
+        if (queue.jobs.empty()) {
+            queue.wake.wait(lock);
+            continue;
+        }
+        const auto next = std::min_element(
+            queue.jobs.begin(), queue.jobs.end(),
+            [](const AftermathJob& a, const AftermathJob& b) { return a.due < b.due; });
+        if (std::chrono::steady_clock::now() < next->due) {
+            queue.wake.wait_until(lock, next->due);
+            continue;
+        }
+        AftermathJob job = std::move(*next);
+        queue.jobs.erase(next);
+        lock.unlock();
+        const SnapshotResult snap = Snapshot(job.mark_seq, IncidentMaxEvents);
+        static_cast<void>(WriteIncidentFile(job.path, "aftermath", job.mark_id, snap, "after_seq",
+                                            job.mark_seq, IncidentMaxEvents));
+        lock.lock();
+    }
+}
+
+/// False when the queue is full or the worker cannot be started.
+bool ScheduleAftermath(AftermathJob job) noexcept {
+    try {
+        AftermathQueue& queue = GetAftermathQueue();
+        std::scoped_lock lock{queue.mutex};
+        if (queue.jobs.size() >= MaxPendingAftermath) {
+            return false;
+        }
+        if (!queue.worker_started) {
+            std::thread{AftermathWorker}.detach();
+            queue.worker_started = true;
+        }
+        queue.jobs.push_back(std::move(job));
+        queue.wake.notify_one();
         return true;
     } catch (...) {
         return false;
     }
+}
+
+} // Anonymous namespace
+
+bool WriteIncidentJsonl(const std::filesystem::path& path, std::string_view reason,
+                        u64 marker_id) noexcept {
+    const SnapshotResult snap = SnapshotThrough((std::numeric_limits<u64>::max)(), IncidentMaxEvents);
+    return WriteIncidentFile(path, reason, marker_id, snap, "newest_through_seq",
+                             snap.status.newest, IncidentMaxEvents);
 }
 
 QuickMarkResult TriggerQuickMark(const std::filesystem::path& incidents_root,
@@ -544,11 +905,26 @@ QuickMarkResult TriggerQuickMark(const std::filesystem::path& incidents_root,
             return res;
         }
 
+        // The window ends at the mark, so it is in its own before file however much the ring has
+        // seen since; the older rows beyond the bound are counted, not silently dropped.
+        const u64 through = res.seq != 0 ? res.seq : (std::numeric_limits<u64>::max)();
+        const SnapshotResult snap = SnapshotThrough(through, IncidentMaxEvents);
         res.before_log = res.directory / "system_events_before.jsonl";
-        const bool before_ok = WriteIncidentJsonl(res.before_log, label, res.mark_id);
+        const bool before_ok = WriteIncidentFile(res.before_log, label, res.mark_id, snap,
+                                                 "newest_through_seq", res.seq, IncidentMaxEvents);
+
+        const bool aftermath_requested = aftermath_delay_ms > 0;
+        if (aftermath_requested) {
+            res.aftermath_scheduled = ScheduleAftermath(AftermathJob{
+                .due = std::chrono::steady_clock::now() +
+                       std::chrono::milliseconds{aftermath_delay_ms},
+                .path = res.directory / "system_events_after.jsonl",
+                .mark_id = res.mark_id,
+                .mark_seq = res.seq,
+            });
+        }
 
         res.summary_path = res.directory / "mark_summary.json";
-        const auto snap = Snapshot(0, 4096);
         const RingStatus& st = snap.status;
         const auto& sources = snap.sources;
         u64 warn_err = 0;
@@ -644,6 +1020,8 @@ QuickMarkResult TriggerQuickMark(const std::filesystem::path& incidents_root,
         }
         suspected_json.push_back(']');
 
+        const bool contains_mark =
+            res.seq != 0 && !snap.events.empty() && snap.events.back().seq == res.seq;
         std::string summary = "{";
         summary += "\"mark_id\":" + std::to_string(res.mark_id);
         summary += ",\"seq\":" + std::to_string(res.seq);
@@ -652,6 +1030,16 @@ QuickMarkResult TriggerQuickMark(const std::filesystem::path& incidents_root,
         summary += ",\"label\":";
         AppendJsonEscaped(summary, label);
         summary += ",\"aftermath_delay_ms\":" + std::to_string(aftermath_delay_ms);
+        summary += ",\"aftermath\":{\"requested\":";
+        summary += aftermath_requested ? "true" : "false";
+        summary += ",\"scheduled\":";
+        summary += res.aftermath_scheduled ? "true" : "false";
+        summary += ",\"after_seq\":" + std::to_string(res.seq) + "}";
+        summary += ",\"before_window\":{\"through_seq\":" + std::to_string(res.seq) +
+                   ",\"max_events\":" + std::to_string(IncidentMaxEvents) +
+                   ",\"included\":" + std::to_string(snap.events.size()) +
+                   ",\"omitted_older\":" + std::to_string(snap.omitted) +
+                   ",\"contains_mark\":" + (contains_mark ? "true" : "false") + "}";
         summary += ",\"ring\":{\"capacity\":" + std::to_string(st.capacity) +
                    ",\"newest\":" + std::to_string(st.newest) +
                    ",\"oldest\":" + std::to_string(st.oldest) +
@@ -674,27 +1062,14 @@ QuickMarkResult TriggerQuickMark(const std::filesystem::path& incidents_root,
                    ",\"missing_sources\":" + missing_json + "}";
         summary += ",\"suspected_causes\":" + suspected_json + "}\n";
 
-        std::FILE* fp =
-#ifdef _WIN32
-            ::_wfopen(res.summary_path.c_str(), L"wb");
-#else
-            std::fopen(res.summary_path.c_str(), "wb");
-#endif
-        if (fp) {
-            std::fwrite(summary.data(), 1, summary.size(), fp);
-            std::fclose(fp);
+        bool summary_ok = false;
+        {
+            CheckedFile file{res.summary_path};
+            file.Write(summary);
+            summary_ok = file.Close();
         }
 
-        if (aftermath_delay_ms > 0) {
-            const std::filesystem::path after_path = res.directory / "system_events_after.jsonl";
-            const u64 id_copy = res.mark_id;
-            std::thread([after_path, id_copy, aftermath_delay_ms] {
-                std::this_thread::sleep_for(std::chrono::milliseconds{aftermath_delay_ms});
-                static_cast<void>(WriteIncidentJsonl(after_path, "aftermath", id_copy));
-            }).detach();
-        }
-
-        res.ok = before_ok && fp != nullptr;
+        res.ok = before_ok && summary_ok;
         return res;
     } catch (...) {
         res.ok = false;
@@ -702,84 +1077,72 @@ QuickMarkResult TriggerQuickMark(const std::filesystem::path& incidents_root,
     }
 }
 
-void DumpCrashTail(const std::filesystem::path& path) noexcept {
-#ifdef _WIN32
-    const HANDLE handle = ::CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
-                                        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (handle == INVALID_HANDLE_VALUE) {
+void DumpCrashTail(const std::filesystem::path::value_type* path, const CrashInfo* crash) noexcept {
+    if (path == nullptr || path[0] == 0) {
         return;
     }
-#else
-    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) {
-        return;
-    }
-#endif
-
-    State& state = GetState();
-    std::unique_lock lock{state.mutex, std::try_to_lock};
-    if (!lock.owns_lock()) {
-        static constexpr char kNotice[] =
-            "{\"type\":\"notice\",\"reason\":\"system_log_lock_held_at_crash\"}\n";
-#ifdef _WIN32
-        WriteRawCrashBytes(handle, kNotice, sizeof(kNotice) - 1);
-        ::CloseHandle(handle);
-#else
-        WriteRawCrashBytes(fd, kNotice, sizeof(kNotice) - 1);
-        ::close(fd);
-#endif
+    const RawFile file = OpenRawFile(path);
+    if (!IsOpen(file)) {
         return;
     }
 
-    char line[512];
-    const int hdr_len = std::snprintf(
-        line, sizeof(line),
-        "{\"type\":\"crash_tail\",\"capacity\":%zu,\"newest\":%llu,\"evicted\":%llu,\"dropped\":%llu}\n",
-        state.capacity, static_cast<unsigned long long>(state.next_seq - 1),
-        static_cast<unsigned long long>(state.evicted),
-        static_cast<unsigned long long>(state.dropped));
-    if (hdr_len > 0) {
-        const std::size_t n = (std::min)(static_cast<std::size_t>(hdr_len), sizeof(line) - 1);
-#ifdef _WIN32
-        WriteRawCrashBytes(handle, line, n);
-#else
-        WriteRawCrashBytes(fd, line, n);
-#endif
-    }
+    char buffer[1024];
+    State* const state = published_state.load(std::memory_order_acquire);
+    bool wrote_ring = false;
+    if (state != nullptr) {
+        std::unique_lock lock{state->mutex, std::try_to_lock};
+        if (lock.owns_lock()) {
+            RawLine header{buffer, sizeof(buffer)};
+            header.Add("{\"type\":\"crash_tail\",\"capacity\":");
+            header.AddUnsigned(state->capacity);
+            header.Add(",\"newest\":");
+            header.AddUnsigned(state->next_seq - 1);
+            header.Add(",\"evicted\":");
+            header.AddUnsigned(state->evicted);
+            header.Add(",\"dropped\":");
+            header.AddUnsigned(state->dropped);
+            header.Add("}\n");
+            WriteRawBytes(file, buffer, header.size);
 
-    const std::size_t tail_count = (std::min)(state.count, std::size_t{256});
-    const std::size_t start_offset = state.count - tail_count;
-    for (std::size_t i = start_offset; i < state.count; ++i) {
-        const Event& ev = state.ring[(state.head + i) % state.capacity];
-        const int prefix_len = std::snprintf(
-            line, sizeof(line),
-            "{\"type\":\"event\",\"seq\":%llu,\"mono_ns\":%llu,\"present_id\":%llu,"
-            "\"subsystem\":\"%s\",\"severity\":\"%s\",\"kind\":\"%s\",\"thread_id\":%u,"
-            "\"arg0\":%llu,\"arg1\":%llu,\"arg2\":%llu,\"arg3\":%lld,\"detail\":",
-            static_cast<unsigned long long>(ev.seq), static_cast<unsigned long long>(ev.mono_ns),
-            static_cast<unsigned long long>(ev.present_id), SubsystemName(ev.subsystem),
-            SeverityName(ev.severity), EventKindName(ev.kind), ev.thread_id,
-            static_cast<unsigned long long>(ev.arg0), static_cast<unsigned long long>(ev.arg1),
-            static_cast<unsigned long long>(ev.arg2), static_cast<long long>(ev.arg3));
-        if (prefix_len <= 0) {
-            continue;
+            const std::size_t tail_count = (std::min)(state->count, std::size_t{256});
+            for (std::size_t i = state->count - tail_count; i < state->count; ++i) {
+                RawLine line{buffer, sizeof(buffer)};
+                FormatEventRow(line, state->ring[(state->head + i) % state->capacity]);
+                WriteRawBytes(file, buffer, line.size);
+            }
+            wrote_ring = true;
         }
-        std::size_t pos = (std::min)(static_cast<std::size_t>(prefix_len), sizeof(line) - 4);
-        pos = AppendEscapedFixed(line, sizeof(line) - 2, pos, ev.detail);
-        line[pos++] = '}';
-        line[pos++] = '\n';
-#ifdef _WIN32
-        WriteRawCrashBytes(handle, line, pos);
-#else
-        WriteRawCrashBytes(fd, line, pos);
-#endif
+    }
+    if (!wrote_ring) {
+        RawLine notice{buffer, sizeof(buffer)};
+        notice.Add(state == nullptr
+                       ? "{\"type\":\"notice\",\"reason\":\"system_log_not_initialized\"}\n"
+                       : "{\"type\":\"notice\",\"reason\":\"system_log_lock_held_at_crash\"}\n");
+        WriteRawBytes(file, buffer, notice.size);
     }
 
-#ifdef _WIN32
-    ::CloseHandle(handle);
-#else
-    ::close(fd);
-#endif
+    if (crash != nullptr) {
+        Event ev{};
+        ev.mono_ns = MonoNsNow();
+        if (state != nullptr) {
+            const auto* counter = state->present_counter.load(std::memory_order_acquire);
+            ev.present_id = counter ? counter->load(std::memory_order_relaxed) : 0;
+        }
+        ev.subsystem = Subsystem::Crash;
+        ev.severity = Severity::Critical;
+        ev.kind = EventKind::HostCrash;
+        ev.thread_id = crash->thread_id;
+        ev.arg0 = crash->code;
+        ev.arg1 = crash->address;
+        ev.arg2 = crash->thread_id;
+        if (crash->module != nullptr) {
+            CopyDetail(ev.detail, crash->module);
+        }
+        RawLine line{buffer, sizeof(buffer)};
+        FormatEventRow(line, ev);
+        WriteRawBytes(file, buffer, line.size);
+    }
+    CloseRawFile(file);
 }
 
 const char* SubsystemName(Subsystem subsystem) noexcept {

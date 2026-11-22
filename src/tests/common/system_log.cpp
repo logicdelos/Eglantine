@@ -134,7 +134,9 @@ TEST_CASE("SystemLog WriteIncidentJsonl and DumpCrashTail produce valid JSONL",
     const auto crash_path = dir / "crash_tail.jsonl";
 
     REQUIRE(Common::SystemLog::WriteIncidentJsonl(incident_path, "unit_test", 7));
-    Common::SystemLog::DumpCrashTail(crash_path);
+    const Common::SystemLog::CrashInfo crash{
+        .code = 0xC0000005ULL, .address = 0x1234, .thread_id = 77, .module = "eglantine.exe"};
+    Common::SystemLog::DumpCrashTail(crash_path.c_str(), &crash);
 
     const auto incident_rows = ReadJsonLines(incident_path);
     REQUIRE(incident_rows.size() == 2);
@@ -146,10 +148,15 @@ TEST_CASE("SystemLog WriteIncidentJsonl and DumpCrashTail produce valid JSONL",
     REQUIRE(incident_rows[1]["kind"] == "GpuDeviceLost");
 
     const auto crash_rows = ReadJsonLines(crash_path);
-    REQUIRE(crash_rows.size() == 2);
+    REQUIRE(crash_rows.size() == 3);
     REQUIRE(crash_rows[0]["type"] == "crash_tail");
     REQUIRE(crash_rows[1]["type"] == "event");
     REQUIRE(crash_rows[1]["kind"] == "GpuDeviceLost");
+    REQUIRE(crash_rows[2]["type"] == "event");
+    REQUIRE(crash_rows[2]["kind"] == "HostCrash");
+    REQUIRE(crash_rows[2]["arg0"] == 0xC0000005ULL);
+    REQUIRE(crash_rows[2]["thread_id"] == 77);
+    REQUIRE(crash_rows[2]["detail"] == "eglantine.exe");
 
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);
@@ -169,12 +176,17 @@ TEST_CASE("SystemLog taps LOG_WARNING and LOG_ERROR automatically", "[common][sy
     bool found_warn = false;
     bool found_err = false;
     for (const auto& ev : snap.events) {
+        const std::string_view detail{ev.detail};
+        // The class and the source line, never the message text.
+        REQUIRE(detail.find("synthetic") == std::string_view::npos);
+        REQUIRE(detail.find("123") == std::string_view::npos);
+        REQUIRE(detail.find("456") == std::string_view::npos);
         if (ev.kind == Common::SystemLog::EventKind::LogWarning &&
-            std::string_view{ev.detail}.find("synthetic warning 123") != std::string_view::npos) {
+            detail.starts_with("Common:system_log.cpp:")) {
             found_warn = true;
         }
         if (ev.kind == Common::SystemLog::EventKind::LogError &&
-            std::string_view{ev.detail}.find("synthetic error 456") != std::string_view::npos) {
+            detail.starts_with("Common:system_log.cpp:")) {
             found_err = true;
         }
     }
@@ -206,6 +218,8 @@ TEST_CASE("SystemLog TriggerQuickMark writes before, summary, and aftermath bund
         REQUIRE(summary.contains("observed"));
         REQUIRE(summary["observed"]["mark_id"] == res.mark_id);
         REQUIRE(summary["observed"]["events_in_ring"].get<u64>() >= 1);
+        REQUIRE(summary["before_window"]["contains_mark"] == true);
+        REQUIRE(summary["aftermath"]["scheduled"] == true);
         REQUIRE(summary.contains("suspected_causes"));
         REQUIRE(summary["suspected_causes"].is_array());
         REQUIRE_FALSE(summary["suspected_causes"].empty());
@@ -223,10 +237,19 @@ TEST_CASE("SystemLog TriggerQuickMark writes before, summary, and aftermath bund
     }
     REQUIRE(std::filesystem::is_regular_file(after_path));
     const auto after_rows = ReadJsonLines(after_path);
-    REQUIRE(after_rows.size() >= 3);
+    REQUIRE(after_rows.size() >= 2);
+    REQUIRE(after_rows[0]["type"] == "header");
+    REQUIRE(after_rows[0]["window"]["mode"] == "after_seq");
+    REQUIRE(after_rows[0]["window"]["anchor_seq"] == res.seq);
     bool saw_after = false;
     for (const auto& row : after_rows) {
-        if (row["type"] == "event" && row["kind"] == "AudioUnderrun") {
+        if (row["type"] != "event") {
+            continue;
+        }
+        // Only what came after the mark: not the event recorded before it, not the mark itself.
+        REQUIRE(row["seq"].get<u64>() > res.seq);
+        REQUIRE(row["detail"] != "before_mark");
+        if (row["kind"] == "AudioUnderrun") {
             saw_after = true;
         }
     }
@@ -259,5 +282,176 @@ TEST_CASE("Nx2Bottleneck::NoteFrame emits FrameHitch with dominant wait on micro
         }
     }
     REQUIRE(saw_hitch);
+    Common::SystemLog::ResetForTests(8192);
+}
+
+TEST_CASE("SystemLog tap of a long message records where it came from and none of its text",
+          "[common][system_log]") {
+    Common::Log::Initialize();
+    Common::Log::Filter filter{Common::Log::Level::Info};
+    Common::Log::SetGlobalFilter(filter);
+    Common::SystemLog::ResetForTests(64);
+
+    // Longer than the logger's stack buffer: the formatted text lives in a temporary that is gone
+    // before the tap runs, and it must not be what the tap reads.
+    const std::string secret = "SECRET-guest-value-" + std::string(2 * BUFSIZ, 'x');
+    LOG_WARNING(Common, "dump {}", secret);
+    const u32 expected_line = __LINE__ - 1;
+
+    const auto snap = Common::SystemLog::Snapshot(0, 64);
+    bool found = false;
+    for (const auto& ev : snap.events) {
+        if (ev.kind != Common::SystemLog::EventKind::LogWarning) {
+            continue;
+        }
+        found = true;
+        const std::string_view detail{ev.detail};
+        REQUIRE(detail.starts_with("Common:system_log.cpp:"));
+        REQUIRE(detail.find("SECRET") == std::string_view::npos);
+        REQUIRE(detail.find("dump") == std::string_view::npos);
+        REQUIRE(detail.find("xxxx") == std::string_view::npos);
+        REQUIRE(ev.arg0 == static_cast<u64>(Common::Log::Class::Common));
+        REQUIRE(ev.arg1 == expected_line);
+    }
+    REQUIRE(found);
+    Common::SystemLog::ResetForTests(8192);
+}
+
+TEST_CASE("SystemLog quick mark window ends at the mark however much the ring has seen",
+          "[common][system_log]") {
+    Common::SystemLog::ResetForTests(32);
+    for (u64 i = 1; i <= 100; ++i) {
+        Common::SystemLog::Record(Common::SystemLog::Subsystem::Gpu,
+                                  Common::SystemLog::Severity::Warning,
+                                  Common::SystemLog::EventKind::GpuFenceWait, i, 0, 0, 0, "pre");
+    }
+    const auto root = std::filesystem::temp_directory_path() / "eglantine_quick_mark_window_test";
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+
+    const auto res = Common::SystemLog::TriggerQuickMark(root, "window", 0);
+    REQUIRE(res.ok);
+    REQUIRE(res.seq == 101);
+    // Events recorded after the mark must not push the mark out of its own before file.
+    for (u64 i = 1; i <= 50; ++i) {
+        Common::SystemLog::Record(Common::SystemLog::Subsystem::Gpu,
+                                  Common::SystemLog::Severity::Warning,
+                                  Common::SystemLog::EventKind::GpuFenceWait, i, 0, 0, 0, "post");
+    }
+
+    const auto before = ReadJsonLines(res.before_log);
+    REQUIRE(before.size() == 1 + 32);
+    REQUIRE(before[0]["window"]["mode"] == "newest_through_seq");
+    REQUIRE(before[0]["window"]["anchor_seq"] == res.seq);
+    REQUIRE(before.back()["type"] == "event");
+    REQUIRE(before.back()["seq"] == res.seq);
+    REQUIRE(before.back()["kind"] == "Marker");
+    for (std::size_t i = 1; i < before.size(); ++i) {
+        REQUIRE(before[i]["seq"].get<u64>() <= res.seq);
+    }
+
+    const auto summary = ReadJsonLines(res.summary_path);
+    REQUIRE(summary.size() == 1);
+    REQUIRE(summary[0]["before_window"]["contains_mark"] == true);
+    REQUIRE(summary[0]["before_window"]["through_seq"] == res.seq);
+    REQUIRE(summary[0]["observed"]["events_in_ring"].get<u64>() == 32);
+    REQUIRE(summary[0]["aftermath"]["requested"] == false);
+
+    std::filesystem::remove_all(root, ec);
+    Common::SystemLog::ResetForTests(8192);
+}
+
+TEST_CASE("SystemLog snapshots report what the bound left out", "[common][system_log]") {
+    Common::SystemLog::ResetForTests(16);
+    for (u64 i = 1; i <= 40; ++i) {
+        Common::SystemLog::Record(Common::SystemLog::Subsystem::Audio,
+                                  Common::SystemLog::Severity::Info,
+                                  Common::SystemLog::EventKind::AudioUnderrun, i);
+    }
+    // The ring holds seq 25..40.
+    const auto through = Common::SystemLog::SnapshotThrough(30, 4);
+    REQUIRE(through.events.size() == 4);
+    REQUIRE(through.events.front().seq == 27);
+    REQUIRE(through.events.back().seq == 30);
+    REQUIRE(through.omitted == 2);
+
+    const auto after = Common::SystemLog::Snapshot(10, 5);
+    REQUIRE(after.events.size() == 5);
+    REQUIRE(after.events.front().seq == 25);
+    REQUIRE(after.events.back().seq == 29);
+    REQUIRE(after.omitted == 11);
+    REQUIRE(after.lost == 14);
+    Common::SystemLog::ResetForTests(8192);
+}
+
+TEST_CASE("SystemLog QueryEvents reaches a match behind more than 4096 non-matches",
+          "[common][system_log]") {
+    Common::SystemLog::ResetForTests(16384);
+    for (u64 i = 1; i <= 5000; ++i) {
+        Common::SystemLog::Record(Common::SystemLog::Subsystem::Audio,
+                                  Common::SystemLog::Severity::Info,
+                                  Common::SystemLog::EventKind::AudioUnderrun, i);
+    }
+    for (u64 i = 0; i < 3; ++i) {
+        Common::SystemLog::Record(Common::SystemLog::Subsystem::Gpu,
+                                  Common::SystemLog::Severity::Error,
+                                  Common::SystemLog::EventKind::GpuError, i);
+    }
+
+    Common::SystemLog::EventQuery query;
+    query.filter_subsystem = true;
+    query.subsystem = Common::SystemLog::Subsystem::Gpu;
+    query.limit = 2;
+    const auto first = Common::SystemLog::QueryEvents(query);
+    REQUIRE(first.events.size() == 2);
+    REQUIRE(first.events[0].seq == 5001);
+    REQUIRE(first.events[1].seq == 5002);
+    REQUIRE(first.more);
+    REQUIRE(first.lost == 0);
+
+    query.after_seq = first.next;
+    const auto second = Common::SystemLog::QueryEvents(query);
+    REQUIRE(second.events.size() == 1);
+    REQUIRE(second.events[0].seq == 5003);
+    REQUIRE_FALSE(second.more);
+    REQUIRE(second.next == 5003);
+
+    // A severity filter that matches nothing still advances the cursor to the newest row.
+    Common::SystemLog::EventQuery none;
+    none.min_severity = Common::SystemLog::Severity::Critical;
+    const auto empty = Common::SystemLog::QueryEvents(none);
+    REQUIRE(empty.events.empty());
+    REQUIRE_FALSE(empty.more);
+    REQUIRE(empty.next == 5003);
+    Common::SystemLog::ResetForTests(8192);
+}
+
+TEST_CASE("SystemLog detail truncation never splits or emits invalid UTF-8",
+          "[common][system_log]") {
+    Common::SystemLog::ResetForTests(16);
+    // 94 bytes, then a two-byte character that would straddle the 95-byte limit.
+    const std::string straddle = std::string(94, 'a') + "\xC3\xA9" + "tail";
+    Common::SystemLog::Record(Common::SystemLog::Subsystem::Filesystem,
+                              Common::SystemLog::Severity::Info,
+                              Common::SystemLog::EventKind::FsError, 0, 0, 0, 0, straddle);
+    // A stray continuation byte, a truncated sequence, and an overlong one.
+    Common::SystemLog::Record(Common::SystemLog::Subsystem::Filesystem,
+                              Common::SystemLog::Severity::Info,
+                              Common::SystemLog::EventKind::FsError, 0, 0, 0, 0,
+                              "ab\x80" "cd\xE2\x82" "ef\xC0\xAF");
+
+    const auto snap = Common::SystemLog::Snapshot(0, 16);
+    REQUIRE(snap.events.size() == 2);
+    REQUIRE(std::string_view{snap.events[0].detail} == std::string(94, 'a'));
+    REQUIRE(std::string_view{snap.events[1].detail}.starts_with("ab\xEF\xBF\xBD" "cd"));
+
+    // Whatever the bytes were, the exported rows parse as JSON (the parser rejects bad UTF-8).
+    const auto path = std::filesystem::temp_directory_path() / "eglantine_utf8_test.jsonl";
+    REQUIRE(Common::SystemLog::WriteIncidentJsonl(path, "utf8", 1));
+    const auto rows = ReadJsonLines(path);
+    REQUIRE(rows.size() == 3);
+    REQUIRE(rows[1]["detail"] == std::string(94, 'a'));
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
     Common::SystemLog::ResetForTests(8192);
 }

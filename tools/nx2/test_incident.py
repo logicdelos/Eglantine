@@ -73,6 +73,10 @@ class FakeEmulator:
         self.mark_logged = True
         self.mark_count = 0
         self.ring = {"lines": [], "next": 0, "more": False, "lost": 0, "omitted": 0}
+        self.system_calls = []
+        self.system_mark_seq = 0  # 0: the server reports no sequence for the mark
+        self.system_oldest = 1
+        self.system_newest = 0
 
     def call(self, method, params, timeout):
         self.calls.append(method)
@@ -88,6 +92,8 @@ class FakeEmulator:
             self.mark_count += 1
             result = {"mark": self.mark_count, "session": self.session, "presents": 777,
                       "uptime_s": 50.0, "logged": self.mark_logged}
+            if self.system_mark_seq:
+                result["system_event_seq"] = self.system_mark_seq
             if self.mark_logged:
                 result["native_seconds"] = self.mark_native
             return result
@@ -97,8 +103,17 @@ class FakeEmulator:
                          "omitted": 0}
             return page
         if method == "system_events":
-            return {"events": [], "next": 0, "more": False, "lost": 0,
-                    "ring": {"capacity": 8192, "newest": 0, "oldest": 1, "evicted": 0,
+            after, limit = params["after"], params["limit"]
+            self.system_calls.append((after, limit))
+            seqs = range(max(after + 1, self.system_oldest), self.system_newest + 1)
+            page = seqs[:limit]
+            more = len(seqs) > limit
+            return {"events": [{"seq": s, "kind": "Marker" if s == self.system_mark_seq else "Row"}
+                               for s in page],
+                    "next": page[-1] if more else self.system_newest, "more": more,
+                    "lost": max(0, self.system_oldest - 1 - after),
+                    "ring": {"capacity": 8192, "newest": self.system_newest,
+                             "oldest": self.system_oldest, "evicted": self.system_oldest - 1,
                              "dropped": 0, "diagnostic_mode": False},
                     "sources": []}
         raise AssertionError(f"unexpected call {method}")
@@ -452,6 +467,53 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(window["present"], 777)
         self.assertIsNotNone(window["log_byte"])
         self.assertEqual(set(fake.calls) - {"status", "mark", "system_events"}, set())
+
+    def system_window(self, fake, mark_seq, oldest, newest):
+        fake.system_mark_seq, fake.system_oldest, fake.system_newest = mark_seq, oldest, newest
+        env = Env(self, fake)
+        env.append(*[line(s, "tick") for s in range(0, 41)])
+        env.run(1.0)
+        env.mark("sys")
+        env.run(8.0)
+        env.finish()
+        return env, env.window()["system_log"], env.rows("marks/001/system_events.jsonl")
+
+    def test_system_events_start_at_the_mark_sequence_and_page(self):
+        fake = FakeEmulator()
+        _env, log, rows = self.system_window(fake, mark_seq=3000, oldest=1200, newest=5000)
+        # 1000 rows before the mark's own row, then everything after it, a page at a time.
+        self.assertEqual(fake.system_calls[0], (2000, 1000))
+        self.assertEqual([call[0] for call in fake.system_calls], [2000, 3000, 4000])
+        self.assertEqual(rows[0]["seq"], 2001)
+        self.assertEqual(rows[-1]["seq"], 5000)
+        self.assertIn(3000, [row["seq"] for row in rows if row["kind"] == "Marker"])
+        self.assertEqual(log["count"], 3000)
+        self.assertEqual(log["mark_seq"], 3000)
+        self.assertEqual(log["lost_rows"], 0)
+        self.assertFalse(log["more_rows_unread"])
+
+    def test_system_events_report_rows_evicted_before_the_window(self):
+        fake = FakeEmulator()
+        _env, log, rows = self.system_window(fake, mark_seq=3000, oldest=2500, newest=3100)
+        self.assertEqual(log["lost_rows"], 499)
+        self.assertEqual(rows[0]["seq"], 2500)
+        self.assertEqual(log["evicted_events"], 2499)
+
+    def test_system_events_page_bound_is_reported(self):
+        fake = FakeEmulator()
+        _env, log, rows = self.system_window(fake, mark_seq=3000, oldest=1, newest=20000)
+        self.assertEqual(len(fake.system_calls), incident.SYS_MAX_PAGES)
+        self.assertEqual(log["pages"], incident.SYS_MAX_PAGES)
+        self.assertEqual(log["count"], incident.SYS_MAX_PAGES * incident.SYS_PAGE_ROWS)
+        self.assertTrue(log["more_rows_unread"])
+        self.assertEqual(len({row["seq"] for row in rows}), len(rows))  # no row read twice
+
+    def test_system_events_without_a_mark_sequence_start_at_the_oldest_row(self):
+        fake = FakeEmulator()
+        _env, log, _rows = self.system_window(fake, mark_seq=0, oldest=1, newest=1500)
+        self.assertEqual(fake.system_calls[0], (0, 1000))
+        self.assertIsNone(log["mark_seq"])
+        self.assertEqual(log["count"], 1500)
 
     def test_filtered_mark_falls_back_to_approximate(self):
         fake = FakeEmulator()

@@ -413,10 +413,12 @@ json Mark(ToolState& state, const json& params) {
         Common::SystemLog::Subsystem::Marker, Common::SystemLog::Severity::Info,
         Common::SystemLog::EventKind::Marker, id, presents, label.size(), 0, label);
     std::string bundle_dir;
+    bool aftermath_scheduled = false;
     if (params.value("save_bundle", false)) {
         const auto quick = Common::SystemLog::TriggerQuickMark(
             Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir) / "incidents",
             label.empty() ? "visual_glitch" : label, 5000);
+        aftermath_scheduled = quick.aftermath_scheduled;
         if (quick.ok) {
             bundle_dir = PathText(quick.directory);
         }
@@ -435,6 +437,7 @@ json Mark(ToolState& state, const json& params) {
     };
     if (!bundle_dir.empty()) {
         result["bundle_dir"] = bundle_dir;
+        result["aftermath_scheduled"] = aftermath_scheduled;
     }
     const std::string needle = fmt::format("Incident mark #{} session={} ", id, state.session);
     for (const auto& line : Common::Log::ReadRing(before)) {
@@ -771,34 +774,37 @@ json SystemEvents(ToolState&, const json& params) {
     const size_t limit = Param<size_t>(params, "limit", 200, 1, 2000);
     const std::string subsystem_filter = params.value("subsystem", std::string{});
     const std::string min_sev_str = params.value("min_severity", std::string{});
-    int min_sev = 0;
-    if (!min_sev_str.empty()) {
-        if (min_sev_str == "Info") {
-            min_sev = 1;
-        } else if (min_sev_str == "Warning") {
-            min_sev = 2;
-        } else if (min_sev_str == "Error") {
-            min_sev = 3;
-        } else if (min_sev_str == "Critical") {
-            min_sev = 4;
+    Common::SystemLog::EventQuery query;
+    query.after_seq = after;
+    query.limit = limit;
+    if (!subsystem_filter.empty()) {
+        constexpr auto Last = static_cast<u8>(Common::SystemLog::Subsystem::Log);
+        for (u8 i = 0; i <= Last; ++i) {
+            const auto subsystem = static_cast<Common::SystemLog::Subsystem>(i);
+            if (subsystem_filter == Common::SystemLog::SubsystemName(subsystem)) {
+                query.filter_subsystem = true;
+                query.subsystem = subsystem;
+                break;
+            }
+        }
+        if (!query.filter_subsystem) {
+            throw std::runtime_error{"subsystem: unknown name"};
         }
     }
-    const auto snap = Common::SystemLog::Snapshot(after, 4096);
+    if (min_sev_str == "Info") {
+        query.min_severity = Common::SystemLog::Severity::Info;
+    } else if (min_sev_str == "Warning") {
+        query.min_severity = Common::SystemLog::Severity::Warning;
+    } else if (min_sev_str == "Error") {
+        query.min_severity = Common::SystemLog::Severity::Error;
+    } else if (min_sev_str == "Critical") {
+        query.min_severity = Common::SystemLog::Severity::Critical;
+    }
+    // `next` is the last raw row the page is complete up to, so a match behind any number of rows
+    // the filter skips is still reached; `more` says rows remain after it.
+    const auto page = Common::SystemLog::QueryEvents(query);
     json events = json::array();
-    bool more = false;
-    u64 next = after;
-    for (const auto& ev : snap.events) {
-        if (!subsystem_filter.empty() &&
-            subsystem_filter != Common::SystemLog::SubsystemName(ev.subsystem)) {
-            continue;
-        }
-        if (static_cast<int>(ev.severity) < min_sev) {
-            continue;
-        }
-        if (events.size() >= limit) {
-            more = true;
-            break;
-        }
+    for (const auto& ev : page.events) {
         events.push_back({
             {"seq", ev.seq},
             {"mono_ns", ev.mono_ns},
@@ -813,15 +819,13 @@ json SystemEvents(ToolState&, const json& params) {
             {"arg3", ev.arg3},
             {"detail", std::string{ev.detail}},
         });
-        next = ev.seq;
     }
-    const u64 lost = after >= snap.status.oldest ? 0 : snap.status.oldest - after - 1;
     return {{"events", std::move(events)},
-            {"next", next},
-            {"more", more},
-            {"lost", lost},
-            {"ring", SystemRingJson(snap.status)},
-            {"sources", SystemSourcesJson(snap.sources)}};
+            {"next", page.next},
+            {"more", page.more},
+            {"lost", page.lost},
+            {"ring", SystemRingJson(page.status)},
+            {"sources", SystemSourcesJson(page.sources)}};
 }
 
 Handlers MakeHandlers(const std::shared_ptr<ToolState>& state) {

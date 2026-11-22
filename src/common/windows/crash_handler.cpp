@@ -134,6 +134,24 @@ DWORD WINAPI CrashWatchdog(void*) {
     return 0;
 }
 
+void WriteMinidump(EXCEPTION_POINTERS* pointers) {
+    if (!write_dump) {
+        return;
+    }
+    const HANDLE file = CreateFileW(dump_path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                    FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    MINIDUMP_EXCEPTION_INFORMATION information{GetCurrentThreadId(), pointers, FALSE};
+    const BOOL written = write_dump(GetCurrentProcess(), GetCurrentProcessId(), file,
+                                    MiniDumpWithThreadInfo, &information, nullptr, nullptr);
+    const DWORD error = written ? 0 : GetLastError();
+    CloseHandle(file);
+    LOG_CRASH("Host crash: minidump of process {} {} ({:#x})", GetCurrentProcessId(),
+              written ? "written next to the log as eden_crash.dmp" : "failed", error);
+}
+
 // `fail_fast` names a failure that ends in a fail-fast (abort() or a CRT invalid-parameter
 // failure), and is null for an unhandled exception.
 void Report(EXCEPTION_POINTERS* pointers, const char* fail_fast) {
@@ -171,46 +189,37 @@ void Report(EXCEPTION_POINTERS* pointers, const char* fail_fast) {
                             nullptr, nullptr);
         LocalFree(description);
     }
+    // Nothing below this point records into the system event ring: Record takes its mutex, which
+    // the crashed thread may hold, and the report and the dump must not wait on it.
+    Common::SystemLog::CrashInfo crash{};
+    crash.thread_id = GetCurrentThreadId();
+    CodeAddress at{"?", 0};
     if (!fail_fast) {
         const EXCEPTION_RECORD& record = *pointers->ExceptionRecord;
-        const CodeAddress at = Locate(fault);
-        Common::SystemLog::Record(
-            Common::SystemLog::Subsystem::Crash, Common::SystemLog::Severity::Critical,
-            Common::SystemLog::EventKind::HostCrash, record.ExceptionCode,
-            reinterpret_cast<uintptr_t>(fault), GetCurrentThreadId(), 0, at.module);
+        at = Locate(fault);
+        crash.code = record.ExceptionCode;
+        crash.address = reinterpret_cast<uintptr_t>(fault);
+        crash.module = at.module;
         LOG_CRASH("Host crash: unhandled exception {:#010x} at {}+{:#x} on thread {} \"{}\", "
                   "info {:#x} {:#x}; stack:{}",
                   record.ExceptionCode, at.module, at.offset, GetCurrentThreadId(), thread_name,
                   record.NumberParameters > 0 ? record.ExceptionInformation[0] : 0,
                   record.NumberParameters > 1 ? record.ExceptionInformation[1] : 0, stack);
     } else {
-        Common::SystemLog::Record(
-            Common::SystemLog::Subsystem::Crash, Common::SystemLog::Severity::Critical,
-            Common::SystemLog::EventKind::HostCrash, 0xC0000409ULL,
-            reinterpret_cast<uintptr_t>(pointers->ExceptionRecord->ExceptionAddress),
-            GetCurrentThreadId(), 0, fail_fast);
+        crash.code = 0xC0000409ULL;
+        crash.address = reinterpret_cast<uintptr_t>(fault);
+        crash.module = fail_fast;
         LOG_CRASH("Host crash: {} on thread {} \"{}\"; stack:{}", fail_fast, GetCurrentThreadId(),
                   thread_name, stack);
     }
-    if (system_log_crash_path[0] != L'\0') {
-        Common::SystemLog::DumpCrashTail(system_log_crash_path);
-    }
 
-    if (!write_dump) {
-        return;
+    WriteMinidump(pointers);
+
+    // Last, and best effort: the tail of the system event ring, written without allocation and
+    // only if the ring's mutex is free at once.
+    if (system_log_crash_path[0] != L'\0') {
+        Common::SystemLog::DumpCrashTail(system_log_crash_path, &crash);
     }
-    const HANDLE file = CreateFileW(dump_path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-                                    FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) {
-        return;
-    }
-    MINIDUMP_EXCEPTION_INFORMATION information{GetCurrentThreadId(), pointers, FALSE};
-    const BOOL written = write_dump(GetCurrentProcess(), GetCurrentProcessId(), file,
-                                    MiniDumpWithThreadInfo, &information, nullptr, nullptr);
-    const DWORD error = written ? 0 : GetLastError();
-    CloseHandle(file);
-    LOG_CRASH("Host crash: minidump of process {} {} ({:#x})", GetCurrentProcessId(),
-              written ? "written next to the log as eden_crash.dmp" : "failed", error);
 }
 
 // Reports a fail-fast. The dump gets the context that RtlCaptureContext captures here, as a

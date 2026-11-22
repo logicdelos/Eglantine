@@ -249,6 +249,25 @@ struct ColorConsoleBackend final : public Backend {
 };
 
 #ifndef __OPENORBIS__
+/// Set while this thread is inside the file backend. The file raises its own errors through the
+/// logger (a failed flush logs one) and the mutex is not recursive: such a message reaches every
+/// other backend, but is not written to the file again.
+struct FileReentryGuard {
+    FileReentryGuard() noexcept : reentered{active} {
+        active = true;
+    }
+    ~FileReentryGuard() {
+        if (!reentered) {
+            active = false;
+        }
+    }
+    FileReentryGuard(const FileReentryGuard&) = delete;
+    FileReentryGuard& operator=(const FileReentryGuard&) = delete;
+
+    static inline thread_local bool active = false;
+    const bool reentered;
+};
+
 /// @brief Backend that writes to a file passed into the constructor
 struct FileBackend final : public Backend {
     explicit FileBackend(const std::filesystem::path filename) noexcept {
@@ -285,11 +304,19 @@ struct FileBackend final : public Backend {
     ~FileBackend() noexcept override = default;
 
     void Write(const Entry& entry) noexcept override {
+        const FileReentryGuard guard;
+        if (guard.reentered) {
+            return;
+        }
         std::scoped_lock lock{write_mutex};
         WriteUnlocked(entry);
     }
 
     void WriteFromCrash(const Entry& entry) noexcept {
+        const FileReentryGuard guard;
+        if (guard.reentered) {
+            return;
+        }
         std::unique_lock lock{write_mutex, std::try_to_lock};
         if (!lock.owns_lock()) {
             return;
@@ -299,6 +326,10 @@ struct FileBackend final : public Backend {
     }
 
     void Flush() noexcept override {
+        const FileReentryGuard guard;
+        if (guard.reentered) {
+            return;
+        }
         std::scoped_lock lock{write_mutex};
         FlushUnlocked();
     }
@@ -373,13 +404,7 @@ private:
     }
 
     void FlushUnlocked() noexcept {
-        // A failed flush logs an Error, whose own flush would fail and log again without end.
-        static thread_local bool flushing = false;
-        if (flushing)
-            return;
-        flushing = true;
         file->Flush();
-        flushing = false;
     }
 
     std::mutex write_mutex;
@@ -717,21 +742,25 @@ void FmtLogMessageImpl(Class log_class, Level log_level, const char* filename, u
             if (sink) sink(GetLogClassName(log_class), log_level, s);
         }
         if (log_level >= Level::Warning) {
+            // Only where the message came from, never its text: it can carry values and dumps
+            // read from guest memory, and this record goes into crash tails and exported bundles.
             const auto sev = log_level == Level::Critical ? SystemLog::Severity::Critical
                            : log_level == Level::Error    ? SystemLog::Severity::Error
                                                           : SystemLog::Severity::Warning;
             const auto kind = log_level == Level::Critical ? SystemLog::EventKind::LogCritical
                             : log_level == Level::Error    ? SystemLog::EventKind::LogError
                                                            : SystemLog::EventKind::LogWarning;
+            std::string_view site = e.filename ? e.filename : "?";
+            if (const auto slash = site.find_last_of("/\\"); slash != std::string_view::npos) {
+                site.remove_prefix(slash + 1);
+            }
             char detail_buf[96];
-            const auto detail_res = fmt::format_to_n(
-                detail_buf, sizeof(detail_buf) - 1, "{}:{}:{}: {}", GetLogClassName(log_class),
-                e.filename ? e.filename : "?", line_num,
-                std::string_view{e.message ? e.message : "", e.message_len});
+            const auto detail_res =
+                fmt::format_to_n(detail_buf, sizeof(detail_buf) - 1, "{}:{}:{}",
+                                 GetLogClassName(log_class), site, line_num);
             const std::size_t detail_len = (std::min)(detail_res.size, sizeof(detail_buf) - 1);
-            SystemLog::Record(SystemLog::Subsystem::Log, sev, kind,
-                              static_cast<u64>(log_class), line_num, 0, 0,
-                              std::string_view{detail_buf, detail_len});
+            SystemLog::Record(SystemLog::Subsystem::Log, sev, kind, static_cast<u64>(log_class),
+                              line_num, 0, 0, std::string_view{detail_buf, detail_len});
         }
     }
 }

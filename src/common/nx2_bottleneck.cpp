@@ -72,6 +72,8 @@ struct IdleMeter {
 
 struct WaitMeter {
     std::atomic<u64> ns{};
+    /// Never reset: `NoteFrame` takes per-frame deltas of it, while `Collect` zeroes `ns`.
+    std::atomic<u64> total_ns{};
     std::atomic<u64> longest_ns{};
     std::atomic<u32> count{};
 };
@@ -1299,6 +1301,7 @@ void EndIdle(Thread thread) {
 void AddWait(Wait wait, u64 ns) {
     WaitMeter& meter = wait_meters[wait_row][static_cast<size_t>(wait)];
     meter.ns.fetch_add(ns, std::memory_order_relaxed);
+    meter.total_ns.fetch_add(ns, std::memory_order_relaxed);
     meter.count.fetch_add(1, std::memory_order_relaxed);
     RaiseTo(meter.longest_ns, ns);
 }
@@ -1381,21 +1384,22 @@ void NoteFrame() {
         coalesced_hitches = 0;
     }
 
-    std::array<u64, NumWaits> cur_wait_ns{};
+    // The monotonic totals, not `ns`: Collect zeroes that on the report thread, and a frame that
+    // spans a reset would lose its waits or name the wrong dominant wait.
     std::array<u64, NumWaits> delta_wait_ns{};
     for (size_t w = 0; w < NumWaits; ++w) {
         u64 sum = 0;
         for (size_t row = 0; row < NumWaitRows; ++row) {
-            sum += wait_meters[row][w].ns.load(std::memory_order_relaxed);
+            sum += wait_meters[row][w].total_ns.load(std::memory_order_relaxed);
         }
-        cur_wait_ns[w] = sum;
-        delta_wait_ns[w] = sum >= prev_wait_ns[w] ? sum - prev_wait_ns[w] : sum;
+        delta_wait_ns[w] = sum - prev_wait_ns[w];
         prev_wait_ns[w] = sum;
     }
 
     const u64 frame_us = ns / 1000;
+    // A hitch needs 33 ms at least: the median of shorter intervals cannot change the outcome.
     u64 median_us = 0;
-    if (rolling_count >= 16) {
+    if (frame_us >= 33'000 && rolling_count >= 16) {
         std::array<u64, RollingWindow> sorted{};
         std::copy_n(rolling_us.begin(), rolling_count, sorted.begin());
         const size_t mid = rolling_count / 2;
