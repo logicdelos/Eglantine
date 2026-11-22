@@ -46,6 +46,7 @@ Hashes and keys must be all 16 hex digits.
 | `status` | title, program id, fps, paused, rejected hashes |
 | `screenshot` | PNG of next presented frame |
 | `log_tail`, `log_filter` | new log lines; change filter live |
+| `mark` | incident mark: present count, uptime and the log line's native time; label text is not logged (see `docs/nx2/incident-capture.md`, `tools/nx2/incident.py`) |
 | `capture_frame` | frame dump now (`sampled`, `buffers` options); `index` builds contact sheet |
 | `capture_image` | one PNG of a capture made this session |
 | `reject_shaders` | reject/restore programs by native key or shader hash |

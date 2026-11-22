@@ -17,6 +17,7 @@
 
 #include "common/logging.h"
 #include "common/run_outcome.h"
+#include "common/system_log.h"
 #include "common/windows/crash_handler.h"
 
 #define LOG_CRASH(...) ::Common::Log::FmtCrashMessage(__FILE__, __LINE__, __func__, __VA_ARGS__)
@@ -36,6 +37,7 @@ MiniDumpWriteDumpFn write_dump{};
 GetThreadDescriptionFn get_thread_description{};
 LPTOP_LEVEL_EXCEPTION_FILTER previous_filter{};
 wchar_t dump_path[MAX_PATH]{};
+wchar_t system_log_crash_path[MAX_PATH]{};
 std::atomic<DWORD> reporting_thread{};
 
 struct CodeAddress {
@@ -172,14 +174,26 @@ void Report(EXCEPTION_POINTERS* pointers, const char* fail_fast) {
     if (!fail_fast) {
         const EXCEPTION_RECORD& record = *pointers->ExceptionRecord;
         const CodeAddress at = Locate(fault);
+        Common::SystemLog::Record(
+            Common::SystemLog::Subsystem::Crash, Common::SystemLog::Severity::Critical,
+            Common::SystemLog::EventKind::HostCrash, record.ExceptionCode,
+            reinterpret_cast<uintptr_t>(fault), GetCurrentThreadId(), 0, at.module);
         LOG_CRASH("Host crash: unhandled exception {:#010x} at {}+{:#x} on thread {} \"{}\", "
                   "info {:#x} {:#x}; stack:{}",
                   record.ExceptionCode, at.module, at.offset, GetCurrentThreadId(), thread_name,
                   record.NumberParameters > 0 ? record.ExceptionInformation[0] : 0,
                   record.NumberParameters > 1 ? record.ExceptionInformation[1] : 0, stack);
     } else {
+        Common::SystemLog::Record(
+            Common::SystemLog::Subsystem::Crash, Common::SystemLog::Severity::Critical,
+            Common::SystemLog::EventKind::HostCrash, 0xC0000409ULL,
+            reinterpret_cast<uintptr_t>(pointers->ExceptionRecord->ExceptionAddress),
+            GetCurrentThreadId(), 0, fail_fast);
         LOG_CRASH("Host crash: {} on thread {} \"{}\"; stack:{}", fail_fast, GetCurrentThreadId(),
                   thread_name, stack);
+    }
+    if (system_log_crash_path[0] != L'\0') {
+        Common::SystemLog::DumpCrashTail(system_log_crash_path);
     }
 
     if (!write_dump) {
@@ -261,6 +275,10 @@ void OnInvalidParameter(const wchar_t* expression, const wchar_t* function, cons
 } // Anonymous namespace
 
 void InstallCrashHandler(const std::filesystem::path& dump_directory) {
+    const std::wstring sys_log_path = (dump_directory / "crash_system_events.jsonl").wstring();
+    if (sys_log_path.size() < MAX_PATH) {
+        std::wmemcpy(system_log_crash_path, sys_log_path.c_str(), sys_log_path.size() + 1);
+    }
     const std::wstring path = (dump_directory / "eden_crash.dmp").wstring();
     if (path.size() < MAX_PATH) {
         std::wmemcpy(dump_path, path.c_str(), path.size() + 1);

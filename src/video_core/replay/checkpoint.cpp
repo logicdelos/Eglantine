@@ -33,6 +33,7 @@
 #include "video_core/dma_pusher.h"
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/engines/kepler_compute.h"
+#include "video_core/native_qmd.h"
 #include "video_core/engines/kepler_memory.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_dma.h"
@@ -329,7 +330,8 @@ bool ValidateCheckpointForRestore(const GpuCheckpoint& checkpoint, std::string& 
         }
         if (space.address_space_bits < 20 || space.address_space_bits > 56 ||
             space.big_page_bits < 12 || space.big_page_bits > 24 ||
-            space.split_address > (u64{1} << space.address_space_bits)) {
+            space.split_address > (u64{1} << space.address_space_bits) ||
+            (space.syncpoint_shim != 0 && space.syncpoint_shim >= (u64{1} << space.address_space_bits))) {
             return Refuse(error, "address space " + Num(space.address_space_id) +
                                      " has a size, page size or split address no MemoryManager has");
         }
@@ -512,9 +514,18 @@ bool ValidateCheckpointForRestore(const GpuCheckpoint& checkpoint, std::string& 
         return Refuse(error, "a macro section does not belong to this macro flavour");
     }
 
-    // Root tables and bound constant buffers.
+    // Root tables, bound constant buffers, and optional shared NativeQmdStates.
     std::set<std::pair<u32, u32>> states;
+    bool has_qmd = false;
     for (const EngineStateSection& state : checkpoint.states) {
+        if (state.kind == EngineStateKind::NativeQmdStates) {
+            if (state.channel_id != SharedChannel || has_qmd ||
+                (state.words.size() % NativeQmdStateWords) != 0) {
+                return Refuse(error, "shared NativeQmdStates section is malformed or repeated");
+            }
+            has_qmd = true;
+            continue;
+        }
         const u32 kind = static_cast<u32>(state.kind);
         if (!known_channel(state.channel_id) || kind < 1 || kind > 2 ||
             !states.emplace(state.channel_id, kind).second) {
@@ -656,6 +667,10 @@ bool CaptureGpuCheckpoint(CutChannels channels, GpuCheckpoint& out, std::string&
         space.address_space_bits = static_cast<u32>(channel.memory_manager->GetAddressSpaceBits());
         space.big_page_bits = static_cast<u32>(channel.memory_manager->GetBigPageBits());
         space.split_address = static_cast<u64>(channel.memory_manager->GetSplitAddress());
+        space.syncpoint_shim = static_cast<u64>(channel.memory_manager->GetNativeSyncpointShim());
+        if (space.syncpoint_shim != 0) {
+            space.flags |= AddressSpaceHasSyncpointShim;
+        }
         spaces.emplace(space_id, space);
 
         AddEngine(out, id, EngineClass::Maxwell3D, payload.maxwell_3d.regs.reg_array);
@@ -758,6 +773,13 @@ bool CaptureGpuCheckpoint(CutChannels channels, GpuCheckpoint& out, std::string&
     }
     if (out.channels.empty()) {
         return Refuse(error, "no initialised channel to checkpoint");
+    }
+    if ((out.channels.front().flags & ChannelTuringMacros) != 0) {
+        auto qmd_words = Tegra::NativeQmdScheduler::ExportActiveStates();
+        if (!qmd_words.empty()) {
+            out.states.push_back(EngineStateSection{
+                SharedChannel, EngineStateKind::NativeQmdStates, std::move(qmd_words)});
+        }
     }
     // What was captured has to be restorable: sequential channel ids, sizes the engines have.
     std::string unrestorable;
@@ -1083,6 +1105,9 @@ bool RestoreGpuCheckpoint(Tegra::GPU& gpu, const GpuCheckpoint& checkpoint, std:
         auto manager = std::make_shared<Tegra::MemoryManager>(
             system, space.address_space_bits, space.split_address, space.big_page_bits, 12);
         gpu.InitAddressSpace(*manager);
+        if (space.syncpoint_shim != 0) {
+            manager->SetNativeSyncpointShim(space.syncpoint_shim);
+        }
         staged.spaces.emplace(space.address_space_id, std::move(manager));
     }
     for (const ChannelEntry& entry : checkpoint.channels) {
@@ -1102,6 +1127,12 @@ bool RestoreGpuCheckpoint(Tegra::GPU& gpu, const GpuCheckpoint& checkpoint, std:
                                      " comes up with other macro or tiling flags than the "
                                      "checkpoint recorded: the build or settings differ");
         }
+    }
+
+    Tegra::NativeQmdScheduler::ClearStates();
+    if (const EngineStateSection* qmd =
+            FindState(checkpoint, SharedChannel, EngineStateKind::NativeQmdStates)) {
+        Tegra::NativeQmdScheduler::ImportActiveStates(qmd->words);
     }
 
     bool shared_macros_done = false;

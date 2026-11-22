@@ -926,7 +926,7 @@ TEST_CASE("Replay codec: reserved fields, ranges and ids are checked", "[video_c
         checkpoint.macros[0].kind = static_cast<R::MacroSectionKind>(8);
         REQUIRE(R::Decode(Enc(checkpoint), back) == R::ReadError::BadPayload);
         checkpoint = MakeCheckpoint();
-        checkpoint.states[0].kind = static_cast<R::EngineStateKind>(3);
+        checkpoint.states[0].kind = static_cast<R::EngineStateKind>(4);
         REQUIRE(R::Decode(Enc(checkpoint), back) == R::ReadError::BadPayload);
         checkpoint = MakeCheckpoint();
         checkpoint.engines[1].engine_class = static_cast<R::EngineClass>(7);

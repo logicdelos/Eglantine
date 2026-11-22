@@ -58,6 +58,7 @@
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_cooperative_hmma_test.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
+#include "video_core/replay/run_state.h"
 #include "video_core/renderer_vulkan/vk_driver_build_report.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -1424,7 +1425,8 @@ ComputePipeline* PipelineCache::CurrentComputePipeline(u64& native_key) {
     const auto [pair, is_new]{compute_cache.try_emplace(key)};
     auto& entry{pair->second};
     const bool rebuild_async =
-        VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::ComputeRebuildAsync);
+        VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::ComputeRebuildAsync) &&
+        !VideoCore::Replay::ReplayGpuRunning();
     if (entry.pending) {
         if (entry.pending->IsBuilt()) {
             if (entry.pipeline) {

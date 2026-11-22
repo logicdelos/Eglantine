@@ -5,16 +5,22 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <map>
 #include <string>
 
 #include <QApplication>
+#include <QMessageBox>
 
 #include "common/driver_shader_cache.h"
+#include "common/fs/fs_paths.h"
 #include "common/fs/path_util.h"
 #include "common/settings.h"
+#ifdef _WIN32
+#include "common/windows/crash_handler.h"
+#endif
 #include "frontend_common/config.h"
 #include "startup_checks.h"
 #include "yuzu/nx2_switches.h"
@@ -205,12 +211,7 @@ int main(int argc, char* argv[]) {
 #ifdef YUZU_CRASH_DUMPS
     Breakpad::InstallCrashHandler();
 #elif defined(_WIN32)
-    // Up to 4 KiB of the log sits in the file buffer and dies with the process: the lines that
-    // lead to a crash. Stop() only flushes the backends.
-    SetUnhandledExceptionFilter([](EXCEPTION_POINTERS*) -> LONG {
-        Common::Log::Stop();
-        return EXCEPTION_CONTINUE_SEARCH;
-    });
+    Common::Windows::InstallCrashHandler(Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir));
 #endif
 
     // Init settings params
@@ -282,6 +283,14 @@ int main(int argc, char* argv[]) {
     QCoreApplication::setAttribute(Qt::AA_DontCheckOpenGLContextThreadAffinity);
 
 #ifdef _WIN32
+    // A native window (the render widget's, for the graphics surface) would otherwise make its
+    // siblings native too: the loading screen and the game list, next to GRenderWindow. In
+    // single-window borderless fullscreen those cover the main window, which Qt then no longer
+    // repaints (see RenderWidget in bootmanager.cpp).
+    QCoreApplication::setAttribute(Qt::AA_DontCreateNativeWidgetSiblings);
+#endif
+
+#ifdef _WIN32
     QApplication::setStyle(QStringLiteral("windowsvista"));
 #endif
 
@@ -306,10 +315,19 @@ int main(int argc, char* argv[]) {
     // generating shaders
     setlocale(LC_ALL, "C");
 
-    MainWindow main_window{has_broken_vulkan};
-    // After settings have been loaded by GMainWindow, apply the filter
-    main_window.show();
+    // A failure while the main window is built (settings, paths, renderer probing) is shown
+    // instead of ending the process without a word.
+    try {
+        MainWindow main_window{has_broken_vulkan};
+        // After settings have been loaded by GMainWindow, apply the filter
+        main_window.show();
 
-    app.connect(&app, &QGuiApplication::applicationStateChanged, &main_window, &MainWindow::OnAppFocusStateChanged);
-    return app.exec();
+        app.connect(&app, &QGuiApplication::applicationStateChanged, &main_window,
+                    &MainWindow::OnAppFocusStateChanged);
+        return app.exec();
+    } catch (const std::exception& exception) {
+        QMessageBox::critical(nullptr, QObject::tr("Eglantine startup stopped"),
+                              QString::fromUtf8(exception.what()));
+        return EXIT_FAILURE;
+    }
 }

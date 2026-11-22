@@ -31,6 +31,17 @@ Tools for Eden and other subprojects. When adding new scripts please use `#!/bin
 - `cpp-lint.sh`: Homemade dumb C++ linter.
 - `fuzzsettings.cpp`: Fuzz settings files.
 
+### Isolated in-game saves for testing
+
+`save_timeline.py` (Python 3.11+) copies only `user/save`, `system/save` and `temp` from the configured save directory. Stop **every** writer to that directory first; hashing is not a filesystem freeze. Use separate directories outside the source:
+
+```text
+python tools/save_timeline.py capture <SaveDir> <generation-store>
+python tools/save_timeline.py branch <printed-generation-directory> <branch-store>
+```
+
+Each `branch` checks the recorded digest before publishing a new writable directory. In a disposable test profile, set **save_directory** to that printed branch path. Repeating `branch` creates another independent copy. Never point the emulator at the generation itself. These files contain private game saves; they do not belong in shared diagnostic reports. No SD-card data, CPU, kernel, GPU or audio state is captured: this cannot resume a cutscene.
+
 ## Android
 
 It's recommended to run these scripts after almost any Android change, as they are relatively fast and important both for APK bloat and CI.

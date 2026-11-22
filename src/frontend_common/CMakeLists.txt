@@ -8,14 +8,21 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 add_library(frontend_common STATIC
+    bug_bundle.cpp
+    bug_bundle.h
+    bug_zip.cpp
+    bug_zip.h
     config.cpp
     config.h
+    content_copy.h
     content_manager.h
     firmware_manager.h
     firmware_manager.cpp
     data_manager.h data_manager.cpp
     play_time_manager.cpp
     play_time_manager.h
+    profile_import.cpp
+    profile_import.h
     settings_generator.h settings_generator.cpp
     mod_manager.h mod_manager.cpp)
 
@@ -33,4 +40,4 @@ endif()
 create_target_directory_groups(frontend_common)
 target_link_libraries(frontend_common
     PUBLIC core SimpleIni::SimpleIni frozen::frozen-headers
-    PRIVATE common Boost::headers)
+    PRIVATE common Boost::headers ZLIB::ZLIB)

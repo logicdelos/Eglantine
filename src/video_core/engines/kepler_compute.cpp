@@ -28,6 +28,7 @@
 #include "video_core/control/channel_state.h"
 #include "video_core/gpu_split.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/replay/effect.h"
 #include "video_core/nx2_diag.h"
 #include "video_core/nx2_method_census.h"
 #include "video_core/nx2_perf.h"
@@ -896,7 +897,10 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
                          offset += sizeof(block)) {
                         if (!memory_manager.IsFullyMappedRange(program + offset, sizeof(block)))
                             break;
-                        memory_manager.ReadBlock(program + offset, block.data(), sizeof(block));
+                        {
+                            VideoCore::Replay::ScopedReplayVerificationRead probe;
+                            memory_manager.ReadBlock(program + offset, block.data(), sizeof(block));
+                        }
                         for (size_t word = 0; word < block.size(); word += 4) {
                             const u32 opcode = block[word] & 0xfff;
                             threshold |= opcode == 0x434 && block[word + 1] == 0x292d292d;
@@ -1460,7 +1464,10 @@ const std::pair<std::vector<u32>, std::vector<u32>>& KeplerCompute::NativeImageH
     bool exited = false;
     for (u64 offset = 0; offset < 0x40000 && !exited; offset += sizeof(block)) {
         if (!memory_manager.IsFullyMappedRange(program + offset, sizeof(block))) break;
-        memory_manager.ReadBlock(program + offset, block.data(), sizeof(block));
+        {
+            VideoCore::Replay::ScopedReplayVerificationRead probe;
+            memory_manager.ReadBlock(program + offset, block.data(), sizeof(block));
+        }
         for (size_t word = 0; word < block.size() && !exited; word += 4) {
             const u32 opcode = block[word] & 0xfff;
             const u32 binding = (block[word + 1] >> 22) & 0x1f;
@@ -1640,7 +1647,10 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
         std::array<u32, 0x400> block{};
         for (u64 offset = 0; offset < 0x20000 && !(threshold && exponent); offset += sizeof(block)) {
             if (!memory_manager.IsFullyMappedRange(program + offset, sizeof(block))) break;
-            memory_manager.ReadBlock(program + offset, block.data(), sizeof(block));
+            {
+                VideoCore::Replay::ScopedReplayVerificationRead probe;
+                memory_manager.ReadBlock(program + offset, block.data(), sizeof(block));
+            }
             for (size_t word = 0; word < block.size(); word += 4) {
                 const u32 opcode = block[word] & 0xfff;
                 threshold |= opcode == 0x434 && block[word + 1] == 0x292d292d;

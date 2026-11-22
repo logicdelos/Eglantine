@@ -8,11 +8,14 @@
 #include <array>
 #include <cstring>
 
+#include <cstdlib>
+
 #include "common/assert.h"
 #include "common/bit_field.h"
 #include "common/common_types.h"
 #include "common/logging.h"
 #include "common/settings.h"
+#include "common/system_log.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_event.h"
 #include "core/hle/kernel/k_readable_event.h"
@@ -494,6 +497,13 @@ void NPad::OnUpdate(Kernel::KernelCore& kernel, const Core::Timing::CoreTiming& 
     }
 
     std::scoped_lock lock{*applet_resource_holder.shared_mutex};
+    // Count publication into guest shared memory, not host input callbacks. Do not retain
+    // button identities, stick values, device IDs or applet IDs.
+    static const bool report_delivery = [] {
+        const char* value = std::getenv("EDEN_NX2_HID_SUMMARY");
+        return Common::SystemLog::DiagnosticEnabled() ||
+               (value && value[0] == '1' && value[1] == '\0');
+    }();
     for (std::size_t aruid_index = 0; aruid_index < AruidIndexMax; ++aruid_index) {
         const auto* data = applet_resource_holder.applet_resource->GetAruidDataByIndex(aruid_index);
 
@@ -644,9 +654,22 @@ void NPad::OnUpdate(Kernel::KernelCore& kernel, const Core::Timing::CoreTiming& 
             libnx_state.sampling_number =
                 npad->system_ext_lifo.ReadCurrentEntry().state.sampling_number + 1;
             npad->system_ext_lifo.WriteNextEntry(libnx_state);
+            if (report_delivery) {
+                ++delivery_samples;
+                delivery_with_buttons += pad_state.npad_buttons.raw != Core::HID::NpadButton::None;
+            }
 
             press_state |= static_cast<u64>(pad_state.npad_buttons.raw);
         }
+    }
+    if (report_delivery && ++delivery_updates == 1000) {
+        Common::SystemLog::Record(Common::SystemLog::Subsystem::Input,
+                                  Common::SystemLog::Severity::Info,
+                                  Common::SystemLog::EventKind::InputSummary, delivery_updates,
+                                  delivery_samples, delivery_with_buttons);
+        LOG_INFO(Service_HID, "NPad delivery: {} updates, {} published samples, {} samples with buttons held",
+                 delivery_updates, delivery_samples, delivery_with_buttons);
+        delivery_updates = delivery_samples = delivery_with_buttons = 0;
     }
 }
 

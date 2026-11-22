@@ -204,6 +204,8 @@ private:
     NpadVibration vibration_handler{};
 
     std::atomic<u64> press_state{};
+    // Per 1000 active OnUpdate calls, under the applet shared-memory lock.
+    u32 delivery_updates{}, delivery_samples{}, delivery_with_buttons{};
     std::array<std::array<NpadControllerData, MaxSupportedNpadIdTypes>, AruidIndexMax> controller_data{};
 };
 } // namespace Service::HID

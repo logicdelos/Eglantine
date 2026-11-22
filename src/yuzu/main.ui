@@ -232,7 +232,11 @@
     <property name="title">
      <string>&amp;Help</string>
     </property>
+    <addaction name="action_Whats_New"/>
+    <addaction name="separator"/>
     <addaction name="action_Report_Bug"/>
+    <addaction name="action_Compatibility_Report"/>
+    <addaction name="action_Open_Issue_Tracker"/>
     <addaction name="action_Open_Mods_Page"/>
     <addaction name="action_Open_UserHandbook"/>
     <addaction name="separator"/>
@@ -412,6 +416,24 @@
   <action name="action_Report_Bug">
    <property name="text">
     <string>Report a &amp;Bug</string>
+   </property>
+  </action>
+  <action name="action_Open_Issue_Tracker">
+   <property name="text">
+    <string>Open the &amp;Issue Tracker</string>
+   </property>
+  </action>
+  <action name="action_Whats_New">
+   <property name="text">
+    <string>&amp;What's New</string>
+   </property>
+  </action>
+  <action name="action_Compatibility_Report">
+   <property name="enabled">
+    <bool>false</bool>
+   </property>
+   <property name="text">
+    <string>&amp;Compatibility Report...</string>
    </property>
   </action>
   <action name="action_Check_For_Updates">

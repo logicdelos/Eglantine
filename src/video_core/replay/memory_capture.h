@@ -539,6 +539,9 @@ inline void NoteFenceWait(FenceKind kind, s32 channel, u32 address_space, u64 id
 // capture knows completely.
 void NoteHostReadbackSlow(u64 device, u64 size);
 inline void NoteHostReadback(u64 device, u64 size) {
+    if (detail::readback_origin != detail::ReadbackOrigin::EmulatedWork) {
+        return;
+    }
     if (CaptureActive()) {
         NoteHostReadbackSlow(device, size);
     } else {

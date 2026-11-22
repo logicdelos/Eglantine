@@ -318,6 +318,15 @@ void QtConfig::ReadUIGamelistValues() {
 
     ReadCategory(Settings::Category::UiGameList);
 
+    // 1 -> 2: the grid and carousel covers had no size of their own and shared game_icon_size
+    // (the file's one value is what the user last chose for them). Applied in memory, to a value
+    // the user set and only where cover size was never stored.
+    if (UISettings::values.game_list_mode.GetValue() != Settings::GameListMode::TreeView &&
+        !Exists("UI", "UIGameList\\game_cover_size") &&
+        !config->GetBoolValue("UI", "UIGameList\\game_icon_size\\default", true)) {
+        UISettings::values.game_cover_size.SetValue(UISettings::values.game_icon_size.GetValue());
+    }
+
     const int favorites_size = BeginArray("favorites");
     for (int i = 0; i < favorites_size; i++) {
         SetArrayIndex(i);
@@ -366,8 +375,9 @@ void QtConfig::ReadMultiplayerValues() {
     size = BeginArray(std::string("ip_ban_list"));
     UISettings::values.multiplayer_ban_list.second.resize(size);
     for (int i = 0; i < size; ++i) {
+        SetArrayIndex(i);
         UISettings::values.multiplayer_ban_list.second[i] =
-            ReadStringSetting("username", std::string(""));
+            ReadStringSetting(std::string("ip"), std::string(""));
     }
     EndArray();
 

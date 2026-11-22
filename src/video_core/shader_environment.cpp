@@ -28,6 +28,7 @@
 
 #include "common/assert.h"
 #include "common/cityhash.h"
+#include "video_core/replay/effect.h"
 #include "common/common_types.h"
 #include "common/div_ceil.h"
 #include "common/fs/fs.h"
@@ -323,7 +324,10 @@ void GenericEnvironment::SetCachedSize(size_t size_bytes) {
     cached_lowest = start_address;
     cached_highest = start_address + static_cast<u32>(size_bytes);
     code.resize(CachedSizeWords());
-    gpu_memory->ReadBlock(program_base + cached_lowest, code.data(), code.size() * sizeof(u64));
+    {
+        VideoCore::Replay::ScopedReplayVerificationRead probe;
+        gpu_memory->ReadBlock(program_base + cached_lowest, code.data(), code.size() * sizeof(u64));
+    }
 }
 
 size_t GenericEnvironment::CachedSizeWords() const noexcept {
@@ -345,7 +349,10 @@ bool GenericEnvironment::CanBeSerialized() const noexcept {
 u64 GenericEnvironment::CalculateHash() const {
     const size_t size{ReadSizeBytes()};
     const auto data{std::make_unique<char[]>(size)};
-    gpu_memory->ReadBlock(program_base + read_lowest, data.get(), size);
+    {
+        VideoCore::Replay::ScopedReplayVerificationRead probe;
+        gpu_memory->ReadBlock(program_base + read_lowest, data.get(), size);
+    }
     return Common::CityHash64(data.get(), size);
 }
 
@@ -432,7 +439,10 @@ std::optional<u64> GenericEnvironment::TryFindSize() {
     size_t size{BLOCK_SIZE};
     while (size <= MAXIMUM_SIZE) {
         u64* const data = code.data() + offset / INST_SIZE;
-        gpu_memory->ReadBlock(guest_addr, data, BLOCK_SIZE);
+        {
+            VideoCore::Replay::ScopedReplayVerificationRead probe;
+            gpu_memory->ReadBlock(guest_addr, data, BLOCK_SIZE);
+        }
         for (size_t index = 0; index < BLOCK_SIZE; index += INST_SIZE) {
             const u64 inst = data[index / INST_SIZE];
             if (inst == SELF_BRANCH_A || inst == SELF_BRANCH_B) {
@@ -459,7 +469,10 @@ Tegra::Texture::TICEntry GenericEnvironment::ReadTextureInfo(GPUVAddr tic_addr, 
     }
     const GPUVAddr descriptor_addr{tic_addr + index * sizeof(Tegra::Texture::TICEntry)};
     Tegra::Texture::TICEntry entry{};
-    gpu_memory->ReadBlock(descriptor_addr, &entry, sizeof(entry));
+    {
+        VideoCore::Replay::ScopedReplayVerificationRead probe;
+        gpu_memory->ReadBlock(descriptor_addr, &entry, sizeof(entry));
+    }
     return entry;
 }
 
@@ -503,6 +516,7 @@ private:
         page_begin = address;
         page_end = address;
         if (length >= sizeof(Instruction) && gpu_memory.IsFullyMappedRange(address, length)) {
+            VideoCore::Replay::ScopedReplayVerificationRead probe;
             gpu_memory.ReadBlock(address, page.data(), length);
             page_end = next_page;
         }
@@ -554,7 +568,10 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
                 if (!native.empty()) break;
                 throw Shader::RuntimeError("Unmapped native shader instruction at {:#x}", address);
             }
-            gpu_memory->ReadBlock(address, &instruction, sizeof(instruction));
+            {
+                VideoCore::Replay::ScopedReplayVerificationRead probe;
+                gpu_memory->ReadBlock(address, &instruction, sizeof(instruction));
+            }
         }
         native.push_back(instruction);
         const auto status = capture.Observe(instruction, index);
@@ -727,7 +744,10 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
                                          u32 start_address_,
                                          std::shared_ptr<const LoweredNativeCode> lowered_native_)
     : GenericEnvironment{gpu_memory_, program_base_, start_address_}, maxwell3d{&maxwell3d_} {
-    gpu_memory->ReadBlock(program_base + start_address, &sph, sizeof(sph));
+    {
+        VideoCore::Replay::ScopedReplayVerificationRead probe;
+        gpu_memory->ReadBlock(program_base + start_address, &sph, sizeof(sph));
+    }
     initial_offset = sizeof(sph);
     texture_bound = maxwell3d->regs.bindless_texture_const_buffer_slot;
     const auto& regs{maxwell3d->regs};
@@ -800,7 +820,10 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
                 regs.pipelines[static_cast<size_t>(Maxwell::ShaderType::Geometry)]};
             const GPUVAddr address{(static_cast<u64>(geometry_pipeline.reserved[0] & 0xff) << 32) |
                                    geometry_pipeline.reserved[1]};
-            gpu_memory->ReadBlock(address, &mesh_primitive_header, sizeof(mesh_primitive_header));
+            {
+                VideoCore::Replay::ScopedReplayVerificationRead probe;
+                gpu_memory->ReadBlock(address, &mesh_primitive_header, sizeof(mesh_primitive_header));
+            }
         }
     }
     const u64 local_size{sph.LocalMemorySize()};

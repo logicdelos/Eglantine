@@ -31,12 +31,14 @@
 
 #include "common/fs/file.h"
 #include "common/fs/fs.h"
+#include "common/fs/fs_util.h"
 #include "common/fs/fs_paths.h"
 #include "common/fs/path_util.h"
 #include "common/literals.h"
 #include "common/log_ring.h"
 #include "common/nx2_sampler.h"
 #include "common/polyfill_thread.h"
+#include "common/system_log.h"
 #include "common/thread.h"
 
 #include "common/logging.h"
@@ -274,15 +276,51 @@ struct FileBackend final : public Backend {
             if (!rotate(path))
                 mode = FS::FileAccessMode::Append;
         }
+        log_path = path;
         file.emplace(path, mode, FS::FileType::TextFile);
         // Count what is already there so the size limit still applies when appending.
         if (mode == FS::FileAccessMode::Append)
-            bytes_written = file->GetSize();
+            bytes_written.store(file->GetSize(), std::memory_order_relaxed);
     }
     ~FileBackend() noexcept override = default;
 
     void Write(const Entry& entry) noexcept override {
-        if (!enabled)
+        std::scoped_lock lock{write_mutex};
+        WriteUnlocked(entry);
+    }
+
+    void WriteFromCrash(const Entry& entry) noexcept {
+        std::unique_lock lock{write_mutex, std::try_to_lock};
+        if (!lock.owns_lock()) {
+            return;
+        }
+        WriteUnlocked(entry);
+        FlushUnlocked();
+    }
+
+    void Flush() noexcept override {
+        std::scoped_lock lock{write_mutex};
+        FlushUnlocked();
+    }
+    [[nodiscard]] const std::filesystem::path& Path() const noexcept {
+        return log_path;
+    }
+    [[nodiscard]] std::size_t BytesWritten() const noexcept {
+        return bytes_written.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] bool LimitReached() const noexcept {
+        return limit_reached.load(std::memory_order_relaxed);
+    }
+
+    /// The size at which the file stops growing.
+    [[nodiscard]] static std::size_t WriteLimit() noexcept {
+        using namespace Common::Literals;
+        static const bool dependency_trace = Nx2Sampler::DependencyTraceEnabled();
+        return (Settings::values.extended_logging.GetValue() || dependency_trace) ? 1_GiB : 100_MiB;
+    }
+private:
+    void WriteUnlocked(const Entry& entry) noexcept {
+        if (!enabled.load(std::memory_order_relaxed))
             return;
 
         auto message = FormatLogMessage(entry);
@@ -307,24 +345,34 @@ struct FileBackend final : public Backend {
 
         // Option to log each line rather than 4k buffers
         if (Settings::values.log_flush_line.GetValue())
-            Flush();
+            FlushUnlocked();
 
-        using namespace Common::Literals;
         // Prevent logs from exceeding a set maximum size in the event that log entries are spammed.
-        static const bool dependency_trace = Nx2Sampler::DependencyTraceEnabled();
-        const auto write_limit =
-            (Settings::values.extended_logging.GetValue() || dependency_trace) ? 1_GiB : 100_MiB;
-        const bool write_limit_exceeded = bytes_written > write_limit;
+        const auto write_limit = WriteLimit();
+        const bool write_limit_exceeded = bytes_written.load(std::memory_order_relaxed) > write_limit;
         if (entry.log_level >= Level::Error || write_limit_exceeded) {
             // Stop writing after the write limit is exceeded.
             // Don't close the file so we can print a stacktrace if necessary
-            if (write_limit_exceeded)
-                enabled = false;
-            Flush();
+            if (write_limit_exceeded) {
+                enabled.store(false, std::memory_order_relaxed);
+                // Without this line the file just ends, and a reader cannot tell a quiet session
+                // from a full file.
+                if (!limit_reached.exchange(true)) {
+                    const auto marker = fmt::format(
+                        "[{:4d}.{:06d}] Log <Warning> common/logging.cpp:{}:Write: Log file size "
+                        "limit of {} bytes reached; later lines of this session are not written "
+                        "to this file\n",
+                        uint32_t(entry.timestamp.count() / 1000000),
+                        uint32_t(entry.timestamp.count() % 1000000), __LINE__, write_limit);
+                    static_cast<void>(
+                        file->WriteSpan(std::span<const char>{marker.begin(), marker.end()}));
+                }
+            }
+            FlushUnlocked();
         }
     }
 
-    void Flush() noexcept override {
+    void FlushUnlocked() noexcept {
         // A failed flush logs an Error, whose own flush would fail and log again without end.
         static thread_local bool flushing = false;
         if (flushing)
@@ -333,10 +381,13 @@ struct FileBackend final : public Backend {
         file->Flush();
         flushing = false;
     }
-private:
+
+    std::mutex write_mutex;
     std::optional<FS::IOFile> file;
-    std::size_t bytes_written = 0;
-    bool enabled = true;
+    std::filesystem::path log_path;
+    std::atomic<std::size_t> bytes_written{0};
+    std::atomic<bool> limit_reached{false};
+    std::atomic<bool> enabled{true};
 };
 #endif
 /// @brief Backend that keeps the last lines in memory, off unless the debug server turns it on
@@ -354,6 +405,7 @@ struct RingBackend final : public Backend {
             lines.push_back({next_sequence++, std::move(text)});
             while (lines.size() > capacity.load(std::memory_order_relaxed)) {
                 lines.pop_front();
+                ++evicted;
             }
         } catch (const std::exception&) {
             // Out of memory: drop the line rather than the process.
@@ -365,6 +417,8 @@ struct RingBackend final : public Backend {
     std::mutex mutex;
     std::deque<RingLine> lines;
     u64 next_sequence = 1;
+    /// Lines dropped to make room; guarded by mutex.
+    u64 evicted = 0;
 };
 #ifdef _WIN32
 /// @brief Backend that writes to Visual Studio's output window
@@ -528,8 +582,7 @@ void FmtCrashMessageImpl(const char* filename, unsigned int line_num, const char
         .function = function,
         .line_num = line_num,
     };
-    logging_instance->file_backend->Write(e);
-    logging_instance->file_backend->Flush();
+    logging_instance->file_backend->WriteFromCrash(e);
 #endif
 }
 
@@ -551,6 +604,7 @@ void SetRingCapacity(std::size_t capacity) {
     ring.capacity.store(capacity, std::memory_order_relaxed);
     while (ring.lines.size() > capacity) {
         ring.lines.pop_front();
+        ++ring.evicted;
     }
 }
 
@@ -579,6 +633,41 @@ std::vector<RingLine> ReadRing(u64 after) {
         }
     }
     return result;
+}
+
+RingRead ReadRingWithStatus(u64 after) {
+    RingRead result{};
+    if (!logging_instance)
+        return result;
+    auto& ring = logging_instance->ring_backend;
+    std::scoped_lock lock{ring.mutex};
+    for (const RingLine& line : ring.lines) {
+        if (line.sequence > after) {
+            result.lines.push_back(line);
+        }
+    }
+    result.status = {
+        .capacity = ring.capacity.load(std::memory_order_relaxed),
+        .newest = ring.next_sequence - 1,
+        .oldest = ring.lines.empty() ? ring.next_sequence : ring.lines.front().sequence,
+        .evicted = ring.evicted,
+    };
+    return result;
+}
+
+FileStatus GetFileStatus() {
+    FileStatus status{};
+#ifndef __OPENORBIS__
+    if (logging_instance && logging_instance->file_backend) {
+        const FileBackend& file = *logging_instance->file_backend;
+        status.open = true;
+        status.path = FS::PathToUTF8String(file.Path());
+        status.bytes_written = file.BytesWritten();
+        status.limit = FileBackend::WriteLimit();
+        status.limit_reached = file.LimitReached();
+    }
+#endif
+    return status;
 }
 
 bool IsLevelEnabled(Class log_class, Level log_level) {
@@ -626,6 +715,23 @@ void FmtLogMessageImpl(Class log_class, Level log_level, const char* filename, u
                 if (flush) backend.Flush();
             });
             if (sink) sink(GetLogClassName(log_class), log_level, s);
+        }
+        if (log_level >= Level::Warning) {
+            const auto sev = log_level == Level::Critical ? SystemLog::Severity::Critical
+                           : log_level == Level::Error    ? SystemLog::Severity::Error
+                                                          : SystemLog::Severity::Warning;
+            const auto kind = log_level == Level::Critical ? SystemLog::EventKind::LogCritical
+                            : log_level == Level::Error    ? SystemLog::EventKind::LogError
+                                                           : SystemLog::EventKind::LogWarning;
+            char detail_buf[96];
+            const auto detail_res = fmt::format_to_n(
+                detail_buf, sizeof(detail_buf) - 1, "{}:{}:{}: {}", GetLogClassName(log_class),
+                e.filename ? e.filename : "?", line_num,
+                std::string_view{e.message ? e.message : "", e.message_len});
+            const std::size_t detail_len = (std::min)(detail_res.size, sizeof(detail_buf) - 1);
+            SystemLog::Record(SystemLog::Subsystem::Log, sev, kind,
+                              static_cast<u64>(log_class), line_num, 0, 0,
+                              std::string_view{detail_buf, detail_len});
         }
     }
 }

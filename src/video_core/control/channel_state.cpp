@@ -25,6 +25,7 @@
 #include "video_core/nx2.h"
 #include "video_core/query_cache/types.h"
 #include "video_core/rasterizer_interface.h"
+#include "video_core/replay/memory_capture.h"
 
 namespace Tegra::Control {
 namespace {
@@ -120,7 +121,8 @@ void ChannelState::Nx2IncrementSyncpoint() {
                  bind_id, nx2_syncpoint, value, nx2_syncpoint_max.load(std::memory_order_relaxed));
     }
     // Never past what the kernel handed out: waits on later submissions would pass early.
-    if (static_cast<s32>(nx2_syncpoint_max.load(std::memory_order_relaxed) - value) <= 0) {
+    if (!VideoCore::Replay::ReplayGpuRunning() &&
+        static_cast<s32>(nx2_syncpoint_max.load(std::memory_order_relaxed) - value) <= 0) {
         return;
     }
     dma_pusher.rasterizer->SignalSyncPoint(nx2_syncpoint);

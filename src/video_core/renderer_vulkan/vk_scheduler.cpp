@@ -21,6 +21,7 @@
 #include "common/logging.h"
 #include "common/nx2_bottleneck.h"
 #include "common/settings.h"
+#include "common/system_log.h"
 #include "common/thread.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/nx2_perf.h"
@@ -132,6 +133,18 @@ bool Scheduler::WaitSubmitted(u64 tick) {
             tick + 1, std::chrono::microseconds{5}, deadline,
             [&] { return IsSubmitted(tick) || !split.BackRunning(); }, std::chrono::milliseconds{1});
         if (IsSubmitted(tick)) {
+            const auto elapsed_us = static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - start)
+                    .count());
+            if (elapsed_us > 16000 || Common::SystemLog::GpuTraceEnabled()) {
+                Common::SystemLog::Record(
+                    Common::SystemLog::Subsystem::Gpu,
+                    elapsed_us > 16000 ? Common::SystemLog::Severity::Warning
+                                       : Common::SystemLog::Severity::Info,
+                    Common::SystemLog::EventKind::GpuFenceWait, tick, elapsed_us, 0, 0,
+                    "WaitSubmitted");
+            }
             return true;
         }
         if (!split.BackRunning()) {
@@ -357,6 +370,13 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer) {
     }
     // Ends any active pass and realizes a deferred clear
     EndRenderPass();
+    if (Common::SystemLog::GpuTraceEnabled()) {
+        Common::SystemLog::Record(Common::SystemLog::Subsystem::Gpu,
+                                  Common::SystemLog::Severity::Info,
+                                  Common::SystemLog::EventKind::GpuRenderPass,
+                                  render_area.width, render_area.height,
+                                  framebuffer->NumImages());
+    }
     BeginRenderPassImpl(framebuffer, renderpass, nullptr, 0);
 }
 
@@ -543,6 +563,13 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
     DispatchWork();
     // Handed to the worker: wakes threads in WaitSubmitted.
     submitted_ticks.AdvanceAtLeast(master_semaphore->CurrentTick());
+    if (Common::SystemLog::GpuTraceEnabled()) {
+        Common::SystemLog::Record(
+            Common::SystemLog::Subsystem::Gpu, Common::SystemLog::Severity::Info,
+            Common::SystemLog::EventKind::GpuSubmit, signal_value,
+            signal_semaphore != VK_NULL_HANDLE ? 1 : 0,
+            wait_semaphore != VK_NULL_HANDLE ? 1 : 0);
+    }
     return signal_value;
 }
 

@@ -253,7 +253,6 @@ Result KProcess::Initialize(KernelCore& kernel, const Svc::CreateProcessParamete
     m_exception_thread = nullptr;
     m_is_suspended = false;
     m_memory_release_hint = 0;
-    m_schedule_count = 0;
     m_is_handle_table_initialized = false;
 
     // Open a reference to our resource limit.

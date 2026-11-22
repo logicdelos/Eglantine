@@ -26,6 +26,7 @@
 #include "common/logging.h"
 #include "common/nx2_dependency_wait.h"
 #include "common/settings.h"
+#include "common/system_log.h"
 #include "core/arm/debug.h"
 #include "core/core.h"
 #include "core/debugger/trace_hooks.h"
@@ -408,7 +409,8 @@ namespace {
 // EDEN_NX2_IPC_SUMMARY: every 5 s, log how often each service command ran and with which result
 // since the last summary (finds a game polling something that never becomes ready).
 void CountRequest(const std::string& service, u32 command, u32 type, u32 result) {
-    static const bool enabled = std::getenv("EDEN_NX2_IPC_SUMMARY") != nullptr;
+    static const bool enabled = Common::SystemLog::DiagnosticEnabled() ||
+                                std::getenv("EDEN_NX2_IPC_SUMMARY") != nullptr;
     if (!enabled) {
         return;
     }
@@ -433,6 +435,11 @@ void CountRequest(const std::string& service, u32 command, u32 type, u32 result)
     for (size_t i = 0; i < std::min<size_t>(lines.size(), 24); ++i) {
         text += fmt::format(" | {}x {}", lines[i].first, lines[i].second);
     }
+    Common::SystemLog::Record(Common::SystemLog::Subsystem::Service,
+                              Common::SystemLog::Severity::Info,
+                              Common::SystemLog::EventKind::IpcSummary, lines.size(),
+                              lines.empty() ? 0 : lines[0].first, 0, 0,
+                              lines.empty() ? std::string_view{} : std::string_view{lines[0].second});
     LOG_INFO(Service, "ipc summary ({} kinds){}", lines.size(), text);
     counts.clear();
 }

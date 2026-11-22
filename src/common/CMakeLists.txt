@@ -93,6 +93,8 @@ add_library(
     free_region_manager.h
     fs/file.cpp
     fs/file.h
+    fs/file_lock.cpp
+    fs/file_lock.h
     fs/fs.cpp
     fs/fs.h
     fs/fs_paths.h
@@ -101,6 +103,8 @@ add_library(
     fs/fs_util.h
     fs/path_util.cpp
     fs/path_util.h
+    fs/profile_migration.cpp
+    fs/profile_migration.h
     hash.h
     heap_tracker.cpp
     heap_tracker.h
@@ -170,6 +174,8 @@ add_library(
     string_util.cpp
     string_util.h
     swap.h
+    system_log.cpp
+    system_log.h
     test_frame_delay.cpp
     test_frame_delay.h
     thread.cpp

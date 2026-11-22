@@ -5,6 +5,7 @@
 // kernel memory layout, so that layout has to exist once the replay's system is set up.
 
 #include <algorithm>
+#include <array>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -14,6 +15,10 @@
 #include "core/device_memory.h"
 #include "core/hle/kernel/k_memory_layout.h"
 #include "core/hle/kernel/k_memory_region_type.h"
+#include "core/hle/kernel/k_readable_event.h"
+#include "core/hle/kernel/k_scheduler.h"
+#include "core/hle/kernel/k_synchronization_wait.h"
+#include "core/hle/kernel/svc_results.h"
 #include "core/hle/kernel/kernel.h"
 #include "tests/core/system_test_context.h"
 
@@ -73,4 +78,53 @@ TEST_CASE("the replay kernel shutdown unlinks every sleep counter", "[core][repl
     system.ShutdownReplayKernel();
     REQUIRE(counter.id == 0);
     REQUIRE(counter.next == nullptr);
+}
+
+TEST_CASE("an armed kernel synchronization wait does not borrow the caller's handle array",
+          "[core][sync_wait]") {
+    ScopedSystemTestContext context;
+    Core::System system;
+    system.Initialize();
+    system.InitializeReplayKernel();
+    auto& kernel = system.Kernel();
+    {
+        Kernel::KReadableEvent a(kernel), b(kernel);
+        Kernel::KAutoObject::Create(&a);
+        Kernel::KAutoObject::Create(&b);
+        a.Initialize(kernel, nullptr);
+        b.Initialize(kernel, nullptr);
+        Kernel::KSynchronizationWait queue(kernel);
+        auto* thread = Kernel::GetCurrentThreadPointer(kernel);
+        // Keep the real scheduler lock across arm and dispatch so no timing or worker is needed.
+        Kernel::KScopedSchedulerLock lock(kernel);
+        std::array<Kernel::KSynchronizationObject*, 3> handles{&a, &b, &b};
+        queue.Link(thread, handles);
+        thread->BeginWait(kernel, &queue);
+        handles.fill(&a);
+        CHECK(b.Signal(kernel).IsSuccess());
+        CHECK(thread->GetState() == Kernel::ThreadState::Runnable);
+        CHECK(thread->GetSyncedIndex() == 1);
+        CHECK(thread->GetWaitResult().IsSuccess());
+        CHECK(a.GetWaitingThreadsForDebugging(kernel).empty());
+        CHECK(b.GetWaitingThreadsForDebugging(kernel).empty());
+
+        // Reuse the queue with duplicate entries; cancellation must unlink every registration.
+        queue.Link(thread, handles);
+        thread->BeginWait(kernel, &queue);
+        thread->CancelWait(kernel, Kernel::ResultCancelled, false);
+        CHECK(thread->GetState() == Kernel::ThreadState::Runnable);
+        CHECK(thread->GetWaitResult() == Kernel::ResultCancelled);
+        CHECK(a.GetWaitingThreadsForDebugging(kernel).empty());
+
+        // No handles is a legal timed wait. Drive the actual hardware-timer callback under its
+        // scheduler lock instead of sleeping, so the result does not depend on the host clock.
+        queue.Link(thread, {});
+        thread->BeginWait(kernel, &queue);
+        thread->OnTimer(kernel);
+        CHECK(thread->GetWaitResult() == Kernel::ResultTimedOut);
+        CHECK(thread->GetState() == Kernel::ThreadState::Runnable);
+        a.Close(kernel);
+        b.Close(kernel);
+    }
+    system.ShutdownReplayKernel();
 }

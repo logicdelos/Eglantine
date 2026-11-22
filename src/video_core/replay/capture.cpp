@@ -35,10 +35,12 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <tuple>
 #include <utility>
 #include <vector>
 
+#include "common/logging.h"
 #include "common/run_outcome.h"
 #include "common/scm_rev.h"
 #include "video_core/nx2.h" // Tegra::g_nx2_ampere
@@ -104,7 +106,7 @@ constexpr size_t BatchEventLimit = 4096;
 constexpr u64 BatchByteLimit = 1ULL << 20;
 constexpr u32 LibraryBatchRecords = 4096;
 constexpr u64 LibraryBatchBytes = 1ULL << 20;
-constexpr u64 TrackerWindowBytesForCapture = 64ULL << 20;
+constexpr u64 TrackerWindowBytesForCapture = 512ULL << 20;
 
 // Cutting: the checkpoint is being taken; hooks are staged (see Capture::Staging).
 enum class State { WaitingCut, Cutting, Recording, Finished, Failed };
@@ -397,7 +399,7 @@ private:
     std::vector<FenceEntry> fence_batch;
     u64 fence_batch_frame = 0;
     std::map<u32, u64> seen_syncpoints;               // syncpoint -> latest value a producer raised
-    std::map<std::pair<u32, u64>, u64> seen_memory;   // (address space, gpu va) -> last value
+    std::map<std::pair<u32, u64>, std::unordered_set<u64>> seen_memory;   // (address space, gpu va) -> seen values
     std::unordered_map<s32, u32> channel_space;       // live channel -> address space
     std::set<u32> checkpoint_spaces;                  // address spaces the checkpoint lists
     void NoteSpaceUnknown(u32 space, const char* what);
@@ -716,6 +718,9 @@ void Capture::AppendEffect(std::vector<LiveEffect>& destination, const LiveEffec
 }
 
 void Capture::AddFence(const FenceEntry& entry) {
+    if (entry.kind != FenceKind::SyncpointRaised) {
+        FlushTracker();
+    }
     AppendEffect(open_effects, {EffectKind::FenceSignal, entry.id, entry.value, true});
     FlushEventBatch();
     if (fence_batch.empty()) {
@@ -1006,6 +1011,9 @@ CutOutcome Capture::CutBody(u64 present_id, std::string& error) {
             header.title_version = cut.title_version;
             header.title_version_status = static_cast<u32>(VersionStatus::Known);
         }
+        header.gpu_architecture = static_cast<u32>(
+            Tegra::g_nx2_ampere.load(std::memory_order_relaxed) ? GpuArchitecture::Ampere
+                                                                : GpuArchitecture::Maxwell);
         output_stats.pins_unknown = cut.unknown_pins.size();
 
         const SessionRecord session = BuildSession(cut);
@@ -1278,12 +1286,16 @@ void Capture::RecordPresentLocked(u64 id, PresentPath path,
     record.path = path;
     record.present_id = id;
     record.output_id = id;
-    if (!fences.empty()) {
-        record.fence_id = static_cast<u32>(fences[0].id);
-        record.fence_value = fences[0].value;
+    for (const auto& fence : fences) {
+        if (fence.id < 0 || static_cast<u32>(fence.id) >= SyncpointCount) {
+            continue;
+        }
+        record.fence_id = static_cast<u32>(fence.id);
+        record.fence_value = fence.value;
         if (recorded_syncpoints[static_cast<u32>(record.fence_id)] < record.fence_value) {
             NoteUnresolved("the PRESENT syncpoint threshold is not established by recorded producers");
         }
+        break;
     }
     for (size_t index = 0; index < layers.size(); ++index) {
         if (index >= MaxLayersPerPresent) {
@@ -1297,15 +1309,21 @@ void Capture::RecordPresentLocked(u64 id, PresentPath path,
                                                source_layer.stride, static_cast<u32>(source_layer.pixel_format));
         const u64 available = std::numeric_limits<u64>::max() - source_layer.address;
         MemoryTracker::Location location;
-        if (bytes && source_layer.offset <= available && *bytes <= available - source_layer.offset &&
-            tracker->Locate(source_layer.address, source_layer.offset + *bytes, location) &&
-            tracker->IsResolved(source_layer.address + source_layer.offset, *bytes)) {
+        const bool range_ok = bytes && source_layer.offset <= available && *bytes <= available - source_layer.offset;
+        const bool located = range_ok && tracker->Locate(source_layer.address, source_layer.offset + *bytes, location);
+        const bool resolved = located && tracker->IsResolved(source_layer.address + source_layer.offset, *bytes);
+        if (resolved) {
             layer.alloc_id = location.alloc_id;
             layer.alloc_offset = location.offset;
             layer.generation = location.generation;
         } else {
             ++cap_unresolved;
             reasons |= IncompleteUnresolvedResource;
+            LOG_WARNING(HW_GPU,
+                        "Replay capture unresolved: present layer addr={:#x} offset={:#x} bytes={} w={} h={} stride={} fmt={} range_ok={} located={} resolved={}",
+                        source_layer.address, source_layer.offset, bytes.value_or(0), source_layer.width,
+                        source_layer.height, source_layer.stride, static_cast<u32>(source_layer.pixel_format),
+                        range_ok, located, resolved);
             if (error_text.empty()) {
                 error_text = "a present layer is not backed by one captured allocation";
             }
@@ -1608,7 +1626,9 @@ void Capture::GpuMap(u32 space, u64 gpu_va, u64 size, u64 device, u32 flags, u32
     if (state != State::Recording || window_closed) {
         return;
     }
-    NoteSpaceUnknown(space, "a mapping");
+    if (checkpoint_spaces.find(space) == checkpoint_spaces.end()) {
+        return;
+    }
     MemoryOutput out;
     StreamBlobs(out, open_frame);
     tracker->Map(space, gpu_va, size, device, flags, pte_kind, out);
@@ -1624,7 +1644,9 @@ void Capture::GpuMapSparse(u32 space, u64 gpu_va, u64 size, u32 flags) {
     if (state != State::Recording || window_closed) {
         return;
     }
-    NoteSpaceUnknown(space, "a sparse mapping");
+    if (checkpoint_spaces.find(space) == checkpoint_spaces.end()) {
+        return;
+    }
     MemoryOutput out;
     tracker->MapSparse(space, gpu_va, size, flags, out);
     EmitMemory(out);
@@ -1637,6 +1659,9 @@ void Capture::GpuUnmap(u32 space, u64 gpu_va, u64 size) {
         return;
     }
     if (state != State::Recording || window_closed) {
+        return;
+    }
+    if (checkpoint_spaces.find(space) == checkpoint_spaces.end()) {
         return;
     }
     MemoryOutput out;
@@ -1744,6 +1769,7 @@ void Capture::NoteSpaceUnknown(u32 space, const char* what) {
     }
     ++cap_unresolved;
     reasons |= IncompleteUnresolvedResource;
+    LOG_WARNING(HW_GPU, "Replay capture unresolved: {} uses unknown address space {}", what, space);
     if (error_text.empty()) {
         error_text = std::string{what} + " uses address space " + std::to_string(space) +
                      ", which the checkpoint does not list: a replay cannot create it";
@@ -1808,9 +1834,27 @@ void Capture::FenceProducedLocked(const FenceNote& note) {
             at->second = note.value;
         }
     } else {
-        seen_memory[{note.space, note.id}] = note.value;
+        auto& vals = seen_memory[{note.space, note.id}];
+        if (vals.size() >= 256) {
+            vals.clear();
+        }
+        vals.insert(note.value);
     }
     if (!note.external) {
+        if (syncpoint) {
+            const u32 sp_id = static_cast<u32>(note.id);
+            if (recorded_syncpoints[sp_id] == 0 && note.value > 1) {
+                const u32 pre_cut = static_cast<u32>(note.value) - 1;
+                if (SyncpointRaiseFits(sp_id, pre_cut)) {
+                    FenceEntry pre_entry;
+                    pre_entry.kind = FenceKind::SyncpointRaised;
+                    pre_entry.id = note.id;
+                    pre_entry.value = pre_cut;
+                    AddFence(pre_entry);
+                    ++fences_synthesized;
+                }
+            }
+        }
         AppendEffect(open_effects, ProducedEffect(note.kind, note.id, note.value));
         if (syncpoint) {
             // A raise by the recorded commands is an output: the number of raises since the cut,
@@ -1864,7 +1908,7 @@ void Capture::FenceWaitLocked(const FenceNote& note) {
         produced = seen != seen_syncpoints.end() && WrapAtLeast(seen->second, note.value);
     } else {
         const auto seen = seen_memory.find({note.space, note.id});
-        produced = seen != seen_memory.end() && seen->second == note.value;
+        produced = seen != seen_memory.end() && seen->second.contains(note.value);
         if (!produced && note.device != 0 &&
             cpu_written.Intersects(note.device, note.device + FenceWidth(note))) {
             produced = true;  // a guest or device write, carried by the memory deltas
@@ -1873,7 +1917,7 @@ void Capture::FenceWaitLocked(const FenceNote& note) {
     if (produced) {
         return;
     }
-    if (!note.blocked) {
+    if (!note.blocked || !syncpoint) {
         // The value was already there when the wait checked it: its producer ran before the
         // capture window. The replay starts from a checkpoint that does not restore syncpoint
         // values, so the fence is recorded here, ahead of the events that depend on it.
@@ -1883,12 +1927,20 @@ void Capture::FenceWaitLocked(const FenceNote& note) {
         entry.value = note.value;
         entry.aux = (note.aux == 4 || note.aux == 8) ? note.aux : 0;
         if (!syncpoint) {
+            if (note.device == 0) {
+                return;
+            }
             entry.channel_id = ResolveChannel(note.channel, note.space);
             if (entry.channel_id == 0) {
                 NoteUnresolved("a memory fence wait names an address space no recorded channel uses");
                 return;
             }
-            seen_memory[{note.space, note.id}] = note.value;
+            tracker->NoteRead(note.device, FenceWidth(note));
+            auto& vals = seen_memory[{note.space, note.id}];
+            if (vals.size() >= 256) {
+                vals.clear();
+            }
+            vals.insert(note.value);
         } else {
             if (!SyncpointRaiseFits(static_cast<u32>(note.id), note.value)) {
                 return;
@@ -2169,6 +2221,7 @@ CaptureReport Capture::End(bool run_ended_normally) {
         if (missing_pictures != 0) {
             cap_unresolved += missing_pictures;
             reasons |= IncompleteUnresolvedResource;
+            LOG_WARNING(HW_GPU, "Replay capture unresolved: {} frame(s) missing composed picture", missing_pictures);
             if (error_text.empty()) {
                 error_text = "the composed picture was unavailable for " +
                              std::to_string(missing_pictures) + " frame(s)";

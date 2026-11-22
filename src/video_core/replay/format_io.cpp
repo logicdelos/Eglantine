@@ -1039,11 +1039,17 @@ void Encode(const GpuCheckpoint& value, std::vector<u8>& out) {
                  return e.address_space_id;
              })) {
             const AddressSpaceEntry& entry = value.address_spaces[i];
+            const u32 flags = entry.syncpoint_shim != 0
+                                  ? (entry.flags | AddressSpaceHasSyncpointShim)
+                                  : (entry.flags & ~AddressSpaceHasSyncpointShim);
             w.Put32(entry.address_space_id);
             w.Put32(entry.address_space_bits);
             w.Put32(entry.big_page_bits);
-            w.Put32(entry.flags);
+            w.Put32(flags);
             w.Put64(entry.split_address);
+            if (entry.syncpoint_shim != 0) {
+                w.Put64(entry.syncpoint_shim);
+            }
         }
     }
     for (const size_t i : OrderedBy(value.engines, [](const EngineRegisters& e) {
@@ -1127,7 +1133,7 @@ void Encode(const GpuCheckpoint& value, std::vector<u8>& out) {
         }
     }
     for (const size_t i : OrderedBy(value.states, [](const EngineStateSection& e) {
-             return e.channel_id;
+             return std::pair{e.channel_id, static_cast<u32>(e.kind)};
          })) {
         ++records;
         const EngineStateSection& state = value.states[i];
@@ -1188,6 +1194,9 @@ struct SubKey {
             entry.big_page_bits = r.Get32();
             entry.flags = r.Get32();
             entry.split_address = r.Get64();
+            if ((entry.flags & AddressSpaceHasSyncpointShim) != 0) {
+                entry.syncpoint_shim = r.Get64();
+            }
             if (!r.Ok()) {
                 return ReadError::Truncated;
             }
@@ -1195,6 +1204,8 @@ struct SubKey {
                 entry.big_page_bits > 64 ||
                 (entry.address_space_bits < 64 &&
                  entry.split_address > (u64{1} << entry.address_space_bits)) ||
+                ((entry.flags & AddressSpaceHasSyncpointShim) != 0 && entry.address_space_bits < 64 &&
+                 entry.syncpoint_shim >= (u64{1} << entry.address_space_bits)) ||
                 (i != 0 && entry.address_space_id <= value.address_spaces.back().address_space_id)) {
                 return ReadError::BadPayload;
             }
@@ -1322,7 +1333,7 @@ struct SubKey {
         const u32 state_kind = r.Get32();
         u32 word_count = 0;
         REPLAY_TRY(ReadCount(r, MaxMacroWords, 4, word_count));
-        if (!InRange(state_kind, 1, 2)) {
+        if (!InRange(state_kind, 1, 3)) {
             return ReadError::BadPayload;
         }
         state.kind = static_cast<EngineStateKind>(state_kind);

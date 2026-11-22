@@ -28,6 +28,7 @@
 #include "common/logging.h"
 #include "common/memory_accounting.h"
 #include "common/run_outcome.h"
+#include "common/system_log.h"
 #include "common/thread.h"
 
 #ifdef _WIN32
@@ -128,6 +129,7 @@ std::atomic<u64> over_50ms_ns{};
 std::atomic<u32> audio_underruns{};
 std::atomic<bool> guest_running{};
 std::atomic<u32> run_count{};
+std::atomic<bool> rolling_hitch_reset{};
 thread_local size_t wait_row = NumThreads;
 
 /// Present intervals as a histogram, kept only while a report records. Microseconds below 64 have
@@ -1363,6 +1365,80 @@ void NoteFrame() {
     if (ns > 100'000'000) {
         frames_over_100ms.fetch_add(1, std::memory_order_relaxed);
     }
+
+    // Per-frame micro-stutter / frame-fluctuation detection (presenting thread only).
+    static constexpr size_t RollingWindow = 32;
+    static std::array<u64, RollingWindow> rolling_us{};
+    static size_t rolling_count = 0;
+    static size_t rolling_pos = 0;
+    static std::array<u64, NumWaits> prev_wait_ns{};
+    static u64 last_hitch_ns = 0;
+    static s64 coalesced_hitches = 0;
+
+    if (rolling_hitch_reset.exchange(false, std::memory_order_relaxed)) {
+        rolling_count = 0;
+        rolling_pos = 0;
+        coalesced_hitches = 0;
+    }
+
+    std::array<u64, NumWaits> cur_wait_ns{};
+    std::array<u64, NumWaits> delta_wait_ns{};
+    for (size_t w = 0; w < NumWaits; ++w) {
+        u64 sum = 0;
+        for (size_t row = 0; row < NumWaitRows; ++row) {
+            sum += wait_meters[row][w].ns.load(std::memory_order_relaxed);
+        }
+        cur_wait_ns[w] = sum;
+        delta_wait_ns[w] = sum >= prev_wait_ns[w] ? sum - prev_wait_ns[w] : sum;
+        prev_wait_ns[w] = sum;
+    }
+
+    const u64 frame_us = ns / 1000;
+    u64 median_us = 0;
+    if (rolling_count >= 16) {
+        std::array<u64, RollingWindow> sorted{};
+        std::copy_n(rolling_us.begin(), rolling_count, sorted.begin());
+        const size_t mid = rolling_count / 2;
+        std::nth_element(sorted.begin(), sorted.begin() + static_cast<std::ptrdiff_t>(mid),
+                         sorted.begin() + static_cast<std::ptrdiff_t>(rolling_count));
+        median_us = sorted[mid];
+    }
+
+    rolling_us[rolling_pos] = frame_us;
+    rolling_pos = (rolling_pos + 1) % RollingWindow;
+    if (rolling_count < RollingWindow) {
+        ++rolling_count;
+    }
+
+    if (median_us > 0 &&
+        ((frame_us >= 33'000 && frame_us * 2 >= median_us * 3) || frame_us >= 50'000)) {
+        if (last_hitch_ns != 0 && now - last_hitch_ns < 100'000'000ULL) {
+            ++coalesced_hitches;
+        } else {
+            last_hitch_ns = now;
+            static constexpr std::array<const char*, NumWaits> ShortWaitNames{
+                "HostGpu", "ShaderBuild", "VulkanWorker", "Present",
+                "GpuBack", "GuestOnGpu",  "FileRead",     "KernelLock",
+            };
+            size_t best_w = 0;
+            u64 best_ns = 0;
+            for (size_t w = 0; w < NumWaits; ++w) {
+                if (delta_wait_ns[w] > best_ns) {
+                    best_ns = delta_wait_ns[w];
+                    best_w = w;
+                }
+            }
+            const char* cause = (best_ns * 10 >= ns) ? ShortWaitNames[best_w] : "Cpu/Unknown";
+            const s64 skipped = coalesced_hitches;
+            coalesced_hitches = 0;
+            Common::SystemLog::Record(
+                Common::SystemLog::Subsystem::Graphics,
+                frame_us >= 100'000 ? Common::SystemLog::Severity::Error
+                                    : Common::SystemLog::Severity::Warning,
+                Common::SystemLog::EventKind::FrameHitch, frame_us, median_us, best_ns / 1000,
+                skipped, cause);
+        }
+    }
 }
 
 void NoteAudioUnderrun() {
@@ -1471,6 +1547,7 @@ void SetGuestRunning(bool running) {
     if (running) {
         // The time paused is not a frame.
         last_frame.store(0, std::memory_order_relaxed);
+        rolling_hitch_reset.store(true, std::memory_order_relaxed);
         run_count.fetch_add(1, std::memory_order_relaxed);
         {
             std::scoped_lock lock{collect_mutex};

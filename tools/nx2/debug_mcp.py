@@ -59,7 +59,9 @@ TOOLS = [
         "name": "log_tail",
         "description": "Log lines kept in memory since the game booted. Without 'after', the newest "
                        "'limit' lines; with 'after' (the 'next' of an earlier call), the lines "
-                       "logged since, oldest first. 'contains' keeps lines with that substring.",
+                       "logged since, oldest first. 'contains' keeps lines with that substring. "
+                       "'lost' counts lines above 'after' the ring had already dropped; 'omitted' "
+                       "counts older matches a first read left out; 'sequences' pairs with 'lines'.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -67,6 +69,17 @@ TOOLS = [
                 "limit": {"type": "integer", "minimum": 1, "maximum": 5000},
                 "contains": {"type": "string"},
             },
+        },
+    },
+    {
+        "name": "mark",
+        "description": "Drop an incident mark: logs one line with the session, present count and "
+                       "the label's length (not the label) and returns the present count, uptime "
+                       "and the log line's native time, so a log window and a frame number can be "
+                       "tied together exactly. 'logged' is false when the log filter hides it.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"label": {"type": "string", "maxLength": 120}},
         },
     },
     {

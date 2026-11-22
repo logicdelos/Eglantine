@@ -12,6 +12,7 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <string>
@@ -53,6 +54,7 @@ class GlobalSchedulerContext;
 class KernelCore;
 class KProcess;
 class KScheduler;
+class KSynchronizationWait;
 class KThreadQueue;
 
 using KThreadFunction = KProcessAddress;
@@ -140,6 +142,7 @@ class KThread final : public KAutoObjectWithSlabHeapAndContainer<KThread, KWorke
 private:
     friend class KScheduler;
     friend class KProcess;
+    friend class KSynchronizationObject;
 
 public:
     static constexpr s32 DefaultThreadPriority = 44;
@@ -366,14 +369,6 @@ public:
     Result SetActivity(KernelCore& kernel, Svc::ThreadActivity activity);
 
     Result Sleep(KernelCore& kernel, s64 timeout);
-
-    s64 GetYieldScheduleCount() const {
-        return m_schedule_count;
-    }
-
-    void SetYieldScheduleCount(s64 count) {
-        m_schedule_count = count;
-    }
 
     void ResetYieldStreak() {
         m_yield_streak = 0;
@@ -920,14 +915,15 @@ private:
     KProcessAddress m_tls_address{};
     KLightLock m_activity_pause_lock;
     SyncObjectBuffer m_sync_object_buffer{};
-    s64 m_schedule_count{};
     Nx2Bottleneck::SleepThreadCounter m_sleep_calls;
     u32 m_yield_streak{};
     u64 m_yield_epoch{};
+    u64 m_empty_yield_token{}; // Read/written only by this thread while executing its yield SVC.
     s64 m_last_scheduled_tick{};
     std::atomic<bool> m_entered_kernel{false};
     std::array<QueueEntry, Core::Hardware::NUM_CPU_CORES> m_per_core_priority_queue_entry{};
     KThreadQueue* m_wait_queue{};
+    std::unique_ptr<KSynchronizationWait> m_sync_wait;
     LockWithPriorityInheritanceInfoList m_held_lock_info_list{};
     LockWithPriorityInheritanceInfo* m_waiting_lock_info{};
     WaiterList m_pinned_waiter_list{};
@@ -967,7 +963,6 @@ private:
     std::condition_variable m_dummy_thread_cv{};
 
     // For debugging
-    std::vector<KSynchronizationObject*> m_wait_objects_for_debugging{};
     KProcessAddress m_mutex_wait_address_for_debugging{};
     ThreadWaitReasonForDebugging m_wait_reason_for_debugging{};
     uintptr_t m_argument{};

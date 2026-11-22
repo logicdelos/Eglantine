@@ -61,6 +61,8 @@ private:
     friend class KScopedSchedulerLockAndSleep;
 
     std::atomic_bool m_scheduler_update_needed{};
+    // Scheduler-lock writers only. Low two bits are reserved for the yield mode in thread tokens.
+    std::atomic<u64> m_queue_generation{4};
     KSchedulerPriorityQueue m_priority_queue;
     LockType m_scheduler_lock;
     std::mutex m_global_list_guard;

@@ -84,15 +84,16 @@ Status: in progress; not released.
 
 Done when: frames over 100 ms in the first two minutes are at least halved on the second launch in both games.
 
-### 0.6: Replay and regression check
-Status: planned.
+### 0.6: Replay, regression testing and incident logging
+Status: in progress; the following are release requirements, not shipped features.
 
 **Significant change:** a frame's graphics calls can be recorded and replayed without the game, and pictures compared automatically.
 
 - A census of the graphics library calls each game makes per frame, built into the emulator.
 - A check that fails a change when median or low-end frame rate drops beyond measured noise.
+- Normal play keeps a bounded local history. A marker preserves evidence from before and after an incident, with monotonic time and frame/present identifiers where available. Diagnostic mode adds scheduling, service/IPC, filesystem, input, audio and GPU evidence (submissions, passes, fences and presents). Identify missing sources and dropped events instead of treating missing data as success.
 
-Done when: an injected 5 % slowdown is caught, and the call census is complete for both games with no per-game code.
+Done when: an injected 5 % slowdown is caught and the call census is complete for both games without per-game code. Exercise a marked visual fault and a non-graphics incident, recover their lead-up and aftermath, and measure normal-play logging overhead separately from diagnostic capture.
 
 ### 0.7: Fast graphics path, preview
 Status: planned. Depends on the measurements above.
@@ -133,6 +134,15 @@ Status: planned.
 - The fast path offered to upstream as an optional back end.
 
 Done when: both tested games and the third game meet the speed target below from the second launch on.
+
+### Post-1.0: Native save states
+
+Deferred; not a release gate through 1.0.
+
+- Quick Save and Quick Load of a running game. A state must survive exiting the emulator and restore execution on the same build, title, content version and compatible settings. A GPU replay or copy of an in-game save is not a state.
+- Loading creates an independent writable save timeline. The original slot, newer game saves, and previously restored branches must survive failed loads, crashes and later autosaves. State files are private and never bundled in diagnostic exports by default.
+
+Done when: save a cutscene, exit the emulator, then load it in a fresh process with working input, graphics and audio. Verify that a subsequent autosave changes only the restored branch and that damaged or incompatible input leaves the session and original saves intact.
 
 ## Speed target
 

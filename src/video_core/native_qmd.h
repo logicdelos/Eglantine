@@ -12,6 +12,7 @@
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
+#include <vector>
 
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_method_census.h"
@@ -42,6 +43,54 @@ public:
     using Word = std::uint32_t;
     using Address = std::uint64_t;
     using Descriptor = std::array<Word, 64>;
+    static constexpr std::size_t SerializedStateWords = 69;
+
+    static void ClearStates() {
+        states.clear();
+    }
+
+    static std::vector<Word> ExportActiveStates() {
+        std::vector<Address> addrs;
+        addrs.reserve(states.size());
+        for (const auto& [addr, st] : states) {
+            if (st.completed && st.deferred == 0) {
+                continue;
+            }
+            addrs.push_back(addr);
+        }
+        std::sort(addrs.begin(), addrs.end());
+        std::vector<Word> out;
+        out.reserve(addrs.size() * SerializedStateWords);
+        for (const Address addr : addrs) {
+            const State& st = states.at(addr);
+            out.push_back(static_cast<Word>(addr & 0xFFFFFFFFULL));
+            out.push_back(static_cast<Word>(addr >> 32));
+            out.push_back(static_cast<Word>(st.dependencies));
+            out.push_back(static_cast<Word>(st.deferred));
+            out.push_back((st.loaded ? 1U : 0U) | (st.scheduled ? 2U : 0U) |
+                          (st.completed ? 4U : 0U));
+            out.insert(out.end(), st.descriptor.begin(), st.descriptor.end());
+        }
+        return out;
+    }
+
+    static void ImportActiveStates(std::span<const Word> words) {
+        states.clear();
+        for (std::size_t i = 0; i + SerializedStateWords <= words.size(); i += SerializedStateWords) {
+            const Address addr =
+                static_cast<Address>(words[i]) | (static_cast<Address>(words[i + 1]) << 32);
+            State st;
+            st.dependencies = static_cast<std::int32_t>(words[i + 2]);
+            st.deferred = static_cast<std::int32_t>(words[i + 3]);
+            const Word flags = words[i + 4];
+            st.loaded = (flags & 1U) != 0;
+            st.scheduled = (flags & 2U) != 0;
+            st.completed = (flags & 4U) != 0;
+            std::copy_n(words.begin() + static_cast<std::ptrdiff_t>(i + 5), st.descriptor.size(),
+                        st.descriptor.begin());
+            states.emplace(addr, st);
+        }
+    }
     struct RejectShaderDispatch { bool operator()(const Descriptor&) const { return false; } };
     // Optional diagnostics: called with "load"/"count"/"defer"/"run" events.
     std::function<void(std::string_view, Address, std::int32_t)> trace;

@@ -33,4 +33,38 @@ void SetRingCapacity(std::size_t capacity);
 /// The kept lines numbered above `after`, oldest first.
 [[nodiscard]] std::vector<RingLine> ReadRing(u64 after);
 
+/// What the ring holds now. `evicted` counts lines pushed out (or dropped by a smaller capacity)
+/// since the process started; `oldest` is the sequence the next line would take when empty.
+struct RingStatus {
+    std::size_t capacity = 0;
+    u64 newest = 0;
+    u64 oldest = 0;
+    u64 evicted = 0;
+};
+
+/// The lines above `after` and the ring state they were read under, taken together.
+struct RingRead {
+    std::vector<RingLine> lines;
+    RingStatus status;
+};
+
+[[nodiscard]] RingRead ReadRingWithStatus(u64 after);
+
+/// How many lines a reader whose last line was `after` can no longer get, given the oldest
+/// sequence still kept.
+[[nodiscard]] constexpr u64 LinesLostSince(u64 after, u64 oldest) {
+    return after >= oldest ? 0 : oldest - after - 1;
+}
+
+/// The native log file as written by this process.
+struct FileStatus {
+    bool open = false;
+    std::string path;
+    u64 bytes_written = 0;
+    u64 limit = 0;
+    bool limit_reached = false;
+};
+
+[[nodiscard]] FileStatus GetFileStatus();
+
 } // namespace Common::Log

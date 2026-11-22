@@ -74,3 +74,11 @@
 # <dir>/session.txt (the title id and a nonce of this run) there and reads the interactive marker
 # "interactive <scene> <pass|fail> <title id> <nonce> [<origin>]" from <dir>/keys.txt.
 #EDEN_NX2_DIAG_DIR=C:\path\to\dir
+
+# --- System event log & diagnostic telemetry ---
+# Enable full diagnostic telemetry (expands SystemLog ring to 32768 events and enables GPU trace,
+# audio/filesystem/scheduler/IPC/HID summaries). Normal play keeps an always-on 8192-event ring.
+#EDEN_NX2_DIAGNOSTIC=1
+#EDEN_NX2_GPU_TRACE=1
+#EDEN_NX2_AUDIO_SUMMARY=1
+#EDEN_NX2_FS_SUMMARY=1

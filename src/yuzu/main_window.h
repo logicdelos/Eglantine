@@ -186,6 +186,8 @@ class MainWindow : public QMainWindow {
 public:
     void filterBarSetChecked(bool state);
     void UpdateUITheme();
+    /// Menu icons of the eglantine_dark theme (null icons for every other theme).
+    void UpdateMenuIcons();
     explicit MainWindow(bool has_broken_vulkan);
     ~MainWindow() override;
 
@@ -361,6 +363,10 @@ private slots:
     void OnOpenModsPage();
     void OnOpenUserHandbook();
     void OnReportBug();
+    void OnOpenIssueTracker();
+    void OnWhatsNew();
+    /// First run of a new WhatsNewDialog::Version: shown once, never with a CLI game or baseline.
+    void MaybeShowWhatsNew();
 
     /// Called whenever a user selects a game in the game list widget.
     void OnGameListLoadFile(QString game_path, u64 program_id);
@@ -448,6 +454,7 @@ private slots:
     void OnCreateHomeMenuDesktopShortcut();
     void OnCreateHomeMenuApplicationMenuShortcut();
     void OnCaptureScreenshot();
+    void OnMarkVisualBug();
     /// Checks for decryption keys; `prompt` asks to install them when they are missing.
     void OnCheckFirmwareDecryption(bool prompt = true);
 #ifdef __unix__
@@ -455,6 +462,8 @@ private slots:
 #endif
     void OnLanguageChanged(const QString& locale);
     void OnMouseActivity();
+    void RememberSpeedLimitBeforeHotkey();
+    void UndoSessionSpeedChanges();
     bool OnShutdownBegin();
     void OnShutdownBeginDialog();
     void OnEmulationStopped();
@@ -533,6 +542,15 @@ private:
 
     MultiplayerState* multiplayer_state = nullptr;
     std::set<u64> asked_recommended_settings;
+
+    /// The speed limit before the session's first Toggle Framerate Limit / turbo / slow hotkey,
+    /// and whether it was the global or the per-game value. Undone when the game stops, so the
+    /// hotkeys only last for the session; a change made in the configuration dialogs is kept.
+    struct SessionSpeedLimit {
+        bool value;
+        bool using_global;
+    };
+    std::optional<SessionSpeedLimit> speed_limit_before_hotkeys;
 
     GRenderWindow* render_window = nullptr;
     GameList* game_list = nullptr;

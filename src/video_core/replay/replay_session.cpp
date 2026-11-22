@@ -578,16 +578,25 @@ private:
             return;
         }
         Tegra::CommandList list;
-        Tegra::CommandListHeader raw{};
-        raw.raw = SubmitHeaderRaw(piece.gpu_va, static_cast<u32>(piece.words.size()),
-                                  piece.header_flags);
-        list.command_lists.push_back(raw);
-        list.submitted_offsets.push_back(0);
-        list.submitted_words.reserve(piece.words.size());
-        for (const u32 word : piece.words) {
-            Tegra::CommandHeader header{};
-            header.argument = word;
-            list.submitted_words.push_back(header);
+        if (piece.gpu_va == 0) {
+            list.prefetch_command_list.reserve(piece.words.size());
+            for (const u32 word : piece.words) {
+                Tegra::CommandHeader header{};
+                header.argument = word;
+                list.prefetch_command_list.push_back(header);
+            }
+        } else {
+            Tegra::CommandListHeader raw{};
+            raw.raw = SubmitHeaderRaw(piece.gpu_va, static_cast<u32>(piece.words.size()),
+                                      piece.header_flags);
+            list.command_lists.push_back(raw);
+            list.submitted_offsets.push_back(0);
+            list.submitted_words.reserve(piece.words.size());
+            for (const u32 word : piece.words) {
+                Tegra::CommandHeader header{};
+                header.argument = word;
+                list.submitted_words.push_back(header);
+            }
         }
         list.snapshot_suspensions =
             channel.state->payload->dma_pusher.suspensions.load(std::memory_order_acquire);
@@ -657,9 +666,11 @@ private:
             return Fail(error);
         }
         if (!fresh) {
+            ScopedReplayVerificationRead probe;
             for (const WrittenRange& range : written_) {
                 gpu_->InvalidateRegion(backing.device_address + range.offset, range.length);
             }
+            gpu_->TickWork();
             gpu_dirty_ = true;
         }
         return true;
@@ -680,6 +691,7 @@ private:
                         " that does not exist");
         }
         const bool big_pages = (map.flags & MapBigPages) != 0;
+        ScopedReplayVerificationRead probe;
         Quiesce();
         if ((map.flags & MapRemap) != 0) {
             memory->PreserveMapping(map.gpu_va, static_cast<size_t>(map.size));
@@ -717,6 +729,7 @@ private:
             return Fail("unmap names address space " + std::to_string(unmap.address_space_id) +
                         " that does not exist");
         }
+        ScopedReplayVerificationRead probe;
         Quiesce();
         memory->PreserveMapping(unmap.gpu_va, static_cast<size_t>(unmap.size));
         memory->Unmap(unmap.gpu_va, static_cast<size_t>(unmap.size));
@@ -733,9 +746,11 @@ private:
                 return Fail(error);
             }
             if (fence.kind == FenceKind::SyncpointRaised) {
+                Quiesce();
                 if (!RaiseSyncpoint(static_cast<u32>(fence.id), static_cast<u32>(fence.value))) {
                     return false;
                 }
+                gpu_->TickWork();
                 const u32 observed = system_->Host1x().GetSyncpointManager().GetHostSyncpointValue(
                     static_cast<u32>(fence.id));
                 ObserveEffect({EffectKind::FenceSignal, fence.id, observed, true});
@@ -751,15 +766,15 @@ private:
             if (!channel->second.memory->IsFullyMappedRange(fence.id, bytes)) {
                 return Fail("memory fence address is not mapped");
             }
-            if (bytes == 4) {
-                const u32 value = static_cast<u32>(fence.value);
-                channel->second.memory->WriteBlock(fence.id, &value, bytes);
-            } else {
-                channel->second.memory->WriteBlock(fence.id, &fence.value, bytes);
-            }
             u64 observed{};
             {
                 ScopedReplayVerificationRead probe;
+                if (bytes == 4) {
+                    const u32 value = static_cast<u32>(fence.value);
+                    channel->second.memory->WriteBlock(fence.id, &value, bytes);
+                } else {
+                    channel->second.memory->WriteBlock(fence.id, &fence.value, bytes);
+                }
                 channel->second.memory->ReadBlock(fence.id, &observed, bytes);
             }
             ObserveEffect({EffectKind::FenceSignal, fence.id, observed, true});
@@ -821,12 +836,31 @@ private:
                         std::to_string(present.present_id));
         }
         // Drain submitted GPU work; external display dependencies must independently be ready.
+        gpu_->TickWork();
         gpu_->WaitForIdle();
         gpu_dirty_ = false;
 
         const auto& syncpoints = system_->Host1x().GetSyncpointManager();
-        if (!PresentFenceReady(present, [&](u32 id) { return syncpoints.GetGuestSyncpointValue(id); })) {
-            return Fail("PRESENT guest syncpoint fence was not satisfied", ReadError::UnsupportedState);
+        if (!PresentFenceReady(present, [&](u32 id) {
+                return (std::max)(syncpoints.GetGuestSyncpointValue(id),
+                                  syncpoints.GetHostSyncpointValue(id));
+            })) {
+            const u32 fid = static_cast<u32>(present.fence_id);
+            const u32 gval = present.fence_id < SyncpointLimit ? syncpoints.GetGuestSyncpointValue(fid) : 0;
+            const u32 hval = present.fence_id < SyncpointLimit ? syncpoints.GetHostSyncpointValue(fid) : 0;
+            std::string ch_info;
+            for (const auto& [cid, cref] : channels_) {
+                if (cref.state && cref.state->payload) {
+                    const auto& p = *cref.state->payload;
+                    ch_info += " ch" + std::to_string(cid) + "(sp=" + std::to_string(cref.state->nx2_syncpoint) +
+                               ",susp=" + std::to_string(p.dma_pusher.suspensions.load()) + ")";
+                }
+            }
+            return Fail("PRESENT guest syncpoint fence was not satisfied (id=" +
+                            std::to_string(present.fence_id) + " want=" +
+                            std::to_string(present.fence_value) + " guest=" + std::to_string(gval) +
+                            " host=" + std::to_string(hval) + ch_info + ")",
+                        ReadError::UnsupportedState);
         }
 
         std::vector<Tegra::FramebufferConfig> layers;
@@ -1287,6 +1321,7 @@ bool ReplaySession::ApplyPins(std::string& error) {
     Settings::values.renderer_backend.SetValue(Settings::RendererBackend::Vulkan);
     Settings::values.vsync_mode.SetValue(Settings::VSyncMode::Immediate);
     Settings::values.use_asynchronous_gpu_emulation.SetValue(false);
+    Settings::values.use_asynchronous_shaders.SetValue(false);
     if (pins.has_docked) {
         Settings::values.use_docked_mode.SetValue(static_cast<Settings::ConsoleMode>(pins.docked));
     }

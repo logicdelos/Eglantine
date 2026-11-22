@@ -19,6 +19,7 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
+#include "common/system_log.h"
 #include "video_core/nx2_spikes.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
@@ -195,14 +196,42 @@ bool Swapchain::AcquireNextImage(bool may_flush) {
         break;
     case VK_SUBOPTIMAL_KHR:
         is_suboptimal = true;
+        Common::SystemLog::Record(Common::SystemLog::Subsystem::Graphics,
+                                  Common::SystemLog::Severity::Warning,
+                                  Common::SystemLog::EventKind::GpuSwapchainRecreate,
+                                  static_cast<u64>(result), image_index, 0, 0,
+                                  "AcquireNextImage suboptimal");
         break;
     case VK_ERROR_OUT_OF_DATE_KHR:
         is_outdated = true;
+        Common::SystemLog::Record(Common::SystemLog::Subsystem::Graphics,
+                                  Common::SystemLog::Severity::Warning,
+                                  Common::SystemLog::EventKind::GpuSwapchainRecreate,
+                                  static_cast<u64>(result), image_index, 0, 0,
+                                  "AcquireNextImage out_of_date");
+        break;
+    case VK_ERROR_DEVICE_LOST:
+        Common::SystemLog::Record(Common::SystemLog::Subsystem::Graphics,
+                                  Common::SystemLog::Severity::Critical,
+                                  Common::SystemLog::EventKind::GpuDeviceLost,
+                                  static_cast<u64>(result), image_index, 0, 0,
+                                  "AcquireNextImage VK_ERROR_DEVICE_LOST");
+        LOG_ERROR(Render_Vulkan, "vkAcquireNextImageKHR returned {}", string_VkResult(result));
         break;
     case VK_ERROR_SURFACE_LOST_KHR:
+        Common::SystemLog::Record(Common::SystemLog::Subsystem::Graphics,
+                                  Common::SystemLog::Severity::Error,
+                                  Common::SystemLog::EventKind::GpuError,
+                                  static_cast<u64>(result), image_index, 0, 0,
+                                  "AcquireNextImage VK_ERROR_SURFACE_LOST_KHR");
         vk::Check(result);
         break;
     default:
+        Common::SystemLog::Record(Common::SystemLog::Subsystem::Graphics,
+                                  Common::SystemLog::Severity::Error,
+                                  Common::SystemLog::EventKind::GpuError,
+                                  static_cast<u64>(result), image_index, 0, 0,
+                                  string_VkResult(result));
         LOG_ERROR(Render_Vulkan, "vkAcquireNextImageKHR returned {}", string_VkResult(result));
         break;
     }
@@ -263,17 +292,51 @@ VkResult Swapchain::Present(VkSemaphore render_semaphore) {
     const VkResult result = present_queue.Present(present_info);
     switch (result) {
     case VK_SUCCESS:
+        if (Common::SystemLog::GpuTraceEnabled()) {
+            Common::SystemLog::Record(Common::SystemLog::Subsystem::Graphics,
+                                      Common::SystemLog::Severity::Info,
+                                      Common::SystemLog::EventKind::GpuPresent, image_index,
+                                      static_cast<u64>(result));
+        }
         break;
     case VK_SUBOPTIMAL_KHR:
+        Common::SystemLog::Record(Common::SystemLog::Subsystem::Graphics,
+                                  Common::SystemLog::Severity::Warning,
+                                  Common::SystemLog::EventKind::GpuSwapchainRecreate,
+                                  static_cast<u64>(result), image_index, 0, 0,
+                                  "Present suboptimal");
         LOG_DEBUG(Render_Vulkan, "Suboptimal swapchain");
         break;
     case VK_ERROR_OUT_OF_DATE_KHR:
         is_outdated = true;
+        Common::SystemLog::Record(Common::SystemLog::Subsystem::Graphics,
+                                  Common::SystemLog::Severity::Warning,
+                                  Common::SystemLog::EventKind::GpuSwapchainRecreate,
+                                  static_cast<u64>(result), image_index, 0, 0,
+                                  "Present out_of_date");
+        break;
+    case VK_ERROR_DEVICE_LOST:
+        Common::SystemLog::Record(Common::SystemLog::Subsystem::Graphics,
+                                  Common::SystemLog::Severity::Critical,
+                                  Common::SystemLog::EventKind::GpuDeviceLost,
+                                  static_cast<u64>(result), image_index, 0, 0,
+                                  "Present VK_ERROR_DEVICE_LOST");
+        LOG_CRITICAL(Render_Vulkan, "Failed to present with error {}", string_VkResult(result));
         break;
     case VK_ERROR_SURFACE_LOST_KHR:
+        Common::SystemLog::Record(Common::SystemLog::Subsystem::Graphics,
+                                  Common::SystemLog::Severity::Error,
+                                  Common::SystemLog::EventKind::GpuError,
+                                  static_cast<u64>(result), image_index, 0, 0,
+                                  "Present VK_ERROR_SURFACE_LOST_KHR");
         vk::Check(result);
         break;
     default:
+        Common::SystemLog::Record(Common::SystemLog::Subsystem::Graphics,
+                                  Common::SystemLog::Severity::Error,
+                                  Common::SystemLog::EventKind::GpuError,
+                                  static_cast<u64>(result), image_index, 0, 0,
+                                  string_VkResult(result));
         LOG_CRITICAL(Render_Vulkan, "Failed to present with error {}", string_VkResult(result));
         break;
     }

@@ -65,6 +65,7 @@ enum class Theme {
     DarkColorful,
     MidnightBlue,
     MidnightBlueColorful,
+    EglantineDark,
 };
 
 static constexpr Theme default_theme{
@@ -75,7 +76,7 @@ static constexpr Theme default_theme{
 #endif
 };
 
-using Themes = std::array<std::pair<const char*, const char*>, 6>;
+using Themes = std::array<std::pair<const char*, const char*>, 7>;
 extern const Themes themes;
 
 struct GameDir {
@@ -150,6 +151,15 @@ struct Values {
                                                     "update_channel", Category::UiGeneral};
     // Tag of the release the user chose not to be reminded of
     Setting<std::string> skipped_update{linkage, {}, "skipped_update", Category::Ui};
+    // Epoch seconds before which no update reminder shows ("remind me later")
+    Setting<unsigned long long> update_remind_at{linkage, 0, "update_remind_at",
+                                                 Category::UiGeneral};
+
+    // The "what's new" notice: shown once per version of the notice, unless turned off
+    Setting<bool> show_whats_new{linkage, true, "show_whats_new", Category::UiGeneral};
+    Setting<u32> whats_new_version{linkage, 0, "whats_new_version", Category::UiGeneral};
+    Setting<bool> show_low_ram_warning{linkage, true, "show_low_ram_warning",
+                                       Category::UiGeneral};
 
     // Linux/MinGW may support (requires libdl support)
     SwitchableSetting<bool> enable_gamemode{linkage,
@@ -220,6 +230,9 @@ struct Values {
     // Game List
     Setting<bool> show_add_ons{linkage, true, "show_add_ons", Category::UiGameList};
     Setting<u32, true> game_icon_size{linkage, 64, 0, 512, "game_icon_size", Category::UiGameList};
+    // Size of a cover in the grid and carousel views; the tree view keeps game_icon_size
+    Setting<u32, true> game_cover_size{linkage, 160, 0, 512, "game_cover_size",
+                                       Category::UiGameList};
     Setting<u32, true> folder_icon_size{linkage, 48, 8, 512, "folder_icon_size", Category::UiGameList};
     Setting<u8> row_1_text_id{linkage, 3, "row_1_text_id", Category::UiGameList};
     Setting<u8> row_2_text_id{linkage, 2, "row_2_text_id", Category::UiGameList};
@@ -253,13 +266,17 @@ struct Values {
 
 extern Values values;
 
+/// The icon size setting the current game list mode uses (tree view: game_icon_size, otherwise
+/// game_cover_size).
+Setting<u32, true>& CurrentGameIconSize();
+
 u32 CalculateWidth(u32 height, Settings::AspectRatio ratio);
 
 void SaveWindowState();
 void RestoreWindowState(std::unique_ptr<QtConfig>& qtConfig);
 
 // sync with uisettings.cpp
-extern const std::array<Shortcut, 32> default_hotkeys;
+extern const std::array<Shortcut, 35> default_hotkeys;
 
 } // namespace UISettings
 

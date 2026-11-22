@@ -7,7 +7,7 @@
 #include "common/assert.h"
 #include "common/common_types.h"
 #include "common/nx2_dependency_wait.h"
-#include "common/scratch_buffer.h"
+#include "core/hle/kernel/k_synchronization_wait.h"
 #include "core/hle/kernel/k_scheduler.h"
 #include "core/hle/kernel/k_scoped_scheduler_lock_and_sleep.h"
 #include "core/hle/kernel/k_readable_event.h"
@@ -20,56 +20,43 @@
 
 namespace Kernel {
 
-namespace {
-
-class ThreadQueueImplForKSynchronizationObjectWait final : public KThreadQueueWithoutEndWait {
-public:
-    ThreadQueueImplForKSynchronizationObjectWait(KernelCore& kernel, KSynchronizationObject** o, KSynchronizationObject::ThreadListNode* n, s32 c)
-        : KThreadQueueWithoutEndWait(kernel), m_objects(o), m_nodes(n), m_count(c) {}
-
-    void NotifyAvailable(KernelCore& kernel, KThread* waiting_thread, KSynchronizationObject* signaled_object, Result wait_result) override {
-        // Determine the sync index, and unlink all nodes.
-        s32 sync_index = -1;
-        for (auto i = 0; i < m_count; ++i) {
-            // Check if this is the signaled object.
-            if (m_objects[i] == signaled_object && sync_index == -1) {
-                sync_index = i;
-            }
-
-            // Unlink the current node from the current object.
-            m_objects[i]->UnlinkNode(std::addressof(m_nodes[i]));
-        }
-
-        // Set the waiting thread's sync index.
-        waiting_thread->SetSyncedIndex(sync_index);
-
-        // Set the waiting thread as not cancellable.
-        waiting_thread->ClearCancellable();
-
-        // Invoke the base end wait handler.
-        KThreadQueue::EndWait(kernel, waiting_thread, wait_result);
+void KSynchronizationWait::Link(KThread* thread, std::span<KSynchronizationObject* const> objects) {
+    ASSERT(count == 0 && objects.size() <= entries.size());
+    for (auto* object : objects) {
+        auto& entry = entries[count++];
+        entry.node = {.next = nullptr, .thread = thread};
+        entry.object = object;
+        object->LinkNode(&entry.node);
     }
+}
 
-    void CancelWait(KernelCore& kernel, KThread* waiting_thread, Result wait_result, bool cancel_timer_task) override {
-        // Remove all nodes from our list.
-        for (auto i = 0; i < m_count; ++i) {
-            m_objects[i]->UnlinkNode(std::addressof(m_nodes[i]));
+s32 KSynchronizationWait::Unlink(KSynchronizationObject* signaled_object) {
+    s32 index = -1;
+    for (s32 i = 0; i < count; ++i) {
+        auto& entry = entries[i];
+        if (entry.object == signaled_object && index < 0) {
+            index = i;
         }
-
-        // Set the waiting thread as not cancellable.
-        waiting_thread->ClearCancellable();
-
-        // Invoke the base cancel wait handler.
-        KThreadQueue::CancelWait(kernel, waiting_thread, wait_result, cancel_timer_task);
+        entry.object->UnlinkNode(&entry.node);
+        entry.object = nullptr;
     }
+    count = 0;
+    return index;
+}
 
-private:
-    KSynchronizationObject** m_objects;
-    KSynchronizationObject::ThreadListNode* m_nodes;
-    s32 m_count;
-};
+void KSynchronizationWait::NotifyAvailable(KernelCore& kernel, KThread* thread,
+                                           KSynchronizationObject* object, Result result) {
+    thread->SetSyncedIndex(Unlink(object));
+    thread->ClearCancellable();
+    KThreadQueue::EndWait(kernel, thread, result);
+}
 
-} // namespace
+void KSynchronizationWait::CancelWait(KernelCore& kernel, KThread* thread, Result result,
+                                      bool cancel_timer) {
+    Unlink(nullptr);
+    thread->ClearCancellable();
+    KThreadQueue::CancelWait(kernel, thread, result, cancel_timer);
+}
 
 void KSynchronizationObject::Finalize(KernelCore& kernel) {
     this->OnFinalizeSynchronizationObject();
@@ -79,14 +66,9 @@ void KSynchronizationObject::Finalize(KernelCore& kernel) {
 Result KSynchronizationObject::Wait(KernelCore& kernel, s32* out_index,
                                     KSynchronizationObject** objects, const s32 num_objects,
                                     s64 timeout) {
-    // Allocate space on stack for thread nodes.
-    std::array<ThreadListNode, Svc::ArgumentHandleCountMax> thread_nodes;
-
     // Prepare for wait.
     KThread* thread = GetCurrentThreadPointer(kernel);
     KHardwareTimer* timer{};
-    ThreadQueueImplForKSynchronizationObjectWait wait_queue(kernel, objects, thread_nodes.data(),
-                                                            num_objects);
 
     Nx2Sampler::DependencyWait dependency_wait;
     {
@@ -123,13 +105,13 @@ Result KSynchronizationObject::Wait(KernelCore& kernel, s32* out_index,
             R_THROW(ResultCancelled);
         }
 
-        // Add the waiters.
-        for (auto i = 0; i < num_objects; ++i) {
-            thread_nodes[i].thread = thread;
-            thread_nodes[i].next = nullptr;
-
-            objects[i]->LinkNode(std::addressof(thread_nodes[i]));
+        // Allocate once, only for threads that actually block. Never publish stack addresses to
+        // kernel objects; even internal waits may supply a caller-local array of object pointers.
+        if (!thread->m_sync_wait) {
+            thread->m_sync_wait = std::make_unique<KSynchronizationWait>(kernel);
         }
+        auto& wait_queue = *thread->m_sync_wait;
+        wait_queue.Link(thread, {objects, static_cast<size_t>(num_objects)});
 
         // Mark the thread as cancellable.
         thread->SetCancellable();

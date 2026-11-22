@@ -123,6 +123,8 @@ private:
         return kernel.GlobalSchedulerContext().m_priority_queue;
     }
     static u64 UpdateHighestPriorityThreadsImpl(KernelCore& kernel);
+    static u64 EmptyYieldToken(KernelCore& kernel, Svc::YieldType mode);
+    static bool CanReuseEmptyYield(KernelCore& kernel, const KThread& thread, u64 token);
 
     static void RescheduleCurrentHLEThread(KernelCore& kernel);
 
@@ -158,6 +160,7 @@ private:
     bool m_is_active{false};
     s32 m_core_id{0};
     s64 m_last_context_switch_time{0};
+    u32 m_report_switches{}, m_switches_to_idle{}; // Written by this core during SwitchThread.
     KThread* m_idle_thread{nullptr};
     std::atomic<KThread*> m_current_thread{nullptr};
     std::shared_ptr<Common::Fiber> m_switch_fiber{};

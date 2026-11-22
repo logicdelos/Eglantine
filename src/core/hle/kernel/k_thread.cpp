@@ -31,6 +31,7 @@
 #include "core/hle/kernel/k_resource_limit.h"
 #include "core/hle/kernel/k_scheduler.h"
 #include "core/hle/kernel/k_scoped_scheduler_lock_and_sleep.h"
+#include "core/hle/kernel/k_synchronization_wait.h"
 #include "core/hle/kernel/k_system_control.h"
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/k_thread_queue.h"
@@ -194,8 +195,7 @@ namespace Kernel {
         m_debug_attached = false;
         m_priority_inheritance_count = 0;
 
-        // We haven't been scheduled, and we have done no light IPC.
-        m_schedule_count = -1;
+        // We haven't done any light IPC.
         m_last_scheduled_tick = 0;
         m_light_ipc_data = nullptr;
 
@@ -383,6 +383,7 @@ namespace Kernel {
 
         // Release host emulation members.
         m_host_context.reset();
+        m_sync_wait.reset();
 
         // Perform inherited finalization.
         KSynchronizationObject::Finalize(kernel);
@@ -438,14 +439,14 @@ namespace Kernel {
             }
         }
 
-        // Acquire the scheduler lock.
-        KScopedSchedulerLock sl{kernel};
+        {
+            KScopedSchedulerLock sl{kernel};
+            m_signaled = true;
+            KSynchronizationObject::NotifyAvailable(kernel);
+        }
 
-        // Signal.
-        m_signaled = true;
-        KSynchronizationObject::NotifyAvailable(kernel);
-
-        // Close the thread.
+        // The last reference can finalize the thread and block on the process list or
+        // resource-limit light lock. That wait must be able to release the scheduler.
         this->Close(kernel);
     }
 

@@ -12,6 +12,7 @@
 #include <ranges>
 #include "common/nx2_bottleneck.h"
 #include "common/settings.h"
+#include "common/system_log.h"
 #include "video_core/nx2_spikes.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -111,12 +112,25 @@ void MasterSemaphore::Wait(u64 tick) {
             return;
         }
 
+        const auto wait_start = std::chrono::steady_clock::now();
         Nx2Bottleneck::WaitScope wait{Nx2Bottleneck::Wait::HostGpu};
         const GpuWaitSpan wait_span{tick};
         u64 last_tick = gpu_tick.load(std::memory_order_relaxed);
         while (gpu_tick.load(std::memory_order_acquire) < tick) {
             gpu_tick.wait(last_tick, std::memory_order_acquire);
             last_tick = gpu_tick.load(std::memory_order_relaxed);
+        }
+        const auto elapsed_us = static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - wait_start)
+                .count());
+        if (elapsed_us > 16000 || Common::SystemLog::GpuTraceEnabled()) {
+            Common::SystemLog::Record(
+                Common::SystemLog::Subsystem::Gpu,
+                elapsed_us > 16000 ? Common::SystemLog::Severity::Warning
+                                   : Common::SystemLog::Severity::Info,
+                Common::SystemLog::EventKind::GpuFenceWait, tick, elapsed_us, 0, 0,
+                "MasterSemaphore::Wait(emulated)");
         }
         return;
     }
@@ -133,6 +147,7 @@ void MasterSemaphore::Wait(u64 tick) {
         return;
     }
 
+    const auto wait_start = std::chrono::steady_clock::now();
     Nx2Bottleneck::WaitScope wait{Nx2Bottleneck::Wait::HostGpu};
     const GpuWaitSpan wait_span{tick};
     // If none of the above is hit, fallback to a regular wait
@@ -140,12 +155,28 @@ void MasterSemaphore::Wait(u64 tick) {
         while (!semaphore.Wait(tick)) {
         }
     } catch (const vk::Exception& exception) {
+        Common::SystemLog::Record(Common::SystemLog::Subsystem::Gpu,
+                                  Common::SystemLog::Severity::Error,
+                                  Common::SystemLog::EventKind::GpuError, tick, 0, 0, 0,
+                                  exception.what());
         // The throw ends the process; say why first (a device loss reached nothing else here).
         LOG_CRITICAL(Render_Vulkan, "Waiting for GPU tick {} failed: {}", tick, exception.what());
         throw;
     }
 
     Refresh();
+    const auto elapsed_us = static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - wait_start)
+            .count());
+    if (elapsed_us > 16000 || Common::SystemLog::GpuTraceEnabled()) {
+        Common::SystemLog::Record(
+            Common::SystemLog::Subsystem::Gpu,
+            elapsed_us > 16000 ? Common::SystemLog::Severity::Warning
+                               : Common::SystemLog::Severity::Info,
+            Common::SystemLog::EventKind::GpuFenceWait, tick, elapsed_us, 0, 0,
+            "MasterSemaphore::Wait");
+    }
 }
 
 VkResult MasterSemaphore::SubmitQueue(vk::CommandBuffer& cmdbuf, vk::CommandBuffer& upload_cmdbuf,

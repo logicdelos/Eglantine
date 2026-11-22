@@ -44,7 +44,10 @@ add_executable(tests
     common/fresh_profile.cpp
     core/launch_params_early.cpp
     common/speed_limit.cpp
+    common/system_log.cpp
     common/test_frame_delay.cpp
+    common/ui_e_profile_migration.cpp
+    common/ui_e_restore_eden_path.h
     common/frame_timing_log.cpp
     core/conductor_pace.cpp
     yuzu_cmd/run_report_documents.cpp
@@ -79,6 +82,8 @@ add_executable(tests
     core/nx2_gpu_memory_registry.cpp
     core/priority_queue.cpp
     core/replay_kernel.cpp
+    core/scheduler_idle_migration.cpp
+    core/scheduler_mixed_yield.cpp
     core/internal_network/network.cpp
     video_core/frame_dump_schedule.cpp
     video_core/framebuffer_limits.cpp
@@ -151,6 +156,8 @@ add_executable(tests
     video_core/ocarina_upscale.cpp
     video_core/compute_clean_cut.cpp
     input_common/calibration_configuration_job.cpp
+    frontend_common/ui_e_install_keys.cpp
+    frontend_common/ui_e_profile_import.cpp
 )
 
 create_target_directory_groups(tests)

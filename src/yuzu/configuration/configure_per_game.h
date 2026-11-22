@@ -9,13 +9,18 @@
 
 #pragma once
 
+#include <atomic>
+#include <filesystem>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
 
 #include <QDialog>
+#include <QFutureWatcher>
 #include <QList>
+#include <QPixmap>
 
 #include "configuration/shared_widget.h"
 #include "core/file_sys/vfs/vfs_types.h"
@@ -24,6 +29,7 @@
 #include "qt_common/config/shared_translation.h"
 #include "qt_common/util/vk.h"
 #include "yuzu/configuration/configuration_shared.h"
+#include "yuzu/util/icon_search.h"
 
 namespace Core {
 class System;
@@ -71,13 +77,37 @@ public:
 
     void LoadFromFile(FileSys::VirtualFile file_);
 
+    /// The name the library should show when the user renamed the game in this dialog: the custom
+    /// name, or the game's own name after the field was cleared.
+    std::optional<QString> RenamedTitle() const {
+        return renamed_title;
+    }
+
+    /// True when a new custom name was saved or the custom name was removed, even when there is no
+    /// name to show in place and the library reads it again.
+    bool TitleChanged() const {
+        return title_changed;
+    }
+
+signals:
+    /// The custom artwork was saved or removed.
+    void CustomArtworkChanged(u64 program_id);
+
 private:
+    void done(int result) override;
     void changeEvent(QEvent* event) override;
     void RetranslateUI();
 
     void HandleApplyButtonClicked();
 
     void LoadConfiguration();
+    void UpdateIconPreview(const QPixmap& map);
+    void OnUploadIcon();
+    void OnDetectIcon();
+    void OnRemoveCustomIcon();
+    void UpdateRemoveIconButton();
+    /// Saves the picked artwork and name, which live outside the game file. False on failure.
+    bool SaveCustomMetadata(bool show_error = false);
 
     // Creates the tabs built from settings widgets, and lists every tab in the tab widget.
     void BuildSettingTabs();
@@ -88,7 +118,23 @@ private:
 
     std::unique_ptr<Ui::ConfigurePerGame> ui;
     FileSys::VirtualFile file;
+    std::filesystem::path file_path;
     u64 title_id;
+    /// The game's own name, and the name shown when the dialog opened (custom or own).
+    std::string original_title;
+    std::string initial_title;
+    std::optional<QString> renamed_title;
+    bool title_changed{false};
+    /// An image picked or detected in this dialog, saved as custom artwork on Apply or OK.
+    std::vector<u8> pending_icon;
+    bool icon_modified{false};
+    /// The game's own icon, shown again when the custom artwork is removed.
+    QPixmap file_icon;
+    bool has_custom_icon{false};
+    /// The saved custom artwork is deleted on Apply or OK.
+    bool remove_custom_icon{false};
+    QFutureWatcher<IconDetectResult> detect_watcher;
+    std::shared_ptr<std::atomic_bool> detect_cancel;
 
     QGraphicsScene* scene;
 

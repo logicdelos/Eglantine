@@ -25,6 +25,7 @@
 #include "common/settings.h"
 #include "common/logging.h"
 #include "common/nx2_bottleneck.h"
+#include "common/system_log.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 
@@ -143,6 +144,24 @@ void SinkStream::ProcessAudioIn(std::span<const s16> input_buffer, std::size_t n
                 // If no buffer was available we've underrun, just push the samples and
                 // continue.
                 Nx2Bottleneck::NoteAudioUnderrun();
+                {
+                    static std::atomic<u64> pending_underruns{0};
+                    static std::atomic<u64> last_underrun_log_ns{0};
+                    const u64 count = pending_underruns.fetch_add(1, std::memory_order_relaxed) + 1;
+                    const u64 now_ns = static_cast<u64>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count());
+                    u64 prev_ns = last_underrun_log_ns.load(std::memory_order_relaxed);
+                    if (now_ns - prev_ns >= 100'000'000ULL &&
+                        last_underrun_log_ns.compare_exchange_strong(prev_ns, now_ns)) {
+                        const u64 batch = pending_underruns.exchange(0, std::memory_order_relaxed);
+                        Common::SystemLog::Record(Common::SystemLog::Subsystem::Audio,
+                                                  Common::SystemLog::Severity::Warning,
+                                                  Common::SystemLog::EventKind::AudioUnderrun,
+                                                  batch > 0 ? batch : count, 0, 0, 0, name);
+                    }
+                }
                 samples_buffer.Push(&input_buffer[frames_written * frame_size], (num_frames - frames_written) * frame_size);
                 frames_written = num_frames;
                 continue;
@@ -242,6 +261,22 @@ void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::siz
             level_peak = 0;
         }
     }
+    if (Common::SystemLog::AudioSummaryEnabled()) {
+        static std::atomic<u64> summary_frames{0};
+        static std::atomic<u64> summary_actual_frames{0};
+        const u64 f = summary_frames.fetch_add(num_frames, std::memory_order_relaxed) + num_frames;
+        summary_actual_frames.fetch_add(actual_frames_written, std::memory_order_relaxed);
+        if (f >= TargetSampleRate * 5) {
+            const u64 total_f = summary_frames.exchange(0, std::memory_order_relaxed);
+            const u64 actual_f = summary_actual_frames.exchange(0, std::memory_order_relaxed);
+            const u64 underrun_f = total_f > actual_f ? total_f - actual_f : 0;
+            LOG_INFO(Audio_Sink, "Audio summary: underruns={} frames={}", underrun_f, total_f);
+            Common::SystemLog::Record(Common::SystemLog::Subsystem::Audio,
+                                      Common::SystemLog::Severity::Info,
+                                      Common::SystemLog::EventKind::AudioSummary, underrun_f,
+                                      total_f, 0, 0, name);
+        }
+    }
 
     {
         std::scoped_lock lk{sample_count_lock};
@@ -283,6 +318,11 @@ void SinkStream::WaitFreeSpace(std::stop_token stop_token) {
             }
             if (callback_count.load(std::memory_order_relaxed) == callbacks_before) {
                 stalled = true;
+                Common::SystemLog::Record(Common::SystemLog::Subsystem::Audio,
+                                          Common::SystemLog::Severity::Error,
+                                          Common::SystemLog::EventKind::AudioError,
+                                          static_cast<u64>(stall_timeout.count()), 0, 0, 0,
+                                          "no device callback");
                 LOG_ERROR(Audio_Sink, "Stream {} got no device callback for {} s, dropping audio",
                           name, stall_timeout.count());
                 break;

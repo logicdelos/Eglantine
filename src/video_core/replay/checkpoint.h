@@ -116,7 +116,8 @@ enum class MacroSectionKind : u32 {
     NativeState = 7,
 };
 
-enum class EngineStateKind : u32 { RootTables = 1, ConstBufferBindings = 2 };
+enum class EngineStateKind : u32 { RootTables = 1, ConstBufferBindings = 2, NativeQmdStates = 3 };
+inline constexpr size_t NativeQmdStateWords = 69;
 
 enum DmaStateFlag : u32 {
     DmaNonIncrementing = 1U << 0,
@@ -133,12 +134,15 @@ struct ChannelEntry {
     u32 flags = 0;
 };
 
+inline constexpr u32 AddressSpaceHasSyncpointShim = 1U << 0;
+
 struct AddressSpaceEntry {
     u32 address_space_id = 0;
     u32 address_space_bits = 0;
     u32 big_page_bits = 0;
     u32 flags = 0;
     u64 split_address = 0;
+    u64 syncpoint_shim = 0;
 };
 
 struct EngineRegisters {

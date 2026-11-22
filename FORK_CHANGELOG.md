@@ -12,6 +12,21 @@ Where a fix is described as a "likely fix", it was written to remove a cause fou
 
 All runs were made on one Windows 11 laptop: AMD Ryzen 9 8940HX, NVIDIA GeForce RTX 5070 Ti Laptop GPU, 16 GB RAM. Only Fire Emblem: Fortune's Weave and Xenoblade Chronicles 2 were run. Fixes marked "Orchid" or "Lichii" were ported from those forks, with the original author named in the commit message.
 
+## 0.6.0 (unreleased)
+
+### New
+
+- Local incident capture for normal play and testing (`tools/nx2/incident.py`, `docs/nx2/incident-capture.md`). It follows the native log (and the debug server when it runs), indexes warnings, the 10 s report, short IStorage reads and, with the diagnostic preset, IPC, NPad, GPU timeline and guest scheduler aggregates, and on a mark keeps the lead-up and aftermath with monotonic, native-log and present-count time. Marks come from a command, Ctrl+Alt+F8 or the debug server. Defaults are metadata only and bounded; missing history, a full log file, a lost debug server or a dropped ring is recorded as a gap, not as success. Checked with 51 synthetic-log tests and a loopback probe against a build, not in a game.
+- The debug server has a `mark` tool; `status` reports the log ring and file state; `log_tail` reports `lost`, `omitted` and sequence numbers.
+- The native log file writes a marker line when it reaches its size limit, instead of stopping silently.
+- `tools/save_timeline.py` snapshots offline in-game save directories and restores each snapshot to a separate writable branch. Existing saves stay untouched. This does **not** save or resume an emulator frame.
+
+### Fixes
+
+- Fixed guest yields that skipped a ready peer after a previous yield found none. Repeated empty yields now skip the scheduler lock only for the same yield mode and unchanged runnable queues, with no pending dispatch on the caller's core. Guest tests cover mixed modes and a peer waking in a different process.
+- An idle guest core now continues looking for work past a source core with a protected top thread. It no longer steals that protected thread or leaves later eligible work behind.
+- Fixed an intermittent crash during concurrent thread exit: the exit worker now signals waiters under the scheduler lock but drops its final thread reference outside it, so finalization can block safely.
+
 ## 0.5.0 (unreleased)
 
 Milestone 0.5, "Smoother first minutes": the report accounts for long frames and the shader caches check the game, update, add-ons and settings before reuse. Qualification remains open; a successful warm launch is not a two-title performance result.

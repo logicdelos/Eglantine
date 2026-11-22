@@ -878,6 +878,9 @@ void Puller::ProcessSemaphoreReduction(DmaPusher& dma_pusher) {
                         static_cast<u32>(memory_manager->GetID()), address, value, 4, false);
                 }
             });
+            if (VideoCore::Replay::CaptureActive() || VideoCore::Replay::ReplayGpuRunning()) {
+                rasterizer->ReleaseFences(true);
+            }
         });
 }
 

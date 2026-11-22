@@ -8,10 +8,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstdlib>
 #include <thread>
 
+#include "common/system_log.h"
 #include "core/core.h"
 #include "core/file_sys/errors.h"
 #include "core/hle/service/cmif_serialization.h"
@@ -67,7 +70,35 @@ Result IStorage::Read(
     }
 
     // Read the data from the Storage backend
-    backend->Read(out_bytes.data(), length, offset);
+    const auto read_start = std::chrono::steady_clock::now();
+    const auto transferred = backend->Read(out_bytes.data(), length, offset);
+    const auto read_us = static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - read_start)
+            .count());
+    if (read_us > 50000) {
+        Common::SystemLog::Record(Common::SystemLog::Subsystem::Filesystem,
+                                  Common::SystemLog::Severity::Warning,
+                                  Common::SystemLog::EventKind::FsSlowRead,
+                                  static_cast<u64>(length), read_us,
+                                  static_cast<u64>(offset));
+    }
+    if (transferred != static_cast<size_t>(length)) {
+        // Preserve the existing guest reply. Record the mismatch without logging file contents
+        // or flooding the log when a title retries an EOF read in a loop.
+        static std::atomic<u64> mismatches{};
+        const u64 occurrence = mismatches.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (std::has_single_bit(occurrence)) {
+            Common::SystemLog::Record(Common::SystemLog::Subsystem::Filesystem,
+                                      Common::SystemLog::Severity::Warning,
+                                      Common::SystemLog::EventKind::FsShortRead,
+                                      static_cast<u64>(length),
+                                      static_cast<u64>(transferred), occurrence);
+            LOG_WARNING(Service_FS, "IStorage read length mismatch: requested={} returned={} "
+                                    "(occurrence {} since process start)",
+                        length, transferred, occurrence);
+        }
+    }
 
     R_SUCCEED();
 }

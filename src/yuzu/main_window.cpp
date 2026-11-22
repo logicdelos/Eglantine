@@ -12,10 +12,12 @@
 #endif
 
 #include <boost/algorithm/string/split.hpp>
+#include "common/baseline_settings.h"
 #include "common/driver_shader_cache.h"
 #include "common/fs/path_util.h"
 #include "common/game_presets.h"
 #include "common/settings.h"
+#include "common/system_log.h"
 #include "common/settings_enums.h"
 #include "frontend_common/settings_generator.h"
 #include "render/performance_overlay.h"
@@ -36,9 +38,12 @@
 #include "debugger/controller.h"
 
 #include "about_dialog.h"
+#include "bug_report_dialog.h"
+#include "compatibility_report.h"
 #include "data_dialog.h"
 #include "deps_dialog.h"
 #include "install_dialog.h"
+#include "whats_new_dialog.h"
 
 #include "bootmanager.h"
 #include "loading_screen.h"
@@ -359,11 +364,13 @@ const int MainWindow::max_recent_files_item;
 
 namespace {
 
-constexpr std::array<std::pair<u32, const char*>, 5> default_game_icon_sizes{
+constexpr std::array<std::pair<u32, const char*>, 7> default_game_icon_sizes{
     std::make_pair(0, QT_TRANSLATE_NOOP("MainWindow", "None")),
     std::make_pair(32, QT_TRANSLATE_NOOP("MainWindow", "Small (32x32)")),
+    std::make_pair(44, QT_TRANSLATE_NOOP("MainWindow", "Medium (44x44)")),
     std::make_pair(64, QT_TRANSLATE_NOOP("MainWindow", "Standard (64x64)")),
     std::make_pair(128, QT_TRANSLATE_NOOP("MainWindow", "Large (128x128)")),
+    std::make_pair(160, QT_TRANSLATE_NOOP("MainWindow", "Cover (160x160)")),
     std::make_pair(256, QT_TRANSLATE_NOOP("MainWindow", "Full Size (256x256)")),
 };
 
@@ -591,6 +598,7 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     } else {
         MaybeStartMcpServer(false, std::nullopt, false);
     }
+    QTimer::singleShot(0, this, &MainWindow::MaybeShowWhatsNew);
 }
 
 /// Sets up the MCP menu and status timer, and starts the server if enabled by CLI or setting.
@@ -1729,6 +1737,7 @@ void MainWindow::InitializeHotkeys() {
     hotkey_registry.LoadHotkeys();
 
     LinkActionShortcut(ui->action_Load_File, QStringLiteral("Load File"));
+    LinkActionShortcut(ui->action_Load_Amiibo, QStringLiteral("Load/Remove Amiibo"));
     LinkActionShortcut(ui->action_Exit, QStringLiteral("Exit Eglantine"));
     LinkActionShortcut(ui->action_Restart, QStringLiteral("Restart Emulation"));
     LinkActionShortcut(ui->action_Pause, QStringLiteral("Continue/Pause Emulation"));
@@ -1739,6 +1748,7 @@ void MainWindow::InitializeHotkeys() {
                        QStringLiteral("Toggle Performance Overlay"));
     LinkActionShortcut(ui->action_Fullscreen, QStringLiteral("Fullscreen"));
     LinkActionShortcut(ui->action_Capture_Screenshot, QStringLiteral("Capture Screenshot"));
+    LinkActionShortcut(ui->action_Report_Bug, QStringLiteral("Report a Bug"));
     LinkActionShortcut(ui->action_TAS_Start, QStringLiteral("TAS Start/Stop"), true);
     LinkActionShortcut(ui->action_TAS_Record, QStringLiteral("TAS Record"), true);
     LinkActionShortcut(ui->action_TAS_Reset, QStringLiteral("TAS Reset"), true);
@@ -1775,18 +1785,31 @@ void MainWindow::InitializeHotkeys() {
     connect_shortcut(QStringLiteral("Audio Mute/Unmute"), &MainWindow::OnMute);
     connect_shortcut(QStringLiteral("Audio Volume Down"), &MainWindow::OnDecreaseVolume);
     connect_shortcut(QStringLiteral("Audio Volume Up"), &MainWindow::OnIncreaseVolume);
+    connect_shortcut(QStringLiteral("Mark Visual Bug"), &MainWindow::OnMarkVisualBug);
 
     connect_shortcut(QStringLiteral("Toggle Framerate Limit"), [this] {
+        if (!emulation_running) {
+            return;
+        }
+        RememberSpeedLimitBeforeHotkey();
         Settings::ToggleStandardMode();
         SetFPSSuffix();
     });
 
     connect_shortcut(QStringLiteral("Toggle Turbo Speed"), [this] {
+        if (!emulation_running) {
+            return;
+        }
+        RememberSpeedLimitBeforeHotkey();
         Settings::ToggleTurboMode();
         SetFPSSuffix();
     });
 
     connect_shortcut(QStringLiteral("Toggle Slow Speed"), [this] {
+        if (!emulation_running) {
+            return;
+        }
+        RememberSpeedLimitBeforeHotkey();
         Settings::ToggleSlowMode();
         SetFPSSuffix();
     });
@@ -1927,6 +1950,12 @@ void MainWindow::ConnectWidgetEvents() {
                 Settings::values.players.SetGlobal(players_were_global);
             });
     connect(game_list, &GameList::LinkToRyujinxRequested, this, &MainWindow::OnLinkToRyujinx);
+    connect(game_list, &GameList::ReportCompatibilityRequested, this, [this](u64 program_id) {
+        if (emulation_running &&
+            QtCommon::system->GetApplicationProcessProgramID() == program_id) {
+            OnMenuReportCompatibility();
+        }
+    });
 
     connect(this, &MainWindow::UpdateInstallProgress, this, &MainWindow::IncrementInstallProgress);
 
@@ -1962,6 +1991,9 @@ void MainWindow::ConnectMenuEvents() {
     connect_menu(ui->action_Open_Mods_Page, &MainWindow::OnOpenModsPage);
     connect_menu(ui->action_Open_UserHandbook, &MainWindow::OnOpenUserHandbook);
     connect_menu(ui->action_Report_Bug, &MainWindow::OnReportBug);
+    connect_menu(ui->action_Open_Issue_Tracker, &MainWindow::OnOpenIssueTracker);
+    connect_menu(ui->action_Whats_New, &MainWindow::OnWhatsNew);
+    connect_menu(ui->action_Compatibility_Report, &MainWindow::OnMenuReportCompatibility);
     connect_menu(ui->action_Restart, &MainWindow::OnRestartGame);
     connect_menu(ui->action_Configure, &MainWindow::OnConfigure);
     connect_menu(ui->action_Configure_Current_Game, &MainWindow::OnConfigurePerGame);
@@ -1993,19 +2025,14 @@ void MainWindow::ConnectMenuEvents() {
     game_size_actions->setExclusive(true);
 
     for (size_t i = 0; i < default_game_icon_sizes.size(); i++) {
-        const auto current_size = UISettings::values.game_icon_size.GetValue();
         const auto size = default_game_icon_sizes[i].first;
         QAction* action = ui->menuGame_Icon_Size->addAction(GetTranslatedGameIconSize(i));
         action->setCheckable(true);
-
-        if (current_size == size)
-            action->setChecked(true);
-
         game_size_actions->addAction(action);
 
         connect(action, &QAction::triggered, this, [this, size](bool checked) {
             if (checked) {
-                UISettings::values.game_icon_size.SetValue(size);
+                UISettings::CurrentGameIconSize().SetValue(size);
                 CheckIconSize();
 
                 game_list->UpdateIconSizes();
@@ -2179,6 +2206,7 @@ void MainWindow::UpdateMenuState() {
     ui->action_Firmware_From_Folder->setEnabled(!emulation_running);
     ui->action_Firmware_From_ZIP->setEnabled(!emulation_running);
     ui->action_Install_Keys->setEnabled(!emulation_running);
+    ui->action_Compatibility_Report->setEnabled(emulation_running);
 
     for (QAction* action : applet_actions) {
         action->setEnabled(is_firmware_available && !emulation_running);
@@ -2525,6 +2553,7 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
         }
     }
 
+    speed_limit_before_hotkeys.reset();
     Settings::LogSettings();
 
     if (UISettings::values.select_user_on_boot && !user_flag_cmd_line) {
@@ -2697,6 +2726,28 @@ void MainWindow::BootGameFromList(const QString& filename, StartGameType with_co
     BootGame(filename, ApplicationAppletParameters(), with_config);
 }
 
+void MainWindow::RememberSpeedLimitBeforeHotkey() {
+    if (!speed_limit_before_hotkeys) {
+        speed_limit_before_hotkeys = SessionSpeedLimit{
+            .value = Settings::values.use_speed_limit.GetValue(),
+            .using_global = Settings::values.use_speed_limit.UsingGlobal(),
+        };
+    }
+}
+
+void MainWindow::UndoSessionSpeedChanges() {
+    // Undo the session's frame rate limit hotkey and turbo/slow modes. Only what the hotkeys
+    // changed is put back, in the scope (global or per-game) it was changed in: forcing the limit
+    // on here saved "Limit Speed Percent" as checked after every game, whatever the user had
+    // chosen. A configuration applied in a dialog that is still open replaces the hotkeys' change.
+    if (speed_limit_before_hotkeys && !UISettings::values.configuration_applied &&
+        Settings::values.use_speed_limit.UsingGlobal() == speed_limit_before_hotkeys->using_global) {
+        Settings::values.use_speed_limit.SetValue(speed_limit_before_hotkeys->value);
+    }
+    speed_limit_before_hotkeys.reset();
+    Settings::values.current_speed_mode = Settings::SpeedMode::Standard;
+}
+
 bool MainWindow::OnShutdownBegin() {
     if (!emulation_running) {
         return false;
@@ -2708,9 +2759,7 @@ bool MainWindow::OnShutdownBegin() {
 
     AllowOSSleep();
 
-    // Disable unlimited frame rate and turbo/slow modes
-    Settings::values.use_speed_limit.SetValue(true);
-    Settings::values.current_speed_mode = Settings::SpeedMode::Standard;
+    UndoSessionSpeedChanges();
 
     if (QtCommon::system->IsShuttingDown()) {
         status_bar_update_timer.stop();
@@ -2795,6 +2844,7 @@ void MainWindow::OnEmulationStopped() {
     if (QtCommon::emu_thread && QtCommon::emu_thread->isRunning()) {
         return;
     }
+    UndoSessionSpeedChanges();
     shutdown_timer.stop();
     emu_terminate_timer.stop();
     if (QtCommon::emu_thread) {
@@ -2858,6 +2908,7 @@ void MainWindow::OnEmulationStopped() {
     }
 
     current_game_path.clear();
+    game_list->SetReportableProgramId(0);
 
     // When closing the game, destroy the GLWindow to clear the context after the game is closed
     render_window->ReleaseRenderTarget();
@@ -3686,6 +3737,7 @@ void MainWindow::OnStartGame() {
 
     play_time_manager->SetProgramId(QtCommon::system->GetApplicationProcessProgramID());
     play_time_manager->Start();
+    game_list->SetReportableProgramId(QtCommon::system->GetApplicationProcessProgramID());
 
     discord_rpc->Update();
     Common::FeralGamemode::Start();
@@ -3822,45 +3874,12 @@ void MainWindow::ErrorDisplayRequestExit() {
 }
 
 void MainWindow::OnMenuReportCompatibility() {
-    QtCommon::Frontend::Critical(
-        tr("Function Disabled"),
-        tr("Compatibility list reporting is currently disabled. Check back later!"));
-
-    // #if defined(ARCHITECTURE_x86_64) && !defined(__APPLE__)
-    //     const auto& caps = g_cpu_caps;
-    //     const bool has_fma = caps.fma;
-    //     const auto processor_count = std::thread::hardware_concurrency();
-    //     const bool has_4threads = processor_count == 0 || processor_count >= 4;
-    //     const bool has_8gb_ram = Common::GetMemInfo().TotalPhysicalMemory >= 8_GiB;
-    //     const bool has_broken_vulkan = UISettings::values.has_broken_vulkan;
-
-    //     if (!has_fma || !has_4threads || !has_8gb_ram || has_broken_vulkan) {
-    //         QMessageBox::critical(this, tr("Hardware requirements not met"),
-    //                               tr("Your system does not meet the recommended hardware
-    //                               requirements. "
-    //                                  "Compatibility reporting has been disabled."));
-    //         return;
-    //     }
-
-    //     if (!Settings::values.eden_token.GetValue().empty() &&
-    //         !Settings::values.eden_username.GetValue().empty()) {
-    //     } else {
-    //         QMessageBox::critical(
-    //             this, tr("Missing yuzu Account"),
-    //             tr("In order to submit a game compatibility test case, you must set up your web
-    //             token "
-    //                "and "
-    //                "username.<br><br/>To link your eden account, go to Emulation &gt;
-    //                Configuration "
-    //                "&gt; "
-    //                "Web."));
-    //     }
-    // #else
-    //     QMessageBox::critical(this, tr("Hardware requirements not met"),
-    //                           tr("Your system does not meet the recommended hardware
-    //                           requirements. "
-    //                              "Compatibility reporting has been disabled."));
-    // #endif
+    if (!emulation_running) {
+        return;
+    }
+    CompatibilityReporting::Dialog dialog(CompatibilityReporting::CurrentSession(*QtCommon::system),
+                                          this);
+    dialog.exec();
 }
 
 void MainWindow::OpenURL(const QUrl& url) {
@@ -3881,7 +3900,31 @@ void MainWindow::OnOpenUserHandbook() {
 }
 
 void MainWindow::OnReportBug() {
+    BugReportDialog dialog(*QtCommon::system, this);
+    dialog.exec();
+}
+
+void MainWindow::OnOpenIssueTracker() {
     OpenURL(QUrl(QStringLiteral("https://github.com/logicdelos/Eglantine/issues")));
+}
+
+void MainWindow::OnWhatsNew() {
+    WhatsNewDialog dialog(this);
+    dialog.exec();
+    if (dialog.OpenConfigureRequested()) {
+        OnConfigure();
+    }
+}
+
+void MainWindow::MaybeShowWhatsNew() {
+    if (emulation_running || !current_game_path.isEmpty() ||
+        !UISettings::values.show_whats_new.GetValue() ||
+        UISettings::values.whats_new_version.GetValue() >= WhatsNewDialog::Version) {
+        return;
+    }
+    UISettings::values.whats_new_version.SetValue(WhatsNewDialog::Version);
+    config->SaveAllValues();
+    OnWhatsNew();
 }
 
 void MainWindow::ToggleFullscreen() {
@@ -4068,30 +4111,25 @@ void MainWindow::SetCarouselView() {
 }
 
 void MainWindow::CheckIconSize() {
+    auto& setting = UISettings::CurrentGameIconSize();
+
     // When in grid/carousel view mode, with text off
     // there is no point in having icons turned off
-    auto actions = game_size_actions->actions();
-    if (UISettings::values.game_list_mode.GetValue() != Settings::GameListMode::TreeView &&
-        !UISettings::values.show_game_name.GetValue()) {
-        u32 newSize = UISettings::values.game_icon_size.GetValue();
-        if (newSize == 0) {
-            newSize = 64;
-            UISettings::values.game_icon_size.SetValue(newSize);
-        }
-
-        // Then disable the "none" action and update that menu.
-        for (size_t i = 0; i < default_game_icon_sizes.size(); i++) {
-            const auto current_size = newSize;
-            const auto size = default_game_icon_sizes[i].first;
-            if (current_size == size)
-                actions.at(i)->setChecked(true);
-        }
-
-        // Update this if you add anything before None.
-        actions.at(0)->setEnabled(false);
-    } else {
-        actions.at(0)->setEnabled(true);
+    const bool icons_required =
+        UISettings::values.game_list_mode.GetValue() != Settings::GameListMode::TreeView &&
+        !UISettings::values.show_game_name.GetValue();
+    if (icons_required && setting.GetValue() == 0) {
+        setting.SetValue(setting.GetDefault());
     }
+
+    auto actions = game_size_actions->actions();
+    for (size_t i = 0; i < default_game_icon_sizes.size(); i++) {
+        if (setting.GetValue() == default_game_icon_sizes[i].first)
+            actions.at(i)->setChecked(true);
+    }
+
+    // Update this if you add anything before None.
+    actions.at(0)->setEnabled(!icons_required);
 }
 
 void MainWindow::ToggleShowGameName() {
@@ -4150,8 +4188,12 @@ void MainWindow::OpenConfigureDialog(bool select_profiles) {
         !UISettings::values.reset_to_defaults) {
         // Runs if the user hit Cancel or closed the window, and did not ever press the Apply button
         // or `Reset to Defaults` button
+        configure_dialog.RestoreInputConfiguration();
         return;
-    } else if (result == QDialog::Accepted) {
+    }
+    // Applied settings (OK, Apply or Reset to Defaults) replace the speed limit the hotkeys changed.
+    speed_limit_before_hotkeys.reset();
+    if (result == QDialog::Accepted) {
         // Only apply new changes if user hit Okay
         // This is here to avoid applying changes if the user hit Apply, made some changes, then hit
         // Cancel
@@ -4222,6 +4264,11 @@ void MainWindow::OpenConfigureDialog(bool select_profiles) {
     UISettings::values.configuration_applied = false;
 
     config->SaveAllValues();
+
+    if (result != QDialog::Accepted) {
+        // Cancel after Apply: keep what was applied, drop the controller edits made after it
+        configure_dialog.RestoreInputConfiguration();
+    }
 
 #ifdef ENABLE_UPDATE_CHECKER
     // Checked right away, as a switch between daily builds and tagged releases is only offered when
@@ -4444,19 +4491,26 @@ void MainWindow::OpenPerGameConfiguration(u64 title_id, const std::string& file_
     Settings::SetConfiguringGlobal(false);
     ConfigurePerGame dialog(this, title_id, file_name, vk_device_records, *QtCommon::system);
     dialog.LoadFromFile(v_file);
+    connect(&dialog, &ConfigurePerGame::CustomArtworkChanged, game_list,
+            &GameList::OnCustomArtworkChanged);
 
     const auto result = dialog.exec();
+
+    // Per-game OK/Apply saves custom artwork and names in done(), so this runs on Cancel too.
+    if (UISettings::values.is_game_list_reload_pending.exchange(false)) {
+        OnGameListRefresh();
+    }
 
     if (result != QDialog::Accepted && !UISettings::values.configuration_applied) {
         Settings::RestoreGlobalState(QtCommon::system->IsPoweredOn());
         return;
-    } else if (result == QDialog::Accepted) {
-        dialog.ApplyConfiguration();
     }
-
-    const auto reload = UISettings::values.is_game_list_reload_pending.exchange(false);
-    if (reload) {
-        OnGameListRefresh();
+    speed_limit_before_hotkeys.reset();
+    if (result == QDialog::Accepted) {
+        dialog.ApplyConfiguration();
+        if (const auto title = dialog.RenamedTitle()) {
+            game_list->SetGameTitle(title_id, *title);
+        }
     }
 
     // Do not cause the global config to write local settings into the config file
@@ -4468,6 +4522,9 @@ void MainWindow::OpenPerGameConfiguration(u64 title_id, const std::string& file_
 
     if (!is_powered_on) {
         config->SaveAllValues();
+    } else if (dialog.TitleChanged() &&
+               QtCommon::system->GetApplicationProcessProgramID() == title_id) {
+        OnApplicationChanged(title_id);
     }
 }
 
@@ -5157,6 +5214,22 @@ void MainWindow::OnCaptureScreenshot() {
     render_window->CaptureScreenshot(filename);
 }
 
+void MainWindow::OnMarkVisualBug() {
+    const auto incidents_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir) / "incidents";
+    const auto res = Common::SystemLog::TriggerQuickMark(incidents_dir, "visual_glitch", 5000);
+    if (res.ok && QtCommon::emu_thread != nullptr && QtCommon::emu_thread->IsRunning()) {
+        const QString shot_path = QString::fromStdString(
+            Common::FS::PathToUTF8String(res.directory / "screenshot.png"));
+        render_window->CaptureScreenshot(shot_path);
+    }
+    LOG_INFO(Debug, "Visual bug marked #{} at present {} -> {}", res.mark_id, res.present_id,
+             Common::FS::PathToUTF8String(res.directory));
+    if (statusBar() != nullptr) {
+        statusBar()->showMessage(
+            tr("Marked visual bug #%1 (present %2)").arg(res.mark_id).arg(res.present_id), 4000);
+    }
+}
+
 #ifdef ENABLE_UPDATE_CHECKER
 // A daily build is rebuilt under the same tag, so skipping one names its commit too.
 static std::string SkippedUpdateKey(const Common::Net::Release& release) {
@@ -5306,6 +5379,7 @@ void MainWindow::OnApplicationChanged(u64 program_id) {
     // Switch to record playtime for the running program
     if (play_time_manager)
         play_time_manager->SetProgramId(program_id);
+    game_list->SetReportableProgramId(program_id);
 }
 
 void MainWindow::UpdateWindowTitle(std::string_view title_name, std::string_view title_version,
@@ -5956,10 +6030,74 @@ void MainWindow::UpdateUITheme() {
         setStyleSheet({});
     }
 
+    UpdateMenuIcons();
+
 #ifdef _WIN32
     RemoveTitlebarFilter();
     ApplyGlobalDarkTitlebar(UISettings::IsDarkTheme());
 #endif
+}
+
+void MainWindow::UpdateMenuIcons() {
+    const std::array<std::pair<QAction*, const char*>, 54> icons{{
+        {ui->action_Install_File_NAND, "download"},
+        {ui->action_Load_File, "file"},
+        {ui->action_Load_Folder, "folder"},
+        {ui->menu_recent_files->menuAction(), "clock"},
+        {ui->action_Load_Amiibo, "star"},
+        {ui->menuOpen_Eden_Folders->menuAction(), "folder"},
+        {ui->action_Exit, "x"},
+        {ui->action_Root_Data_Folder, "folder"},
+        {ui->action_NAND_Folder, "hdd"},
+        {ui->action_SDMC_Folder, "sd"},
+        {ui->action_Mod_Folder, "puzzle"},
+        {ui->action_Log_Folder, "list"},
+        {ui->action_Pause, "pause"},
+        {ui->action_Stop, "stop"},
+        {ui->action_Restart, "restart"},
+        {ui->action_Configure, "sliders"},
+        {ui->action_Configure_Current_Game, "gamepad"},
+        {ui->action_Post_Processing_Shaders, "wand"},
+        {ui->menu_Reset_Window_Size->menuAction(), "monitor"},
+        {ui->menu_View_Debugging->menuAction(), "bug"},
+        {ui->menu_Game_List_Mode->menuAction(), "grid"},
+        {ui->menuGame_Icon_Size->menuAction(), "image"},
+        {ui->action_View_Lobby, "globe"},
+        {ui->action_Start_Room, "plus"},
+        {ui->action_Connect_To_Room, "users"},
+        {ui->action_Show_Room, "dot"},
+        {ui->action_Leave_Room, "x"},
+        {ui->action_Install_Keys, "key"},
+        {ui->menuInstall_Firmware->menuAction(), "cpu"},
+        {ui->action_Firmware_From_Folder, "folder"},
+        {ui->action_Firmware_From_ZIP, "archive"},
+        {ui->action_Verify_installed_contents, "check"},
+        {ui->action_Data_Manager, "hdd"},
+        {ui->menu_cabinet_applet->menuAction(), "star"},
+        {ui->menu_Applets->menuAction(), "apps"},
+        {ui->menu_Create_Shortcuts->menuAction(), "share"},
+        {ui->action_Desktop, "monitor"},
+        {ui->action_Application_Menu, "apps"},
+        {ui->action_Capture_Screenshot, "image"},
+        {ui->menuTAS->menuAction(), "play"},
+        {ui->action_TAS_Start, "play"},
+        {ui->action_TAS_Record, "record"},
+        {ui->action_TAS_Reset, "restart"},
+        {ui->action_Configure_Tas, "sliders"},
+        {ui->action_Launch_QLaunch, "apps"},
+        {ui->action_Launch_MiiEdit, "user"},
+        {ui->action_Launch_Controller, "gamepad"},
+        {ui->action_Launch_PhotoViewer, "image"},
+        {ui->action_Open_Mods_Page, "puzzle"},
+        {ui->action_Open_UserHandbook, "help"},
+        {ui->action_Check_For_Updates, "download"},
+        {ui->action_Whats_New, "sparkles"},
+        {ui->action_About, "info"},
+        {ui->action_Eden_Dependencies, "list"},
+    }};
+    for (const auto& [action, name] : icons) {
+        action->setIcon(MenuIcon(name));
+    }
 }
 
 void MainWindow::LoadTranslation() {

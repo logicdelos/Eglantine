@@ -40,6 +40,10 @@ add_executable(yuzu
     applets/qt_web_browser_scripts.h
     bootmanager.cpp
     bootmanager.h
+    bug_report_dialog.cpp
+    bug_report_dialog.h
+    compatibility_report.cpp
+    compatibility_report.h
     configuration/configuration_shared.cpp
     configuration/configuration_shared.h
     configuration/configure.ui
@@ -229,6 +233,8 @@ add_executable(yuzu
     util/icon_search.h
 
     user_data_migration.h user_data_migration.cpp
+    whats_new_dialog.cpp
+    whats_new_dialog.h
 
     yuzu.qrc
     yuzu.rc

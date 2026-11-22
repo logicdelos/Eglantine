@@ -23,6 +23,7 @@
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "common/string_util.h"
+#include "common/system_log.h"
 #include "common/thread.h"
 #include "core/arm/arm_interface.h"
 #include "core/arm/exclusive_monitor.h"
@@ -439,6 +440,10 @@ struct System::Impl {
     // the bottom of the device memory) must exist before the replay allocates GPU backing above
     // it. System::Initialize only configures the kernel; the game path initializes it in Load.
     void InitializeReplayKernel(System& system) {
+        if (Settings::values.memory_layout_mode.GetValue() < Settings::MemoryLayout::Memory_12Gb) {
+            Settings::values.memory_layout_mode.SetGlobal(false);
+            Settings::values.memory_layout_mode.SetValue(Settings::MemoryLayout::Memory_12Gb);
+        }
         InitializeKernel(system);
     }
 
@@ -805,6 +810,7 @@ const CpuManager& System::GetCpuManager() const {
 }
 
 void System::Initialize() {
+    Common::SystemLog::SetPresentCounter(&g_nx2_present_count);
     impl->Initialize(*this);
 }
 

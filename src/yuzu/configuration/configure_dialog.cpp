@@ -74,7 +74,7 @@ ConfigureDialog::ConfigureDialog(QWidget* parent, HotkeyRegistry& registry_,
           nullptr, *builder, this)},
       hotkeys_tab{std::make_unique<ConfigureHotkeys>(system_.HIDCore(), this)},
       input_tab{std::make_unique<ConfigureInput>(system_, this)},
-      network_tab{std::make_unique<ConfigureNetwork>(system_, false, this)},
+      network_tab{std::make_unique<ConfigureNetwork>(system_, this)},
       performance_state{std::make_unique<Performance::State>()},
       performance_gpu_tab{
           std::make_unique<ConfigureGpu>(*performance_state, vk_device_records, this)},
@@ -144,9 +144,6 @@ ConfigureDialog::ConfigureDialog(QWidget* parent, HotkeyRegistry& registry_,
     for (auto* const tab : input_tab->GetSubTabs()) {
         tab->setProperty("tabIcon", QStringLiteral("gamepad"));
     }
-    graphics_tab->LinkFrameGeneration(frame_gen_tab->EnabledCheckBox(),
-                                      frame_gen_tab->TypeComboBox());
-
     PopulateSelectionList();
 
     connect(ui->tabWidget, &QTabWidget::currentChanged, this, [this](int index) {

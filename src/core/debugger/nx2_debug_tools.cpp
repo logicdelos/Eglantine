@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <atomic>
 #include <bit>
 #include <charconv>
@@ -26,6 +27,7 @@
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/stb.h"
+#include "common/system_log.h"
 #include "core/core.h"
 #include "core/debugger/nx2_debug_server.h"
 #include "core/debugger/nx2_debug_tools.h"
@@ -95,6 +97,7 @@ struct ToolState {
     u64 captures{};
     u64 screenshots{};
     u64 samples{};
+    u64 marks{};
     u64 gpu_reads{};
     std::atomic<bool> stopping{};
 };
@@ -203,6 +206,53 @@ void AppendPng(void* context, void* data, int size) {
     png.insert(png.end(), bytes, bytes + size);
 }
 
+json RingJson(const Common::Log::RingStatus& ring) {
+    return {{"enabled", ring.capacity != 0},
+            {"capacity", ring.capacity},
+            {"newest", ring.newest},
+            {"oldest", ring.oldest},
+            {"evicted", ring.evicted}};
+}
+
+/// The in-memory ring and the log file: what a reader needs to know whether a gap is possible.
+/// The file path is local and private.
+json LogState() {
+    const Common::Log::FileStatus file = Common::Log::GetFileStatus();
+    return {{"ring", RingJson(Common::Log::ReadRingWithStatus(~u64{0}).status)},
+            {"file",
+             {{"open", file.open},
+              {"path", file.path},
+              {"bytes_written", file.bytes_written},
+              {"limit", file.limit},
+              {"limit_reached", file.limit_reached}}}};
+}
+
+json SystemRingJson(const Common::SystemLog::RingStatus& ring) {
+    return {{"capacity", ring.capacity},
+            {"newest", ring.newest},
+            {"oldest", ring.oldest},
+            {"evicted", ring.evicted},
+            {"dropped", ring.dropped},
+            {"diagnostic_mode", ring.diagnostic_mode}};
+}
+
+json SystemSourcesJson(const std::vector<Common::SystemLog::SourceInfo>& sources) {
+    json out = json::array();
+    for (const auto& s : sources) {
+        out.push_back({{"name", s.name},
+                       {"enabled", s.enabled},
+                       {"recorded", s.recorded},
+                       {"dropped", s.dropped},
+                       {"missing_reason", s.missing_reason}});
+    }
+    return out;
+}
+
+json SystemLogJson() {
+    return {{"ring", SystemRingJson(Common::SystemLog::GetStatus())},
+            {"sources", SystemSourcesJson(Common::SystemLog::GetSources())}};
+}
+
 json Status(ToolState& state, const json& params) {
     const auto window =
         std::chrono::milliseconds{Param<int>(params, "fps_window_ms", 500, 0, 5000)};
@@ -230,6 +280,9 @@ json Status(ToolState& state, const json& params) {
          std::chrono::duration<double>(std::chrono::steady_clock::now() - state.start).count()},
         {"dump_dir", PathText(state.dump_directory)},
         {"log_filter", state.log_filter},
+        {"session", state.session},
+        {"log", LogState()},
+        {"system_log", SystemLogJson()},
         {"rejected", HexList(VideoCore::Nx2Debug::RejectedHashes())},
         {"write_memory", state.write_enabled},
     };
@@ -293,7 +346,8 @@ json LogTail(ToolState&, const json& params) {
     const u64 after = params.value("after", u64{0});
     const size_t limit = Param<size_t>(params, "limit", 200, 1, 5000);
     const std::string contains = params.value("contains", std::string{});
-    const std::vector<Common::Log::RingLine> lines = Common::Log::ReadRing(after);
+    const Common::Log::RingRead read = Common::Log::ReadRingWithStatus(after);
+    const std::vector<Common::Log::RingLine>& lines = read.lines;
     std::vector<const Common::Log::RingLine*> matched;
     for (const auto& line : lines) {
         if (contains.empty() || line.text.find(contains) != std::string::npos) {
@@ -302,21 +356,34 @@ json LogTail(ToolState&, const json& params) {
     }
     // From the start the newest lines; after a sequence number the oldest ones, to page forward.
     const bool more = matched.size() > limit;
+    size_t omitted = 0;
     if (more) {
         if (after == 0) {
+            omitted = matched.size() - limit;
             matched.erase(matched.begin(), matched.end() - static_cast<std::ptrdiff_t>(limit));
         } else {
             matched.resize(limit);
         }
     }
     json text = json::array();
+    json sequences = json::array();
     for (const auto* line : matched) {
         text.push_back(line->text);
+        sequences.push_back(line->sequence);
     }
     const u64 next = more && after != 0 ? matched.back()->sequence
                      : lines.empty()    ? after
                                         : lines.back().sequence;
-    return {{"lines", std::move(text)}, {"next", next}, {"more", more}};
+    // lost: lines numbered above `after` that the ring dropped before this read, so a reader that
+    // polls knows its view has a hole. omitted: matching lines older than the returned ones that
+    // a first read (no 'after') left out because of 'limit'; they are still in the ring.
+    return {{"lines", std::move(text)},
+            {"sequences", std::move(sequences)},
+            {"next", next},
+            {"more", more},
+            {"lost", Common::Log::LinesLostSince(after, read.status.oldest)},
+            {"omitted", omitted},
+            {"ring", RingJson(read.status)}};
 }
 
 json LogFilter(ToolState& state, const json& params) {
@@ -326,6 +393,65 @@ json LogFilter(ToolState& state, const json& params) {
     Common::Log::SetGlobalFilter(parsed);
     json result = {{"previous", state.log_filter}, {"filter", filter}};
     state.log_filter = filter;
+    return result;
+}
+
+/// Writes one numbered line to the log, so a recorder can tie its own clock to the log's: the
+/// line carries the log's elapsed time, and the result the present count and the ring sequence
+/// it landed at. The label stays with the caller; the log gets only its length.
+json Mark(ToolState& state, const json& params) {
+    const std::string label = params.value("label", std::string{});
+    if (label.size() > 120 ||
+        std::any_of(label.begin(), label.end(),
+                    [](unsigned char c) { return c < 0x20 || c == 0x7f; })) {
+        throw std::runtime_error{"label: at most 120 bytes, no control characters"};
+    }
+    const u64 id = ++state.marks;
+    const u64 before = Common::Log::RingNewestSequence();
+    const u64 presents = g_nx2_present_count.load(std::memory_order_relaxed);
+    const u64 sys_seq = Common::SystemLog::Record(
+        Common::SystemLog::Subsystem::Marker, Common::SystemLog::Severity::Info,
+        Common::SystemLog::EventKind::Marker, id, presents, label.size(), 0, label);
+    std::string bundle_dir;
+    if (params.value("save_bundle", false)) {
+        const auto quick = Common::SystemLog::TriggerQuickMark(
+            Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir) / "incidents",
+            label.empty() ? "visual_glitch" : label, 5000);
+        if (quick.ok) {
+            bundle_dir = PathText(quick.directory);
+        }
+    }
+    LOG_INFO(Debug, "Incident mark #{} session={} presents={} label_bytes={}", id, state.session,
+             presents, label.size());
+    json result = {
+        {"mark", id},
+        {"session", state.session},
+        {"presents", presents},
+        {"uptime_s",
+         std::chrono::duration<double>(std::chrono::steady_clock::now() - state.start).count()},
+        {"label", label},
+        {"logged", false},
+        {"system_event_seq", sys_seq},
+    };
+    if (!bundle_dir.empty()) {
+        result["bundle_dir"] = bundle_dir;
+    }
+    const std::string needle = fmt::format("Incident mark #{} session={} ", id, state.session);
+    for (const auto& line : Common::Log::ReadRing(before)) {
+        if (line.text.find(needle) == std::string::npos) {
+            continue;
+        }
+        result["logged"] = true;
+        result["line_sequence"] = line.sequence;
+        // "[  12.345678] ...": the log's elapsed seconds.
+        const size_t close = line.text.find(']');
+        if (line.text.starts_with('[') && close != std::string::npos) {
+            result["native_seconds"] = std::strtod(line.text.substr(1, close - 1).c_str(), nullptr);
+        }
+        return result;
+    }
+    result["note"] = "the log filter drops Debug <Info> lines, so the mark is not in the log; "
+                     "correlate by presents and uptime_s";
     return result;
 }
 
@@ -640,6 +766,64 @@ json InputSequence(ToolState& state, const json& params, const ClientGone& clien
     return RunInput(state, steps, params, client_gone);
 }
 
+json SystemEvents(ToolState&, const json& params) {
+    const u64 after = params.value("after", u64{0});
+    const size_t limit = Param<size_t>(params, "limit", 200, 1, 2000);
+    const std::string subsystem_filter = params.value("subsystem", std::string{});
+    const std::string min_sev_str = params.value("min_severity", std::string{});
+    int min_sev = 0;
+    if (!min_sev_str.empty()) {
+        if (min_sev_str == "Info") {
+            min_sev = 1;
+        } else if (min_sev_str == "Warning") {
+            min_sev = 2;
+        } else if (min_sev_str == "Error") {
+            min_sev = 3;
+        } else if (min_sev_str == "Critical") {
+            min_sev = 4;
+        }
+    }
+    const auto snap = Common::SystemLog::Snapshot(after, 4096);
+    json events = json::array();
+    bool more = false;
+    u64 next = after;
+    for (const auto& ev : snap.events) {
+        if (!subsystem_filter.empty() &&
+            subsystem_filter != Common::SystemLog::SubsystemName(ev.subsystem)) {
+            continue;
+        }
+        if (static_cast<int>(ev.severity) < min_sev) {
+            continue;
+        }
+        if (events.size() >= limit) {
+            more = true;
+            break;
+        }
+        events.push_back({
+            {"seq", ev.seq},
+            {"mono_ns", ev.mono_ns},
+            {"present_id", ev.present_id},
+            {"subsystem", Common::SystemLog::SubsystemName(ev.subsystem)},
+            {"severity", Common::SystemLog::SeverityName(ev.severity)},
+            {"kind", Common::SystemLog::EventKindName(ev.kind)},
+            {"thread_id", ev.thread_id},
+            {"arg0", ev.arg0},
+            {"arg1", ev.arg1},
+            {"arg2", ev.arg2},
+            {"arg3", ev.arg3},
+            {"detail", std::string{ev.detail}},
+        });
+        next = ev.seq;
+    }
+    const u64 lost = after >= snap.status.oldest ? 0 : snap.status.oldest - after - 1;
+    return {{"events", std::move(events)},
+            {"next", next},
+            {"more", more},
+            {"lost", lost},
+            {"ring", SystemRingJson(snap.status)},
+            {"sources", SystemSourcesJson(snap.sources)}};
+}
+
 Handlers MakeHandlers(const std::shared_ptr<ToolState>& state) {
     const auto handler = [&state](json (*tool)(ToolState&, const json&)) -> Handler {
         return
@@ -655,7 +839,9 @@ Handlers MakeHandlers(const std::shared_ptr<ToolState>& state) {
         {"status", handler(Status)},
         {"screenshot", handler(Screenshot)},
         {"log_tail", handler(LogTail)},
+        {"system_events", handler(SystemEvents)},
         {"log_filter", handler(LogFilter)},
+        {"mark", handler(Mark)},
         {"capture_frame", handler(CaptureFrame)},
         {"reject_shaders", handler(RejectShaders)},
         {"sample", handler(SampleThreads)},

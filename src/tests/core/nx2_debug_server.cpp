@@ -13,8 +13,10 @@
 #include <boost/asio.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include "common/log_ring.h"
 #include "common/page_table.h"
 #include "common/scope_exit.h"
+#include "common/system_log.h"
 #include "core/core.h"
 #include "core/debugger/nx2_debug_server.h"
 #include "core/debugger/nx2_debug_tools.h"
@@ -429,4 +431,36 @@ TEST_CASE("Injected input merges buttons and replaces sticks while installed",
     controller.SetInputInjector({});
     REQUIRE(controller.GetNpadButtons().raw == None);
     REQUIRE(controller.GetSticks().left.x == 0);
+}
+
+TEST_CASE("Log tail counts the lines a reader can no longer get", "[core][nx2_debug_server]") {
+    using Common::Log::LinesLostSince;
+    // A reader at 10 with 11 the oldest kept line has missed nothing.
+    REQUIRE(LinesLostSince(10, 11) == 0);
+    // Lines 11..19 were pushed out: nine lost.
+    REQUIRE(LinesLostSince(10, 20) == 9);
+    // A reader that is ahead of, or inside, what is kept lost nothing.
+    REQUIRE(LinesLostSince(25, 20) == 0);
+    REQUIRE(LinesLostSince(20, 20) == 0);
+    // The newest-line cursor ~0 a caller passes to read only the status is not a gap.
+    REQUIRE(LinesLostSince(~u64{0}, 20) == 0);
+    // Nothing read yet and nothing evicted: the first line is 1.
+    REQUIRE(LinesLostSince(0, 1) == 0);
+    // Nothing read yet while 1..4 were evicted.
+    REQUIRE(LinesLostSince(0, 5) == 4);
+}
+
+TEST_CASE("SystemLog tracks Core::g_nx2_present_count when bound", "[core][nx2_debug_server]") {
+    Common::SystemLog::ResetForTests(16);
+    Core::g_nx2_present_count.store(77, std::memory_order_relaxed);
+    Common::SystemLog::SetPresentCounter(&Core::g_nx2_present_count);
+    const u64 seq = Common::SystemLog::Record(
+        Common::SystemLog::Subsystem::Marker, Common::SystemLog::Severity::Info,
+        Common::SystemLog::EventKind::Marker, 1, 77, 4, 0, "test");
+    const auto snap = Common::SystemLog::Snapshot(0, 16);
+    REQUIRE(snap.events.size() == 1);
+    REQUIRE(snap.events[0].seq == seq);
+    REQUIRE(snap.events[0].present_id == 77);
+    Common::SystemLog::SetPresentCounter(nullptr);
+    Common::SystemLog::ResetForTests(8192);
 }

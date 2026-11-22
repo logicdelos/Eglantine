@@ -14,7 +14,10 @@
 #include "video_core/gpu.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/memory_manager.h"
+#include "video_core/rasterizer_interface.h"
+#include "video_core/renderer_base.h"
 #include "video_core/replay/capture_host.h"
+#include "video_core/replay/effect.h"
 
 namespace VideoCore::Replay {
 namespace {
@@ -127,6 +130,17 @@ public:
                     mapping.sparse = run.sparse;
                     out.mappings.push_back(mapping);
                 });
+        }
+        if (auto* rasterizer = gpu.Renderer().ReadRasterizer()) {
+            ScopedReplayVerificationRead probe;
+            for (const CutMapping& mapping : out.mappings) {
+                if (!mapping.sparse && mapping.device != 0 &&
+                    rasterizer->MustFlushRegion(mapping.device, mapping.size,
+                                                VideoCommon::CacheType::All)) {
+                    rasterizer->FlushRegion(mapping.device, mapping.size,
+                                            VideoCommon::CacheType::All);
+                }
+            }
         }
         const CaptureHostHooks hooks = HostHooks();
         if (hooks.device_identity != nullptr && !hooks.device_identity(system, out.device)) {
