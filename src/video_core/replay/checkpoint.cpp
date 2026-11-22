@@ -766,8 +766,9 @@ bool CaptureGpuCheckpoint(CutChannels channels, GpuCheckpoint& out, std::string&
         }
         out.dma.push_back(std::move(dma));
 
-        syncpoints = &pusher.system.Host1x().GetSyncpointManager();
         if (channel.nx2_syncpoint != 0) {
+            // Only a channel with a syncpoint has a Host1x behind it (a bare test system has none).
+            syncpoints = &pusher.system.Host1x().GetSyncpointManager();
             CheckpointFence fence;
             fence.kind = FenceKind::SyncpointRaised;
             fence.channel_id = id;
