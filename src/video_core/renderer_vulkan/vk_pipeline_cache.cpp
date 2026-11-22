@@ -58,6 +58,7 @@
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_cooperative_hmma_test.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
+#include "video_core/replay/capture.h"
 #include "video_core/replay/run_state.h"
 #include "video_core/renderer_vulkan/vk_driver_build_report.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -1424,9 +1425,11 @@ ComputePipeline* PipelineCache::CurrentComputePipeline(u64& native_key) {
     }
     const auto [pair, is_new]{compute_cache.try_emplace(key)};
     auto& entry{pair->second};
+    // A recorded run and its replay must pick the same pipeline at the same command: a rebuild
+    // that lands whenever a worker finishes is timing, so both build synchronously.
     const bool rebuild_async =
         VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::ComputeRebuildAsync) &&
-        !VideoCore::Replay::ReplayGpuRunning();
+        !VideoCore::Replay::CaptureActive() && !VideoCore::Replay::ReplayGpuRunning();
     if (entry.pending) {
         if (entry.pending->IsBuilt()) {
             if (entry.pipeline) {

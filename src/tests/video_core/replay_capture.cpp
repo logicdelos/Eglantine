@@ -89,6 +89,7 @@ struct HostScript {
     std::function<void(s32)> on_pin;
     u64 vsync = 0;
     bool wrong_picture = false;
+    std::vector<std::pair<u32, u32>> syncpoints;  // syncpoint, guest value at the cut
 };
 
 class FakeHost final : public R::CaptureHost {
@@ -133,6 +134,17 @@ public:
         out.device.device_id = 0x2204;
         out.title_version_known = true;
         out.title_version = TitleVersion;
+        if (!script.syncpoints.empty()) {
+            // The guest counters of the cut, as CaptureGpuCheckpoint snapshots them.
+            R::EngineStateSection counters;
+            counters.channel_id = R::SharedChannel;
+            counters.kind = R::EngineStateKind::SyncpointCounters;
+            counters.words.assign(R::SyncpointCounterWords, 0);
+            for (const auto& [id, value] : script.syncpoints) {
+                counters.words[size_t{id} * 2] = value;
+            }
+            out.checkpoint.states.push_back(std::move(counters));
+        }
         return true;
     }
 
@@ -662,4 +674,176 @@ TEST_CASE("recorder: preroll stays in the live ledger without stealing the selec
         }
     }
     REQUIRE(pictures == std::vector<u64>{2});
+}
+
+namespace {
+
+std::vector<std::string> LedgerKinds(const std::filesystem::path& directory) {
+    std::ifstream ledger{directory / "expected_effects.jsonl"};
+    std::vector<std::string> kinds;
+    for (std::string row; std::getline(ledger, row);) {
+        kinds.push_back(nlohmann::json::parse(row).at("kind"));
+    }
+    return kinds;
+}
+
+std::vector<R::GpuEvent> ReadGpuEvents(const std::filesystem::path& path) {
+    R::CaptureReader reader;
+    std::string why;
+    REQUIRE(reader.Open(path, why) == R::ReadError::None);
+    REQUIRE(reader.Validate(why) == R::ReadError::None);
+    std::vector<R::GpuEvent> events;
+    for (;;) {
+        R::ChunkView chunk;
+        bool eof = false;
+        REQUIRE(reader.Next(chunk, eof, why) == R::ReadError::None);
+        if (eof) break;
+        if (chunk.type == R::ChunkType::GpuEvent) {
+            std::vector<R::GpuEvent> batch;
+            REQUIRE(R::Decode(chunk.payload, batch) == R::ReadError::None);
+            events.insert(events.end(), batch.begin(), batch.end());
+        }
+    }
+    return events;
+}
+
+bool Contains(const std::vector<std::string>& kinds, const char* kind) {
+    return std::ranges::find(kinds, kind) != kinds.end();
+}
+
+} // namespace
+
+TEST_CASE("recorder: a blocked wait that nothing in the capture produced stays unresolved",
+          "[video_core][replay][recorder]") {
+    TempDirectory dir;
+    HostScript script;
+    CaptureGuard guard;
+    Start(script, MakeConfig(dir.path / "blocked.egcap", 1, 1, 0));
+    Submit();
+    Consume();
+    SECTION("memory fence, device address unknown") {
+        R::NoteFenceWaitSlow(R::FenceKind::SemaphoreWrite, Channel, Space, SemaphoreVa, 5, 0, true);
+    }
+    SECTION("memory fence with its device address") {
+        R::NoteFenceWaitSlow(R::FenceKind::SemaphoreWrite, Channel, Space, SemaphoreVa, 5,
+                             DeviceBase + (SemaphoreVa - MapGpu), true);
+    }
+    SECTION("syncpoint") {
+        R::NoteFenceWaitSlow(R::FenceKind::SyncpointRaised, Channel, Space, 9, 3, 0, true);
+    }
+    PresentAndCompose(1);
+    const auto report = R::EndCapture(true);
+    // The threshold is not evidence of a producer: no fence is made up for it, and the capture
+    // says it cannot be replayed faithfully.
+    REQUIRE_FALSE(report.run_complete);
+    REQUIRE((report.incomplete_reasons & R::IncompleteMissingFence) != 0);
+    REQUIRE_FALSE(Contains(LedgerKinds(dir.path), "fence_signal"));
+}
+
+TEST_CASE("recorder: a wait that found its value already there is still verified by a fence",
+          "[video_core][replay][recorder]") {
+    TempDirectory dir;
+    HostScript script;
+    CaptureGuard guard;
+    Start(script, MakeConfig(dir.path / "found.egcap", 1, 1, 0));
+    Submit();
+    Consume();
+    R::NoteFenceWaitSlow(R::FenceKind::SemaphoreWrite, Channel, Space, SemaphoreVa, 5,
+                         DeviceBase + (SemaphoreVa - MapGpu), false);
+    PresentAndCompose(1);
+    const auto report = R::EndCapture(true);
+    INFO(report.error);
+    REQUIRE(report.run_complete);
+    REQUIRE(Contains(LedgerKinds(dir.path), "fence_signal"));
+}
+
+TEST_CASE("recorder: syncpoint counters of the cut are what a wait is measured against",
+          "[video_core][replay][recorder]") {
+    TempDirectory dir;
+    HostScript script;
+    script.syncpoints = {{7, 100}};
+    CaptureGuard guard;
+    Start(script, MakeConfig(dir.path / "counters.egcap", 1, 1, 0));
+    Submit();
+    Consume();
+    bool complete = true;
+    SECTION("a wait at the cut counter was met before the capture: no fence") {
+        R::NoteFenceWaitSlow(R::FenceKind::SyncpointRaised, Channel, Space, 7, 100, 0, false);
+    }
+    SECTION("a blocked wait at or below it needs no producer either") {
+        R::NoteFenceWaitSlow(R::FenceKind::SyncpointRaised, Channel, Space, 7, 90, 0, true);
+    }
+    SECTION("a blocked wait above it with no raiser is unresolved") {
+        R::NoteFenceWaitSlow(R::FenceKind::SyncpointRaised, Channel, Space, 7, 101, 0, true);
+        complete = false;
+    }
+    PresentAndCompose(1);
+    const auto report = R::EndCapture(true);
+    INFO(report.error);
+    REQUIRE(report.run_complete == complete);
+    REQUIRE_FALSE(Contains(LedgerKinds(dir.path), "fence_signal"));
+}
+
+TEST_CASE("recorder: the submission maximum of a channel's syncpoint is recorded with its submit",
+          "[video_core][replay][recorder]") {
+    TempDirectory dir;
+    HostScript script;
+    CaptureGuard guard;
+    const auto path = dir.path / "max.egcap";
+    Start(script, MakeConfig(path, 1, 1, 0));
+    const Tegra::CommandList list = MakeList(0x1000, 4);
+    R::NoteSubmitSlow(Channel, list, 1234U);
+    R::NoteSubmitSlow(Channel, list);
+    R::NoteSubmitSlow(Channel, list, 0U); // a maximum of zero is still a recorded maximum
+    for (int i = 0; i < 3; ++i) {
+        Consume();
+    }
+    PresentAndCompose(1);
+    const auto report = R::EndCapture(true);
+    INFO(report.error);
+    REQUIRE(report.run_complete);
+    std::vector<R::SubmitEvent> submits;
+    for (const R::GpuEvent& event : ReadGpuEvents(path)) {
+        if (event.kind == R::GpuEventKind::Submit) submits.push_back(event.submit);
+    }
+    REQUIRE(submits.size() == 3);
+    REQUIRE((submits[0].flags & R::SubmitSyncpointMax) != 0);
+    REQUIRE(submits[0].syncpoint_raise_value == 1234);
+    REQUIRE((submits[1].flags & R::SubmitSyncpointMax) == 0);
+    REQUIRE(submits[1].syncpoint_raise_value == 0);
+    REQUIRE((submits[2].flags & R::SubmitSyncpointMax) != 0);
+    REQUIRE(submits[2].syncpoint_raise_value == 0);
+}
+
+TEST_CASE("a submit's syncpoint maximum round-trips and is refused when it has no flag",
+          "[video_core][replay][recorder]") {
+    R::GpuEvent event;
+    event.kind = R::GpuEventKind::Submit;
+    event.submit.channel_id = 1;
+    event.submit.submit_id = 1;
+    event.submit.flags = R::SubmitSyncpointMax;
+    event.submit.syncpoint_raise_value = 0xFFFFFFF0U;
+    event.submit.entries.push_back({0x1000, 4, 0});
+    const auto round_trip = [](const R::GpuEvent& value, std::vector<R::GpuEvent>& back) {
+        std::vector<u8> bytes;
+        R::Encode(std::span<const R::GpuEvent>{&value, 1}, bytes);
+        return R::Decode(bytes, back);
+    };
+    std::vector<R::GpuEvent> back;
+    REQUIRE(round_trip(event, back) == R::ReadError::None);
+    REQUIRE(back.size() == 1);
+    REQUIRE(back[0].submit.flags == R::SubmitSyncpointMax);
+    REQUIRE(back[0].submit.syncpoint_raise_value == 0xFFFFFFF0U);
+
+    event.submit.flags = R::SubmitGenerated | R::SubmitSyncpointMax;
+    REQUIRE(round_trip(event, back) == R::ReadError::None);
+    // A value without the flag is not a maximum anyone recorded.
+    event.submit.flags = 0;
+    back.clear();
+    REQUIRE(round_trip(event, back) == R::ReadError::BadPayload);
+    // Nor is a flag this build does not know.
+    event.submit.flags = 1U << 5;
+    event.submit.syncpoint_raise_value = 0;
+    back.clear();
+    REQUIRE(round_trip(event, back) == R::ReadError::BadPayload);
 }

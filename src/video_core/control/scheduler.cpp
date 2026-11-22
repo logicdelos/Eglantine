@@ -55,7 +55,8 @@ void Scheduler::Push(GPU& gpu, s32 channel, CommandList&& entries) {
     BindChannel(gpu, channel_state);
     // Process commands outside the lock to reduce contention.
     // Multiple channels can prepare their commands in parallel.
-    VideoCore::Replay::NoteSubmit(channel, entries);
+    VideoCore::Replay::NoteSubmit(channel, entries, channel_state->nx2_syncpoint,
+                                  channel_state->nx2_syncpoint_max);
     channel_state->payload->dma_pusher.Push(std::move(entries));
     channel_state->payload->dma_pusher.DispatchCalls();
     if (channel_state->payload->dma_pusher.HasPendingAcquire() &&

@@ -196,11 +196,14 @@ bool Swapchain::AcquireNextImage(bool may_flush) {
         break;
     case VK_SUBOPTIMAL_KHR:
         is_suboptimal = true;
-        Common::SystemLog::Record(Common::SystemLog::Subsystem::Graphics,
-                                  Common::SystemLog::Severity::Warning,
-                                  Common::SystemLog::EventKind::GpuSwapchainRecreate,
-                                  static_cast<u64>(result), image_index, 0, 0,
-                                  "AcquireNextImage suboptimal");
+        // A suboptimal swapchain can be reported on every frame: recorded under GPU trace only.
+        if (Common::SystemLog::GpuTraceEnabled()) {
+            Common::SystemLog::Record(Common::SystemLog::Subsystem::Graphics,
+                                      Common::SystemLog::Severity::Warning,
+                                      Common::SystemLog::EventKind::GpuSwapchainRecreate,
+                                      static_cast<u64>(result), image_index, 0, 0,
+                                      "AcquireNextImage suboptimal");
+        }
         break;
     case VK_ERROR_OUT_OF_DATE_KHR:
         is_outdated = true;
@@ -300,11 +303,14 @@ VkResult Swapchain::Present(VkSemaphore render_semaphore) {
         }
         break;
     case VK_SUBOPTIMAL_KHR:
-        Common::SystemLog::Record(Common::SystemLog::Subsystem::Graphics,
-                                  Common::SystemLog::Severity::Warning,
-                                  Common::SystemLog::EventKind::GpuSwapchainRecreate,
-                                  static_cast<u64>(result), image_index, 0, 0,
-                                  "Present suboptimal");
+        // A suboptimal swapchain can be reported on every frame: recorded under GPU trace only.
+        if (Common::SystemLog::GpuTraceEnabled()) {
+            Common::SystemLog::Record(Common::SystemLog::Subsystem::Graphics,
+                                      Common::SystemLog::Severity::Warning,
+                                      Common::SystemLog::EventKind::GpuSwapchainRecreate,
+                                      static_cast<u64>(result), image_index, 0, 0,
+                                      "Present suboptimal");
+        }
         LOG_DEBUG(Render_Vulkan, "Suboptimal swapchain");
         break;
     case VK_ERROR_OUT_OF_DATE_KHR:

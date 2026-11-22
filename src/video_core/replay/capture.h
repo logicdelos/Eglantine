@@ -22,6 +22,7 @@
 #pragma once
 
 #include <atomic>
+#include <optional>
 #include <span>
 #include <string>
 
@@ -78,16 +79,24 @@ inline void NoteGraphicsCall() {
     }
 }
 
-void NoteSubmitSlow(s32 channel, const Tegra::CommandList& list);
+// `syncpoint_max` is the channel's submission maximum when it has a syncpoint (a Switch 2
+// channel), nullopt otherwise.
+void NoteSubmitSlow(s32 channel, const Tegra::CommandList& list,
+                    std::optional<u32> syncpoint_max = std::nullopt);
 void NoteGuestWriteSlow(u64 device_address, u64 size);
 void NoteAcceptedPresentSlow(u64 present_id, PresentPath path,
                              std::span<const Tegra::FramebufferConfig> layers,
                              std::span<const Service::Nvidia::NvFence> fences);
 
-// Tegra::GPU::PushGPUEntries, before the list is queued.
-inline void NoteSubmit(s32 channel, const Tegra::CommandList& list) {
+// Tegra::GPU::PushGPUEntries, before the list is queued. The channel's syncpoint and its
+// submission maximum are passed by reference and read only while a capture records.
+inline void NoteSubmit(s32 channel, const Tegra::CommandList& list, const u32& channel_syncpoint,
+                       const std::atomic<u32>& syncpoint_max) {
     if (CaptureActive()) {
-        NoteSubmitSlow(channel, list);
+        NoteSubmitSlow(channel, list,
+                       channel_syncpoint != 0
+                           ? std::optional<u32>{syncpoint_max.load(std::memory_order_relaxed)}
+                           : std::nullopt);
     }
 }
 

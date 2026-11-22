@@ -539,11 +539,12 @@ inline void NoteFenceWait(FenceKind kind, s32 channel, u32 address_space, u64 id
 // capture knows completely.
 void NoteHostReadbackSlow(u64 device, u64 size);
 inline void NoteHostReadback(u64 device, u64 size) {
-    if (detail::readback_origin != detail::ReadbackOrigin::EmulatedWork) {
-        return;
-    }
+    // Idle: one relaxed load (ObserveReplayReadback checks the origin itself). The thread-local
+    // origin is read only while a capture records.
     if (CaptureActive()) {
-        NoteHostReadbackSlow(device, size);
+        if (detail::readback_origin == detail::ReadbackOrigin::EmulatedWork) {
+            NoteHostReadbackSlow(device, size);
+        }
     } else {
         ObserveReplayReadback();
     }

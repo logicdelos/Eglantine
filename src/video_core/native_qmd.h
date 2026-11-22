@@ -8,6 +8,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <span>
 #include <string_view>
 #include <type_traits>
@@ -44,19 +45,22 @@ public:
     using Address = std::uint64_t;
     using Descriptor = std::array<Word, 64>;
     static constexpr std::size_t SerializedStateWords = 69;
+    // The live table never holds more (Signal refuses a new QMD at this size), so a larger
+    // serialized table was not produced by a scheduler.
+    static constexpr std::size_t MaxStates = 4096;
+    static constexpr Word KnownStateFlags = 7; // loaded, scheduled, completed
 
     static void ClearStates() {
         states.clear();
     }
 
-    static std::vector<Word> ExportActiveStates() {
+    // The whole table, finished entries included: a QMD that was loaded and finished is not
+    // loaded again by action 2, so a table without it would dispatch it a second time.
+    static std::vector<Word> ExportStates() {
         std::vector<Address> addrs;
         addrs.reserve(states.size());
-        for (const auto& [addr, st] : states) {
-            if (st.completed && st.deferred == 0) {
-                continue;
-            }
-            addrs.push_back(addr);
+        for (const auto& entry : states) {
+            addrs.push_back(entry.first);
         }
         std::sort(addrs.begin(), addrs.end());
         std::vector<Word> out;
@@ -74,9 +78,38 @@ public:
         return out;
     }
 
-    static void ImportActiveStates(std::span<const Word> words) {
+    // Empty when ImportStates accepts `words`, else why it does not.
+    static std::string_view CheckSerializedStates(std::span<const Word> words) {
+        if (words.size() % SerializedStateWords != 0) {
+            return "QMD table is not whole records";
+        }
+        const std::size_t count = words.size() / SerializedStateWords;
+        if (count > MaxStates) {
+            return "QMD table has more records than the scheduler holds";
+        }
+        std::vector<Address> addrs;
+        addrs.reserve(count);
+        for (std::size_t i = 0; i < words.size(); i += SerializedStateWords) {
+            if ((words[i + 4] & ~KnownStateFlags) != 0) {
+                return "QMD record has unknown flags";
+            }
+            addrs.push_back(static_cast<Address>(words[i]) |
+                            (static_cast<Address>(words[i + 1]) << 32));
+        }
+        std::sort(addrs.begin(), addrs.end());
+        if (std::adjacent_find(addrs.begin(), addrs.end()) != addrs.end()) {
+            return "QMD table names an address twice";
+        }
+        return {};
+    }
+
+    // Replaces the table with `words`; false, with the table untouched, when it is not one.
+    static bool ImportStates(std::span<const Word> words) {
+        if (!CheckSerializedStates(words).empty()) {
+            return false;
+        }
         states.clear();
-        for (std::size_t i = 0; i + SerializedStateWords <= words.size(); i += SerializedStateWords) {
+        for (std::size_t i = 0; i < words.size(); i += SerializedStateWords) {
             const Address addr =
                 static_cast<Address>(words[i]) | (static_cast<Address>(words[i + 1]) << 32);
             State st;
@@ -90,6 +123,7 @@ public:
                         st.descriptor.begin());
             states.emplace(addr, st);
         }
+        return true;
     }
     struct RejectShaderDispatch { bool operator()(const Descriptor&) const { return false; } };
     // Optional diagnostics: called with "load"/"count"/"defer"/"run" events.
@@ -122,12 +156,12 @@ public:
         pending[0] = {address, argument & 15, ((argument >> 14) & 0x3ff) + 1};
         for (std::size_t i = 0; i < count; ++i) {
             const auto request = pending[i];
-            if (states.size() >= 4096 && !states.contains(request.address)) {
+            if (states.size() >= MaxStates && !states.contains(request.address)) {
                 // Finished QMDs with nothing deferred are only history, drop them instead of stalling.
                 std::erase_if(states, [](const auto& entry) {
                     return entry.second.completed && entry.second.deferred == 0;
                 });
-                if (states.size() >= 4096) return "QMD cache limit";
+                if (states.size() >= MaxStates) return "QMD cache limit";
             }
             auto& state = states[request.address];
             bool just_loaded = false;
@@ -147,7 +181,12 @@ public:
                         if (qmd[12] && (qmd[13] & 0xffff) && (qmd[14] & 0xffff))
                             return "native shader dispatch required";
                     }
-                    state.dependencies = std::int32_t((qmd[4] >> 14) & 0xffff) + state.deferred;
+                    const std::int64_t dependencies =
+                        std::int64_t{(qmd[4] >> 14) & 0xffff} + std::int64_t{state.deferred};
+                    if (dependencies > std::numeric_limits<std::int32_t>::max()) {
+                        return "QMD dependency overflow";
+                    }
+                    state.dependencies = static_cast<std::int32_t>(dependencies);
                     if (trace) trace("base", request.address, std::int32_t((qmd[4] >> 14) & 0xffff));
                     if (trace) trace("load", request.address, state.dependencies);
                     state.deferred = 0;
@@ -158,11 +197,11 @@ public:
             } else if (request.action == 7 || request.action == 12) {
                 const auto delta = request.action == 7 ? -std::int32_t(request.count) : std::int32_t(request.count);
                 if (!state.loaded || state.completed) {
-                    state.deferred += delta;
+                    if (!AddCounter(state.deferred, delta)) return "QMD dependency overflow";
                     if (trace) trace("defer", request.address, state.deferred);
                     continue;
                 }
-                state.dependencies += delta;
+                if (!AddCounter(state.dependencies, delta)) return "QMD dependency overflow";
                 if (trace) trace("count", request.address, state.dependencies);
             } else if (request.action == 0 || request.action == 1) {
                 continue;
@@ -221,6 +260,18 @@ public:
         return error;
     }
 private:
+    // Counters are restored from a file and moved by guest-controlled counts: the sum is taken
+    // wide and refused when it does not fit, never stored wrapped.
+    static bool AddCounter(std::int32_t& counter, std::int64_t delta) {
+        const std::int64_t sum = std::int64_t{counter} + delta;
+        if (sum < std::numeric_limits<std::int32_t>::min() ||
+            sum > std::numeric_limits<std::int32_t>::max()) {
+            return false;
+        }
+        counter = static_cast<std::int32_t>(sum);
+        return true;
+    }
+
     // Release slots (address low, flags | address high, payload). NVN2 patches a third one at
     // word 52 for queue syncs (e.g. a compute queue releasing a semaphore another queue waits on).
     static constexpr std::array<Word, 3> ReleaseSlots{24, 28, 52};

@@ -512,7 +512,9 @@ namespace {
         submit.syncpoint_raise_value = r.Get32();
         u32 entry_count = 0;
         REPLAY_TRY(ReadCount(r, MaxEntriesPerSubmit, 16, entry_count));
-        if ((submit.flags & ~static_cast<u32>(SubmitGenerated)) != 0 || submit.submit_id == 0) {
+        if ((submit.flags & ~static_cast<u32>(SubmitGenerated | SubmitSyncpointMax)) != 0 ||
+            submit.submit_id == 0 ||
+            ((submit.flags & SubmitSyncpointMax) == 0 && submit.syncpoint_raise_value != 0)) {
             return ReadError::BadPayload;
         }
         submit.entries.reserve(entry_count);
@@ -1333,7 +1335,7 @@ struct SubKey {
         const u32 state_kind = r.Get32();
         u32 word_count = 0;
         REPLAY_TRY(ReadCount(r, MaxMacroWords, 4, word_count));
-        if (!InRange(state_kind, 1, 3)) {
+        if (!InRange(state_kind, 1, 4)) {
             return ReadError::BadPayload;
         }
         state.kind = static_cast<EngineStateKind>(state_kind);

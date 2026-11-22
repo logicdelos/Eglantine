@@ -75,6 +75,11 @@ public:
         func();
     }
 
+    /// Replay restore: sets both counters of a syncpoint to the values a checkpoint recorded,
+    /// through the guest mirror like an increment. Only while no action waits on the syncpoint;
+    /// false (nothing changed) otherwise or for an id past the table.
+    bool RestoreValues(u32 syncpoint_id, u32 guest, u32 host);
+
     void IncrementHost(u32 syncpoint_id);
 
     void WaitGuest(u32 syncpoint_id, u32 expected_value);

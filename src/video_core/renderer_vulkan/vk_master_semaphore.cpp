@@ -112,7 +112,11 @@ void MasterSemaphore::Wait(u64 tick) {
             return;
         }
 
-        const auto wait_start = std::chrono::steady_clock::now();
+        // Timed and recorded only while GPU tracing is on: a wait costs what it costs, normal
+        // play pays no clock reads or log writes for it.
+        const bool trace = Common::SystemLog::GpuTraceEnabled();
+        const auto wait_start = trace ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
         Nx2Bottleneck::WaitScope wait{Nx2Bottleneck::Wait::HostGpu};
         const GpuWaitSpan wait_span{tick};
         u64 last_tick = gpu_tick.load(std::memory_order_relaxed);
@@ -120,11 +124,11 @@ void MasterSemaphore::Wait(u64 tick) {
             gpu_tick.wait(last_tick, std::memory_order_acquire);
             last_tick = gpu_tick.load(std::memory_order_relaxed);
         }
-        const auto elapsed_us = static_cast<u64>(
-            std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() - wait_start)
-                .count());
-        if (elapsed_us > 16000 || Common::SystemLog::GpuTraceEnabled()) {
+        if (trace) {
+            const auto elapsed_us = static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - wait_start)
+                    .count());
             Common::SystemLog::Record(
                 Common::SystemLog::Subsystem::Gpu,
                 elapsed_us > 16000 ? Common::SystemLog::Severity::Warning
@@ -147,7 +151,9 @@ void MasterSemaphore::Wait(u64 tick) {
         return;
     }
 
-    const auto wait_start = std::chrono::steady_clock::now();
+    const bool trace = Common::SystemLog::GpuTraceEnabled();
+    const auto wait_start = trace ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point{};
     Nx2Bottleneck::WaitScope wait{Nx2Bottleneck::Wait::HostGpu};
     const GpuWaitSpan wait_span{tick};
     // If none of the above is hit, fallback to a regular wait
@@ -165,11 +171,11 @@ void MasterSemaphore::Wait(u64 tick) {
     }
 
     Refresh();
-    const auto elapsed_us = static_cast<u64>(
-        std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - wait_start)
-            .count());
-    if (elapsed_us > 16000 || Common::SystemLog::GpuTraceEnabled()) {
+    if (trace) {
+        const auto elapsed_us = static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - wait_start)
+                .count());
         Common::SystemLog::Record(
             Common::SystemLog::Subsystem::Gpu,
             elapsed_us > 16000 ? Common::SystemLog::Severity::Warning

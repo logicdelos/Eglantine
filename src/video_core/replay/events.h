@@ -55,7 +55,8 @@
 //   ChannelCreate : u32 channel_id, u32 address_space_id, u32 flags (ChannelFlag), u32 reserved
 //   ChannelRelease: u32 channel_id, u32 reserved
 //   Submit        : u32 channel_id, u32 flags (SubmitFlag), u64 submit_id (dense from 1),
-//                   u32 syncpoint_raise_value, u32 entry_count (<= MaxEntriesPerSubmit), then
+//                   u32 syncpoint_raise_value (0 unless the SubmitSyncpointMax flag is set),
+//                   u32 entry_count (<= MaxEntriesPerSubmit), then
 //                   entries of 16 bytes: u64 gpu_va, u32 word_count, u32 header_flags (bit 0
 //                   allow_flush, bit 1 is_push_buffer, bit 2 sync of the submitted list header)
 //   Consume       : u32 channel_id, u32 entry_index, u64 submit_id, u64 consume_id (dense from 1,
@@ -278,6 +279,9 @@ enum ChannelFlag : u32 {
 
 enum SubmitFlag : u32 {
     SubmitGenerated = 1U << 0,  // submitted by emulator code on behalf of the guest, not the guest
+    // syncpoint_raise_value is the submission maximum of the channel's syncpoint (what the kernel
+    // handed out so far) when the list was queued; a replay stores it before it feeds the list
+    SubmitSyncpointMax = 1U << 1,
 };
 
 enum ConsumeFlag : u32 {

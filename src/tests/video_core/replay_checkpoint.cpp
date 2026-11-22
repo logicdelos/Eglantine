@@ -18,6 +18,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "video_core/engines/puller.h"
+#include "video_core/native_qmd.h"
 #include "video_core/replay/checkpoint.h"
 #include "video_core/replay/events.h"
 #include "video_core/replay/format.h"
@@ -348,4 +349,107 @@ TEST_CASE("the puller serializes as many words as a checkpoint accepts and resto
     unknown[Puller::RegisterWordCount] = 0x1234;
     REQUIRE_FALSE(puller.RestoreStateWords(unknown));
     REQUIRE(puller.StateWords() == words);
+}
+
+namespace {
+
+// A serialized QMD table of `count` records at distinct addresses.
+std::vector<u32> QmdTable(size_t count, u32 flags = 1) {
+    std::vector<u32> words(count * Tegra::NativeQmdScheduler::SerializedStateWords);
+    for (size_t i = 0; i < count; ++i) {
+        u32* record = words.data() + i * Tegra::NativeQmdScheduler::SerializedStateWords;
+        record[0] = 0x1000 + static_cast<u32>(i) * 0x100;
+        record[1] = 0x20;
+        record[4] = flags;
+    }
+    return words;
+}
+
+// Syncpoint counters in which every id has the guest value `10 + id` and host value 0, except the
+// fences of Restorable (id 10 + channel, value 3), which the section has to agree with.
+std::vector<u32> Counters() {
+    std::vector<u32> words(R::SyncpointCounterWords);
+    for (u32 id = 0; id < R::SyncpointCounterCount; ++id) {
+        words[size_t{id} * 2] = 10 + id;
+    }
+    return words;
+}
+
+R::GpuCheckpoint WithCounters(R::GpuCheckpoint cp) {
+    std::vector<u32> words = Counters();
+    for (const R::CheckpointFence& fence : cp.fences) {
+        words[size_t{fence.id} * 2] = static_cast<u32>(fence.value);
+    }
+    cp.states.push_back({R::SharedChannel, R::EngineStateKind::SyncpointCounters, std::move(words)});
+    return cp;
+}
+
+} // namespace
+
+TEST_CASE("a QMD table in a checkpoint is checked before anything is restored",
+          "[video_core][replay][checkpoint]") {
+    const auto with_table = [](std::vector<u32> table) {
+        R::GpuCheckpoint cp = Restorable(true);
+        cp.states.push_back({R::SharedChannel, R::EngineStateKind::NativeQmdStates,
+                             std::move(table)});
+        return cp;
+    };
+    R::GpuCheckpoint good = with_table(QmdTable(3, 7));
+    std::string error;
+    REQUIRE(R::ValidateCheckpointForRestore(good, error));
+    R::GpuCheckpoint back;
+    REQUIRE(R::Decode(Enc(good), back) == R::ReadError::None);
+    REQUIRE(R::ValidateCheckpointForRestore(back, error));
+
+    // The same address twice: restoring would keep whichever came last.
+    auto twice = QmdTable(2);
+    std::copy_n(twice.begin(), 2, twice.begin() + Tegra::NativeQmdScheduler::SerializedStateWords);
+    REQUIRE(RefusedWith(with_table(twice), "QMD table names an address twice"));
+    // More records than the scheduler ever holds.
+    REQUIRE(RefusedWith(with_table(QmdTable(Tegra::NativeQmdScheduler::MaxStates + 1)),
+                        "more records than the scheduler holds"));
+    REQUIRE(R::ValidateCheckpointForRestore(with_table(QmdTable(Tegra::NativeQmdScheduler::MaxStates)),
+                                            error));
+    // A flag no scheduler sets, and a table that is not whole records.
+    REQUIRE(RefusedWith(with_table(QmdTable(2, 8)), "unknown flags"));
+    auto torn = QmdTable(2);
+    torn.pop_back();
+    REQUIRE(RefusedWith(with_table(torn), "not whole records"));
+    // One table for the whole GPU.
+    R::GpuCheckpoint repeated = with_table(QmdTable(1));
+    repeated.states.push_back({R::SharedChannel, R::EngineStateKind::NativeQmdStates, QmdTable(1)});
+    REQUIRE(RefusedWith(repeated, "misplaced or repeated"));
+}
+
+TEST_CASE("the syncpoint counters of a checkpoint are one shared section that its fences agree with",
+          "[video_core][replay][checkpoint]") {
+    const R::GpuCheckpoint good = WithCounters(Restorable(false));
+    std::string error;
+    REQUIRE(R::ValidateCheckpointForRestore(good, error));
+    R::GpuCheckpoint back;
+    REQUIRE(R::Decode(Enc(good), back) == R::ReadError::None);
+    REQUIRE(Enc(back) == Enc(good));
+    REQUIRE(R::ValidateCheckpointForRestore(back, error));
+    const auto counters = std::ranges::find_if(back.states, [](const R::EngineStateSection& s) {
+        return s.kind == R::EngineStateKind::SyncpointCounters;
+    });
+    REQUIRE(counters != back.states.end());
+    REQUIRE(counters->channel_id == R::SharedChannel);
+    REQUIRE(counters->words.size() == R::SyncpointCounterWords);
+    REQUIRE(counters->words[size_t{11} * 2] == 3);
+
+    const char* malformed = "SyncpointCounters section is malformed or repeated";
+    R::GpuCheckpoint cp = good;
+    cp.states.back().words.pop_back();
+    REQUIRE(RefusedWith(cp, malformed));
+    cp = good;
+    cp.states.back().channel_id = 1;
+    REQUIRE(RefusedWith(cp, malformed));
+    cp = good;
+    cp.states.push_back(cp.states.back());
+    REQUIRE(RefusedWith(cp, malformed));
+    // A channel's fence is the counter of its syncpoint: they cannot differ.
+    cp = good;
+    cp.states.back().words[size_t{11} * 2] += 1;
+    REQUIRE(RefusedWith(cp, "fence disagrees with the syncpoint counters section"));
 }

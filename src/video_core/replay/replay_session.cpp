@@ -547,6 +547,13 @@ private:
             return Fail("submit names channel " + std::to_string(submit.channel_id) +
                         " that does not exist");
         }
+        if ((submit.flags & SubmitSyncpointMax) != 0) {
+            // The kernel's submission count the live channel guard compared increments with,
+            // in the order the live run queued it.
+            channels_.at(submit.channel_id)
+                .state->nx2_syncpoint_max.store(submit.syncpoint_raise_value,
+                                                std::memory_order_relaxed);
+        }
         std::string error;
         if (!QueueSubmitEvent(pending_[submit.channel_id], submit, error)) {
             return Fail(error);
@@ -578,7 +585,7 @@ private:
             return;
         }
         Tegra::CommandList list;
-        if (piece.gpu_va == 0) {
+        if (piece.prefetch) {
             list.prefetch_command_list.reserve(piece.words.size());
             for (const u32 word : piece.words) {
                 Tegra::CommandHeader header{};

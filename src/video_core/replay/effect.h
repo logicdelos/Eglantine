@@ -46,7 +46,10 @@ inline void ObserveReplayEffect(const LiveEffect& effect) noexcept {
     }
 }
 inline void ObserveReplayReadback() noexcept {
-    if (detail::readback_origin == detail::ReadbackOrigin::EmulatedWork) {
+    // The observer is only set during a replay: normal play stops at this one load, before the
+    // thread-local origin.
+    if (detail::replay_effect_observer.load(std::memory_order_relaxed) != nullptr &&
+        detail::readback_origin == detail::ReadbackOrigin::EmulatedWork) {
         ObserveReplayEffect({EffectKind::ReadbackVisibility, 0, 0, false});
     }
 }

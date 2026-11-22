@@ -55,7 +55,13 @@
 //   EngineState        u32 channel_id, u32 state (EngineStateKind), u32 word_count
 //                      (<= MaxMacroWords), word_count * u32. RootTables: 8 tables of 64 words,
 //                      then selected, offset, loaded; ConstBufferBindings: per shader stage and
-//                      slot {address_lo, address_hi, size, enabled}
+//                      slot {address_lo, address_hi, size, enabled}. Shared (channel_id =
+//                      0xFFFFFFFF), at most once each: NativeQmdStates, whole records of 69 words
+//                      {addr_lo, addr_hi, dependencies, deferred, flags (1 loaded, 2 scheduled,
+//                      4 completed), 64 descriptor words} of the QMD table (finished entries
+//                      included, at most 4096, no address twice); SyncpointCounters, 192 pairs
+//                      {guest, host} of the Host1x syncpoint values (what a Switch 2 syncpoint
+//                      shim reads), restored before the first command is fed
 // The meaning of a register or macro word is whatever the emulator's own state holds; the
 // checkpoint is only valid for the build and settings pinned in the header and SESSION chunk, and
 // a replayer that cannot restore a sub-record fails with UnsupportedState rather than skipping it.
@@ -116,8 +122,15 @@ enum class MacroSectionKind : u32 {
     NativeState = 7,
 };
 
-enum class EngineStateKind : u32 { RootTables = 1, ConstBufferBindings = 2, NativeQmdStates = 3 };
+enum class EngineStateKind : u32 {
+    RootTables = 1,
+    ConstBufferBindings = 2,
+    NativeQmdStates = 3,
+    SyncpointCounters = 4,
+};
 inline constexpr size_t NativeQmdStateWords = 69;
+inline constexpr u32 SyncpointCounterCount = 192;  // Tegra::Host1x::SyncpointManager
+inline constexpr size_t SyncpointCounterWords = size_t{SyncpointCounterCount} * 2;
 
 enum DmaStateFlag : u32 {
     DmaNonIncrementing = 1U << 0,

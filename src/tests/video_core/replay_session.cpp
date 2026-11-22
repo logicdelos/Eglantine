@@ -593,6 +593,35 @@ TEST_CASE("Replay session: submits are consumed in order and checked", "[video_c
         SubmitOf(1, {R::SubmitEntry{0x1000, R::SubmitHeaderMaxWords + 1U, 0}}), refused, error));
 }
 
+TEST_CASE("Replay session: a prefetch list stays a prefetch list when its consume is split",
+          "[video_core][replay]") {
+    std::deque<R::PendingSubmit> queue;
+    std::string error;
+    // Entry 0 has no address (a prefetch list), entry 1 is addressed.
+    REQUIRE(R::QueueSubmitEvent(
+        queue, SubmitOf(50, {R::SubmitEntry{0, 6, 0}, R::SubmitEntry{0x4000, 2, 0}}), error));
+    R::SubmitPiece piece;
+    // The first piece, then the pieces the pusher resumes at a word offset: the consume's address
+    // is the (non-zero) offset, and still the words are a prefetch list's.
+    REQUIRE(R::FeedConsumeEvent(queue, ConsumeOf(50, 0, 0, 0, 2), piece, error));
+    CHECK(piece.prefetch);
+    CHECK(piece.gpu_va == 0);
+    REQUIRE(R::FeedConsumeEvent(queue, ConsumeOf(50, 0, 0, 2, 2), piece, error));
+    CHECK(piece.gpu_va == 8);
+    CHECK(piece.prefetch);
+    REQUIRE(R::FeedConsumeEvent(queue, ConsumeOf(50, 0, 0, 4, 2), piece, error));
+    CHECK(piece.gpu_va == 16);
+    CHECK(piece.prefetch);
+    // An addressed entry is not one, whether whole or resumed.
+    R::ConsumeEvent first = ConsumeOf(50, 1, 0x4000, 0, 1);
+    REQUIRE(R::FeedConsumeEvent(queue, first, piece, error));
+    CHECK_FALSE(piece.prefetch);
+    REQUIRE(R::FeedConsumeEvent(queue, ConsumeOf(50, 1, 0x4000, 1, 1), piece, error));
+    CHECK(piece.gpu_va == 0x4004);
+    CHECK_FALSE(piece.prefetch);
+    CHECK(queue.empty());
+}
+
 TEST_CASE("Replay session: a command list header is built from its parts", "[video_core][replay]") {
     CHECK(R::SubmitHeaderFits(1));
     CHECK(R::SubmitHeaderFits(R::SubmitHeaderMaxWords));

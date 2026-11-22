@@ -321,3 +321,132 @@ TEST_CASE("Semaphore reductions follow the documented ops", "[video_core][native
     REQUIRE(ReduceSemaphore(6, false, 0b1100, 0b1010) == 0b1110);
     REQUIRE(ReduceSemaphore(7, false, 0b1100, 0b1010) == 0b0110);
 }
+
+namespace {
+
+std::vector<NativeQmdScheduler::Word> StateRecord(NativeQmdScheduler::Address address,
+                                                  NativeQmdScheduler::Word flags,
+                                                  std::int32_t dependencies = 0,
+                                                  std::int32_t deferred = 0) {
+    std::vector<NativeQmdScheduler::Word> record(NativeQmdScheduler::SerializedStateWords);
+    record[0] = static_cast<NativeQmdScheduler::Word>(address);
+    record[1] = static_cast<NativeQmdScheduler::Word>(address >> 32);
+    record[2] = static_cast<NativeQmdScheduler::Word>(dependencies);
+    record[3] = static_cast<NativeQmdScheduler::Word>(deferred);
+    record[4] = flags;
+    return record;
+}
+
+Descriptor RunnableQmd(NativeQmdScheduler::Word dependencies) {
+    Descriptor qmd = MakeQmd();
+    qmd[4] = dependencies << 14;
+    qmd[12] = qmd[13] = qmd[14] = 1; // A grid: dispatched
+    return qmd;
+}
+
+} // Anonymous namespace
+
+TEST_CASE("A restored QMD table keeps finished QMDs: action 2 does not dispatch them again",
+          "[video_core][native_qmd][replay]") {
+    NativeQmdScheduler::ClearStates();
+    constexpr Address address = 0x6000000000ULL;
+    const Descriptor qmd = RunnableQmd(0);
+    u32 dispatches = 0;
+    const auto read = [&](Address, Descriptor& descriptor) {
+        descriptor = qmd;
+        return true;
+    };
+    const auto release = [](Address, Word, Word) { return true; };
+    const auto dispatch = [&](const Descriptor&) {
+        ++dispatches;
+        return true;
+    };
+    NativeQmdScheduler scheduler;
+    REQUIRE(scheduler.Signal(address, 3, read, release, dispatch).empty());
+    REQUIRE(dispatches == 1);
+
+    // The checkpoint of a capture cut after the QMD finished.
+    const auto table = NativeQmdScheduler::ExportStates();
+    REQUIRE(table.size() == NativeQmdScheduler::SerializedStateWords);
+    REQUIRE((table[4] & 4U) != 0); // Completed
+
+    NativeQmdScheduler::ClearStates();
+    REQUIRE(NativeQmdScheduler::ImportStates(table));
+    REQUIRE(NativeQmdScheduler::ExportStates() == table);
+    REQUIRE(scheduler.Signal(address, 2, read, release, dispatch).empty());
+    REQUIRE(dispatches == 1);
+
+    // Without the finished entry (what a table of active QMDs gives) the signal runs it again.
+    NativeQmdScheduler::ClearStates();
+    REQUIRE(scheduler.Signal(address, 2, read, release, dispatch).empty());
+    REQUIRE(dispatches == 2);
+    NativeQmdScheduler::ClearStates();
+}
+
+TEST_CASE("A serialized QMD table that no scheduler produced is refused and changes nothing",
+          "[video_core][native_qmd][replay]") {
+    NativeQmdScheduler::ClearStates();
+    const auto join = [](std::vector<NativeQmdScheduler::Word> a,
+                         const std::vector<NativeQmdScheduler::Word>& b) {
+        a.insert(a.end(), b.begin(), b.end());
+        return a;
+    };
+    const auto good = join(StateRecord(0x7000000000ULL, 1), StateRecord(0x7000000100ULL, 7));
+    REQUIRE(NativeQmdScheduler::CheckSerializedStates(good).empty());
+    REQUIRE(NativeQmdScheduler::ImportStates(good));
+    const auto before = NativeQmdScheduler::ExportStates();
+    REQUIRE(before == good);
+
+    SECTION("an address twice") {
+        const auto table = join(StateRecord(0x7000000200ULL, 1), StateRecord(0x7000000200ULL, 2));
+        REQUIRE(NativeQmdScheduler::CheckSerializedStates(table) ==
+                "QMD table names an address twice");
+        REQUIRE_FALSE(NativeQmdScheduler::ImportStates(table));
+    }
+    SECTION("flags no scheduler sets") {
+        const auto table = StateRecord(0x7000000200ULL, 8);
+        REQUIRE(NativeQmdScheduler::CheckSerializedStates(table) == "QMD record has unknown flags");
+        REQUIRE_FALSE(NativeQmdScheduler::ImportStates(table));
+    }
+    SECTION("a partial record") {
+        auto table = StateRecord(0x7000000200ULL, 1);
+        table.pop_back();
+        REQUIRE_FALSE(NativeQmdScheduler::ImportStates(table));
+    }
+    SECTION("more records than the scheduler holds") {
+        std::vector<NativeQmdScheduler::Word> table;
+        for (u64 i = 0; i <= NativeQmdScheduler::MaxStates; ++i) {
+            table = join(std::move(table), StateRecord(0x8000000000ULL + i * 0x100, 1));
+        }
+        REQUIRE(NativeQmdScheduler::CheckSerializedStates(table) ==
+                "QMD table has more records than the scheduler holds");
+        REQUIRE_FALSE(NativeQmdScheduler::ImportStates(table));
+    }
+    REQUIRE(NativeQmdScheduler::ExportStates() == before);
+    NativeQmdScheduler::ClearStates();
+}
+
+TEST_CASE("A QMD dependency counter that would overflow is an error, not a wrap",
+          "[video_core][native_qmd][replay]") {
+    NativeQmdScheduler::ClearStates();
+    constexpr std::int32_t Max = std::numeric_limits<std::int32_t>::max();
+    constexpr Address loaded = 0x9000000000ULL;
+    constexpr Address deferred = 0x9000000100ULL;
+    auto table = StateRecord(loaded, 0, 0, Max);
+    const auto second = StateRecord(deferred, 0, 0, Max);
+    table.insert(table.end(), second.begin(), second.end());
+    REQUIRE(NativeQmdScheduler::ImportStates(table));
+
+    NativeQmdScheduler scheduler;
+    const auto read = [](Address, Descriptor& descriptor) {
+        descriptor = RunnableQmd(1);
+        return true;
+    };
+    const auto release = [](Address, Word, Word) { return true; };
+    const auto dispatch = [](const Descriptor&) { return true; };
+    // Loading adds the deferred decrements to the QMD's own count of one.
+    REQUIRE(scheduler.Signal(loaded, 3, read, release, dispatch) == "QMD dependency overflow");
+    // A decrement-free increment of a QMD that is not loaded defers.
+    REQUIRE(scheduler.Signal(deferred, 12, read, release, dispatch) == "QMD dependency overflow");
+    NativeQmdScheduler::ClearStates();
+}

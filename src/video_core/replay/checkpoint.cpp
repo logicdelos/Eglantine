@@ -514,16 +514,29 @@ bool ValidateCheckpointForRestore(const GpuCheckpoint& checkpoint, std::string& 
         return Refuse(error, "a macro section does not belong to this macro flavour");
     }
 
-    // Root tables, bound constant buffers, and optional shared NativeQmdStates.
+    // Root tables, bound constant buffers, and the optional shared NativeQmdStates and
+    // SyncpointCounters sections.
     std::set<std::pair<u32, u32>> states;
     bool has_qmd = false;
+    const EngineStateSection* counters = nullptr;
     for (const EngineStateSection& state : checkpoint.states) {
         if (state.kind == EngineStateKind::NativeQmdStates) {
-            if (state.channel_id != SharedChannel || has_qmd ||
-                (state.words.size() % NativeQmdStateWords) != 0) {
-                return Refuse(error, "shared NativeQmdStates section is malformed or repeated");
+            if (state.channel_id != SharedChannel || has_qmd) {
+                return Refuse(error, "shared NativeQmdStates section is misplaced or repeated");
+            }
+            if (const auto why = Tegra::NativeQmdScheduler::CheckSerializedStates(state.words);
+                !why.empty()) {
+                return Refuse(error, std::string{why});
             }
             has_qmd = true;
+            continue;
+        }
+        if (state.kind == EngineStateKind::SyncpointCounters) {
+            if (state.channel_id != SharedChannel || counters != nullptr ||
+                state.words.size() != SyncpointCounterWords) {
+                return Refuse(error, "shared SyncpointCounters section is malformed or repeated");
+            }
+            counters = &state;
             continue;
         }
         const u32 kind = static_cast<u32>(state.kind);
@@ -552,6 +565,10 @@ bool ValidateCheckpointForRestore(const GpuCheckpoint& checkpoint, std::string& 
             fence.value > 0xFFFFFFFFULL || fence.aux > 0xFFFFFFFFULL) {
             return Refuse(error, "a fence of channel " + Num(fence.channel_id) +
                                      " is not a syncpoint a channel can hold");
+        }
+        if (counters != nullptr && counters->words[size_t{fence.id} * 2] != fence.value) {
+            return Refuse(error, "channel " + Num(fence.channel_id) +
+                                     " fence disagrees with the syncpoint counters section");
         }
     }
     return true;
@@ -596,6 +613,7 @@ bool CaptureGpuCheckpoint(CutChannels channels, GpuCheckpoint& out, std::string&
     bool transient = false;
     std::map<u32, AddressSpaceEntry> spaces;
     bool shared_macros_done = false;
+    Tegra::Host1x::SyncpointManager* syncpoints = nullptr;
 
     std::ranges::for_each(channels, [&](const auto& owner) {
         auto& channel = *owner;
@@ -748,14 +766,13 @@ bool CaptureGpuCheckpoint(CutChannels channels, GpuCheckpoint& out, std::string&
         }
         out.dma.push_back(std::move(dma));
 
+        syncpoints = &pusher.system.Host1x().GetSyncpointManager();
         if (channel.nx2_syncpoint != 0) {
             CheckpointFence fence;
             fence.kind = FenceKind::SyncpointRaised;
             fence.channel_id = id;
             fence.id = channel.nx2_syncpoint;
-            fence.value =
-                pusher.system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(
-                    channel.nx2_syncpoint);
+            fence.value = syncpoints->GetGuestSyncpointValue(channel.nx2_syncpoint);
             fence.aux = channel.nx2_syncpoint_max.load(std::memory_order_relaxed);
             out.fences.push_back(fence);
         }
@@ -775,10 +792,31 @@ bool CaptureGpuCheckpoint(CutChannels channels, GpuCheckpoint& out, std::string&
         return Refuse(error, "no initialised channel to checkpoint");
     }
     if ((out.channels.front().flags & ChannelTuringMacros) != 0) {
-        auto qmd_words = Tegra::NativeQmdScheduler::ExportActiveStates();
+        auto qmd_words = Tegra::NativeQmdScheduler::ExportStates();
         if (!qmd_words.empty()) {
             out.states.push_back(EngineStateSection{
                 SharedChannel, EngineStateKind::NativeQmdStates, std::move(qmd_words)});
+        }
+    }
+    if (syncpoints != nullptr) {
+        // Every counter, not only a channel's own: a client the shim serves reads any of them.
+        // The guest values are taken with increments held off, and the channel fences are made
+        // to agree with that one snapshot.
+        std::vector<u32> counters(SyncpointCounterWords);
+        syncpoints->WithGuestValuesStable([&] {
+            for (u32 id = 0; id < SyncpointCounterCount; ++id) {
+                counters[size_t{id} * 2] = syncpoints->GetGuestSyncpointValue(id);
+                counters[size_t{id} * 2 + 1] = syncpoints->GetHostSyncpointValue(id);
+            }
+        });
+        if (std::ranges::any_of(counters, [](u32 word) { return word != 0; })) {
+            for (CheckpointFence& fence : out.fences) {
+                if (fence.id < SyncpointCounterCount) {
+                    fence.value = counters[size_t{fence.id} * 2];
+                }
+            }
+            out.states.push_back(EngineStateSection{
+                SharedChannel, EngineStateKind::SyncpointCounters, std::move(counters)});
         }
     }
     // What was captured has to be restorable: sequential channel ids, sizes the engines have.
@@ -1132,7 +1170,22 @@ bool RestoreGpuCheckpoint(Tegra::GPU& gpu, const GpuCheckpoint& checkpoint, std:
     Tegra::NativeQmdScheduler::ClearStates();
     if (const EngineStateSection* qmd =
             FindState(checkpoint, SharedChannel, EngineStateKind::NativeQmdStates)) {
-        Tegra::NativeQmdScheduler::ImportActiveStates(qmd->words);
+        if (!Tegra::NativeQmdScheduler::ImportStates(qmd->words)) {
+            return Refuse(error, "the checkpoint's QMD table cannot be imported");
+        }
+    }
+    // Before the first command is fed: the session takes its syncpoint baseline from these, and
+    // a client reads them through the syncpoint shim.
+    if (const EngineStateSection* counters =
+            FindState(checkpoint, SharedChannel, EngineStateKind::SyncpointCounters)) {
+        auto& syncpoints = gpu.Host1x().GetSyncpointManager();
+        for (u32 id = 0; id < SyncpointCounterCount; ++id) {
+            if (!syncpoints.RestoreValues(id, counters->words[size_t{id} * 2],
+                                          counters->words[size_t{id} * 2 + 1])) {
+                return Refuse(error, "syncpoint " + Num(id) +
+                                         " cannot be restored: an action already waits on it");
+            }
+        }
     }
 
     bool shared_macros_done = false;

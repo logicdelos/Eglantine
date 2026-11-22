@@ -35,7 +35,6 @@
 #include <set>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -286,7 +285,7 @@ public:
     void EngineEffect(const LiveEffect& effect);
     void DrainFinal();
     void ReleasePins();
-    void Submit(s32 channel, const Tegra::CommandList& list);
+    void Submit(s32 channel, const Tegra::CommandList& list, std::optional<u32> syncpoint_max);
     void Consume(s32 channel, u32 entry_index, u64 gpu_va, u32 word_offset, u32 flags, u32 epoch,
                  std::span<const u32> words);
     void GuestWrite(u64 device, u64 size);
@@ -399,7 +398,7 @@ private:
     std::vector<FenceEntry> fence_batch;
     u64 fence_batch_frame = 0;
     std::map<u32, u64> seen_syncpoints;               // syncpoint -> latest value a producer raised
-    std::map<std::pair<u32, u64>, std::unordered_set<u64>> seen_memory;   // (address space, gpu va) -> seen values
+    std::map<std::pair<u32, u64>, u64> seen_memory;   // (address space, gpu va) -> last value
     std::unordered_map<s32, u32> channel_space;       // live channel -> address space
     std::set<u32> checkpoint_spaces;                  // address spaces the checkpoint lists
     void NoteSpaceUnknown(u32 space, const char* what);
@@ -1007,6 +1006,20 @@ CutOutcome Capture::CutBody(u64 present_id, std::string& error) {
         for (const AddressSpaceEntry& entry : cut.checkpoint.address_spaces) {
             checkpoint_spaces.insert(entry.address_space_id);
         }
+        // The replay restores these counters before its first command, so a producer or a wait
+        // meets the same value the live run did, and a value at or below them needs no fence.
+        for (const EngineStateSection& section : cut.checkpoint.states) {
+            if (section.kind != EngineStateKind::SyncpointCounters ||
+                section.words.size() != SyncpointCounterWords) {
+                continue;
+            }
+            for (u32 id = 0; id < SyncpointCounterCount; ++id) {
+                if (const u32 guest = section.words[size_t{id} * 2]; guest != 0) {
+                    recorded_syncpoints[id] = guest;
+                    seen_syncpoints[id] = guest;
+                }
+            }
+        }
         if (cut.title_version_known) {
             header.title_version = cut.title_version;
             header.title_version_status = static_cast<u32>(VersionStatus::Known);
@@ -1455,9 +1468,14 @@ void Capture::FinishComposedLocked(u64 id, bool have_picture, const EndPicture& 
     FinishFrame(id, have_picture && !awaiting.front().preroll ? &picture : nullptr);
 }
 
-void Capture::Submit(s32 channel, const Tegra::CommandList& list) {
+void Capture::Submit(s32 channel, const Tegra::CommandList& list, std::optional<u32> syncpoint_max) {
     SubmitEvent submit;
     submit.channel_id = static_cast<u32>(channel);
+    if (syncpoint_max) {
+        // What the replay's channel guard compares increments against, in stream order.
+        submit.flags |= SubmitSyncpointMax;
+        submit.syncpoint_raise_value = *syncpoint_max;
+    }
     SubmitInfo info;
     if (!list.prefetch_command_list.empty()) {
         SubmitEntry entry;
@@ -1834,27 +1852,9 @@ void Capture::FenceProducedLocked(const FenceNote& note) {
             at->second = note.value;
         }
     } else {
-        auto& vals = seen_memory[{note.space, note.id}];
-        if (vals.size() >= 256) {
-            vals.clear();
-        }
-        vals.insert(note.value);
+        seen_memory[{note.space, note.id}] = note.value;
     }
     if (!note.external) {
-        if (syncpoint) {
-            const u32 sp_id = static_cast<u32>(note.id);
-            if (recorded_syncpoints[sp_id] == 0 && note.value > 1) {
-                const u32 pre_cut = static_cast<u32>(note.value) - 1;
-                if (SyncpointRaiseFits(sp_id, pre_cut)) {
-                    FenceEntry pre_entry;
-                    pre_entry.kind = FenceKind::SyncpointRaised;
-                    pre_entry.id = note.id;
-                    pre_entry.value = pre_cut;
-                    AddFence(pre_entry);
-                    ++fences_synthesized;
-                }
-            }
-        }
         AppendEffect(open_effects, ProducedEffect(note.kind, note.id, note.value));
         if (syncpoint) {
             // A raise by the recorded commands is an output: the number of raises since the cut,
@@ -1908,7 +1908,7 @@ void Capture::FenceWaitLocked(const FenceNote& note) {
         produced = seen != seen_syncpoints.end() && WrapAtLeast(seen->second, note.value);
     } else {
         const auto seen = seen_memory.find({note.space, note.id});
-        produced = seen != seen_memory.end() && seen->second.contains(note.value);
+        produced = seen != seen_memory.end() && seen->second == note.value;
         if (!produced && note.device != 0 &&
             cpu_written.Intersects(note.device, note.device + FenceWidth(note))) {
             produced = true;  // a guest or device write, carried by the memory deltas
@@ -1917,30 +1917,26 @@ void Capture::FenceWaitLocked(const FenceNote& note) {
     if (produced) {
         return;
     }
-    if (!note.blocked || !syncpoint) {
-        // The value was already there when the wait checked it: its producer ran before the
-        // capture window. The replay starts from a checkpoint that does not restore syncpoint
-        // values, so the fence is recorded here, ahead of the events that depend on it.
+    if (!note.blocked) {
+        // The wait found its value already there: the producer ran before the capture window and
+        // the checkpoint holds its effect (syncpoint counters included), or the value is
+        // verified here by the file. A wait that BLOCKED is never turned into a producer from
+        // its threshold: nothing proves who delivered the value, so it stays unresolved below.
         FenceEntry entry;
         entry.kind = note.kind;
         entry.id = note.id;
         entry.value = note.value;
         entry.aux = (note.aux == 4 || note.aux == 8) ? note.aux : 0;
         if (!syncpoint) {
-            if (note.device == 0) {
-                return;
-            }
             entry.channel_id = ResolveChannel(note.channel, note.space);
             if (entry.channel_id == 0) {
                 NoteUnresolved("a memory fence wait names an address space no recorded channel uses");
                 return;
             }
-            tracker->NoteRead(note.device, FenceWidth(note));
-            auto& vals = seen_memory[{note.space, note.id}];
-            if (vals.size() >= 256) {
-                vals.clear();
+            if (note.device != 0) {
+                tracker->NoteRead(note.device, FenceWidth(note));
             }
-            vals.insert(note.value);
+            seen_memory[{note.space, note.id}] = note.value;
         } else {
             if (!SyncpointRaiseFits(static_cast<u32>(note.id), note.value)) {
                 return;
@@ -2404,9 +2400,9 @@ void NoteEngineEffectSlow(const LiveEffect& effect) {
     if (const auto capture = Current()) capture->EngineEffect(effect);
 }
 
-void NoteSubmitSlow(s32 channel, const Tegra::CommandList& list) {
+void NoteSubmitSlow(s32 channel, const Tegra::CommandList& list, std::optional<u32> syncpoint_max) {
     if (const auto capture = Current()) {
-        capture->Submit(channel, list);
+        capture->Submit(channel, list, syncpoint_max);
     }
 }
 

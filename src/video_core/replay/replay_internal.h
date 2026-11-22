@@ -1003,6 +1003,10 @@ inline constexpr u64 GpuAddressLimit = 1ULL << 40;
 struct SubmitPiece {
     u64 gpu_va = 0;
     u32 header_flags = 0;
+    // The words belong to a prefetch list (the entry has no address): the pusher takes them as
+    // they are. Carried from the entry, not inferred from gpu_va, which is the consume's address
+    // and is not zero for a prefetch list resumed at a word offset.
+    bool prefetch = false;
     std::span<const u32> words;  // the consume's own words; none: nothing to push
 };
 
@@ -1049,6 +1053,7 @@ inline void PopCompleteSubmits(std::deque<PendingSubmit>& queue) {
         return false;
     }
     piece.gpu_va = consume.gpu_va;
+    piece.prefetch = head.event.entries[consume.entry_index].gpu_va == 0;
     piece.header_flags =
         consume.word_offset == 0 ? head.event.entries[consume.entry_index].header_flags : 0U;
     piece.words = consume.words;

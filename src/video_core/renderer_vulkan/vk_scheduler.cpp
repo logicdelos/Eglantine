@@ -133,11 +133,11 @@ bool Scheduler::WaitSubmitted(u64 tick) {
             tick + 1, std::chrono::microseconds{5}, deadline,
             [&] { return IsSubmitted(tick) || !split.BackRunning(); }, std::chrono::milliseconds{1});
         if (IsSubmitted(tick)) {
-            const auto elapsed_us = static_cast<u64>(
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - start)
-                    .count());
-            if (elapsed_us > 16000 || Common::SystemLog::GpuTraceEnabled()) {
+            if (Common::SystemLog::GpuTraceEnabled()) {
+                const auto elapsed_us = static_cast<u64>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - start)
+                        .count());
                 Common::SystemLog::Record(
                     Common::SystemLog::Subsystem::Gpu,
                     elapsed_us > 16000 ? Common::SystemLog::Severity::Warning
@@ -241,6 +241,15 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
     state.renderpass = framebuffer->RenderPass();
     state.framebuffer = framebuffer_handle;
     state.render_area = render_area;
+
+    // Every pass begins here, a realized deferred clear included.
+    if (Common::SystemLog::GpuTraceEnabled()) {
+        Common::SystemLog::Record(Common::SystemLog::Subsystem::Gpu,
+                                  Common::SystemLog::Severity::Info,
+                                  Common::SystemLog::EventKind::GpuRenderPass,
+                                  render_area.width, render_area.height,
+                                  framebuffer->NumImages());
+    }
 
     if (GPU::Logging::IsActive() && Settings::values.gpu_log_vulkan_calls.GetValue()) {
         const std::string render_pass_info =
@@ -370,13 +379,6 @@ void Scheduler::RequestRenderpass(const Framebuffer* framebuffer) {
     }
     // Ends any active pass and realizes a deferred clear
     EndRenderPass();
-    if (Common::SystemLog::GpuTraceEnabled()) {
-        Common::SystemLog::Record(Common::SystemLog::Subsystem::Gpu,
-                                  Common::SystemLog::Severity::Info,
-                                  Common::SystemLog::EventKind::GpuRenderPass,
-                                  render_area.width, render_area.height,
-                                  framebuffer->NumImages());
-    }
     BeginRenderPassImpl(framebuffer, renderpass, nullptr, 0);
 }
 

@@ -86,6 +86,25 @@ void SyncpointManager::WaitHost(u32 syncpoint_id, u32 expected_value) {
     Wait(syncpoints_host[syncpoint_id], wait_host_cv, expected_value);
 }
 
+bool SyncpointManager::RestoreValues(u32 syncpoint_id, u32 guest, u32 host) {
+    if (syncpoint_id >= NUM_MAX_SYNCPOINTS) {
+        return false;
+    }
+    std::scoped_lock lk(guard);
+    const u32 guest_now = syncpoints_guest[syncpoint_id].load(std::memory_order_relaxed);
+    // Only with nothing waiting: an action that already runs on the value would see a history
+    // the restore is not part of.
+    if (!guest_action_storage[syncpoint_id].empty() || !host_action_storage[syncpoint_id].empty()) {
+        return false;
+    }
+    if (guest_mirror && guest != guest_now) {
+        guest_mirror(syncpoint_id, guest);
+    }
+    syncpoints_guest[syncpoint_id].store(guest, std::memory_order_release);
+    syncpoints_host[syncpoint_id].store(host, std::memory_order_release);
+    return true;
+}
+
 bool SyncpointManager::WaitHostFor(u32 syncpoint_id, u32 expected_value,
                                    std::chrono::milliseconds timeout) {
     const auto& syncpoint = syncpoints_host[syncpoint_id];
