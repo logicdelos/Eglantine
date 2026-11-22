@@ -199,6 +199,11 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, use_disk_shader_cache, tr("Use persistent pipeline cache"),
            tr("Allows saving shaders to storage for faster loading on following game "
               "boots.\nDisabling it is only intended for debugging."));
+    INSERT(Settings, free_unused_pipelines, tr("Free unused shaders from memory"),
+           tr("Off: every shader built this session stays in memory, so areas you go back to never "
+              "build their shaders again.\nOn: once more than 2048 are held (1024 when the PC is "
+              "low on memory), the ones unused the longest are freed and are built again (with "
+              "brief pop-in) when needed.\nTurn it on if a long session runs out of memory."));
     INSERT(
         Settings, use_asynchronous_gpu_emulation, tr("Use asynchronous GPU emulation"),
         tr("Uses an extra CPU thread for rendering.\nThis option should always remain enabled."));

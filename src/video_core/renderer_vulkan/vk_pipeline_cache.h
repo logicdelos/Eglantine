@@ -331,6 +331,7 @@ private:
     std::deque<std::pair<u64, std::unique_ptr<GraphicsPipeline>>> evicted_pipelines; ///< (tick, pipeline)
     std::unordered_set<u64> used_and_evicted; ///< Key hashes of pipelines used this session, evicted since
     std::unordered_set<u64> evicted_keys; ///< Key hashes of every evicted pipeline, to count rebuilds
+    bool warned_pipelines_kept{}; ///< The low-memory hint for free_unused_pipelines was logged
 
     ::Common::unordered_map<ComputePipelineCacheKey, ComputePipelineCacheEntry> compute_cache;
     /// Replaced compute pipelines, destroyed once the GPU and their queued build are done with

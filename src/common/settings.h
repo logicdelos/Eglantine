@@ -645,6 +645,12 @@ struct Values {
         linkage, true, "use_vulkan_driver_pipeline_cache", Category::RendererAdvanced,
         Specialization::Default};
 
+    // Off (default): every graphics pipeline built in a session stays in memory, so a game going
+    // back to an area never rebuilds its shaders. On: above 2048 pipelines (1024 while the host is
+    // low on memory) the least recently used ones unused for 150 s are destroyed.
+    SwitchableSetting<bool> free_unused_pipelines{linkage, false, "free_unused_pipelines",
+                                                  Category::RendererAdvanced};
+
     // Off: task/mesh draws take the compute fallback even when the device has VK_EXT_mesh_shader.
     SwitchableSetting<bool> use_mesh_shaders{linkage, true, "use_mesh_shaders",
                                              Category::RendererAdvanced};

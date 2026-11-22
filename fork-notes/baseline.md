@@ -44,16 +44,17 @@ Four defaults depend on the platform: `cpu_backend`, `cpuopt_unsafe_host_mmu`, `
 
 The baseline has a version number and a hash (SHA-256 of the sorted `key=value` lines). The hash changes whenever a baseline default changes, a baseline setting is added or removed, or the platform changes one of the four platform-dependent defaults. Raise the version and add a history line below whenever the list changes; the test fails until the pinned list and the pinned hash match.
 
-| Platform | Version 1 hash (126 entries) |
+| Platform | Version 2 hash (127 entries) |
 |---|---|
-| Windows x86-64 | `57f9c3b773893b948dacca41e57da5d81d7502f203cd95f7e9bab65c3f4648db` |
-| Linux x86-64 | `a4caf374a41520be82f05bdca2f46b9e7db2c1cb7ff4e81e34477f1dcedb032c` |
+| Windows x86-64 | `9ee81aaf5956e607be1c470bad3b6931ee8f5c2248b2dabba0bc5edd0ba12c2b` |
+| Linux x86-64 | `1fc9705cd5f66daa06667051b8c62af9909b960019a8557be052835bd36faa0e` |
 
 ## History
 
 | Version | Change |
 |---|---|
 | 1 | Console mode Docked, anti-aliasing SMAA and scaling filter BUF become the defaults on desktop builds (before: handheld, FXAA and ScaleForce, which Android keeps). These are the settings the games in the README table were run on in releases 0.1 to 0.3. Config files that kept the old defaults follow the new ones; a value you chose yourself is kept. The debug settings that change a run (`debug_knobs`, `disable_macro_hle`, `disable_macro_jit`, `disable_web_applet`, `enable_all_controllers`, `perform_vulkan_check`, `quest_flag`, `use_auto_stub`, `use_dev_keys`) and `allow_speed_up` (off) are part of the list. Version 1 was never released, so these entries were added to it instead of raising the version. |
+| 2 | Adds `free_unused_pipelines` (off): every graphics pipeline built in a session stays in memory. Before, every pipeline unused for 150 s was destroyed and built again when the game came back to it; on, the setting destroys the least recently used ones only above 2048 (1024 while the host is low on memory). |
 
 ## Command line (`eden-cli`)
 

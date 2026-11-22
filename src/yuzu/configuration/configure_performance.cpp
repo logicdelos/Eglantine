@@ -593,7 +593,7 @@ ConfigureShaders::ConfigureShaders(const Core::System& system_,
 
     add_group(tr("Compilation"), {&values.use_asynchronous_shaders, &values.use_mesh_shaders});
     add_group(tr("Caches"), {&values.use_disk_shader_cache, &values.use_vulkan_driver_pipeline_cache,
-                             &values.driver_shader_cache_size});
+                             &values.driver_shader_cache_size, &values.free_unused_pipelines});
     layout->addStretch(1);
 }
 
@@ -603,7 +603,8 @@ bool ConfigureShaders::IsShaderSetting(u32 id) {
     const auto& v = Settings::values;
     return id == v.use_asynchronous_shaders.Id() || id == v.use_mesh_shaders.Id() ||
            id == v.use_disk_shader_cache.Id() || id == v.use_vulkan_driver_pipeline_cache.Id() ||
-           id == v.private_driver_shader_cache.Id() || id == v.driver_shader_cache_size.Id();
+           id == v.private_driver_shader_cache.Id() || id == v.driver_shader_cache_size.Id() ||
+           id == v.free_unused_pipelines.Id();
 }
 
 void ConfigureShaders::ApplyConfiguration() {
