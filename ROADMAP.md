@@ -85,7 +85,7 @@ Status: in progress; not released.
 Done when: frames over 100 ms in the first two minutes are at least halved on the second launch in both games.
 
 ### 0.6: Replay, regression testing and incident logging
-Status: in progress; the following are release requirements, not shipped features.
+Status: release candidate; requalification on the release binary is open. Nothing here is a shipped result until the release notes show it measured on that binary. Quick Save and Quick Load are not part of 0.6 and are deferred past 1.0 (see Post-1.0).
 
 **Significant change:** a frame's graphics calls can be recorded and replayed without the game, and pictures compared automatically.
 
