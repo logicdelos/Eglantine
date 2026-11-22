@@ -17,6 +17,7 @@
 #include "common/common_types.h"
 #include "common/logging.h"
 #include "core/core.h"
+#include "core/hle/kernel/k_process.h"
 #include "core/hle/service/nvdrv/core/container.h"
 #include "core/hle/service/nvdrv/core/heap_mapper.h"
 #include "core/hle/service/nvdrv/core/nvmap.h"
@@ -146,6 +147,7 @@ void nvhost_as_gpu::Nx2Map(u64 gpu_address, u64 cpu_address, u64 size) {
     // The same CPU range is often mapped twice (at its own address and in a sparse region), so
     // reuse its SMMU mapping.
     Nx2DeviceRange range{};
+    bool mapped_now = false;
     if (const auto it = nx2_device_ranges.find({cpu_address, size}); it != nx2_device_ranges.end()) {
         range = it->second;
     } else if (session->has_preallocated_area && session->mapper->IsInBounds(cpu_address, size)) {
@@ -156,6 +158,7 @@ void nvhost_as_gpu::Nx2Map(u64 gpu_address, u64 cpu_address, u64 size) {
             const DAddr address = smmu.Allocate(Common::AlignUp(size, 0x20000));
             if (address != 0) {
                 smmu.Map(address, cpu_address, size, session->asid, true);
+                mapped_now = true;
             }
             return address;
         };
@@ -177,11 +180,39 @@ void nvhost_as_gpu::Nx2Map(u64 gpu_address, u64 cpu_address, u64 size) {
     const DAddr device_address = range.address;
     nx2_device_ranges[{cpu_address, size}] = range;
     Nx2GpuMemoryRegistry::Get().RecordDeviceRange(cpu_address, size, device_address);
+    // An SMMU mapping holds the physical pages its CPU range had when it was made. A reused range
+    // whose CPU range was freed (sub 102) and got new pages since, as an area load does, would show
+    // the GPU the old pages and keep CPU writes to the new ones from reaching the GPU caches.
+    bool stale = false;
+    if (!mapped_now) {
+        auto& smmu = system.Host1x().MemoryManager();
+        auto& memory = session->process->GetMemory();
+        for (u64 offset = 0; offset < size; offset += Core::Memory::YUZU_PAGESIZE) {
+            if (smmu.GetPointer<u8>(device_address + offset) !=
+                memory.GetPointerSilent(Common::ProcessAddress(cpu_address + offset))) {
+                stale = true;
+                break;
+            }
+        }
+    }
+    if (stale) {
+        LOG_DEBUG(Service_NVDRV,
+                  "Switch 2 GPU mapping {:#x}+{:#x}: CPU {:#x} has new backing, device range "
+                  "{:#x} re-mapped",
+                  gpu_address, size, cpu_address, device_address);
+    }
     // On the GPU thread, like unmaps: a GMMU map takes the texture cache lock, and the callers hold
     // nx2:gpu locks that the GPU thread takes under that lock (sparse blocks backed on write).
     system.GPU().MapInOrder(
-        gpu_address, size, [gmmu = this->gmmu, gpu_address, device_address, size] {
+        gpu_address, size,
+        [gmmu = this->gmmu, &smmu = system.Host1x().MemoryManager(), gpu_address, device_address,
+         cpu_address, size, stale, asid = session->asid] {
             gmmu->SettleIssuedReleases(gpu_address, size);
+            if (stale) {
+                // Unmap invalidates the caches over the range (shader rejections included).
+                smmu.Unmap(device_address, size);
+                smmu.Map(device_address, cpu_address, size, asid, true);
+            }
             gmmu->Map(gpu_address, device_address, size, Tegra::PTEKind::PITCH, false);
         });
     LOG_DEBUG(Service_NVDRV, "Switch 2 GPU mapping {:#x}+{:#x} -> CPU {:#x}", gpu_address, size,
