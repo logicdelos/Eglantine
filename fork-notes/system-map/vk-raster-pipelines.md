@@ -47,7 +47,7 @@
 5. `BuiltPipeline` decides whether a still-compiling pipeline skips its draw (`zeta_enable` draws and mesh draws skip; small draws skip only if the target already holds earlier output; Switch 2 native draws are not skipped).
 6. Back in `PrepareDraw`: take buffer and texture cache mutexes, `pipeline->SetEngine`, `SetVertexRepackLayout`, `pipeline->Configure`, frame dump, `UpdateDynamicStates`, query cache, then the Vulkan draw call.
 7. `UpdateDynamicStates` bit-casts the 32-byte dirty set to four `u64` words and ANDs it with constant masks, so a clean draw costs a few instructions. Updaters call `state_tracker.Touch*` and `scheduler.Record`.
-8. Every frame `TickFrame` drains disk results, sorts deferred build candidates, increments `frame_count`, retires pipelines, and every 600 frames runs `EvictUnusedPipelines` (unused for 9000 frames; never-used preloaded pipelines are kept).
+8. Every frame `TickFrame` drains disk results, sorts deferred build candidates, increments `frame_count`, retires pipelines, and every 600 frames runs `EvictUnusedPipelines`: only above 2048 graphics pipelines (1024 while `Nx2Bottleneck::IsLowMemory`), it destroys the least recently used ones unused for 9000 frames, down to 7/8 of the cap; never-used preloaded pipelines are kept.
 9. Boot: `LoadDiskResources` reads `vulkan.mythos.bin` (graphics/compute records with their environments), queues builds, optionally defers the rest to background workers, then `StartShaderPrecache`.
 
 ## Connections

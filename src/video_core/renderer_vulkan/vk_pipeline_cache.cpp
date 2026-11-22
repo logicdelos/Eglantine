@@ -31,6 +31,7 @@
 #include <vector>
 #include "common/cityhash.h"
 #include "common/env_gate.h"
+#include "common/nx2_diagnostics.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/scope_exit.h"
@@ -2486,50 +2487,74 @@ void PipelineCache::EvictUnusedPipelines() {
         return;
     }
     // Each built pipeline holds ~0.45 MB of driver memory and none was ever destroyed, so it grew
-    // with every place a session went (title 1: 1,500 on its title screen alone). One unused for
-    // this long is destroyed; rebuilding it later requires a full GPU-thread shader translation
-    // (~8.5 ms each) plus a driver pipeline cache hit.
+    // with every place a session went (title 1: 1,500 on its title screen alone). Rebuilding one
+    // later costs a shader translation plus a driver pipeline cache hit, and its draws are skipped
+    // until the rebuild lands. Destroying every pipeline unused for 150 s made a game that comes
+    // back to its areas rebuild the same ones over and over (Xenoblade 2, 68 min: 1,886 distinct
+    // pipelines, 4,744 evictions, 66% of all builds were rebuilds, 10,825 draws skipped while they
+    // landed). So pipelines are only destroyed above a count cap, least recently used first and
+    // only those unused for 150 s, down to 7/8 of the cap; the cap halves while the host is low
+    // on memory (Nx2Bottleneck::IsLowMemory).
     constexpr u64 EvictAfterFrames = 9000;
+    constexpr size_t PipelineCap = 2048;
     if (frame_count <= EvictAfterFrames) {
+        return;
+    }
+    const bool low_memory = Nx2Bottleneck::IsLowMemory(Nx2Bottleneck::ReadHostMemory());
+    const size_t cap = low_memory ? PipelineCap / 2 : PipelineCap;
+    if (graphics_cache.size() <= cap) {
         return;
     }
     const u64 cutoff = frame_count - EvictAfterFrames;
     const u64 tick = scheduler.CurrentTick();
     // Nx2Perf pipeline_keep_preloaded (on by default): the ones built at boot from the used list
     // that this session has not drawn with yet keep LastUse() == 0; they are kept, not evicted
-    // after 150 s and rebuilt on the GPU thread when the player enters their area.
+    // and rebuilt on the GPU thread when the player enters their area.
     const bool keep_preloaded =
         VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::PipelineKeepPreloaded);
-    size_t evicted = 0;
+    std::vector<std::pair<u64, GraphicsPipeline*>> candidates;
     size_t kept = 0;
-    for (auto it = graphics_cache.begin(); it != graphics_cache.end();) {
-        GraphicsPipeline* const pipeline = it->second.get();
+    for (const auto& [key, owned] : graphics_cache) {
+        GraphicsPipeline* const pipeline = owned.get();
         if (pipeline == nullptr || pipeline == current_pipeline || !pipeline->IsBuilt() ||
             pipeline->LastUse() >= cutoff) {
-            ++it;
             continue;
         }
         if (keep_preloaded && !used_this_session.contains(pipeline)) {
             ++kept;
+            continue;
+        }
+        candidates.emplace_back(pipeline->LastUse(), pipeline);
+    }
+    if (keep_preloaded && VideoCommon::Nx2Perf::Verify()) {
+        // Eviction only frees driver memory, so there is no wrong answer to fall back from.
+        LOG_INFO(Render_Vulkan,
+                 "Nx2Perf pipeline_keep_preloaded: {} unused for {} frames, kept {} never-used",
+                 candidates.size() + kept, EvictAfterFrames, kept);
+    }
+    const size_t target = cap - cap / 8;
+    const size_t evict = std::min(candidates.size(), graphics_cache.size() - target);
+    if (evict == 0) {
+        return;
+    }
+    std::nth_element(candidates.begin(), candidates.begin() + (evict - 1), candidates.end(),
+                     [](const auto& a, const auto& b) { return a.first < b.first; });
+    std::unordered_set<const GraphicsPipeline*> victims;
+    victims.reserve(evict);
+    for (size_t i = 0; i < evict; ++i) {
+        victims.insert(candidates[i].second);
+    }
+    for (auto it = graphics_cache.begin(); it != graphics_cache.end();) {
+        if (!victims.contains(it->second.get())) {
             ++it;
             continue;
         }
-        if (used_this_session.erase(pipeline) != 0) {
+        if (used_this_session.erase(it->second.get()) != 0) {
             used_and_evicted.insert(it->first.Hash());
         }
         evicted_keys.insert(it->first.Hash());
         evicted_pipelines.emplace_back(tick, std::move(it->second));
         it = graphics_cache.erase(it);
-        ++evicted;
-    }
-    if (keep_preloaded && VideoCommon::Nx2Perf::Verify()) {
-        // Eviction only frees driver memory, so there is no wrong answer to fall back from.
-        LOG_INFO(Render_Vulkan,
-                 "Nx2Perf pipeline_keep_preloaded: old rule would evict {}, kept {} never-used",
-                 evicted + kept, kept);
-    }
-    if (evicted == 0) {
-        return;
     }
     for (auto& [key, pipeline] : graphics_cache) {
         if (pipeline) {
@@ -2539,8 +2564,11 @@ void PipelineCache::EvictUnusedPipelines() {
     graphics_fast_cache.fill(nullptr);
     skipped_geometry = {};
     last_skipped_geometry_frame = ~u64{};
-    LOG_INFO(Render_Vulkan, "Evicted {} graphics pipelines unused for {} frames, {} left", evicted,
-             EvictAfterFrames, graphics_cache.size());
+    LOG_INFO(Render_Vulkan,
+             "Evicted {} least recently used graphics pipelines (unused for {} frames or more), "
+             "{} left, cap {}{}",
+             evict, EvictAfterFrames, graphics_cache.size(), cap,
+             low_memory ? " (halved: host low on memory)" : "");
 }
 
 void PipelineCache::StartShaderPrecache(u64 title_id) {
