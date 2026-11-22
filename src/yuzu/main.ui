@@ -433,7 +433,7 @@
     <bool>false</bool>
    </property>
    <property name="text">
-    <string>&amp;Compatibility Report...</string>
+    <string>Export &amp;Compatibility Report...</string>
    </property>
   </action>
   <action name="action_Check_For_Updates">

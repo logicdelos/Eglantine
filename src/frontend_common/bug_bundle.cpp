@@ -120,10 +120,9 @@ std::string ManifestJson(const Report& report, std::time_t now, const std::strin
     out += "  \"format\": \"eglantine-bug-bundle\",\n  \"version\": 1,\n";
     out += fmt::format("  \"created\": {},\n  \"trigger\": {},\n",
                        JsonString(UtcStamp(now)), JsonString(report.trigger));
-    out += fmt::format(
-        "  \"build\": {{\"name\": {}, \"version\": {}, \"scm_rev\": {}, \"branch\": {}}},\n",
-        JsonString(Common::g_build_fullname), JsonString(Common::g_build_version),
-        JsonString(Common::g_scm_rev), JsonString(Common::g_scm_branch));
+    out += fmt::format("  \"build\": {{\"name\": {}, \"scm_rev\": {}, \"branch\": {}}},\n",
+                       JsonString(Common::BuildDisplayName()), JsonString(Common::g_scm_rev),
+                       JsonString(Common::g_scm_branch));
     out += fmt::format("  \"game\": {{\"title\": {}, \"program_id\": {}, \"version\": {}}},\n",
                        JsonString(report.game_title), JsonString(report.game_program_id),
                        JsonString(report.game_version));
@@ -155,7 +154,7 @@ std::string Redact(std::string text) {
     return text;
 }
 
-std::string SettingsReport() {
+std::string SettingsReport(bool changed_only) {
     std::string out;
     for (const auto& [category, settings] : Settings::values.linkage.by_category) {
         if (category == Settings::Category::WebService ||
@@ -165,6 +164,9 @@ std::string SettingsReport() {
         for (const Settings::BasicSetting* const setting : settings) {
             const std::string& label = setting->GetLabel();
             if (Settings::IsSecretSetting(label) || label.find("username") != std::string::npos) {
+                continue;
+            }
+            if (changed_only && setting->ToString() == setting->DefaultToString()) {
                 continue;
             }
             out += fmt::format("[{}] {} = {}", Settings::TranslateCategory(category), label,
@@ -199,9 +201,11 @@ std::string ReadLog(const std::filesystem::path& path) {
 }
 
 std::string Preview(const Report& report) {
-    std::string out = "Nothing is sent. This is what the report file will hold.\n\n";
-    out += fmt::format("== Build ==\n{} {} ({})\n\n", Common::g_build_fullname,
-                       Common::g_build_version, Common::g_scm_rev);
+    std::string out =
+        "Nothing is sent. This is a summary of what the report file will hold: long texts are "
+        "shortened and the screenshot is not shown. Open the ZIP and inspect it before you share "
+        "it.\n\n";
+    out += fmt::format("== Build ==\n{} ({})\n\n", Common::BuildDisplayName(), Common::g_scm_rev);
     out += "== Game ==\n";
     if (report.game_title.empty() && report.game_program_id.empty()) {
         out += "(no game running)\n";
@@ -215,12 +219,12 @@ std::string Preview(const Report& report) {
     for (const auto& [key, value] : report.system) {
         out += fmt::format("{}: {}\n", key, value);
     }
-    out += fmt::format("\n== Settings (settings.txt, {} bytes) ==\n{}\n", report.settings.size(),
-                       Excerpt(report.settings));
+    out += fmt::format("\n== Settings (settings.txt, {} bytes, excerpt) ==\n{}\n",
+                       report.settings.size(), Excerpt(report.settings));
     out += report.screenshot_png.empty()
                ? std::string{"\n== Screenshot ==\n(not included)\n"}
-               : fmt::format("\n== Screenshot ==\nscreenshot.png, {} bytes. Check it for anything "
-                             "private that was on screen.\n",
+               : fmt::format("\n== Screenshot ==\nscreenshot.png, {} bytes (not shown here). It "
+                             "can show anything that was on screen: open it and check it.\n",
                              report.screenshot_png.size());
     out += report.log.empty()
                ? std::string{"\n== Log ==\n(not included)\n"}

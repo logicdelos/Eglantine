@@ -22,7 +22,7 @@ struct Addon {
     bool enabled;
 };
 
-/// "Name vVersion, Name2" for the enabled add-ons, "none" when there are none.
+/// "Enabled: Name (Version); Name2" for the enabled add-ons, "None enabled." when there are none.
 QString SummarizeEnabledAddons(const QList<Addon>& addons);
 
 /// What the report states about the game and the computer it ran on.
@@ -33,7 +33,6 @@ struct Session {
     QString game_version;
     QString cpu;
     QString gpu;
-    QString driver;
     QString os;
     QString ram;
     QString graphics_api;

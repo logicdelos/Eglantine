@@ -7,7 +7,6 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <QIcon>
 #include <fmt/ranges.h>
 #include "common/scm_rev.h"
 #include "ui_aboutdialog.h"
@@ -28,11 +27,6 @@ AboutDialog::AboutDialog(QWidget* parent)
         QStringLiteral("<html><head/><body><p><span style=\" font-size:18pt;\">%1</span></p>"
                        "</body></html>")
             .arg(QString::fromUtf8(Common::g_build_name).toHtmlEscaped()));
-    // Try and request the icon from Qt theme (Linux?)
-    const QIcon yuzu_logo = QIcon::fromTheme(QStringLiteral("org.yuzu_emu.yuzu"));
-    if (!yuzu_logo.isNull()) {
-        ui->labelLogo->setPixmap(yuzu_logo.pixmap(200));
-    }
     // Everything the identity does not already carry: the label this run was
     // given, the compiler, and when it was built. Ordered by what gets asked for.
     static const std::string details = fmt::format(

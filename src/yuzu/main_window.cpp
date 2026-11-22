@@ -4508,9 +4508,10 @@ void MainWindow::OpenPerGameConfiguration(u64 title_id, const std::string& file_
     speed_limit_before_hotkeys.reset();
     if (result == QDialog::Accepted) {
         dialog.ApplyConfiguration();
-        if (const auto title = dialog.RenamedTitle()) {
-            game_list->SetGameTitle(title_id, *title);
-        }
+    }
+    // Apply saves the title too, so the library row follows it even when the dialog is cancelled.
+    if (const auto title = dialog.RenamedTitle()) {
+        game_list->SetGameTitle(title_id, *title);
     }
 
     // Do not cause the global config to write local settings into the config file
@@ -5215,12 +5216,17 @@ void MainWindow::OnCaptureScreenshot() {
 }
 
 void MainWindow::OnMarkVisualBug() {
+    // Metadata only: the mark records no screenshot unless the user takes one themselves.
     const auto incidents_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir) / "incidents";
     const auto res = Common::SystemLog::TriggerQuickMark(incidents_dir, "visual_glitch", 5000);
-    if (res.ok && QtCommon::emu_thread != nullptr && QtCommon::emu_thread->IsRunning()) {
-        const QString shot_path = QString::fromStdString(
-            Common::FS::PathToUTF8String(res.directory / "screenshot.png"));
-        render_window->CaptureScreenshot(shot_path);
+    if (!res.ok) {
+        LOG_ERROR(Debug, "Visual bug mark failed at present {} -> {}", res.present_id,
+                  Common::FS::PathToUTF8String(res.directory));
+        if (statusBar() != nullptr) {
+            statusBar()->showMessage(tr("Could not mark the visual bug. See the log for details."),
+                                     6000);
+        }
+        return;
     }
     LOG_INFO(Debug, "Visual bug marked #{} at present {} -> {}", res.mark_id, res.present_id,
              Common::FS::PathToUTF8String(res.directory));

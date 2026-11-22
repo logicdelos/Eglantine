@@ -55,15 +55,16 @@ struct Result {
 [[nodiscard]] std::string Redact(std::string text);
 
 /// Every setting as "[Category] label = value", credentials left out, redacted. A setting a game
-/// overrides shows its global value too.
-[[nodiscard]] std::string SettingsReport();
+/// overrides shows its global value too. With changed_only, only the settings that differ from
+/// their defaults.
+[[nodiscard]] std::string SettingsReport(bool changed_only = false);
 
 /// The log file as text: redacted, and cut in the middle (first 1 MiB, last 6 MiB) when over
 /// 8 MiB. Empty when there is no log.
 [[nodiscard]] std::string ReadLog(const std::filesystem::path& path);
 
-/// The text the user reviews before saving: what the zip will hold, its main texts in full and
-/// the length of the others.
+/// The summary the user reads before saving: what the zip will hold, with long texts shortened
+/// and the screenshot only counted. The user is told to inspect the zip itself before sharing.
 [[nodiscard]] std::string Preview(const Report& report);
 
 /// Writes <directory>/eglantine-bug-<stamp>.zip with README.md, bundle.json, settings.txt,

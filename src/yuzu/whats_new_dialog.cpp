@@ -82,23 +82,23 @@ WhatsNewDialog::WhatsNewDialog(QWidget* parent) : QDialog(parent) {
                          tr("Games run the same without any enhancement. Upscaling, frame "
                             "generation and the other extras are off until you turn them on in "
                             "Configure or in a game's Properties.")));
-    body->addWidget(Item(tr("Recommended settings, only when you ask"),
-                         tr("Help > Apply Recommended Settings returns a short list of "
-                            "performance and compatibility settings to Eglantine's defaults. Your "
-                            "previous values are kept: Help > Restore My Previous Settings puts "
-                            "them back. Nothing is applied automatically.")));
-    body->addWidget(Item(tr("Report a bug, with a review first"),
+    body->addWidget(Item(tr("Recommended settings, per game"),
+                         tr("Games with known-good settings list them in their own Properties, "
+                            "under the Tweaks tab. Tick the ones you want and choose Apply "
+                            "Selected. Nothing is applied automatically.")));
+    body->addWidget(Item(tr("Report a bug, with a summary first"),
                          tr("Help > Report a Bug (Ctrl+F12) saves a bundle on your computer with "
-                            "a screenshot and the details you choose. You can read what it holds "
-                            "before you share it. Eglantine sends nothing by itself.")));
+                            "the details you choose. The review shows a summary of what it holds, "
+                            "so open the ZIP and inspect it before you share it. Eglantine sends "
+                            "nothing by itself.")));
     body->addWidget(Item(tr("Safer profile import"),
                          tr("Importing from another emulator copies your data and keeps the "
                             "originals. If an import is interrupted, Eglantine offers to recover "
                             "it the next time and keeps your current profile meanwhile.")));
     body->addWidget(Item(tr("Same places as before"),
                          tr("Configure is in Emulation > Configure (Ctrl+,). Right-click a game "
-                            "and choose Properties for its own settings. Help > What's New in "
-                            "Eglantine shows this again.")));
+                            "and choose Configure Game for its own settings. Help > What's New "
+                            "shows this again.")));
     auto* const scroll = new QScrollArea;
     scroll->setFrameShape(QFrame::NoFrame);
     scroll->setWidgetResizable(true);

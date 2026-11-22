@@ -67,8 +67,9 @@ BugReportDialog::BugReportDialog(Core::System& system, QWidget* parent)
     auto* const layout = new QVBoxLayout(this);
     auto* const intro = new QLabel(
         tr("Describe what went wrong and what you expected. Eglantine saves a report on this "
-           "computer. You read everything in it before it is written, and Eglantine sends "
-           "nothing: you decide whether to share the file."));
+           "computer. A summary of it is shown before it is written, and Eglantine sends "
+           "nothing: you decide whether to share the file. Open the ZIP and inspect it before "
+           "you share it."));
     intro->setWordWrap(true);
     layout->addWidget(intro);
 
@@ -103,7 +104,7 @@ BugReportDialog::BugReportDialog(Core::System& system, QWidget* parent)
     layout->addWidget(status);
 
     buttons = new QDialogButtonBox;
-    review_button = buttons->addButton(tr("Review Report"), QDialogButtonBox::ActionRole);
+    review_button = buttons->addButton(tr("Show Summary"), QDialogButtonBox::ActionRole);
     save = buttons->addButton(tr("Save Report"), QDialogButtonBox::AcceptRole);
     save->setEnabled(false);
     open_folder = buttons->addButton(tr("Open Folder"), QDialogButtonBox::ActionRole);
@@ -177,8 +178,8 @@ void BugReportDialog::PollScreenshot() {
     QBuffer buffer(&screenshot_png);
     buffer.open(QIODevice::WriteOnly);
     if (image.save(&buffer, "PNG")) {
+        // Offered, never selected for the user: a screenshot can show anything on screen.
         include_screenshot->setEnabled(true);
-        include_screenshot->setChecked(true);
     } else {
         screenshot_png.clear();
     }
@@ -192,7 +193,7 @@ void BugReportDialog::InvalidateReview() {
     save->setEnabled(false);
     if (review_text->isVisible()) {
         review_text->setPlainText(
-            tr("The report changed. Press Review Report to read it again before saving."));
+            tr("The report changed. Press Show Summary to read it again before saving."));
     }
 }
 
