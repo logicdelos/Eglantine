@@ -73,6 +73,7 @@ public:
     void GetContext(Kernel::Svc::ThreadContext& ctx) const override;
     void SetContext(const Kernel::Svc::ThreadContext& ctx) override;
     void SetTpidrroEl0(u64 value) override;
+    u64 GetProgramCounter() const override;
 
     void GetSvcArguments(std::span<uint64_t, 8> args) const override;
     void SetSvcArguments(std::span<const uint64_t, 8> args) override;

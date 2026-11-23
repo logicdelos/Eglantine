@@ -381,6 +381,10 @@ void ArmDynarmic32::SetTpidrroEl0(u64 value) {
     m_cp15->uro = static_cast<u32>(value);
 }
 
+u64 ArmDynarmic32::GetProgramCounter() const {
+    return m_jit->Regs()[15];
+}
+
 void ArmDynarmic32::GetContext(Kernel::Svc::ThreadContext& ctx) const {
     Dynarmic::A32::Jit const& j = *m_jit;
     auto& gpr = j.Regs();

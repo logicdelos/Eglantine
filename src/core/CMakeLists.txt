@@ -14,6 +14,7 @@ add_library(core STATIC
     arm/debug.h
     arm/exclusive_monitor.cpp
     arm/exclusive_monitor.h
+    arm/guest_sample.h
     arm/symbols.cpp
     arm/symbols.h
     constants.cpp

@@ -84,6 +84,7 @@ add_executable(tests
     core/nx2_debug_server.cpp
     core/nx2_movie_pacing.cpp
     core/nx2_gpu_memory_registry.cpp
+    core/guest_sample.cpp
     core/priority_queue.cpp
     core/replay_kernel.cpp
     core/scheduler_idle_migration.cpp

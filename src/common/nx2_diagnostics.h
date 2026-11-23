@@ -203,10 +203,11 @@ private:
     bool fired_{};
 };
 
-/// Where the probe of a stuck core reads the guest from. `read` gives the program counter of the
-/// guest code the core runs (and the id of the guest thread on it) and returns false when it
-/// cannot; `locate` turns a program counter into "module+0xoffset". Set by the core while a
-/// process lives, cleared before it goes; both are only called with the source's lock held.
+/// Where the probe of a stuck core reads the guest from. `read` gives the program counter where the
+/// core's guest code last stopped (and the id of the guest thread it ran), as the core published
+/// them itself, and returns false when there is none; `locate` turns a program counter into
+/// "module+0xoffset". Set by the core while a process lives, cleared before it goes; both are only
+/// called with the source's lock held.
 struct GuestCoreSource {
     bool (*read)(void* user, size_t core, u64& pc, u64& thread_id) = nullptr;
     std::string (*locate)(void* user, u64 pc) = nullptr;

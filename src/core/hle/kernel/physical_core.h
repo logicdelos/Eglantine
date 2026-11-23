@@ -17,6 +17,7 @@
 #include <mutex>
 
 #include "core/arm/arm_interface.h"
+#include "core/arm/guest_sample.h"
 
 namespace Kernel {
 class KernelCore;
@@ -77,12 +78,20 @@ public:
         return m_core_index;
     }
 
+    // Where this core's guest code last stopped, and the guest thread it ran (the no-progress
+    // probe's source). Safe from any host thread at any time: the core publishes it itself when
+    // RunThread's CPU slice ends, so it lags a slice that is still running.
+    bool ReadGuestSample(u64& pc, u64& thread_id) const noexcept {
+        return m_guest_sample.Read(pc, thread_id);
+    }
+
 private:
     const std::size_t m_core_index;
     std::mutex m_guard;
     std::condition_variable m_on_interrupt;
     Core::ArmInterface* m_arm_interface{};
     KThread* m_current_thread{};
+    Core::GuestSample m_guest_sample;
     std::atomic<bool> m_is_interrupted{};
     std::atomic<bool> m_yield_idle{};
     bool m_yield_woken{};

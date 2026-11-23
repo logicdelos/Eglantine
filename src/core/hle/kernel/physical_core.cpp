@@ -88,6 +88,10 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
             interface->GetContext(thread->GetContext());
         }
 
+        // The CPU has stopped, so this host thread is the only one that may read its registers:
+        // publish where it stopped for the diagnostics poller, which reads nothing else.
+        m_guest_sample.Publish(interface->GetProgramCounter(), thread->GetThreadId());
+
         // Unlock the thread.
         interface->UnlockThread(thread);
 

@@ -127,6 +127,11 @@ public:
     virtual void SetContext(const Kernel::Svc::ThreadContext& ctx) = 0;
     virtual void SetTpidrroEl0(u64 value) = 0;
 
+    // The guest program counter, for the core's own host thread once the CPU has stopped (what
+    // PhysicalCore publishes in its GuestSample). Cheaper than GetContext, which copies every
+    // register; the same rule applies: never while the CPU is running.
+    virtual u64 GetProgramCounter() const = 0;
+
     virtual void GetSvcArguments(std::span<uint64_t, 8> args) const = 0;
     virtual void SetSvcArguments(std::span<const uint64_t, 8> args) = 0;
     virtual u32 GetSvcNumber() const = 0;

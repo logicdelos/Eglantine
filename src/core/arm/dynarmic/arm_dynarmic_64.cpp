@@ -678,6 +678,10 @@ void ArmDynarmic64::SetTpidrroEl0(u64 value) {
     m_cb->m_tpidrro_el0 = value;
 }
 
+u64 ArmDynarmic64::GetProgramCounter() const {
+    return m_jit->GetPC();
+}
+
 void ArmDynarmic64::GetContext(Kernel::Svc::ThreadContext& ctx) const {
     Dynarmic::A64::Jit const& j = *m_jit;
     auto gpr = j.GetRegisters();

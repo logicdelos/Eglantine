@@ -240,28 +240,18 @@ std::string GuestThreadName(void* user, u64 id) {
     return {};
 }
 
-/// The no-progress probe's source: the guest program counter of `core` and the guest thread on it.
-/// A copy read from another host thread while the core runs: it can be a little stale, which is
-/// all a diagnostic sample needs.
+/// The no-progress probe's source: the guest program counter of `core` and the guest thread it
+/// ran. Reads the pair the core's own host thread published when its CPU last stopped (see
+/// PhysicalCore::ReadGuestSample); the CPU's registers and the scheduler's current thread are
+/// never touched from here, so a running core cannot race with this. The pair lags a slice that
+/// is still running, and in a wait loop (the case this probe exists for) the slice ends at every
+/// SVC, so it names the call site the guest keeps coming back to.
 bool ReadGuestCore(void* user, size_t core, u64& pc, u64& thread_id) {
     auto& system = *static_cast<System*>(user);
-    Kernel::KProcess* const process = system.Kernel().ApplicationProcess();
-    if (process == nullptr || core >= Hardware::NUM_CPU_CORES) {
+    if (core >= Hardware::NUM_CPU_CORES) {
         return false;
     }
-    const Core::ArmInterface* const arm = process->GetArmInterface(core);
-    if (arm == nullptr) {
-        return false;
-    }
-    Kernel::Svc::ThreadContext context{};
-    arm->GetContext(context);
-    pc = context.pc;
-    thread_id = 0;
-    if (const Kernel::KThread* const thread =
-            system.Kernel().Scheduler(core).GetSchedulerCurrentThread()) {
-        thread_id = thread->GetThreadId();
-    }
-    return true;
+    return system.Kernel().PhysicalCore(core).ReadGuestSample(pc, thread_id);
 }
 
 /// "module+0xoffset" of a guest address, or nothing. Called with the source's lock held and so by

@@ -399,6 +399,10 @@ void ArmNce::SetTpidrroEl0(u64 value) {
     m_guest_ctx.tpidrro_el0 = value;
 }
 
+u64 ArmNce::GetProgramCounter() const {
+    return m_guest_ctx.pc;
+}
+
 void ArmNce::GetContext(Kernel::Svc::ThreadContext& ctx) const {
     for (size_t i = 0; i < 29; i++) {
         ctx.r[i] = m_guest_ctx.cpu_registers[i];
