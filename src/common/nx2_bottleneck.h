@@ -34,6 +34,7 @@ enum class Wait : u32 {
     VulkanWorker, // the Vulkan worker, to empty its queue
     Present,      // a free presentation frame
     GpuBack,      // the GPU thread, for the back thread (GPU thread split)
+    HostGpuPresent, // the host graphics card, inside the present call (vkQueuePresentKHR, acquire)
     GuestOnGpu,   // the game, for the frame it presented to finish on the GPU
     FileRead,     // any thread, inside a read of a host file
     KernelLock,   // any thread, to take the kernel scheduler lock while another one holds it

@@ -46,6 +46,7 @@ add_executable(tests
     common/speed_limit.cpp
     common/log_retention.cpp
     common/read_attribution.cpp
+    common/nx2_bottleneck_present.cpp
     common/system_log.cpp
     common/nx2_diagnostics.cpp
     common/test_frame_delay.cpp
@@ -162,6 +163,7 @@ add_executable(tests
     video_core/ocarina_upscale.cpp
     video_core/compute_clean_cut.cpp
     video_core/nx2_profile_lite.cpp
+    video_core/nx2_host_gpu.cpp
     input_common/calibration_configuration_job.cpp
     frontend_common/ui_e_install_keys.cpp
     frontend_common/ui_e_profile_import.cpp

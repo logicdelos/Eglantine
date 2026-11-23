@@ -241,8 +241,8 @@ Json SplitJson(const Nx2Bottleneck::ThreadSplit& split) {
     if (!split.seen) {
         return nullptr;
     }
-    static constexpr std::array<std::string_view, 5> names{"host_gpu", "shader_build",
-                                                           "vulkan_worker", "present", "gpu_back"};
+    static constexpr std::array<std::string_view, 6> names{
+        "host_gpu", "shader_build", "vulkan_worker", "present", "gpu_back", "host_gpu_present"};
     static_assert(std::tuple_size_v<decltype(split.waits_ms)> == names.size());
     Json waits = Json::object();
     for (size_t i = 0; i < names.size(); ++i) {

@@ -60,7 +60,7 @@ constexpr std::array<std::string_view, NumThreads> ThreadNames{
 };
 constexpr std::array<std::string_view, NumThreadWaits> WaitNames{
     "the graphics card", "shader builds",       "the Vulkan worker",
-    "a present frame",   "the GPU back thread",
+    "a present frame",   "the GPU back thread", "the graphics card in the present call",
 };
 /// A thread working this much of the time, or guest code filling a core this much, limits.
 constexpr double Saturated = 0.85;
@@ -395,6 +395,10 @@ std::string Describe(const Window& window, Thread thread, size_t part) {
         return fmt::format("the graphics card (the {} waits for it)", name);
     case Wait::ShaderBuild:
         return fmt::format("shader builds (the {} waits for them)", name);
+    case Wait::HostGpuPresent:
+        return fmt::format("the graphics card (the {} waits {:.0f}% of its time in the present "
+                           "call for it)",
+                           name, window.Share(thread, part) * 100.0);
     case Wait::VulkanWorker:
         return Dominant(window, Thread::VulkanWorker);
     case Wait::Present:
@@ -1450,8 +1454,8 @@ void NoteFrame() {
         } else {
             last_hitch_ns = now;
             static constexpr std::array<const char*, NumWaits> ShortWaitNames{
-                "HostGpu", "ShaderBuild", "VulkanWorker", "Present",
-                "GpuBack", "GuestOnGpu",  "FileRead",     "KernelLock",
+                "HostGpu", "ShaderBuild", "VulkanWorker",   "Present",   "GpuBack",
+                "HostGpuPresent", "GuestOnGpu",  "FileRead", "KernelLock",
             };
             size_t best_w = 0;
             u64 best_ns = 0;

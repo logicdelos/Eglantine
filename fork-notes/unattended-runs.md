@@ -67,7 +67,7 @@ Without the three options, only codes 0, 1 and 75 exist; a bad argument also exi
 | `frames` | Completed frames counted by the emulator's frame counter. |
 | `fps` | `frames` divided by `active_seconds`. |
 | `frame_time_ms` | Frame times: `samples` (intervals measured), `mean`, `p50`, `p95`, `p99`, `max`, `method` (`nearest_rank_log_histogram_us`), `relative_bucket_width` (0.015625; a bucket is at most 1/64 of its value), and `over_25_ms`, `over_50_ms`, `over_100_ms`. |
-| `threads.gpu`, `threads.gpu_back`, `threads.vulkan_worker` | One object per thread, or `null` when that thread was never observed: `observed_seconds`, `work_ms`, `idle_ms`, `waits_ms`, with the waits split into `host_gpu`, `shader_build`, `vulkan_worker`, `present` and `gpu_back`. |
+| `threads.gpu`, `threads.gpu_back`, `threads.vulkan_worker` | One object per thread, or `null` when that thread was never observed: `observed_seconds`, `work_ms`, `idle_ms`, `waits_ms`, with the waits split into `host_gpu`, `shader_build`, `vulkan_worker`, `present`, `gpu_back` and `host_gpu_present` (the host graphics card, inside the present call). |
 | `guest_gpu_wait` | `total_ms`, `longest_ms`, `count`, and `fraction`, the total wait as a fraction of `active_seconds`. |
 | `guest_cpu_core_busy_ms` | Busy milliseconds per guest core; empty when the guest never ran. |
 | `shader_wait` | `total_ms`, `longest_ms`, `count` — time the guest waited for shader work. |

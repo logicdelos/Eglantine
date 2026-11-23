@@ -17,6 +17,7 @@
 #endif
 
 #include "common/logging.h"
+#include "common/nx2_bottleneck.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "common/system_log.h"
@@ -188,6 +189,7 @@ bool Swapchain::AcquireNextImage(bool may_flush) {
     VkResult result;
     {
         const VideoCommon::Nx2Spikes::SpanScope acquire_wait{VideoCommon::Nx2Spikes::Cause::Waiting};
+        const Nx2Bottleneck::WaitScope host_wait{Nx2Bottleneck::Wait::HostGpuPresent};
         const VideoCommon::Nx2Profile::Scope acquire_zone{VideoCommon::Nx2Profile::Zone::SwapAcquire};
         result = device.GetLogical().AcquireNextImageKHR(
             *swapchain, (std::numeric_limits<u64>::max)(), *present_semaphores[frame_index],
@@ -295,6 +297,7 @@ VkResult Swapchain::Present(VkSemaphore render_semaphore) {
     // The submit lock and the present call can both block (a full presentation queue): that is
     // waiting before the host present this call ends, with no producer to name.
     const VideoCommon::Nx2Spikes::SpanScope present_wait{VideoCommon::Nx2Spikes::Cause::Waiting};
+    const Nx2Bottleneck::WaitScope host_wait{Nx2Bottleneck::Wait::HostGpuPresent};
     std::scoped_lock lock{scheduler.submit_mutex};
     const VkResult result = present_queue.Present(present_info);
     switch (result) {

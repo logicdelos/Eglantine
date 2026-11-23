@@ -334,6 +334,17 @@ public:
         return graphics_family;
     }
 
+    /// Returns the number of valid bits in a timestamp of the graphics queue family (0 when it
+    /// has none).
+    u32 GetGraphicsTimestampValidBits() const {
+        return graphics_timestamp_valid_bits;
+    }
+
+    /// Returns the nanoseconds one timestamp tick lasts.
+    float GetTimestampPeriod() const {
+        return properties.properties.limits.timestampPeriod;
+    }
+
     /// Returns main present queue family index.
     u32 GetPresentFamily() const {
         return present_family;
@@ -1323,6 +1334,7 @@ private:
     u32 graphics_family{};       ///< Main graphics queue family index.
     u32 present_family{};        ///< Main present queue family index.
     bool graphics_family_sparse_binding{};
+    u32 graphics_timestamp_valid_bits{}; ///< Valid timestamp bits of the graphics queue family.
 
     struct Extensions {
 #define EXTENSION(prefix, macro_name, var_name) bool var_name{};

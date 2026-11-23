@@ -25,6 +25,7 @@
 #include "common/progress_counter.h"
 #include "common/settings.h"
 #include "video_core/gpu_split.h"
+#include "video_core/nx2_host_gpu.h"
 #include "video_core/renderer_vulkan/fragment_barrier_state.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -40,6 +41,7 @@ class CommandPool;
 class Device;
 class Framebuffer;
 class GraphicsPipeline;
+class HostGpuTimeline;
 class StateTracker;
 class UploadBatch;
 
@@ -114,6 +116,24 @@ public:
             return;
         }
         EndRenderPass();
+    }
+
+    /// Host GPU time by pass (EDEN_NX2_GPU_PROFILE, see nx2_host_gpu.h). On the recording thread:
+    /// the start of a frame, after the present of the one before. Reads back finished profiled
+    /// frames, and profiles this one if it is the one in FrameInterval.
+    void TickHostGpuProfile();
+
+    /// The end of a profiled frame: the timestamp that ends the last span, in the submission that
+    /// presents it (before its Flush). Does nothing for a frame that is not profiled.
+    void EndHostGpuProfileFrame();
+
+    /// A profiled frame: a timestamp that starts a span of `kind` (Compute, PresentBlit or
+    /// Other: render passes note themselves). PresentBlit makes the passes until the next Other
+    /// the blit's. A branch on a flag otherwise.
+    void NoteHostGpuSpan(VideoCommon::Nx2HostGpu::Kind kind) {
+        if (host_gpu_recording) [[unlikely]] {
+            NoteHostGpuSpanImpl(kind);
+        }
     }
 
     void DeferFragmentBarrier() {
@@ -447,6 +467,10 @@ private:
 
     void AcquireNewChunk();
 
+    void NoteHostGpuSpanImpl(VideoCommon::Nx2HostGpu::Kind kind);
+
+    void NoteHostGpuPass(const Framebuffer* framebuffer);
+
     const Device& device;
     StateTracker& state_tracker;
 
@@ -470,6 +494,9 @@ private:
 
     std::unique_ptr<CommandChunk> chunk;
     std::function<void()> on_submit;
+    std::unique_ptr<HostGpuTimeline> host_gpu;
+    bool host_gpu_recording{}; ///< The frame being recorded is profiled.
+    VideoCommon::Nx2HostGpu::Kind host_gpu_scope{VideoCommon::Nx2HostGpu::Kind::Other};
 
     State state;
     u64 recording_epoch = 0;

@@ -289,6 +289,7 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkCmdSetColorBlendEnableEXT vkCmdSetColorBlendEnableEXT{};
     PFN_vkCmdSetColorBlendEquationEXT vkCmdSetColorBlendEquationEXT{};
     PFN_vkCmdWaitEvents vkCmdWaitEvents{};
+    PFN_vkCmdWriteTimestamp vkCmdWriteTimestamp{};
     PFN_vkCreateBuffer vkCreateBuffer{};
     PFN_vkCreateBufferView vkCreateBufferView{};
     PFN_vkCreateCommandPool vkCreateCommandPool{};
@@ -1285,6 +1286,11 @@ public:
 
     void ResetQueryPool(VkQueryPool query_pool, u32 first, u32 count) const noexcept {
         dld->vkCmdResetQueryPool(handle, query_pool, first, count);
+    }
+
+    void WriteTimestamp(VkPipelineStageFlagBits stage, VkQueryPool query_pool,
+                        u32 query) const noexcept {
+        dld->vkCmdWriteTimestamp(handle, stage, query_pool, query);
     }
 
     void BindDescriptorSets(VkPipelineBindPoint bind_point, VkPipelineLayout layout, u32 first,

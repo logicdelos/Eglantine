@@ -2041,6 +2041,7 @@ void RasterizerVulkan::DispatchCompute() {
         if (SyncFixEnabled()) {
             record_read_barrier();
         }
+        scheduler.NoteHostGpuSpan(VideoCommon::Nx2HostGpu::Kind::Compute);
         scheduler.Record([pipeline, indirect_buffer = buffer->Handle(),
                           indirect_offset = offset](vk::CommandBuffer cmdbuf) {
             if (!pipeline->IsBound()) {
@@ -2048,6 +2049,7 @@ void RasterizerVulkan::DispatchCompute() {
             }
             cmdbuf.DispatchIndirect(indirect_buffer, indirect_offset);
         });
+        scheduler.NoteHostGpuSpan(VideoCommon::Nx2HostGpu::Kind::Other);
         NoteWriterDeps(*pipeline);
         SubmitNx2ListCopies();
         publish_collision_map();
@@ -2060,12 +2062,14 @@ void RasterizerVulkan::DispatchCompute() {
     }
     scheduler.RequestOutsideRenderPassOperationContext();
     record_read_barrier();
+    scheduler.NoteHostGpuSpan(VideoCommon::Nx2HostGpu::Kind::Compute);
     scheduler.Record([pipeline, dim](vk::CommandBuffer cmdbuf) {
         if (!pipeline->IsBound()) {
             return;
         }
         cmdbuf.Dispatch(dim[0], dim[1], dim[2]);
     });
+    scheduler.NoteHostGpuSpan(VideoCommon::Nx2HostGpu::Kind::Other);
     NoteWriterDeps(*pipeline);
     SubmitNx2ListCopies();
     publish_collision_map();
@@ -2631,6 +2635,8 @@ void RasterizerVulkan::FlushCommands() {
 void RasterizerVulkan::TickFrame() {
     draw_counter = 0;
     Nx2Bottleneck::NoteSceneFrame();
+    // Host GPU time by pass (Nx2HostGpu): this frame starts here; a profiled one ends in Composite.
+    scheduler.TickHostGpuProfile();
     // Debug server requests (docs/nx2/debug-mcp.md), taken between frames on the owning thread.
     if (VideoCore::Nx2Debug::HasRequests()) {
         if (auto capture = VideoCore::Nx2Debug::TakeCapture()) {

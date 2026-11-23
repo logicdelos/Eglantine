@@ -376,6 +376,7 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     {
         const Profile::Scope blit_zone{Profile::Zone::PresentBlit};
         scheduler.RequestOutsideRenderPassOperationContext();
+        scheduler.NoteHostGpuSpan(VideoCommon::Nx2HostGpu::Kind::PresentBlit);
         blit_swapchain.DrawToFrame(device, rasterizer, frame, framebuffers,
                                    render_window.GetFramebufferLayout(),
                                    present_manager.SwapchainImageCount(),
@@ -387,6 +388,8 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
         frame_gen.Process(device, frame, present_manager.SwapchainImageFormat(),
                           GuestExtent(framebuffers));
 #endif
+        // The last span of a profiled frame ends with the blit, in the submission that presents it.
+        scheduler.EndHostGpuProfileFrame();
     }
 
 #ifdef HAS_LSFG

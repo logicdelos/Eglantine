@@ -30,6 +30,7 @@
 #include "video_core/renderer_vulkan/upload_batch.h"
 #include "video_core/renderer_vulkan/vk_command_pool.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+#include "video_core/renderer_vulkan/vk_host_gpu_timeline.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
@@ -256,6 +257,10 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
             fmt::format("renderArea={}x{}, numImages={}", render_area.width, render_area.height,
                         framebuffer->NumImages());
         GPU::Logging::GPULogger::GetInstance().LogRenderPassBegin(render_pass_info);
+    }
+
+    if (host_gpu_recording) [[unlikely]] {
+        NoteHostGpuPass(framebuffer);
     }
 
     std::array<VkClearValue, 9> values{};
@@ -679,9 +684,53 @@ void Scheduler::EndRenderPass()
             }
         });
 
+        if (host_gpu_recording) [[unlikely]] {
+            // The work after the pass is the scope's: the blit's own, or nothing in particular.
+            host_gpu->Note({.kind = host_gpu_scope});
+        }
+
         state.renderpass = VkRenderPass{};
         num_renderpass_images = 0;
     }
+
+void Scheduler::TickHostGpuProfile() {
+    if (!VideoCommon::Nx2Profile::Enabled()) {
+        EndHostGpuProfileFrame();
+        return;
+    }
+    if (host_gpu == nullptr) {
+        host_gpu = std::make_unique<HostGpuTimeline>(device, *this, *master_semaphore);
+    }
+    host_gpu_scope = VideoCommon::Nx2HostGpu::Kind::Other;
+    host_gpu_recording = host_gpu->BeginFrame();
+}
+
+void Scheduler::EndHostGpuProfileFrame() {
+    if (!host_gpu_recording) {
+        return;
+    }
+    host_gpu->EndFrame();
+    host_gpu_recording = false;
+    host_gpu_scope = VideoCommon::Nx2HostGpu::Kind::Other;
+}
+
+void Scheduler::NoteHostGpuSpanImpl(VideoCommon::Nx2HostGpu::Kind kind) {
+    host_gpu_scope = kind == VideoCommon::Nx2HostGpu::Kind::PresentBlit
+                         ? VideoCommon::Nx2HostGpu::Kind::PresentBlit
+                         : VideoCommon::Nx2HostGpu::Kind::Other;
+    host_gpu->Note({.kind = kind});
+}
+
+void Scheduler::NoteHostGpuPass(const Framebuffer* framebuffer) {
+    if (host_gpu_scope == VideoCommon::Nx2HostGpu::Kind::PresentBlit) {
+        host_gpu->Note({.kind = VideoCommon::Nx2HostGpu::Kind::PresentBlit});
+        return;
+    }
+    const VkExtent2D area = framebuffer->RenderArea();
+    host_gpu->Note(VideoCommon::Nx2HostGpu::PassLabel(
+        area.width, area.height, static_cast<u32>(framebuffer->Samples()),
+        framebuffer->NumColorBuffers(), framebuffer->HasAspectDepthBit()));
+}
 
 
 void Scheduler::AcquireNewChunk() {

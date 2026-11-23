@@ -275,7 +275,16 @@ moves the dump to `<dir>`), `EDEN_NX2_AUTO_STUB`, `EDEN_NX2_IPC_TRACE`, `EDEN_NX
 `EDEN_NX2_GPU_PROFILE` (GPU-thread zone timers every 10 s; `=lite` leaves every code path as it is
 without the profiler and times one split back ring entry in 32, attributed by entry class and per
 deferred callee; any other value is the full mode, which turns off `fast_maxwell3d` and the
-uniform bind and DMA pusher fast paths), `EDEN_NX2_SAMPLE=<threads>` with
+uniform bind and DMA pusher fast paths. In both modes the Vulkan scheduler also profiles one frame
+in 16 (between two `Composite` calls) with GPU timestamps, bottom of pipe, written where the work
+changes: a render pass begins or ends, around each compute dispatch, around the present blit.
+Every window it logs `Host GPU per profiled frame (N frames sampled): total X ms | pass 3840x2160
+c1: a ms in n passes | compute: ... | other (copies, uploads, barriers): ... | passes P |
+first-to-last timestamp X ms` (top 12 groups by time, per profiled frame). A span is the time from
+one timestamp to the next, so "other" also holds the host GPU idling for lack of work and what
+copies and uploads cost outside any pass; a pass that overlaps the one before is charged only the
+part after it. At most 4096 timestamps a frame, the rest counted. The queries are read back
+without waiting once the frame's last submission is known done, a few frames later), `EDEN_NX2_SAMPLE=<threads>` with
 `_START`/`_SECONDS`/`_OUT` (sampling profiler; `C:\dev\nx2work\folded.py` reads its .folded stacks),
 `EDEN_NX2_MME_RECORD=<file>` (macro calls for `C:\dev\nx2work\mme_test`),
 `EDEN_NX2_FENCE_BATCH=0`, `EDEN_NX2_MACRO_COPY=1`, `EDEN_NX2_CNTPCT_PAUSE=0` (turn rows 124, 126, 127 off),
