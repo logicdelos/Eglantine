@@ -156,7 +156,14 @@ void NPad::ControllerUpdate(Kernel::KernelCore& kernel, Core::HID::ControllerTri
     // The callback is registered in the constructor, but the applet resource only arrives with
     // SetNpadExternals. A controller event (e.g. DualSense motion polled by the frontend thread)
     // in that window used to dereference the null resource and crash the host.
-    auto* const applet_resource = applet_resource_holder.applet_resource.get();
+    // Copy the pointer under the NPad mutex (SetNpadExternals writes it under the same lock) and
+    // release before touching anything else, so no other lock is ever nested inside it.
+    std::shared_ptr<AppletResource> applet_resource_ref;
+    {
+        std::scoped_lock lock{mutex};
+        applet_resource_ref = applet_resource_holder.applet_resource;
+    }
+    auto* const applet_resource = applet_resource_ref.get();
     if (applet_resource == nullptr) {
         return;
     }
@@ -1155,6 +1162,7 @@ void NPad::SetNpadExternals(std::shared_ptr<AppletResource> resource,
                             std::shared_ptr<HandheldConfig> handheld_config,
                             Kernel::KEvent* input_event, std::mutex* input_mutex,
                             std::shared_ptr<Service::Set::ISystemSettingsServer> settings) {
+    std::scoped_lock lock{mutex};
     applet_resource_holder.applet_resource = resource;
     applet_resource_holder.shared_mutex = shared_mutex;
     applet_resource_holder.shared_npad_resource = &npad_resource;
