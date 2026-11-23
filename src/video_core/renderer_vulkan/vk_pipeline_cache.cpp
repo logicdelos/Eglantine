@@ -2492,10 +2492,12 @@ void PipelineCache::EvictUnusedPipelines() {
     // until the rebuild lands. Destroying every pipeline unused for 150 s made a game that comes
     // back to its areas rebuild the same ones over and over (Xenoblade 2, 68 min: 1,886 distinct
     // pipelines, 4,744 evictions, 66% of all builds were rebuilds, 10,825 draws skipped while they
-    // landed). So by default nothing is destroyed (setting free_unused_pipelines off). With it on,
-    // pipelines are only destroyed above a count cap, least recently used first and only those
-    // unused for 150 s, down to 7/8 of the cap; the cap halves while the host is low on memory
-    // (Nx2Bottleneck::IsLowMemory).
+    // landed). So by default nothing is destroyed (setting free_unused_pipelines off), except in an
+    // emergency: while the host is critically low on memory (Nx2Bottleneck::IsLowMemory) the least
+    // recently used ones go even with the setting off, down to the low-memory cap, so the process
+    // is not killed for memory. With it on, pipelines are only destroyed above a count cap, least
+    // recently used first and only those unused for 150 s, down to 7/8 of the cap; the cap halves
+    // while the host is low on memory.
     constexpr u64 EvictAfterFrames = 9000;
     constexpr size_t PipelineCap = 2048;
     if (frame_count <= EvictAfterFrames) {
@@ -2506,16 +2508,18 @@ void PipelineCache::EvictUnusedPipelines() {
     if (graphics_cache.size() <= cap) {
         return;
     }
-    if (!Settings::values.free_unused_pipelines.GetValue()) {
-        if (low_memory && !warned_pipelines_kept) {
-            warned_pipelines_kept = true;
-            LOG_WARNING(Render_Vulkan,
-                        "Host low on memory with {} graphics pipelines kept in memory (about {} MiB "
-                        "of driver memory); the setting free_unused_pipelines (Free unused "
-                        "shaders from memory) would free the least recently used ones",
-                        graphics_cache.size(), graphics_cache.size() * 45 / 100);
-        }
+    const bool keep_all = !Settings::values.free_unused_pipelines.GetValue();
+    if (keep_all && !low_memory) {
         return;
+    }
+    if (keep_all && !warned_pipelines_kept) {
+        warned_pipelines_kept = true;
+        LOG_WARNING(Render_Vulkan,
+                    "Host critically low on memory with {} graphics pipelines kept in memory "
+                    "(about {} MiB of driver memory): evicting the least recently used ones down "
+                    "to {} even though the setting free_unused_pipelines (Free unused shaders "
+                    "from memory) is off",
+                    graphics_cache.size(), graphics_cache.size() * 45 / 100, cap - cap / 8);
     }
     const u64 cutoff = frame_count - EvictAfterFrames;
     const u64 tick = scheduler.CurrentTick();
