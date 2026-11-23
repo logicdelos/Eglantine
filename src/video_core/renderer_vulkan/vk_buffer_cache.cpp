@@ -242,6 +242,7 @@ public:
         }
 
         if (!host_visible) {
+            const HostGpuScope host_span{scheduler, HostGpuKind::BufferCopy};
             scheduler.RequestOutsideRenderPassOperationContext();
             scheduler.Record([src_buffer = staging.buffer, src_offset = staging.offset,
                               dst_buffer = *buffer, size_bytes](vk::CommandBuffer cmdbuf) {
@@ -919,6 +920,7 @@ vk::Buffer BufferCacheRuntime::CreateNullBuffer() {
         ret.SetObjectNameEXT("Null buffer");
     }
 
+    const HostGpuScope host_span{scheduler, HostGpuKind::BufferCopy};
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Record([buffer = *ret](vk::CommandBuffer cmdbuf) {
         cmdbuf.FillBuffer(buffer, 0, VK_WHOLE_SIZE, 0);

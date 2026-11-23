@@ -261,6 +261,9 @@ void HostGpuTimeline::LogWindow() {
     if (window.Frames() != 0) {
         LOG_INFO(HW_GPU, "{}", window.Format());
     }
+    if (const std::string other = window.FormatOther(); !other.empty()) {
+        LOG_INFO(HW_GPU, "{}", other);
+    }
     window.Clear();
 }
 

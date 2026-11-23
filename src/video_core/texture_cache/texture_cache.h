@@ -1006,6 +1006,19 @@ void TextureCache<P>::ReplaceColorFeedbackViews(std::span<ImageViewInOut> views)
     // tiles). Maxwell reads the texel before the draw's write lands, so sample a copy instead.
     std::vector<ImageId> used_shadows;
     const auto& regs = maxwell3d->regs;
+    // The probe of the shadow copies (nx2_profile.h): plain counters while the profiler is on.
+    const bool probe = VideoCommon::Nx2Profile::Enabled();
+    std::vector<std::pair<ImageId, ImageViewId>> probe_views;
+    if (probe) {
+        VideoCommon::Nx2Profile::FeedbackProbe& feedback = VideoCommon::Nx2Profile::Feedback();
+        feedback.NoteDraw(frame_tick);
+        for (u32 index = 0; index < regs.rt_control.count; ++index) {
+            const auto& rt = regs.rt[regs.rt_control.Map(index)];
+            if (rt.format != Tegra::RenderTargetFormat::NONE) {
+                feedback.NoteTargetDraw(rt.Address());
+            }
+        }
+    }
     for (ImageViewInOut& view : views) {
         if (view.id == NULL_IMAGE_VIEW_ID || view.blacklist) {
             continue;
@@ -1058,6 +1071,79 @@ void TextureCache<P>::ReplaceColorFeedbackViews(std::span<ImageViewInOut> views)
         Image& shadow = slot_images[shadow_id];
         const auto copies = MakeShrinkImageCopies(shadow.info, image.info, SubresourceBase{});
         runtime.CopyImage(shadow, image, copies);
+        if (probe) {
+            const ImageInfo& probe_info = image.info;
+            const ImageViewBase& sampled = slot_image_views[view.id];
+            // The target's slot in the draw: the registers of its blend, mask and scissor.
+            u32 probe_slot = 0;
+            for (u32 index = 0; index < regs.rt_control.count; ++index) {
+                const auto& rt = regs.rt[regs.rt_control.Map(index)];
+                if (rt.format != Tegra::RenderTargetFormat::NONE && rt.Address() == gpu_addr) {
+                    probe_slot = index;
+                    break;
+                }
+            }
+            u64 probe_pixels = 0;
+            for (const ImageCopy& copy : copies) {
+                probe_pixels += u64{copy.extent.width} * copy.extent.height * copy.extent.depth *
+                                static_cast<u64>((std::max)(copy.dst_subresource.num_layers, 1));
+            }
+            const double target_width = static_cast<double>(probe_info.size.width);
+            const double target_height = static_cast<double>(probe_info.size.height);
+            const auto probe_fraction = [&](double width, double height) {
+                const double area = target_width * target_height;
+                return area > 0.0 ? (std::min)(width, target_width) *
+                                        (std::min)(height, target_height) / area
+                                  : 0.0;
+            };
+            // Scissor and viewport 0: the rasterizer's too, for a draw of one viewport.
+            const auto& scissor = regs.scissor_test[0];
+            const double scissor_width = (std::max)(
+                0.0, static_cast<double>(scissor.max_x.Value()) -
+                         static_cast<double>(scissor.min_x.Value()));
+            const double scissor_height = (std::max)(
+                0.0, static_cast<double>(scissor.max_y.Value()) -
+                         static_cast<double>(scissor.min_y.Value()));
+            const auto& viewport = regs.viewport_transform[0];
+            bool disjoint = false;
+            if (const ImageViewId rt_view_id = render_targets.color_buffer_ids[probe_slot];
+                rt_view_id) {
+                const ImageViewBase& rt_view = slot_image_views[rt_view_id];
+                if (rt_view.image_id == image_id) {
+                    const SubresourceRange& a = sampled.range;
+                    const SubresourceRange& b = rt_view.range;
+                    disjoint = a.base.level + a.extent.levels <= b.base.level ||
+                               b.base.level + b.extent.levels <= a.base.level ||
+                               a.base.layer + a.extent.layers <= b.base.layer ||
+                               b.base.layer + b.extent.layers <= a.base.layer;
+                }
+            }
+            const std::pair<ImageId, ImageViewId> probe_key{image_id, view.id};
+            const bool first_in_draw = probe_views.empty();
+            const bool repeat_in_draw = std::ranges::find(probe_views, probe_key) != probe_views.end();
+            probe_views.push_back(probe_key);
+            VideoCommon::Nx2Profile::Feedback().Add({
+                .target = gpu_addr,
+                .view = view.id.index,
+                .width = probe_info.size.width,
+                .height = probe_info.size.height,
+                .format = static_cast<u32>(probe_info.format),
+                .regions = static_cast<u32>(copies.size()),
+                .pixels = probe_pixels,
+                .first_in_draw = first_in_draw,
+                .repeat_in_draw = repeat_in_draw,
+                .scissor_on = scissor.enable != 0,
+                .range_disjoint = disjoint,
+                .mask_off =
+                    (regs.color_mask[regs.color_mask_common ? 0 : probe_slot].raw & 0x1111) == 0,
+                .blend_on = regs.blend.enable[probe_slot] != 0,
+                .depth_test = regs.depth_test_enable != 0,
+                .depth_write = regs.depth_write_enabled != 0,
+                .scissor_area = probe_fraction(scissor_width, scissor_height),
+                .viewport_area = probe_fraction(static_cast<double>(viewport.GetWidth()),
+                                                static_cast<double>(viewport.GetHeight())),
+            });
+        }
         const auto view_it = std::ranges::find(image.image_view_ids, view.id);
         const ImageViewInfo view_info =
             image.image_view_infos[std::distance(image.image_view_ids.begin(), view_it)];

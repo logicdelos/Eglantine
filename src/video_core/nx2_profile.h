@@ -270,6 +270,223 @@ struct CalleeStat {
 };
 inline constexpr size_t CalleeSlots = 64;
 
+/// What the colour feedback shadow copies of TextureCache::ReplaceColorFeedbackViews look like
+/// (the draws that sample their own colour target). Plain counters of the thread that runs the
+/// texture cache, added only while the profiler is enabled; Report logs them per frame and
+/// starts again. Nothing here changes what the cache does.
+struct FeedbackProbe {
+    /// Targets and (target, view) pairs followed at once; more are counted in `untracked`.
+    static constexpr size_t MaxTracked = 64;
+
+    /// One shadow copy and the state of the draw that made it.
+    struct Event {
+        u64 target{};  ///< The target's GPU address
+        u64 view{};    ///< The sampled view's id
+        u32 width{};   ///< The target's size and format
+        u32 height{};
+        u32 format{};
+        u32 regions{}; ///< Regions of the CopyImage call
+        u64 pixels{};  ///< Texels the regions copy
+        bool first_in_draw{};  ///< The draw's first copy
+        bool repeat_in_draw{}; ///< The draw copied this target and view before
+        bool scissor_on{};
+        bool range_disjoint{}; ///< The view's levels or layers miss the rendered one's
+        bool mask_off{};       ///< The colour write mask of the target is 0
+        bool blend_on{};
+        bool depth_test{};
+        bool depth_write{};
+        double scissor_area{};  ///< Fraction of the target
+        double viewport_area{}; ///< Fraction of the target
+    };
+
+    struct Target {
+        u64 address{};
+        u32 width{};
+        u32 height{};
+        u32 format{};
+        u64 copies{};
+        u64 pixels{};
+        u64 last_frame{};     ///< The frame (counted from 1) of its last copy
+        u64 draws{};          ///< Draws that rendered to it since the window began
+        u64 draws_at_copy{};  ///< `draws` at its last copy
+    };
+
+    struct Run {
+        u64 target{};
+        u64 view{};
+        u64 last_draw{}; ///< The draw (serial) of its last copy, 0 for none
+        u64 length{};    ///< Draws in the run
+    };
+
+    /// A draw that goes through the cache's feedback check, with or without a copy, in the
+    /// cache's frame `frame` (the frames are counted here: the draws and the frame ticks need not
+    /// be on one thread).
+    void NoteDraw(u64 frame) {
+        ++serial;
+        if (frame != current_frame) {
+            current_frame = frame;
+            ++frames;
+        }
+    }
+
+    /// A draw that renders to the target at `address`.
+    void NoteTargetDraw(u64 address) {
+        for (Target& target : targets) {
+            if (target.address == address) {
+                ++target.draws;
+            }
+        }
+    }
+
+    void Add(const Event& event) {
+        if (event.first_in_draw) {
+            ++draws;
+        }
+        ++copies;
+        pixels += event.pixels;
+        regions += event.regions;
+        regions_max = (std::max)(regions_max, u64{event.regions});
+        repeats_in_draw += event.repeat_in_draw ? 1 : 0;
+        if (event.scissor_on) {
+            ++scissor_on;
+            scissor_area_sum += event.scissor_area;
+        }
+        viewport_area_sum += event.viewport_area;
+        disjoint += event.range_disjoint ? 1 : 0;
+        mask_off += event.mask_off ? 1 : 0;
+        blend_on += event.blend_on ? 1 : 0;
+        depth_test += event.depth_test ? 1 : 0;
+        depth_write += event.depth_write ? 1 : 0;
+
+        Target* target = nullptr;
+        for (Target& candidate : targets) {
+            if (candidate.address == event.target && candidate.width == event.width &&
+                candidate.height == event.height && candidate.format == event.format) {
+                target = &candidate;
+                break;
+            }
+        }
+        if (target == nullptr && targets.size() < MaxTracked) {
+            targets.push_back({.address = event.target,
+                               .width = event.width,
+                               .height = event.height,
+                               .format = event.format});
+            target = &targets.back();
+        }
+        if (target != nullptr) {
+            if (target->last_frame != frames) {
+                target->last_frame = frames;
+                ++distinct_sum;
+            }
+            if (target->copies != 0) {
+                ++repeat_copies;
+                // More than the one draw of this copy rendered to it since the last copy.
+                if (target->draws - target->draws_at_copy > 1) {
+                    ++other_written;
+                }
+            }
+            ++target->copies;
+            target->pixels += event.pixels;
+            target->draws_at_copy = target->draws;
+        } else {
+            ++untracked;
+        }
+
+        Run* run = nullptr;
+        for (Run& candidate : run_list) {
+            if (candidate.target == event.target && candidate.view == event.view) {
+                run = &candidate;
+                break;
+            }
+        }
+        if (run == nullptr && run_list.size() < MaxTracked) {
+            run_list.push_back({.target = event.target, .view = event.view});
+            run = &run_list.back();
+        }
+        if (run != nullptr && run->last_draw != serial) {
+            if (run->last_draw != 0 && run->last_draw + 1 == serial) {
+                ++run->length;
+            } else {
+                ++runs;
+                run->length = 1;
+            }
+            run->last_draw = serial;
+            ++run_draws;
+            run_max = (std::max)(run_max, run->length);
+        }
+    }
+
+    /// The report line, per frame; empty when nothing was copied.
+    [[nodiscard]] std::string Format() const {
+        if (copies == 0) {
+            return {};
+        }
+        const double per_frame = 1.0 / static_cast<double>((std::max)(frames, u64{1}));
+        const auto per = [&](u64 count) { return static_cast<double>(count) * per_frame; };
+        const double copies_d = static_cast<double>(copies);
+        std::vector<const Target*> order;
+        for (const Target& target : targets) {
+            order.push_back(&target);
+        }
+        std::stable_sort(order.begin(), order.end(),
+                         [](const Target* a, const Target* b) { return a->pixels > b->pixels; });
+        std::string top;
+        for (size_t i = 0; i < (std::min)(order.size(), size_t{3}); ++i) {
+            const Target& target = *order[i];
+            top += fmt::format("{}{}x{} format {}: {:.1f} copies, {:.1f} MP", i == 0 ? "" : "; ",
+                               target.width, target.height, target.format, per(target.copies),
+                               per(target.pixels) / 1e6);
+        }
+        return fmt::format(
+            "Feedback shadow copies per frame: {:.1f} copies in {:.1f} draws, {:.1f} MP "
+            "({:.1f} repeat a view the draw already copied) | regions per CopyImage: mean {:.2f}, "
+            "max {} | {:.1f} distinct targets (top by MP: {}{}) | scissor on for {:.1f} copies, "
+            "mean {:.2f} of the target | viewport mean {:.2f} of the target | view outside the "
+            "rendered level or layer: {:.1f} | colour write mask off: {:.1f} | same target and "
+            "view in consecutive draws: runs of mean {:.2f}, max {} draws | rendered to by "
+            "another draw between copies: {:.1f} of {:.1f} repeat copies | blend on {:.1f} | depth "
+            "test on {:.1f}, depth write on {:.1f}{}",
+            per(copies), per(draws), per(pixels) / 1e6, per(repeats_in_draw),
+            static_cast<double>(regions) / copies_d, regions_max, per(distinct_sum), top,
+            order.size() > 3 ? "; ..." : "", per(scissor_on),
+            scissor_on != 0 ? scissor_area_sum / static_cast<double>(scissor_on) : 0.0,
+            viewport_area_sum / copies_d, per(disjoint), per(mask_off),
+            runs != 0 ? static_cast<double>(run_draws) / static_cast<double>(runs) : 0.0, run_max,
+            per(other_written), per(repeat_copies), per(blend_on), per(depth_test),
+            per(depth_write),
+            untracked != 0 ? fmt::format(" | {} copies of targets past the {} followed", untracked,
+                                         MaxTracked)
+                           : std::string{});
+    }
+
+    std::vector<Target> targets;
+    std::vector<Run> run_list;
+    u64 serial{};      ///< Draws through the check
+    u64 frames{};
+    u64 draws{};       ///< Draws with a copy
+    u64 copies{};
+    u64 pixels{};
+    u64 regions{};
+    u64 regions_max{};
+    u64 repeats_in_draw{};
+    u64 scissor_on{};
+    u64 disjoint{};
+    u64 mask_off{};
+    u64 blend_on{};
+    u64 depth_test{};
+    u64 depth_write{};
+    u64 runs{};
+    u64 run_draws{};
+    u64 run_max{};
+    u64 repeat_copies{};
+    u64 other_written{};
+    u64 distinct_sum{};
+    u64 current_frame{~u64{0}}; ///< The cache's frame of the last draw
+    u64 untracked{};
+    double scissor_area_sum{};
+    double viewport_area_sum{};
+};
+
 struct ThreadData {
     std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{};
     std::array<u64, static_cast<size_t>(Zone::Count)> count{};
@@ -294,9 +511,15 @@ struct ThreadData {
     u64 child_ns{};    ///< Time of the zones nested in the current one
     u64 window_start{};
     u32 generation{};
+    FeedbackProbe feedback;
 };
 
 inline thread_local ThreadData t_data;
+
+/// The feedback probe of this thread (the one that runs the texture cache).
+inline FeedbackProbe& Feedback() {
+    return t_data.feedback;
+}
 
 /// Totals since the thread started, never reset by the report window: the frame spike recorder
 /// (nx2_spikes.h) takes their difference over one frame.
@@ -1132,6 +1355,9 @@ inline void Report(const char* thread_name = "GPU thread") {
     }
     if (!macros.empty()) {
         LOG_INFO(HW_GPU, "{} macros per second (top 12 by calls):{}", thread_name, macros);
+    }
+    if (const std::string feedback = data.feedback.Format(); !feedback.empty()) {
+        LOG_INFO(HW_GPU, "{}", feedback);
     }
     data = {};
     data.window_start = now;

@@ -111,3 +111,70 @@ TEST_CASE("Nx2Profile methods: method 0 is a row, the 65th key goes to the other
     CHECK(data.other_calls.calls == u64{0});
     data = {};
 }
+
+TEST_CASE("Nx2Profile feedback probe: runs, repeats and what rendered in between",
+          "[video_core]") {
+    Profile::FeedbackProbe probe;
+    CHECK(probe.Format().empty());
+
+    constexpr u64 target = 0x1000;
+    const auto copy = [&](bool first_in_draw, bool repeat_in_draw) {
+        probe.Add({.target = target,
+                   .view = 7,
+                   .width = 880,
+                   .height = 880,
+                   .format = 52,
+                   .regions = 2,
+                   .pixels = 1'000'000,
+                   .first_in_draw = first_in_draw,
+                   .repeat_in_draw = repeat_in_draw,
+                   .scissor_on = true,
+                   .scissor_area = 0.5,
+                   .viewport_area = 1.0});
+    };
+    // Three draws of one frame sample the target through the same view. The first has two copies
+    // (the same view twice), the third had another draw render to the target after the second.
+    probe.NoteDraw(1);
+    probe.NoteTargetDraw(target);
+    copy(true, false);
+    copy(false, true);
+    probe.NoteDraw(1);
+    probe.NoteTargetDraw(target);
+    copy(true, false);
+    probe.NoteDraw(1);
+    probe.NoteTargetDraw(target);
+    probe.NoteTargetDraw(target);
+    copy(true, false);
+
+    CHECK(probe.frames == u64{1});
+    CHECK(probe.draws == u64{3});
+    CHECK(probe.copies == u64{4});
+    CHECK(probe.regions_max == u64{2});
+    CHECK(probe.repeats_in_draw == u64{1});
+    CHECK(probe.distinct_sum == u64{1});
+    CHECK(probe.repeat_copies == u64{3});
+    CHECK(probe.other_written == u64{1});
+    CHECK(probe.runs == u64{1});
+    CHECK(probe.run_draws == u64{3});
+    CHECK(probe.run_max == u64{3});
+
+    const std::string line = probe.Format();
+    CHECK(line.starts_with("Feedback shadow copies per frame: 4.0 copies in 3.0 draws, 4.0 MP "
+                           "(1.0 repeat a view the draw already copied)"));
+    CHECK(line.find("regions per CopyImage: mean 2.00, max 2") != std::string::npos);
+    CHECK(line.find("1.0 distinct targets (top by MP: 880x880 format 52: 4.0 copies, 4.0 MP)") !=
+          std::string::npos);
+    CHECK(line.find("scissor on for 4.0 copies, mean 0.50 of the target") != std::string::npos);
+    CHECK(line.find("viewport mean 1.00 of the target") != std::string::npos);
+    CHECK(line.find("runs of mean 3.00, max 3 draws") != std::string::npos);
+    CHECK(line.find("rendered to by another draw between copies: 1.0 of 3.0 repeat copies") !=
+          std::string::npos);
+
+    // A second frame: the counts are per frame.
+    probe.NoteDraw(2);
+    probe.NoteTargetDraw(target);
+    copy(true, false);
+    CHECK(probe.frames == u64{2});
+    CHECK(probe.distinct_sum == u64{2});
+    CHECK(probe.Format().starts_with("Feedback shadow copies per frame: 2.5 copies in 2.0 draws"));
+}

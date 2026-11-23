@@ -296,11 +296,33 @@ frame-start gap Z ms | pass 3840x2160 c1: a ms in n passes | image copy: a ms in
 compute: ... | frame start: ... | other (barriers, unlabelled work): ... | K more groups: ... |
 passes P | first-to-last timestamp X ms` (top 14 groups by time, per profiled frame; the largest
 gap is the window's). "frame start" is the span from the first timestamp to the first pass or
-copy; "other" is what no label covers (barriers, clears of tiles, layout transitions, query
-copies outside the labelled sites). A span is the time from one timestamp to the next, so a
+copy; "other" is what no label covers (barriers outside a render pass, query copies, the emulator's
+own work at sites without a label). Labelled since: tile clears (`image clear`), layout
+transitions (`layout transition`), the game's DLSS, FSR, Streamline, temporal and camera-motion
+upscale paths (`upscale chain`), and the index buffer's staging copy and the null buffer's fill
+(`buffer copy`). Where the stamps sit: a pass's end barrier is recorded in the same command as
+`vkCmdEndRenderPass` and the next timestamp is written after it, so it counts inside the pass;
+a pass's begin timestamp is written before the record that holds `vkCmdBeginRenderPass`, so what is
+recorded between the end of a pass and the next pass's stamp (transitions, copies, barriers,
+uniform and buffer work, and the pipeline draining at the bottom-of-pipe stamp) is "other between
+pass and pass". A span is the time from one timestamp to the next, so a
 pass that overlaps the one before is charged only the part after it, and a timestamp that reads
 earlier than the one before it makes a span of 0. At most 4096 timestamps a frame, the rest
-counted. The queries are read back without waiting once the frame's last submission is known
+counted. Each window a second line follows the first: `Host GPU other, per profiled frame (N
+sampled): X ms in S spans | between pass and pass: x ms in n spans; between compute and compute:
+...; K more pairs: x ms | sizes <5 us: n spans, x ms; 5-20 us: ...; 20-100 us; 100-500 us; 0.5-2
+ms; >2 ms | largest L ms between A and B`: the "other" spans keyed by the kinds of the labels
+before and after them (all pass sizes are `pass`), the top 8 pairs by time, and a size histogram;
+the largest span is the window's. The back thread (the GPU thread without the split) also logs
+`Feedback shadow copies per frame: ...` each window, counted in `ReplaceColorFeedbackViews` while
+the profiler is on (plain counters, no behaviour change): copies, draws with a copy, megapixels,
+copies that repeat a view the draw already copied, regions per `CopyImage`, distinct targets (top 3
+by MP with size and format), scissor (index 0) and viewport area as fractions of the target, views
+whose level or layer range misses the rendered one, colour write mask off, runs of consecutive
+draws on the same target and view, copies after which another draw rendered to the target (a draw
+counter per target; clears and blits are not seen), blend and depth test and write on. Frames are
+the cache's frame ticks that saw a draw. The queries are read back without waiting once the
+frame's last submission is known
 done, a few frames later), `EDEN_NX2_SAMPLE=<threads>` with
 `_START`/`_SECONDS`/`_OUT` (sampling profiler; `C:\dev\nx2work\folded.py` reads its .folded stacks),
 `EDEN_NX2_MME_RECORD=<file>` (macro calls for `C:\dev\nx2work\mme_test`),

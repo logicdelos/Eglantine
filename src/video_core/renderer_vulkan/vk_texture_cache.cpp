@@ -1878,6 +1878,7 @@ bool TextureCacheRuntime::UpscaleWithCameraMotion(Framebuffer* dst_framebuffer,
     if (!DlssUpscaler()) {
         return false;
     }
+    const HostGpuScope host_span{scheduler, HostGpuKind::UpscaleChain};
     if (!camera_motion_pass) {
         camera_motion_pass = std::make_unique<CameraMotionPass>(
             device, scheduler, descriptor_pool, compute_pass_descriptor_queue, memory_allocator);
@@ -1943,6 +1944,7 @@ bool TextureCacheRuntime::TemporalUpscale(Framebuffer* dst_framebuffer, ImageVie
     if (dst.Samples() != VK_SAMPLE_COUNT_1_BIT || ImageAspectMask(dst.format) != VK_IMAGE_ASPECT_COLOR_BIT) {
         return false;
     }
+    const HostGpuScope host_span{scheduler, HostGpuKind::UpscaleChain};
     if (depth && UpscaleWithFsr3(dst_framebuffer, input_color, motion_vectors, *depth, render_size,
                                  jitter, motion_scale)) {
         return true;
@@ -3891,6 +3893,7 @@ bool Image::BindZeroBlock() {
 }
 
 void Image::ClearTiles() {
+    const HostGpuScope host_span{*scheduler, HostGpuKind::ImageClear};
     scheduler->RequestOutsideRenderPassOperationContext();
     const VkImage vk_image = *original_image;
     const bool was_initialized = std::exchange(initialized, true);
@@ -5366,6 +5369,7 @@ void TextureCacheRuntime::TransitionImageLayout(Image& image) {
                 .layerCount = VK_REMAINING_ARRAY_LAYERS,
             },
         };
+        const HostGpuScope host_span{scheduler, HostGpuKind::Transition};
         scheduler.RequestOutsideRenderPassOperationContext();
         scheduler.Record([barrier](vk::CommandBuffer cmdbuf) {
             cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,
