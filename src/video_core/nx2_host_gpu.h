@@ -19,11 +19,15 @@
 // timestamps turn into spans, and how the spans of a report window add up and print. The Vulkan
 // side (the timestamp writes and their readback) is in the scheduler.
 //
-// A timestamp is written where the work changes (a render pass begins or ends, a dispatch, the
-// present blit) and labelled for the span that starts there; a span lasts until the next
-// timestamp. The time between two timestamps is all the GPU needed to get from one to the other,
-// so a span also holds the time the GPU waited with nothing to do (the host submitted late) and
-// work of the span before that overlapped it.
+// A timestamp is written where the work changes (a render pass begins or ends, a dispatch, a copy
+// outside a pass, the present blit) and labelled for the span that starts there; a span lasts
+// until the next timestamp. The time between two timestamps is all the GPU needed to get from one
+// to the other, so a span also holds work of the span before that overlapped it.
+//
+// The GPU waiting for the host is not in a work span: the first and the last command of every
+// command buffer the scheduler submits is a timestamp, and the span from a submission's last one
+// to the next one's first is Kind::Idle (the GPU had nothing to run, or waited for a semaphore of
+// the submission). The labels of the work spans are GPU work only.
 namespace VideoCommon::Nx2HostGpu {
 
 /// One frame in this many is profiled.
@@ -32,14 +36,26 @@ constexpr u32 FrameInterval = 16;
 /// counted (the last one is kept for the end of the frame).
 constexpr u32 MaxQueriesPerFrame = 4096;
 /// Groups a report line prints, by time.
-constexpr size_t MaxReportedGroups = 12;
+constexpr size_t MaxReportedGroups = 14;
 
 enum class Kind : u8 {
-    Pass,        // a render pass
-    Compute,     // a dispatch
-    PresentBlit, // the blit of the frame to the present image
-    Other,       // everything else: copies, uploads, barriers, the GPU waiting for the host
-    End,         // the end of the frame, no span of its own
+    Pass,            // a render pass
+    Compute,         // a dispatch of the guest
+    PresentBlit,     // the blit of the frame to the present image
+    Other,           // everything else: barriers, work nothing labels
+    End,             // the end of the frame, no span of its own
+    FrameStart,      // from the start of the frame to the first thing that is labelled
+    Idle,            // between the last command of a submission and the first of the next
+    ImageCopy,       // an image copy outside a pass
+    ImageBlit,       // an image blit (also its helper passes)
+    ImageConvert,    // a format conversion of an image
+    ImageUpload,     // buffer to image
+    ImageDownload,   // image to buffer
+    BufferCopy,      // a buffer copy or clear
+    BufferUpload,    // staging to buffer
+    EmulatorCompute, // a compute pass of the emulator (index conversion, unswizzle, ...)
+    MipGen,          // mip chain generation
+    Rescale,         // an image scaled up or down for resolution scaling
 };
 
 /// What a span is. The size, samples and attachments tell render passes apart.
@@ -48,8 +64,13 @@ struct Label {
     bool depth{};
     u8 colors{};
     u8 samples{1};
+    /// The span goes on with work that was counted when it started (the end of a pass, after a
+    /// submission): its time counts, it is not one more of its kind.
+    bool continued{};
     u32 width{};
     u32 height{};
+    /// The pixels the work moves (image copies and blits), 0 when unknown.
+    u64 pixels{};
 
     friend bool operator==(const Label&, const Label&) = default;
 };
@@ -65,10 +86,27 @@ struct Label {
     };
 }
 
+/// The label of the work after `label` goes on: the same, not counted again.
+[[nodiscard]] inline Label Continued(Label label) {
+    label.continued = true;
+    label.pixels = 0;
+    return label;
+}
+
 /// A label that the passes of one size, sample count and attachment set share: only a render pass
 /// has more than its kind.
 [[nodiscard]] inline Label GroupOf(const Label& label) {
-    return label.kind == Kind::Pass ? label : Label{.kind = label.kind};
+    if (label.kind != Kind::Pass) {
+        return Label{.kind = label.kind};
+    }
+    return {
+        .kind = Kind::Pass,
+        .depth = label.depth,
+        .colors = label.colors,
+        .samples = label.samples,
+        .width = label.width,
+        .height = label.height,
+    };
 }
 
 [[nodiscard]] inline std::string Describe(const Label& label) {
@@ -83,26 +121,69 @@ struct Label {
         return "compute";
     case Kind::PresentBlit:
         return "present blit";
+    case Kind::FrameStart:
+        return "frame start";
+    case Kind::Idle:
+        return "idle waiting for a submit";
+    case Kind::ImageCopy:
+        return "image copy";
+    case Kind::ImageBlit:
+        return "image blit";
+    case Kind::ImageConvert:
+        return "image convert";
+    case Kind::ImageUpload:
+        return "image upload";
+    case Kind::ImageDownload:
+        return "image download";
+    case Kind::BufferCopy:
+        return "buffer copy";
+    case Kind::BufferUpload:
+        return "buffer upload";
+    case Kind::EmulatorCompute:
+        return "compute (emulator)";
+    case Kind::MipGen:
+        return "mip gen";
+    case Kind::Rescale:
+        return "rescale";
     case Kind::End:
     case Kind::Other:
         break;
     }
-    return "other (copies, uploads, barriers)";
+    return "other (barriers, unlabelled work)";
 }
 
+/// What the spans of a kind count, nullptr for the kinds that are not counted.
 [[nodiscard]] inline const char* UnitOf(Kind kind) {
     switch (kind) {
     case Kind::Pass:
         return "passes";
     case Kind::Compute:
+    case Kind::EmulatorCompute:
         return "dispatches";
     case Kind::PresentBlit:
+    case Kind::ImageBlit:
         return "blits";
+    case Kind::ImageCopy:
+    case Kind::BufferCopy:
+        return "copies";
+    case Kind::ImageConvert:
+        return "conversions";
+    case Kind::ImageUpload:
+    case Kind::BufferUpload:
+        return "uploads";
+    case Kind::ImageDownload:
+        return "downloads";
+    case Kind::MipGen:
+        return "chains";
+    case Kind::Rescale:
+        return "rescales";
     case Kind::End:
     case Kind::Other:
+    case Kind::FrameStart:
+    case Kind::Idle:
         break;
     }
-    return "spans";
+    return nullptr;
 }
 
 /// The labels of the timestamps of one profiled frame, in the order they are written. A
@@ -118,9 +199,11 @@ public:
     }
 
     /// The index of the timestamp that starts a span with `label`, or NoQuery when the frame is
-    /// out of timestamps (counted in Overflow). The last timestamp is kept for End.
-    [[nodiscard]] u32 Begin(const Label& label) {
-        if (labels.size() + 1 >= max_queries) {
+    /// out of timestamps (counted in Overflow). The last timestamp is kept for End, and
+    /// `reserve` more for what the caller writes right after (the first timestamp of the next
+    /// submission, after the last of this one).
+    [[nodiscard]] u32 Begin(const Label& label, u32 reserve = 0) {
+        if (labels.size() + 1 + reserve >= max_queries) {
             ++overflow;
             return NoQuery;
         }
@@ -171,11 +254,14 @@ public:
         Label label;
         double ns{};
         u64 spans{};
+        u64 pixels{};
     };
 
     /// Adds a profiled frame: timestamps[i] (device ticks) starts the span labels[i]; the
     /// timestamp of the End label, the last, ends the last one. A frame without a span is not
-    /// added. `overflow` is what FrameLog counted.
+    /// added. `overflow` is what FrameLog counted. A span of Kind::Idle is the GPU waiting: it
+    /// is in the idle numbers, not in a group. A timestamp that is before the one it follows
+    /// makes a span of 0.
     void AddFrame(std::span<const u64> timestamps, std::span<const Label> labels, u32 overflow,
                   double ns_per_tick, u32 valid_bits) {
         const size_t count = (std::min)(timestamps.size(), labels.size());
@@ -183,18 +269,38 @@ public:
             return;
         }
         const u64 mask = valid_bits >= 64 ? ~u64{0} : (u64{1} << valid_bits) - 1;
+        const auto span_ns = [&](u64 from, u64 to) {
+            // The counter wraps at its valid bits; a difference past half of that went backwards.
+            u64 ticks = (to - from) & mask;
+            if (ticks > mask / 2) {
+                ticks = 0;
+            }
+            return static_cast<double>(ticks) * ns_per_tick;
+        };
         for (size_t i = 0; i + 1 < count; ++i) {
-            // The counter wraps at its valid bits.
-            const u64 ticks = (timestamps[i + 1] - timestamps[i]) & mask;
-            const double ns = static_cast<double>(ticks) * ns_per_tick;
-            AddSpan(labels[i], ns);
+            const double ns = span_ns(timestamps[i], timestamps[i + 1]);
             total_ns += ns;
-            if (labels[i].kind == Kind::Pass) {
+            const Label& label = labels[i];
+            if (label.kind == Kind::Idle) {
+                idle_ns += ns;
+                ++submits;
+                if (ns > 0.0) {
+                    ++gaps;
+                }
+                largest_gap_ns = (std::max)(largest_gap_ns, ns);
+                if (i + 2 == count) {
+                    // The gap that ends the frame: from its last submission to the first command
+                    // of the next one, so the host's time between frames.
+                    frame_gap_ns += ns;
+                }
+                continue;
+            }
+            AddSpan(label, ns);
+            if (label.kind == Kind::Pass && !label.continued) {
                 ++passes;
             }
         }
-        first_to_last_ns +=
-            static_cast<double>((timestamps[count - 1] - timestamps[0]) & mask) * ns_per_tick;
+        first_to_last_ns += span_ns(timestamps[0], timestamps[count - 1]);
         dropped += overflow;
         ++frames;
     }
@@ -217,6 +323,21 @@ public:
     [[nodiscard]] double TotalNs() const noexcept {
         return total_ns;
     }
+    [[nodiscard]] double IdleNs() const noexcept {
+        return idle_ns;
+    }
+    [[nodiscard]] double LargestGapNs() const noexcept {
+        return largest_gap_ns;
+    }
+    [[nodiscard]] double FrameGapNs() const noexcept {
+        return frame_gap_ns;
+    }
+    [[nodiscard]] u64 Gaps() const noexcept {
+        return gaps;
+    }
+    [[nodiscard]] u64 Submits() const noexcept {
+        return submits;
+    }
     [[nodiscard]] double FirstToLastNs() const noexcept {
         return first_to_last_ns;
     }
@@ -224,7 +345,8 @@ public:
         return dropped;
     }
 
-    /// The report line, per profiled frame: the top MaxReportedGroups groups by time, the rest as
+    /// The report line, per profiled frame (the largest gap is the largest of the window): total
+    /// and busy time, the idle time, then the top MaxReportedGroups groups by time, the rest as
     /// one. Empty when no frame was profiled.
     [[nodiscard]] std::string Format() const {
         if (frames == 0) {
@@ -238,21 +360,28 @@ public:
         }
         std::stable_sort(order.begin(), order.end(),
                          [](const Group* a, const Group* b) { return a->ns > b->ns; });
-        std::string line = fmt::format("Host GPU per profiled frame ({} frames sampled): total "
-                                       "{:.2f} ms",
-                                       frames, total_ns * per_frame / 1e6);
+        std::string line = fmt::format(
+            "Host GPU per profiled frame ({} sampled): total {:.2f} ms | busy {:.2f} ms | idle "
+            "waiting for a submit {:.2f} ms in {:.1f} gaps (largest {:.2f} ms) | submits {:.1f} | "
+            "frame-start gap {:.2f} ms",
+            frames, total_ns * per_frame / 1e6, (total_ns - idle_ns) * per_frame / 1e6,
+            idle_ns * per_frame / 1e6, static_cast<double>(gaps) * per_frame,
+            largest_gap_ns / 1e6, static_cast<double>(submits) * per_frame,
+            frame_gap_ns * per_frame / 1e6);
         const size_t shown = (std::min)(order.size(), MaxReportedGroups);
         for (size_t i = 0; i < shown; ++i) {
             const Group& group = *order[i];
-            const std::string name = Describe(group.label);
-            const char* const unit = UnitOf(group.label.kind);
-            if (group.label.kind == Kind::Other) {
-                line += fmt::format(" | {}: {:.2f} ms", name, group.ns * per_frame / 1e6);
-            } else {
-                line += fmt::format(" | {}: {:.2f} ms in {:.1f} {}", name,
-                                    group.ns * per_frame / 1e6,
-                                    static_cast<double>(group.spans) * per_frame, unit);
+            std::string detail;
+            if (const char* const unit = UnitOf(group.label.kind); unit != nullptr) {
+                detail = fmt::format(" in {:.1f} {}", static_cast<double>(group.spans) * per_frame,
+                                     unit);
             }
+            if (group.pixels != 0) {
+                detail += fmt::format(", {:.1f} MP",
+                                      static_cast<double>(group.pixels) * per_frame / 1e6);
+            }
+            line += fmt::format(" | {}: {:.2f} ms{}", Describe(group.label),
+                                group.ns * per_frame / 1e6, detail);
         }
         if (order.size() > shown) {
             double rest_ns = 0.0;
@@ -282,19 +411,26 @@ public:
 private:
     void AddSpan(const Label& label, double ns) {
         const Label key = GroupOf(label);
+        const u64 counted = label.continued ? 0 : 1;
         for (Group& group : groups) {
             if (group.label == key) {
                 group.ns += ns;
-                ++group.spans;
+                group.spans += counted;
+                group.pixels += label.pixels;
                 return;
             }
         }
-        groups.push_back({.label = key, .ns = ns, .spans = 1});
+        groups.push_back({.label = key, .ns = ns, .spans = counted, .pixels = label.pixels});
     }
 
     std::vector<Group> groups;
     double total_ns{};
+    double idle_ns{};
+    double largest_gap_ns{};
+    double frame_gap_ns{};
     double first_to_last_ns{};
+    u64 gaps{};
+    u64 submits{};
     u64 dropped{};
     u64 passes{};
     u32 frames{};
