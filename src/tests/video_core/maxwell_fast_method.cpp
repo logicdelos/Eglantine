@@ -587,15 +587,20 @@ void CompareArms(const Arm& legacy, const Arm& preview) {
 }
 
 // The same words through the legacy decoder (setting off) and the preview (setting on), compared
-// after every call.
+// after every call. The arms hold a Maxwell3D each, so they live on the heap: two of them on the
+// stack, with the fixture's engines, overflow the 1 MiB main-thread stack.
 struct Channel {
-    Arm legacy;
-    Arm preview;
+    std::unique_ptr<Arm> legacy_owner;
+    std::unique_ptr<Arm> preview_owner;
+    Arm& legacy;
+    Arm& preview;
     bool preview_on = true;
     bool vulkan = true; ///< The renderer the channel was started with
 
     Channel(Fixture& f, bool fast_engine, s32 bind_id = 0)
-        : legacy{f, fast_engine, bind_id}, preview{f, fast_engine, bind_id} {}
+        : legacy_owner{std::make_unique<Arm>(f, fast_engine, bind_id)},
+          preview_owner{std::make_unique<Arm>(f, fast_engine, bind_id)}, legacy{*legacy_owner},
+          preview{*preview_owner} {}
 
     // One decoder call over `words`, which start `offset` words into the entry. Returns the words
     // both consumed.
@@ -1328,7 +1333,7 @@ TEST_CASE("Fast graphics preview takes both bind encodings on every stage",
     }
 }
 
-TEST_CASE("Fast graphics preview binds every time, whatever the arguments",
+TEST_CASE("Fast graphics preview binds every time whatever the arguments",
           "[video_core][nx2_fast_graphics]") {
     PreviewSettings settings;
     Fixture f;
@@ -1661,8 +1666,11 @@ TEST_CASE("Fast graphics preview leaves a split GPU thread to the legacy path",
         const auto commands = ToHeaders(
             Concat({BindWords({.stage = 1, .slot = 2, .inline_form = inline_form}),
                     BindWords({.stage = 2, .slot = 3, .inline_form = inline_form})}));
-        Arm legacy{f, true, 0};
-        Arm preview{f, true, 0};
+        // Arms hold a whole Maxwell3D each: on the heap, as the 1 MiB main-thread stack is small.
+        const auto legacy_owner = std::make_unique<Arm>(f, true, 0);
+        const auto preview_owner = std::make_unique<Arm>(f, true, 0);
+        Arm& legacy = *legacy_owner;
+        Arm& preview = *preview_owner;
         std::array<std::vector<u64>, 2> rings;
         std::array<size_t, 2> consumed{};
         size_t index = 0;
