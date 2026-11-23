@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <openssl/err.h>
@@ -94,7 +95,16 @@ Crypto::AESCipher<Key>::AESCipher(Key key, Mode mode) : ctx(std::make_unique<Cip
 
     ASSERT(ctx->encryption_context && ctx->decryption_context && ctx->cipher && "OpenSSL cipher context failed init!");
     // now init ciphers
-    ASSERT(EVP_CipherInit_ex2(ctx->encryption_context, ctx->cipher, key.data(), NULL, 1, NULL));
+    // OpenSSL 3 refuses to start XTS encryption when both key halves are equal (it still allows
+    // decryption). That is what the all-zero placeholder key is while the key file is missing: the
+    // NCA header storage then fails this call for every NCA and falls back to a plaintext header.
+    // The missing keys are already reported once by the frontend, so it is not an assert here.
+    const bool xts_equal_halves =
+        mode == Mode::XTS &&
+        std::equal(key.begin(), key.begin() + key.size() / 2, key.begin() + key.size() / 2);
+    const int encryption_ready =
+        EVP_CipherInit_ex2(ctx->encryption_context, ctx->cipher, key.data(), NULL, 1, NULL);
+    ASSERT(encryption_ready == 1 || xts_equal_halves);
     ASSERT(EVP_CipherInit_ex2(ctx->decryption_context, ctx->cipher, key.data(), NULL, 0, NULL));
 
     EVP_CIPHER_CTX_set_padding(ctx->encryption_context, 0);
