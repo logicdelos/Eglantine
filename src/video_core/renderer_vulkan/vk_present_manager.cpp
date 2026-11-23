@@ -26,6 +26,7 @@
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_surface.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/nx2_spikes.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -261,7 +262,11 @@ void PresentManager::Present(Frame* frame) {
             frame_cv.notify_one();
         });
     } else {
-        scheduler.WaitWorker();
+        {
+            const VideoCommon::Nx2Profile::Scope wait_zone{
+                VideoCommon::Nx2Profile::Zone::PresentWaitWorker};
+            scheduler.WaitWorker();
+        }
         CopyToSwapchain(frame);
         free_queue.push_back(frame);
     }
@@ -424,6 +429,7 @@ void PresentManager::PresentThread(std::stop_token token) {
 
     bool device_lost = false;
     while (!token.stop_requested()) {
+        VideoCommon::Nx2Profile::Report("Vulkan present");
         std::unique_lock lock{queue_mutex};
         // Wait for presentation frames. The wait ends when the scheduler worker enqueues the next
         // frame, so it is linked to the worker run that produced that frame.
@@ -663,6 +669,8 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
         }
     }
 
+    std::optional<VideoCommon::Nx2Profile::Scope> record_zone;
+    record_zone.emplace(VideoCommon::Nx2Profile::Zone::SwapRecord);
     const vk::CommandBuffer cmdbuf{frame->cmdbuf};
     cmdbuf.Begin({
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -768,6 +776,7 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
                            {}, {}, post_barriers);
 
     cmdbuf.End();
+    record_zone.reset();
 
     const VkSemaphore present_semaphore = swapchain.CurrentPresentSemaphore();
     const VkSemaphore render_semaphore = swapchain.CurrentRenderSemaphore();
@@ -795,6 +804,7 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
         // The submit lock is shared with the worker's submissions and the queue can block: waiting
         // before the host present, with no producer to name.
         const VideoCommon::Nx2Spikes::SpanScope submit_wait{VideoCommon::Nx2Spikes::Cause::Waiting};
+        const VideoCommon::Nx2Profile::Scope submit_zone{VideoCommon::Nx2Profile::Zone::SwapSubmit};
         std::scoped_lock submit_lock{scheduler.submit_mutex};
         switch (const VkResult result =
                     device.GetGraphicsQueue().Submit(submit_info, *frame->present_done)) {
@@ -810,7 +820,12 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
     }
 
     // Present
-    ReportHostPresent(frame, swapchain.Present(render_semaphore));
+    VkResult present_result;
+    {
+        const VideoCommon::Nx2Profile::Scope present_zone{VideoCommon::Nx2Profile::Zone::SwapPresent};
+        present_result = swapchain.Present(render_semaphore);
+    }
+    ReportHostPresent(frame, present_result);
 }
 
 } // namespace Vulkan

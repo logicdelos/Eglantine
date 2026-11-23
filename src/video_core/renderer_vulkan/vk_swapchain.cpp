@@ -20,6 +20,7 @@
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "common/system_log.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/nx2_spikes.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
@@ -187,6 +188,7 @@ bool Swapchain::AcquireNextImage(bool may_flush) {
     VkResult result;
     {
         const VideoCommon::Nx2Spikes::SpanScope acquire_wait{VideoCommon::Nx2Spikes::Cause::Waiting};
+        const VideoCommon::Nx2Profile::Scope acquire_zone{VideoCommon::Nx2Profile::Zone::SwapAcquire};
         result = device.GetLogical().AcquireNextImageKHR(
             *swapchain, (std::numeric_limits<u64>::max)(), *present_semaphores[frame_index],
             VK_NULL_HANDLE, &image_index);
@@ -259,6 +261,7 @@ bool Swapchain::AcquireNextImage(bool may_flush) {
     }
     };
 
+    VideoCommon::Nx2Profile::Scope ready_zone{VideoCommon::Nx2Profile::Zone::SwapReadyWait};
 #ifdef __ANDROID__
     if (android_get_device_api_level() >= 30) {
         scheduler.Wait(resource_ticks[image_index], 0.0, may_flush);
@@ -268,6 +271,7 @@ bool Swapchain::AcquireNextImage(bool may_flush) {
 #else
     wait_with_frame_pacing();
 #endif
+    ready_zone.Stop();
 
     resource_ticks[image_index] = scheduler.CurrentTick();
 

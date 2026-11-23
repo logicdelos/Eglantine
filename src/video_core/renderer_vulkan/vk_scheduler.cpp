@@ -428,6 +428,7 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
 
     bool device_lost = false;
     while (!stop_token.stop_requested()) {
+        VideoCommon::Nx2Profile::Report("Vulkan worker");
         std::unique_ptr<CommandChunk> work;
 
         {
@@ -460,7 +461,11 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
                 work.reset();
             } else {
                 try {
-                    work->ExecuteAll(current_cmdbuf, current_upload_cmdbuf);
+                    {
+                        const VideoCommon::Nx2Profile::Scope execute_zone{
+                            VideoCommon::Nx2Profile::Zone::WorkerExecute};
+                        work->ExecuteAll(current_cmdbuf, current_upload_cmdbuf);
+                    }
                     // If the chunk was a submission, reallocate the command buffer.
                     if (has_submit) {
                         AllocateWorkerCommandBuffer();
@@ -542,6 +547,8 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
             VideoCommon::Nx2Spikes::Cause::Waiting,
             VideoCommon::Nx2Spikes::DerivedWorkId(VideoCommon::Nx2Spikes::WorkKind::Submission,
                                                   signal_value)};
+        const VideoCommon::Nx2Profile::Scope submit_zone{
+            VideoCommon::Nx2Profile::Zone::WorkerSubmit};
         std::scoped_lock lock{submit_mutex};
         switch (const VkResult result = master_semaphore->SubmitQueue(
                     cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, signal_value)) {

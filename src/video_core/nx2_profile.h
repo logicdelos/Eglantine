@@ -88,6 +88,21 @@ enum class Zone : u32 {
     BackMulti,      ///< Split back, lite: sampled multi method entries (Kind::Multi)
     BackCall,       ///< Split back, lite: sampled deferred calls (Kind::Call)
     BackOtherEntry, ///< Split back, lite: sampled engine, wrap, repeated and other entries
+    CompositeCapture, ///< Composite: applet capture layer, capture composition and screenshot
+    PresentFrameWait, ///< Composite: GetRenderFrame (a free frame and its present fence)
+    PresentBlit,      ///< Composite: the blit to the frame (and frame generation work)
+    PresentFlush,     ///< Composite: scheduler flush that signals the frame
+    PresentCall,      ///< Composite: PresentManager::Present outside the zones it calls
+    PresentWaitWorker, ///< Present without a present thread: waiting for the Vulkan worker
+    SwapAcquire,      ///< Present: vkAcquireNextImageKHR
+    SwapReadyWait,    ///< Present: the wait for the GPU tick that last used the acquired image
+    SwapRecord,       ///< Present: recording the copy to the swapchain image
+    SwapSubmit,       ///< Present: the submit lock and the queue submit of the copy
+    SwapPresent,      ///< Present: the submit lock and vkQueuePresentKHR
+    CompositeEnd,     ///< Composite: after the present (frame end notify, tick, frame displayed)
+    CompositeHidden,  ///< Composite: window hidden, waiting for the frame's own submission
+    WorkerExecute,    ///< Vulkan worker: executing a command chunk outside the zones it calls
+    WorkerSubmit,     ///< Vulkan worker: the submit lock and vkQueueSubmit
     Count,
 };
 
@@ -104,6 +119,9 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "back replay", "back idle hook",
     "back state run", "back exec method", "back cb words", "back multi", "back call",
     "back other entry",
+    "composite capture", "present frame wait", "present blit", "present flush", "present call",
+    "present wait worker", "swap acquire", "swap ready wait", "swap record", "swap submit",
+    "swap present", "composite end", "composite hidden", "worker execute", "worker submit",
 };
 
 static_assert(zone_names[static_cast<size_t>(Zone::Count) - 1] != nullptr,
@@ -242,9 +260,10 @@ enum class FlushOrigin : u32 {
 inline constexpr std::array<const char*, static_cast<size_t>(FlushOrigin::Count)>
     flush_origin_names{"other", "waited", "gpu idle", "budget", "fence", "list copy", "idle hook"};
 
-/// One Defer callee's totals on the split back, per thunk (AddCallee).
+/// One row of a back table: a Defer callee per thunk (AddCallee), an executed method per key
+/// (AddMethod).
 struct CalleeStat {
-    u64 thunk;
+    u64 key;
     u64 inclusive_ns; ///< Scaled: the time of the sampled entries times SampleEvery
     u64 exclusive_ns; ///< The same without the zones nested in the call
     u64 calls;        ///< Scaled the same way
@@ -268,6 +287,10 @@ struct ThreadData {
     /// other_calls.
     std::array<CalleeStat, CalleeSlots> callees{};
     CalleeStat other_calls{};
+    /// The back's executed methods (BackExecMethod and BackMulti entries), the same table by
+    /// method key; methods past the 64 slots go to other_methods.
+    std::array<CalleeStat, CalleeSlots> methods{};
+    CalleeStat other_methods{};
     u64 child_ns{};    ///< Time of the zones nested in the current one
     u64 window_start{};
     u32 generation{};
@@ -607,17 +630,17 @@ inline void AddBackEntry(BackEntry entry, u64 words, u64 writes, u32 scale) {
     }
 }
 
-/// A Kind::Call entry the back timed, per callee thunk (GpuSplit::CalleeName). The times are
-/// already scaled; `calls` is the number of entries the sample stands for.
-inline void AddCallee(u64 thunk, u64 inclusive_ns, u64 exclusive_ns, u64 calls) {
-    auto& data = t_data;
-    const size_t first = static_cast<size_t>((thunk * 0x9e3779b97f4a7c15ULL) >> 58);
+/// Adds to the row of `key` in a back table (open addressing, the top 6 bits of a hash; a key is
+/// never 0, an empty row), or to `other` when the 64 rows are taken.
+inline void AddStat(std::array<CalleeStat, CalleeSlots>& table, CalleeStat& other, u64 key,
+                    u64 inclusive_ns, u64 exclusive_ns, u64 calls) {
+    const size_t first = static_cast<size_t>((key * 0x9e3779b97f4a7c15ULL) >> 58);
     static_assert(CalleeSlots == 64, "the hash keeps the top 6 bits");
-    CalleeStat* slot = &data.other_calls;
+    CalleeStat* slot = &other;
     for (size_t probe = 0; probe < CalleeSlots; ++probe) {
-        CalleeStat& candidate = data.callees[(first + probe) % CalleeSlots];
-        if (candidate.thunk == thunk || candidate.thunk == 0) {
-            candidate.thunk = thunk;
+        CalleeStat& candidate = table[(first + probe) % CalleeSlots];
+        if (candidate.key == key || candidate.key == 0) {
+            candidate.key = key;
             slot = &candidate;
             break;
         }
@@ -625,6 +648,63 @@ inline void AddCallee(u64 thunk, u64 inclusive_ns, u64 exclusive_ns, u64 calls) 
     slot->inclusive_ns += inclusive_ns;
     slot->exclusive_ns += exclusive_ns;
     slot->calls += calls;
+}
+
+/// A Kind::Call entry the back timed, per callee thunk (GpuSplit::CalleeName). The times are
+/// already scaled; `calls` is the number of entries the sample stands for.
+inline void AddCallee(u64 thunk, u64 inclusive_ns, u64 exclusive_ns, u64 calls) {
+    auto& data = t_data;
+    AddStat(data.callees, data.other_calls, thunk, inclusive_ns, exclusive_ns, calls);
+}
+
+/// What a method row's key holds on top of the method: set, so that no key is 0.
+inline constexpr u64 MethodKeyTag = u64{1} << 32;
+
+/// A BackExecMethod or BackMulti entry the back timed, per method key (method, and the engine's
+/// id shifted left 16 for any engine but a fast Maxwell3D; GpuSplit::NoteMethod). Scaled like
+/// AddCallee.
+inline void AddMethod(u32 method_key, u64 inclusive_ns, u64 exclusive_ns, u64 calls) {
+    auto& data = t_data;
+    AddStat(data.methods, data.other_methods, MethodKeyTag | method_key, inclusive_ns,
+            exclusive_ns, calls);
+}
+
+/// Logs one back table's top 16 rows by exclusive time, per second, plus the rows past the table.
+/// `name_of` gives a row's name from its key.
+template <typename NameOf>
+void ReportStats(const char* thread_name, const char* what,
+                 const std::array<CalleeStat, CalleeSlots>& table, const CalleeStat& other,
+                 double per_s, NameOf&& name_of) {
+    std::array<const CalleeStat*, CalleeSlots> used{};
+    size_t used_count = 0;
+    for (const CalleeStat& row : table) {
+        if (row.calls != 0) {
+            used[used_count++] = &row;
+        }
+    }
+    if (used_count == 0 && other.calls == 0) {
+        return;
+    }
+    const size_t top = std::min<size_t>(used_count, 16);
+    std::partial_sort(used.begin(), used.begin() + static_cast<std::ptrdiff_t>(top),
+                      used.begin() + static_cast<std::ptrdiff_t>(used_count),
+                      [](const CalleeStat* a, const CalleeStat* b) {
+                          return a->exclusive_ns > b->exclusive_ns;
+                      });
+    const auto format_row = [per_s](const std::string& name, const CalleeStat& row) {
+        return fmt::format(" | {}: {:.2f} ms excl, {:.2f} ms incl, {:.0f} calls", name,
+                           static_cast<double>(row.exclusive_ns) * 1e-6 * per_s,
+                           static_cast<double>(row.inclusive_ns) * 1e-6 * per_s,
+                           static_cast<double>(row.calls) * per_s);
+    };
+    std::string text;
+    for (size_t i = 0; i < top; ++i) {
+        text += format_row(name_of(used[i]->key), *used[i]);
+    }
+    if (other.calls != 0) {
+        text += format_row("others", other);
+    }
+    LOG_INFO(HW_GPU, "{} {} per second (top 16 by exclusive time):{}", thread_name, what, text);
 }
 
 /// A Defer callee's name for the report: the compiler's signature of GpuSplit::CalleeSignature<Func>
@@ -984,41 +1064,20 @@ inline void Report(const char* thread_name = "GPU thread") {
     }
     LOG_INFO(HW_GPU, "{} per second:{}", thread_name, line);
     {
-        std::array<const CalleeStat*, CalleeSlots> used{};
-        size_t used_count = 0;
-        for (const CalleeStat& callee : data.callees) {
-            if (callee.calls != 0) {
-                used[used_count++] = &callee;
-            }
-        }
-        if (used_count != 0 || data.other_calls.calls != 0) {
-            const size_t top = std::min<size_t>(used_count, 16);
-            std::partial_sort(used.begin(), used.begin() + static_cast<std::ptrdiff_t>(top),
-                              used.begin() + static_cast<std::ptrdiff_t>(used_count),
-                              [](const CalleeStat* a, const CalleeStat* b) {
-                                  return a->exclusive_ns > b->exclusive_ns;
-                              });
-            const double per_s = 1e9 / static_cast<double>(window);
-            const auto format_callee = [&](const std::string& callee_name, const CalleeStat& c) {
-                return fmt::format(" | {}: {:.2f} ms excl, {:.2f} ms incl, {:.0f} calls",
-                                   callee_name,
-                                   static_cast<double>(c.exclusive_ns) * 1e-6 * per_s,
-                                   static_cast<double>(c.inclusive_ns) * 1e-6 * per_s,
-                                   static_cast<double>(c.calls) * per_s);
-            };
-            std::string callees;
-            for (size_t i = 0; i < top; ++i) {
-                const char* const raw = GpuSplit::CalleeName(used[i]->thunk);
-                callees += format_callee(raw != nullptr ? TrimCalleeName(raw)
-                                                       : fmt::format("{:#x}", used[i]->thunk),
-                                         *used[i]);
-            }
-            if (data.other_calls.calls != 0) {
-                callees += format_callee("other calls", data.other_calls);
-            }
-            LOG_INFO(HW_GPU, "{} deferred calls per second (top 16 by exclusive time):{}",
-                     thread_name, callees);
-        }
+        const double per_s = 1e9 / static_cast<double>(window);
+        ReportStats(thread_name, "deferred calls", data.callees, data.other_calls, per_s,
+                    [](u64 thunk) {
+                        const char* const raw = GpuSplit::CalleeName(thunk);
+                        return raw != nullptr ? TrimCalleeName(raw)
+                                              : fmt::format("{:#x}", thunk);
+                    });
+        ReportStats(thread_name, "executed methods", data.methods, data.other_methods, per_s,
+                    [](u64 key) {
+                        const u32 method = static_cast<u32>(key & 0xffff);
+                        const u32 engine = static_cast<u32>((key >> 16) & 0xffff);
+                        return engine == 0 ? fmt::format("{:#x}", method)
+                                           : fmt::format("e{}:{:#x}", engine, method);
+                    });
     }
     {
         // The first Counter entries, in order.

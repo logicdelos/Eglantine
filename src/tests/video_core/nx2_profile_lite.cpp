@@ -87,3 +87,27 @@ TEST_CASE("Nx2Profile back entries: counts scaled, writes only for state runs", 
     CHECK(counter(Profile::Counter::BackEntryOther) == u64{0});
     data = {};
 }
+
+TEST_CASE("Nx2Profile methods: method 0 is a row, the 65th key goes to the others",
+          "[video_core]") {
+    auto& data = Profile::t_data;
+    data = {};
+    // Method 0 of the first engine has key 0: it must still take a row of its own.
+    for (u32 key = 0; key < 65; ++key) {
+        Profile::AddMethod(key, 10, 5, 32);
+        Profile::AddMethod(key, 10, 5, 32);
+    }
+    u64 rows = 0;
+    for (const Profile::CalleeStat& row : data.methods) {
+        if (row.calls != 0) {
+            ++rows;
+            CHECK(row.calls == u64{2 * 32});
+            CHECK(row.exclusive_ns == u64{2 * 5});
+            CHECK((row.key & Profile::MethodKeyTag) != 0);
+        }
+    }
+    CHECK(rows == u64{64});
+    CHECK(data.other_methods.calls == u64{2 * 32});
+    CHECK(data.other_calls.calls == u64{0});
+    data = {};
+}

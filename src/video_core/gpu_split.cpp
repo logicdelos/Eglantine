@@ -404,6 +404,19 @@ const char* GpuSplit::CalleeName(u64 thunk) {
     return nullptr;
 }
 
+u32 GpuSplit::BackEngineId(Tegra::Engines::EngineInterface* engine) {
+    for (size_t i = 0; i < back_engines_seen.size(); ++i) {
+        if (back_engines_seen[i] == engine) {
+            return static_cast<u32>(i + 1);
+        }
+        if (back_engines_seen[i] == nullptr) {
+            back_engines_seen[i] = engine;
+            return static_cast<u32>(i + 1);
+        }
+    }
+    return static_cast<u32>(back_engines_seen.size() + 1);
+}
+
 bool GpuSplit::NoteWrite(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size,
                          WriteKind kind) {
     if (size == 0 || !Nx2Perf::On(Nx2Perf::Opt::MacroReadEarly)) {
@@ -619,6 +632,7 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
             }
             if ((head & Direct) != 0) {
                 NoteEntry<Classify>(BackEntry::ExecMethod);
+                NoteMethod<Classify>(method, engine);
                 maxwell3d->ConsumeSink(*system);
                 maxwell3d->CallMethod(*system, method, argument, true);
             } else if (!maxwell3d->execution_mask[method]) {
@@ -626,6 +640,7 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
                 maxwell3d->method_sink.emplace_back(method, argument);
             } else {
                 NoteEntry<Classify>(BackEntry::ExecMethod);
+                NoteMethod<Classify>(method, engine);
                 maxwell3d->ConsumeSink(*system);
                 if ((head & HasSegment) != 0) {
                     maxwell3d->current_dma_segment = entry[1];
@@ -648,6 +663,7 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
                 engine->CallStateMethod(*system, method, argument);
             } else {
                 NoteEntry<Classify>(BackEntry::ExecMethod);
+                NoteMethod<Classify>(method, engine);
                 engine->CallMethod(*system, method, argument, true);
             }
         } else if (!engine->execution_mask[method]) {
@@ -655,6 +671,7 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
             engine->method_sink.emplace_back(method, argument);
         } else {
             NoteEntry<Classify>(BackEntry::ExecMethod);
+            NoteMethod<Classify>(method, engine);
             Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
             engine->ConsumeSink(*system);
             if ((head & HasSegment) != 0) {
@@ -670,6 +687,7 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
         const u32 amount = static_cast<u32>(head >> 32);
         const size_t data = (head & HasSegment) != 0 ? 3 : 2;
         auto* const engine = back_engine;
+        NoteMethod<Classify>(method, engine);
         Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
         engine->ConsumeSink(*system);
         if ((head & HasSegment) != 0) {
@@ -718,6 +736,10 @@ size_t GpuSplit::ProfiledExecute(const u64* entry, size_t words) {
     Profile::AddBackEntry(back_entry.entry, size, back_entry.writes, scope.Scale());
     if (back_entry.entry == BackEntry::Call) {
         Profile::AddCallee(back_entry.thunk, scope.InclusiveNs(), scope.ExclusiveNs(),
+                           scope.Scale());
+    }
+    if (back_entry.entry == BackEntry::ExecMethod || back_entry.entry == BackEntry::Multi) {
+        Profile::AddMethod(back_entry.method_key, scope.InclusiveNs(), scope.ExclusiveNs(),
                            scope.Scale());
     }
     return size;

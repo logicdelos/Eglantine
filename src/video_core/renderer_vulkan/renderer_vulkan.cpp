@@ -29,6 +29,7 @@
 #include "core/core.h"
 #include "core/frontend/graphics_context.h"
 #include "video_core/capture.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/nx2_spikes.h"
 #include "video_core/gpu.h"
 #include "video_core/present.h"
@@ -315,7 +316,9 @@ bool RendererVulkan::FillDeviceIdentity(VideoCore::Replay::DeviceIdentity& out) 
 }
 
 void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebuffers) {
+    namespace Profile = VideoCommon::Nx2Profile;
     SCOPE_EXIT {
+        const Profile::Scope end_zone{Profile::Zone::CompositeEnd};
         render_window.OnFrameDisplayed();
     };
 
@@ -325,11 +328,14 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
         return;
     }
 
-    RenderAppletCaptureLayer(framebuffers);
-    // A live capture keeps the picture the way a replay composes it: at the guest size, layer
-    // stack default, no overlay. Only while a capture runs.
-    if (auto* picture = VideoCore::Replay::CaptureComposition::Target()) {
-        ComposeForCapture(framebuffers, *picture);
+    {
+        const Profile::Scope capture_zone{Profile::Zone::CompositeCapture};
+        RenderAppletCaptureLayer(framebuffers);
+        // A live capture keeps the picture the way a replay composes it: at the guest size, layer
+        // stack default, no overlay. Only while a capture runs.
+        if (auto* picture = VideoCore::Replay::CaptureComposition::Target()) {
+            ComposeForCapture(framebuffers, *picture);
+        }
     }
     if (!render_window.IsShown()) {
         // Nothing is presented, but the frame still ends for the per-frame resources: without the
@@ -340,14 +346,24 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
         // without asking the GPU. So the frame's own submission is waited for on the device
         // (a blocking semaphore wait, no spin) before anything is released.
         NoteHiddenComposite();
-        scheduler.Wait(scheduler.Flush());
+        {
+            const Profile::Scope hidden_zone{Profile::Zone::CompositeHidden};
+            scheduler.Wait(scheduler.Flush());
+        }
+        const Profile::Scope end_zone{Profile::Zone::CompositeEnd};
         rasterizer.TickFrame();
         return;
     }
     NoteShownComposite();
 
-    RenderScreenshot(framebuffers);
-    Frame* frame = present_manager.GetRenderFrame();
+    {
+        const Profile::Scope capture_zone{Profile::Zone::CompositeCapture};
+        RenderScreenshot(framebuffers);
+    }
+    Frame* frame = [this] {
+        const Profile::Scope wait_zone{Profile::Zone::PresentFrameWait};
+        return present_manager.GetRenderFrame();
+    }();
     frame->is_generated = false;
     frame->generation_index = 0;
     frame->generation_count = 0;
@@ -357,17 +373,23 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
                                 ? guest_frames_composited.fetch_add(1, std::memory_order_relaxed) + 1
                                 : 0;
 
-    scheduler.RequestOutsideRenderPassOperationContext();
-    blit_swapchain.DrawToFrame(device, rasterizer, frame, framebuffers,
-                               render_window.GetFramebufferLayout(),
-                               present_manager.SwapchainImageCount(),
-                               swapchain.GetImageViewFormat());
+    {
+        const Profile::Scope blit_zone{Profile::Zone::PresentBlit};
+        scheduler.RequestOutsideRenderPassOperationContext();
+        blit_swapchain.DrawToFrame(device, rasterizer, frame, framebuffers,
+                                   render_window.GetFramebufferLayout(),
+                                   present_manager.SwapchainImageCount(),
+                                   swapchain.GetImageViewFormat());
 
 #ifdef HAS_LSFG
-    void(frame_gen.WantedGenerations(present_manager.MaxExtraFrames()));
+        void(frame_gen.WantedGenerations(present_manager.MaxExtraFrames()));
 
-    frame_gen.Process(device, frame, present_manager.SwapchainImageFormat(),
-                      GuestExtent(framebuffers));
+        frame_gen.Process(device, frame, present_manager.SwapchainImageFormat(),
+                          GuestExtent(framebuffers));
+#endif
+    }
+
+#ifdef HAS_LSFG
 
     const size_t generated_frames = frame_gen.GeneratedFrameCount();
     for (size_t generation = 0; generation < generated_frames; ++generation) {
@@ -379,16 +401,30 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
         generated->generation_index = static_cast<u32>(generation);
         generated->generation_count = static_cast<u32>(generated_frames);
         generated->guest_frame_id = frame->guest_frame_id;
-        blit_swapchain.PrepareFrame(device, generated, render_window.GetFramebufferLayout());
-        frame_gen.GenerateInto(device, generated, generation);
-        scheduler.Flush(*generated->render_ready);
+        {
+            const Profile::Scope blit_zone{Profile::Zone::PresentBlit};
+            blit_swapchain.PrepareFrame(device, generated, render_window.GetFramebufferLayout());
+            frame_gen.GenerateInto(device, generated, generation);
+        }
+        {
+            const Profile::Scope flush_zone{Profile::Zone::PresentFlush};
+            scheduler.Flush(*generated->render_ready);
+        }
+        const Profile::Scope call_zone{Profile::Zone::PresentCall};
         present_manager.Present(generated);
     }
 #endif
 
-    scheduler.Flush(*frame->render_ready);
+    {
+        const Profile::Scope flush_zone{Profile::Zone::PresentFlush};
+        scheduler.Flush(*frame->render_ready);
+    }
 
-    present_manager.Present(frame);
+    {
+        const Profile::Scope call_zone{Profile::Zone::PresentCall};
+        present_manager.Present(frame);
+    }
+    const Profile::Scope end_zone{Profile::Zone::CompositeEnd};
 #ifdef HAS_LSFG
     scheduler.DispatchWork();
 #endif
