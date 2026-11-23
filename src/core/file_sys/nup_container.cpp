@@ -1260,13 +1260,22 @@ Loader::ResultStatus NupContainer::VerifyIntegrity(
     return Loader::ResultStatus::Success;
 }
 
-std::vector<std::string> NupContainer::MemberPaths() const {
+std::vector<std::string> NupContainer::MemberPaths(const std::function<bool(u64)>& cancel) const {
     std::vector<std::string> paths(files.size());
     for (std::size_t i = 0; i < files.size(); ++i) {
         paths[i] = files[i].name;
     }
+    // Each directory is visited once (a DAG may share subdirectories); the first path in package
+    // and slot order names its members.
+    std::vector<bool> visited(dirs.size(), false);
+    bool cancelled = false;
     const auto walk = [&](const auto& self, u32 dir, const std::string& path, u32 depth) -> void {
-        if (dir >= dirs.size() || depth > MaxDirDepth) {
+        if (cancelled || dir >= dirs.size() || depth > MaxDirDepth || visited[dir]) {
+            return;
+        }
+        visited[dir] = true;
+        if (cancel && !cancel(0)) {
+            cancelled = true;
             return;
         }
         const DirNode& node = dirs[dir];
@@ -1307,7 +1316,16 @@ NupContainer::MemberVerifyResult NupContainer::VerifyMembers(
     constexpr std::size_t Chunk = 1024 * 1024;
     MemberVerifyResult result;
     result.members = files.size();
-    const std::vector<std::string> paths = MemberPaths();
+    bool paths_cancelled = false;
+    const std::vector<std::string> paths = MemberPaths([&](u64 n) {
+        const bool keep_going = !before_read || before_read(n);
+        paths_cancelled = paths_cancelled || !keep_going;
+        return keep_going;
+    });
+    if (paths_cancelled) {
+        result.cancelled = true;
+        return result;
+    }
     const u64 container_size = file->GetSize();
     const std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> digest{EVP_MD_CTX_new(),
                                                                           &EVP_MD_CTX_free};

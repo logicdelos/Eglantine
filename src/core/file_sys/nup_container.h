@@ -204,7 +204,9 @@ public:
     MemberVerifyResult VerifyMembers(const std::function<bool(u64)>& before_read) const;
 
     /// "base/romfs/x", "update-v65536/romfs/x", "addon-<title>/romfs/x" for each member index.
-    std::vector<std::string> MemberPaths() const;
+    /// Each directory is walked once; `cancel(0)` is polled per directory and false stops early
+    /// (remaining members keep their bare names).
+    std::vector<std::string> MemberPaths(const std::function<bool(u64)>& cancel = {}) const;
 
     std::size_t GetFileCount() const {
         return files.size();

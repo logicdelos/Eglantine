@@ -196,6 +196,18 @@ TEST_CASE("NupContainer::VerifyMembers stops when before_read says so", "[nup][n
     REQUIRE(calls == 3);
 }
 
+TEST_CASE("NupContainer::MemberPaths polls cancellation and is deterministic",
+          "[nup][nup-integrity]") {
+    const auto nup = Open({Raw("a.bin", Content(16, 1)), Raw("b.bin", Content(16, 2))});
+    REQUIRE(nup->MemberPaths() == nup->MemberPaths());
+    int calls = 0;
+    (void)nup->MemberPaths([&](u64) {
+        ++calls;
+        return false;
+    });
+    REQUIRE(calls == 1);
+}
+
 TEST_CASE("NUP integrity cache round trip", "[nup][nup-integrity]") {
     std::vector<Integrity::CacheEntry> entries;
     Integrity::Remember(entries, Entry("C:\\Games\\a b.nup", 1000, -5));
