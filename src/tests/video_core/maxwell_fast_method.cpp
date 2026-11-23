@@ -1684,9 +1684,13 @@ TEST_CASE("Fast graphics preview leaves a split GPU thread to the legacy path",
             }
             ++index;
         }
-        // Every write went to the split's ring, the same ones in the same order.
+        // Every write went to the split's ring, the same ones in the same order. Word 1 is the
+        // submitting arm's host engine address, which differs between the two arms by design.
         REQUIRE(consumed[0] == consumed[1]);
-        REQUIRE_FALSE(rings[0].empty());
+        REQUIRE(rings[0].size() > 1);
+        REQUIRE(rings[0].size() == rings[1].size());
+        rings[0][1] = 0;
+        rings[1][1] = 0;
         REQUIRE(rings[0] == rings[1]);
         CompareArms(legacy, preview);
         // Both binds were looked at, and neither taken.
