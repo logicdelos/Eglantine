@@ -1076,6 +1076,33 @@ void TryTransformSwizzleIfNeeded(PixelFormat format, std::array<SwizzleSource, 4
     return VK_FORMAT_R32_UINT;
 }
 
+/// The pixels of copies, blits and uploads for the host GPU profile (nx2_host_gpu.h); only called
+/// while a profiled frame is recorded.
+u64 CopyPixels(std::span<const VideoCommon::ImageCopy> copies) {
+    u64 pixels = 0;
+    for (const VideoCommon::ImageCopy& copy : copies) {
+        pixels += u64{copy.extent.width} * copy.extent.height * copy.extent.depth *
+                  static_cast<u64>((std::max)(copy.dst_subresource.num_layers, 1));
+    }
+    return pixels;
+}
+
+u64 BufferImagePixels(std::span<const VideoCommon::BufferImageCopy> copies) {
+    u64 pixels = 0;
+    for (const VideoCommon::BufferImageCopy& copy : copies) {
+        pixels += u64{copy.image_extent.width} * copy.image_extent.height *
+                  copy.image_extent.depth *
+                  static_cast<u64>((std::max)(copy.image_subresource.num_layers, 1));
+    }
+    return pixels;
+}
+
+u64 RegionPixels(const VideoCommon::Region2D& region) {
+    const s32 width = (std::max)(region.start.x, region.end.x) - (std::min)(region.start.x, region.end.x);
+    const s32 height = (std::max)(region.start.y, region.end.y) - (std::min)(region.start.y, region.end.y);
+    return static_cast<u64>(width) * static_cast<u64>(height);
+}
+
 void BlitScale(Scheduler& scheduler, VkImage src_image, VkImage dst_image, const ImageInfo& info,
                VkImageAspectFlags aspect_mask, const Settings::ResolutionScalingInfo& resolution,
                bool up_scaling = true) {
@@ -1090,6 +1117,9 @@ void BlitScale(Scheduler& scheduler, VkImage src_image, VkImage dst_image, const
     const bool is_bilinear{is_color && !IsPixelFormatInteger(info.format)};
     const VkFilter vk_filter = is_bilinear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
 
+    const HostGpuScope host_span{scheduler, HostGpuKind::Rescale,
+                                 scheduler.HostGpuRecording() ? u64{extent.width} * extent.height
+                                                              : u64{0}};
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Record([dst_image, src_image, extent, resources, aspect_mask, resolution, is_2d,
                       vk_filter, up_scaling](vk::CommandBuffer cmdbuf) {
@@ -1486,6 +1516,7 @@ void TextureCacheRuntime::ReinterpretImage(Image& dst, Image& src,
     const VkBuffer copy_buffer = GetTemporaryBuffer(total_size);
     const VkImage dst_image = dst.Handle();
     const VkImage src_image = src.Handle();
+    const HostGpuScope host_span{scheduler, HostGpuKind::ImageConvert};
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Record([dst_image, src_image, copy_buffer, src_aspect_mask, dst_aspect_mask,
                       vk_in_copies, vk_out_copies](vk::CommandBuffer cmdbuf) {
@@ -2100,6 +2131,8 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
                                     const Region2D& dst_region, const Region2D& src_region,
                                     Tegra::Engines::Fermi2D::Filter filter,
                                     Tegra::Engines::Fermi2D::Operation operation) {
+    const HostGpuScope host_span{scheduler, HostGpuKind::ImageBlit,
+                                 scheduler.HostGpuRecording() ? RegionPixels(dst_region) : u64{0}};
     const VkImageAspectFlags aspect_mask = ImageAspectMask(src.format);
     const bool is_dst_msaa = dst.Samples() != VK_SAMPLE_COUNT_1_BIT;
     const bool is_src_msaa = src.Samples() != VK_SAMPLE_COUNT_1_BIT;
@@ -2255,6 +2288,7 @@ void TextureCacheRuntime::ConvertImage(Framebuffer* dst, ImageView& dst_view, Im
     if (!dst->RenderPass()) {
         return;
     }
+    const HostGpuScope host_span{scheduler, HostGpuKind::ImageConvert};
 
     switch (dst_view.format) {
     case PixelFormat::R16_UNORM:
@@ -2402,6 +2436,8 @@ void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
     });
     const VkImage dst_image = dst.Handle();
     const VkImage src_image = src.Handle();
+    const HostGpuScope host_span{scheduler, HostGpuKind::ImageCopy,
+                                 scheduler.HostGpuRecording() ? CopyPixels(copies) : u64{0}};
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Record([dst_image, src_image, aspect_mask, vk_copies](vk::CommandBuffer cmdbuf) {
         RangedBarrierRange dst_range;
@@ -2488,6 +2524,8 @@ void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
 
 void TextureCacheRuntime::CopyImageMSAA(Image& dst, Image& src,
                                         std::span<const VideoCommon::ImageCopy> copies) {
+    const HostGpuScope host_span{scheduler, HostGpuKind::ImageCopy,
+                                 scheduler.HostGpuRecording() ? CopyPixels(copies) : u64{0}};
     const bool msaa_to_non_msaa = src.info.num_samples > 1 && dst.info.num_samples == 1;
     const u32 num_samples = msaa_to_non_msaa ? src.info.num_samples : dst.info.num_samples;
     if (ENABLE_MSAA_RESOLVE_CONSUME && msaa_to_non_msaa && copies.size() == 1 &&
@@ -3232,6 +3270,8 @@ void Image::AllocateComputeUnswizzleBuffer(u32 max_slices) {
 
 void Image::UploadMemory(VkBuffer buffer, VkDeviceSize offset,
                          std::span<const VideoCommon::BufferImageCopy> copies) {
+    const HostGpuScope host_span{*scheduler, HostGpuKind::ImageUpload,
+                                 scheduler->HostGpuRecording() ? BufferImagePixels(copies) : u64{0}};
     // TODO: Move this to another API
     if (ENABLE_MSAA_RESOLVE_CONSUME && runtime != nullptr) {
         runtime->InvalidateResolveShadow(Handle());
@@ -3346,6 +3386,8 @@ void Image::DownloadMemory(VkBuffer buffer, size_t offset,
 
 void Image::DownloadMemory(std::span<VkBuffer> buffers_span, std::span<size_t> offsets_span,
                             std::span<const VideoCommon::BufferImageCopy> copies) {
+    const HostGpuScope host_span{*scheduler, HostGpuKind::ImageDownload,
+                                 scheduler->HostGpuRecording() ? BufferImagePixels(copies) : u64{0}};
     if (!original_image) {
         LOG_CRITICAL(Render_Vulkan, "Missing image at download: gpu={:#x}, cpu={:#x}, type={}, format={}, flags={:#x}, size={}, dimensions={}x{}",
                      gpu_addr, cpu_addr, static_cast<u32>(info.type), static_cast<u32>(info.format),
@@ -4343,6 +4385,7 @@ bool Image::ScaleDown(bool ignore) {
 }
 
 bool Image::BlitScaleHelper(bool scale_up) {
+    const HostGpuScope host_span{*scheduler, HostGpuKind::Rescale};
     using namespace VideoCommon;
     static constexpr auto BLIT_OPERATION = Tegra::Engines::Fermi2D::Operation::SrcCopy;
     const bool is_color{aspect_mask == VK_IMAGE_ASPECT_COLOR_BIT};

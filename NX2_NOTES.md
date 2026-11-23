@@ -276,15 +276,32 @@ moves the dump to `<dir>`), `EDEN_NX2_AUTO_STUB`, `EDEN_NX2_IPC_TRACE`, `EDEN_NX
 without the profiler and times one split back ring entry in 32, attributed by entry class and per
 deferred callee; any other value is the full mode, which turns off `fast_maxwell3d` and the
 uniform bind and DMA pusher fast paths. In both modes the Vulkan scheduler also profiles one frame
-in 16 (between two `Composite` calls) with GPU timestamps, bottom of pipe, written where the work
-changes: a render pass begins or ends, around each compute dispatch, around the present blit.
-Every window it logs `Host GPU per profiled frame (N frames sampled): total X ms | pass 3840x2160
-c1: a ms in n passes | compute: ... | other (copies, uploads, barriers): ... | passes P |
-first-to-last timestamp X ms` (top 12 groups by time, per profiled frame). A span is the time from
-one timestamp to the next, so "other" also holds the host GPU idling for lack of work and what
-copies and uploads cost outside any pass; a pass that overlaps the one before is charged only the
-part after it. At most 4096 timestamps a frame, the rest counted. The queries are read back
-without waiting once the frame's last submission is known done, a few frames later), `EDEN_NX2_SAMPLE=<threads>` with
+in 16 (from one `TickFrame` to the first command of the first submission after the next
+`Composite`) with GPU timestamps, bottom of pipe, written where the work changes: a render pass
+begins or ends, around each compute dispatch, around the present blit, around the emulator's own
+copies, blits, conversions, uploads, downloads, rescales and compute passes (labels `image copy`,
+`image blit`, `image convert`, `image upload`, `image download`, `buffer copy`, `buffer upload`,
+`rescale`, `compute (emulator)`; `mip gen` is there for a mip generation, which the tree has none
+of). Every submission also starts with a timestamp (the first command of its upload command
+buffer, which the queue runs first) and ends with one (after its last barrier, before the command
+buffer ends), so the time between them is the GPU idle, waiting for the next submit, and not
+work: the labels show GPU work only. The span after the first timestamp up to the main command
+buffer's is the upload command buffer, labelled `buffer upload`. The frame stays open until the
+first command of the next frame's first submission, so the last idle span is the "frame-start
+gap", the host's time between two frames (the present manager's own submission, which copies to
+the swapchain on the present thread, is not stamped: its GPU time is in that gap or the one
+before the next submission). Every window it logs `Host GPU per profiled frame (N sampled): total
+T ms | busy B ms | idle waiting for a submit I ms in G gaps (largest L ms) | submits S |
+frame-start gap Z ms | pass 3840x2160 c1: a ms in n passes | image copy: a ms in n copies, M MP |
+compute: ... | frame start: ... | other (barriers, unlabelled work): ... | K more groups: ... |
+passes P | first-to-last timestamp X ms` (top 14 groups by time, per profiled frame; the largest
+gap is the window's). "frame start" is the span from the first timestamp to the first pass or
+copy; "other" is what no label covers (barriers, clears of tiles, layout transitions, query
+copies outside the labelled sites). A span is the time from one timestamp to the next, so a
+pass that overlaps the one before is charged only the part after it, and a timestamp that reads
+earlier than the one before it makes a span of 0. At most 4096 timestamps a frame, the rest
+counted. The queries are read back without waiting once the frame's last submission is known
+done, a few frames later), `EDEN_NX2_SAMPLE=<threads>` with
 `_START`/`_SECONDS`/`_OUT` (sampling profiler; `C:\dev\nx2work\folded.py` reads its .folded stacks),
 `EDEN_NX2_MME_RECORD=<file>` (macro calls for `C:\dev\nx2work\mme_test`),
 `EDEN_NX2_FENCE_BATCH=0`, `EDEN_NX2_MACRO_COPY=1`, `EDEN_NX2_CNTPCT_PAUSE=0` (turn rows 124, 126, 127 off),

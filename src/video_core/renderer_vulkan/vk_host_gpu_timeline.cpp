@@ -73,6 +73,15 @@ void HostGpuTimeline::Write(u32 query) {
     });
 }
 
+void HostGpuTimeline::WriteFirst(u32 query) {
+    // The upload command buffer is the first of a submission's two (MasterSemaphore::SubmitQueue
+    // lists it first), and nothing was recorded for the new submission before this.
+    scheduler.RecordWithUploadBuffer(
+        [pool = *query_pool, query](vk::CommandBuffer, vk::CommandBuffer upload_cmdbuf) {
+            upload_cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pool, query);
+        });
+}
+
 void HostGpuTimeline::Reset(u32 base) {
     if (host_reset) {
         // The slot was read back, so the host GPU is done with its queries.
@@ -90,8 +99,8 @@ bool HostGpuTimeline::BeginFrame() {
         return false;
     }
     if (recording != nullptr) {
-        // The last frame did not reach the present that ends a frame.
-        EndFrame();
+        // No submission came after the present of the last frame.
+        Finish(false);
     }
     ReadBack();
     LogWindow();
@@ -114,24 +123,39 @@ bool HostGpuTimeline::BeginFrame() {
     free_slot->tick = 0;
     free_slot->polls = 0;
     recording = free_slot;
+    closing = false;
+    batch_open = false;
     Reset(BaseOf(*free_slot));
-    Note(Host::Label{});
+    Note(Host::Label{.kind = Host::Kind::FrameStart});
     return true;
 }
 
-void HostGpuTimeline::EndFrame() {
-    if (recording == nullptr) {
-        return;
+void HostGpuTimeline::CloseFrame() {
+    if (recording != nullptr) {
+        closing = true;
+    }
+}
+
+void HostGpuTimeline::Finish(bool first_of_batch) {
+    if (!first_of_batch) {
+        // The uploads batched so far are recorded before the timestamp, as they are labelled.
+        scheduler.FlushPendingUploads();
     }
     Slot& slot = *recording;
     recording = nullptr;
+    closing = false;
+    batch_open = false;
     const u32 index = slot.log.End();
     if (index == Host::FrameLog::NoQuery) {
         slot.state = State::Free;
         window.NoteSkipped();
         return;
     }
-    Write(BaseOf(slot) + index);
+    if (first_of_batch) {
+        WriteFirst(BaseOf(slot) + index);
+    } else {
+        Write(BaseOf(slot) + index);
+    }
     // The timestamp is in the submission that carries this tick.
     slot.tick = scheduler.CurrentTick();
     slot.state = State::Pending;
@@ -141,10 +165,51 @@ void HostGpuTimeline::Note(const Host::Label& label) {
     if (recording == nullptr) {
         return;
     }
+    scheduler.FlushPendingUploads();
     const u32 index = recording->log.Begin(label);
     if (index != Host::FrameLog::NoQuery) {
         Write(BaseOf(*recording) + index);
+        current = label;
     }
+}
+
+HostGpuStamp HostGpuTimeline::BatchEnd() {
+    if (recording == nullptr) {
+        return {};
+    }
+    // Two more are kept for the first timestamps of the next submission, which close the span.
+    const u32 index = recording->log.Begin({.kind = Host::Kind::Idle}, 2);
+    if (index == Host::FrameLog::NoQuery) {
+        return {};
+    }
+    batch_open = true;
+    return {.pool = *query_pool, .query = BaseOf(*recording) + index};
+}
+
+bool HostGpuTimeline::BatchStart() {
+    if (recording == nullptr) {
+        return false;
+    }
+    if (closing) {
+        Finish(true);
+        return false;
+    }
+    if (!batch_open) {
+        return true;
+    }
+    batch_open = false;
+    // The first command of the upload command buffer, which the queue runs before the main one:
+    // the span after it is the upload command buffer's. The first command of the main command
+    // buffer goes on with what was open.
+    const u32 upload_index = recording->log.Begin({.kind = Host::Kind::BufferUpload});
+    const u32 main_index = recording->log.Begin(Host::Continued(current));
+    if (upload_index != Host::FrameLog::NoQuery) {
+        WriteFirst(BaseOf(*recording) + upload_index);
+    }
+    if (main_index != Host::FrameLog::NoQuery) {
+        Write(BaseOf(*recording) + main_index);
+    }
+    return true;
 }
 
 void HostGpuTimeline::ReadBack() {

@@ -358,6 +358,7 @@ std::optional<std::pair<VkBuffer, VkDeviceSize>> VertexRepackPass::Assemble(VkBu
     descriptor_queue.AddBuffer(source, base_offset, parameters->source_range);
     descriptor_queue.AddBuffer(dest.buffer, dest.offset, output_size);
     const void* data = descriptor_queue.UpdateData();
+    const HostGpuScope host_span{scheduler, HostGpuKind::EmulatorCompute};
     scheduler.RequestOutsideRenderPassOperationContext();
     LOG_DEBUG(Render_Vulkan, "Vertex repack queued: source_size={}, output_size={}, groups={}",
               size, output_size, parameters->dispatch_groups);
@@ -404,6 +405,7 @@ void PlainUnswizzlePass::Dispatch(VkBuffer source, VkDeviceSize offset, VkBuffer
     descriptor_queue.AddBuffer(source, offset, u64{parameters.source_words} * 4);
     descriptor_queue.AddBuffer(destination, 0, u64{parameters.word_count} * 4 + guard_bytes);
     const void* data = descriptor_queue.UpdateData();
+    const HostGpuScope host_span{scheduler, HostGpuKind::EmulatorCompute};
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Record([this, data, parameters](vk::CommandBuffer cmdbuf) {
         // The shared output may still be read by an earlier buffer-to-image copy.
@@ -451,6 +453,7 @@ std::pair<VkBuffer, VkDeviceSize> Uint8Pass::Assemble(u32 num_vertices, VkBuffer
     compute_pass_descriptor_queue.AddBuffer(staging.buffer, staging.offset, staging_size);
     const void* const descriptor_data{compute_pass_descriptor_queue.UpdateData()};
 
+    const HostGpuScope host_span{scheduler, HostGpuKind::EmulatorCompute};
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Record([this, descriptor_data, num_vertices](vk::CommandBuffer cmdbuf) {
         static constexpr u32 DISPATCH_SIZE = 1024;
@@ -510,6 +513,7 @@ std::pair<VkBuffer, VkDeviceSize> QuadIndexedPass::Assemble(
     compute_pass_descriptor_queue.AddBuffer(staging.buffer, staging.offset, staging_size);
     const void* const descriptor_data{compute_pass_descriptor_queue.UpdateData()};
 
+    const HostGpuScope host_span{scheduler, HostGpuKind::EmulatorCompute};
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Record([this, descriptor_data, num_tri_vertices, base_vertex, index_shift,
                       is_strip](vk::CommandBuffer cmdbuf) {
@@ -556,6 +560,7 @@ void ConditionalRenderingResolvePass::Resolve(VkBuffer dst_buffer, VkBuffer src_
     compute_pass_descriptor_queue.AddBuffer(dst_buffer, 0, sizeof(u32));
     const void* const descriptor_data{compute_pass_descriptor_queue.UpdateData()};
 
+    const HostGpuScope host_span{scheduler, HostGpuKind::EmulatorCompute};
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Record([this, descriptor_data, compare_to_zero](vk::CommandBuffer cmdbuf) {
         static constexpr VkMemoryBarrier read_barrier{
@@ -629,6 +634,7 @@ void QueriesPrefixScanPass::Run(VkBuffer accumulation_buffer, VkBuffer dst_buffe
         size_t used_offset = offset;
         offset += runs_to_do;
 
+        const HostGpuScope host_span{scheduler, HostGpuKind::EmulatorCompute};
         scheduler.RequestOutsideRenderPassOperationContext();
         scheduler.Record([this, descriptor_data, min_accumulation_limit, max_accumulation_limit,
                           runs_to_do, used_offset, conditional_access](vk::CommandBuffer cmdbuf) {
@@ -729,6 +735,7 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
         VideoCore::Surface::DefaultBlockWidth(info.format),
         VideoCore::Surface::DefaultBlockHeight(info.format),
     };
+    const HostGpuScope host_span{scheduler, HostGpuKind::EmulatorCompute};
     scheduler.RequestOutsideRenderPassOperationContext();
     const VkPipeline vk_pipeline = *pipeline;
     const VkImageAspectFlags aspect_mask = target.aspect_mask;
@@ -908,6 +915,7 @@ BcEncoderPass::~BcEncoderPass() = default;
 void BcEncoderPass::Encode(VkImageView source, u32 width, u32 height, u32 layers, bool bc3,
                            VkBuffer buffer, VkDeviceSize buffer_offset, VkDeviceSize buffer_size,
                            VkDeviceSize out_offset) {
+    const HostGpuScope host_span{scheduler, HostGpuKind::EmulatorCompute};
     scheduler.RequestOutsideRenderPassOperationContext();
     compute_pass_descriptor_queue.Acquire(scheduler, 2);
     compute_pass_descriptor_queue.AddImage(source);
@@ -1036,6 +1044,7 @@ void BlockLinearUnswizzle3DPass::Unswizzle(
     const u32 blocks_x = (image.info.size.width  + 3) / 4;
     const u32 blocks_y = (image.info.size.height + 3) / 4;
 
+    const HostGpuScope host_span{scheduler, HostGpuKind::EmulatorCompute};
     scheduler.RequestOutsideRenderPassOperationContext();
     for (u32 z_offset = 0; z_offset < z_count; z_offset += MAX_BATCH_SLICES) {
         const u32 current_chunk_slices = (std::min)(MAX_BATCH_SLICES, z_count - z_offset);

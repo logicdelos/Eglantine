@@ -123,17 +123,40 @@ public:
     /// frames, and profiles this one if it is the one in FrameInterval.
     void TickHostGpuProfile();
 
-    /// The end of a profiled frame: the timestamp that ends the last span, in the submission that
-    /// presents it (before its Flush). Does nothing for a frame that is not profiled.
+    /// The present of a profiled frame is recorded (before its Flush). The frame ends at the first
+    /// command of the next submission, so the GPU's wait for it is in the frame. Does nothing for
+    /// a frame that is not profiled.
     void EndHostGpuProfileFrame();
 
-    /// A profiled frame: a timestamp that starts a span of `kind` (Compute, PresentBlit or
-    /// Other: render passes note themselves). PresentBlit makes the passes until the next Other
-    /// the blit's. A branch on a flag otherwise.
-    void NoteHostGpuSpan(VideoCommon::Nx2HostGpu::Kind kind) {
-        if (host_gpu_recording) [[unlikely]] {
-            NoteHostGpuSpanImpl(kind);
+    /// Whether the frame being recorded is profiled.
+    [[nodiscard]] bool HostGpuRecording() const noexcept {
+        return host_gpu_recording;
+    }
+
+    /// The label of the work outside render passes that is being recorded.
+    [[nodiscard]] const VideoCommon::Nx2HostGpu::Label& HostGpuScopeLabel() const noexcept {
+        return host_gpu_scope;
+    }
+
+    /// Records the uploads batched so far. A timestamp of a profiled frame comes after them in
+    /// command order, as it does in its labels.
+    void FlushPendingUploads() {
+        if (uploads_pending) {
+            FlushUploads();
         }
+    }
+
+    /// A profiled frame: a timestamp that starts a span with `label` (render passes note
+    /// themselves) and makes it the scope: the passes and the end of the passes until the next
+    /// span are its too, unless it is Other. A branch on a flag otherwise.
+    void NoteHostGpuSpan(const VideoCommon::Nx2HostGpu::Label& label) {
+        if (host_gpu_recording) [[unlikely]] {
+            NoteHostGpuSpanImpl(label);
+        }
+    }
+
+    void NoteHostGpuSpan(VideoCommon::Nx2HostGpu::Kind kind) {
+        NoteHostGpuSpan(VideoCommon::Nx2HostGpu::Label{.kind = kind});
     }
 
     void DeferFragmentBarrier() {
@@ -467,7 +490,7 @@ private:
 
     void AcquireNewChunk();
 
-    void NoteHostGpuSpanImpl(VideoCommon::Nx2HostGpu::Kind kind);
+    void NoteHostGpuSpanImpl(const VideoCommon::Nx2HostGpu::Label& label);
 
     void NoteHostGpuPass(const Framebuffer* framebuffer);
 
@@ -496,7 +519,7 @@ private:
     std::function<void()> on_submit;
     std::unique_ptr<HostGpuTimeline> host_gpu;
     bool host_gpu_recording{}; ///< The frame being recorded is profiled.
-    VideoCommon::Nx2HostGpu::Kind host_gpu_scope{VideoCommon::Nx2HostGpu::Kind::Other};
+    VideoCommon::Nx2HostGpu::Label host_gpu_scope;
 
     State state;
     u64 recording_epoch = 0;
@@ -521,5 +544,37 @@ private:
     u64 max_frame_count{};
     u64 frame_counter{};
 };
+
+/// The GPU work recorded while this exists is `kind`'s in a profiled frame (nx2_host_gpu.h): a
+/// timestamp that starts the span, `pixels` for the megapixels a copy moves, and one that goes
+/// back to the label before at the end. Passes begun inside are `kind`'s too. A flag test on
+/// either side when the frame is not profiled.
+class HostGpuScope {
+public:
+    HostGpuScope(Scheduler& scheduler_, VideoCommon::Nx2HostGpu::Kind kind, u64 pixels = 0)
+        : scheduler{scheduler_} {
+        if (scheduler.HostGpuRecording()) [[unlikely]] {
+            active = true;
+            previous = scheduler.HostGpuScopeLabel();
+            scheduler.NoteHostGpuSpan(VideoCommon::Nx2HostGpu::Label{.kind = kind, .pixels = pixels});
+        }
+    }
+
+    ~HostGpuScope() {
+        if (active) [[unlikely]] {
+            scheduler.NoteHostGpuSpan(VideoCommon::Nx2HostGpu::Continued(previous));
+        }
+    }
+
+    HostGpuScope(const HostGpuScope&) = delete;
+    HostGpuScope& operator=(const HostGpuScope&) = delete;
+
+private:
+    Scheduler& scheduler;
+    VideoCommon::Nx2HostGpu::Label previous;
+    bool active{};
+};
+
+using HostGpuKind = VideoCommon::Nx2HostGpu::Kind;
 
 } // namespace Vulkan

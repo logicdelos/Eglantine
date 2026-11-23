@@ -232,6 +232,7 @@ void Scheduler::FlushUploads() {
     upload_batch->copies.clear();
     upload_batch->groups.clear();
     uploads_pending = false;
+    const HostGpuScope host_span{*this, HostGpuKind::BufferUpload};
     Record(std::move(command));
 }
 
@@ -523,7 +524,10 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
     draws_since_submit = 0;
 
     const u64 signal_value = master_semaphore->NextTick();
-    RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value,
+    // The last command of the submission in a profiled frame: a timestamp the worker writes, which
+    // the first command of the next submission (AllocateNewContext) answers.
+    const HostGpuStamp host_gpu_stamp = host_gpu_recording ? host_gpu->BatchEnd() : HostGpuStamp{};
+    RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value, host_gpu_stamp,
                             this](vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf) {
         static constexpr VkMemoryBarrier WRITE_BARRIER{
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -540,6 +544,10 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
         upload_cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, WRITE_BARRIER);
         upload_cmdbuf.End();
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, READ_BARRIER);
+        if (host_gpu_stamp.query != VideoCommon::Nx2HostGpu::FrameLog::NoQuery) [[unlikely]] {
+            cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, host_gpu_stamp.pool,
+                                  host_gpu_stamp.query);
+        }
         cmdbuf.End();
 
         if (on_submit) {
@@ -589,6 +597,13 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
 
 void Scheduler::AllocateNewContext() {
     // Enable counters once again. These are disabled when a command buffer is finished.
+    if (host_gpu_recording) [[unlikely]] {
+        // The first command of the new submission, and the end of a frame that was closed.
+        host_gpu_recording = host_gpu->BatchStart();
+        if (!host_gpu_recording) {
+            host_gpu_scope = {};
+        }
+    }
 }
 
 void Scheduler::InvalidateState() {
@@ -686,7 +701,7 @@ void Scheduler::EndRenderPass()
 
         if (host_gpu_recording) [[unlikely]] {
             // The work after the pass is the scope's: the blit's own, or nothing in particular.
-            host_gpu->Note({.kind = host_gpu_scope});
+            host_gpu->Note(VideoCommon::Nx2HostGpu::Continued(host_gpu_scope));
         }
 
         state.renderpass = VkRenderPass{};
@@ -695,13 +710,12 @@ void Scheduler::EndRenderPass()
 
 void Scheduler::TickHostGpuProfile() {
     if (!VideoCommon::Nx2Profile::Enabled()) {
-        EndHostGpuProfileFrame();
         return;
     }
     if (host_gpu == nullptr) {
         host_gpu = std::make_unique<HostGpuTimeline>(device, *this, *master_semaphore);
     }
-    host_gpu_scope = VideoCommon::Nx2HostGpu::Kind::Other;
+    host_gpu_scope = {};
     host_gpu_recording = host_gpu->BeginFrame();
 }
 
@@ -709,21 +723,21 @@ void Scheduler::EndHostGpuProfileFrame() {
     if (!host_gpu_recording) {
         return;
     }
-    host_gpu->EndFrame();
-    host_gpu_recording = false;
-    host_gpu_scope = VideoCommon::Nx2HostGpu::Kind::Other;
+    // The frame goes on until the first command of the next submission (AllocateNewContext): the
+    // GPU's wait for it is the frame's last span.
+    host_gpu->CloseFrame();
 }
 
-void Scheduler::NoteHostGpuSpanImpl(VideoCommon::Nx2HostGpu::Kind kind) {
-    host_gpu_scope = kind == VideoCommon::Nx2HostGpu::Kind::PresentBlit
-                         ? VideoCommon::Nx2HostGpu::Kind::PresentBlit
-                         : VideoCommon::Nx2HostGpu::Kind::Other;
-    host_gpu->Note({.kind = kind});
+void Scheduler::NoteHostGpuSpanImpl(const VideoCommon::Nx2HostGpu::Label& label) {
+    host_gpu_scope = label;
+    host_gpu->Note(label);
 }
 
 void Scheduler::NoteHostGpuPass(const Framebuffer* framebuffer) {
-    if (host_gpu_scope == VideoCommon::Nx2HostGpu::Kind::PresentBlit) {
-        host_gpu->Note({.kind = VideoCommon::Nx2HostGpu::Kind::PresentBlit});
+    using VideoCommon::Nx2HostGpu::Kind;
+    if (host_gpu_scope.kind != Kind::Other && host_gpu_scope.kind != Kind::FrameStart) {
+        // A pass of an emulator copy or of the present blit is that work's.
+        host_gpu->Note(VideoCommon::Nx2HostGpu::Continued(host_gpu_scope));
         return;
     }
     const VkExtent2D area = framebuffer->RenderArea();
