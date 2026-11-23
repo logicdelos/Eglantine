@@ -460,12 +460,11 @@ private:
     void NoteMethod([[maybe_unused]] u32 method,
                     [[maybe_unused]] Tegra::Engines::EngineInterface* engine) {
         if constexpr (Classify) {
-            back_entry.method_key =
-                method | (engine->fast_maxwell3d ? u32{0} : BackEngineId(engine) << 16);
+            back_entry.method_key = method | (BackEngineId(engine) << 16);
         }
     }
-    /// A small id (from 1) of an engine the profiled back ran a method of, in order of first
-    /// sight (the engines carry no type); 8 for any past the 7 it tells apart.
+    /// 0 for a fast Maxwell3D; else a small id (from 1) of an engine the profiled back ran a
+    /// method of, in order of first sight (the engines carry no type); 8 past the 7 it tells apart.
     u32 BackEngineId(Tegra::Engines::EngineInterface* engine);
     /// A Method entry with a repeat count (RepeatableMethod): the call, then the repeats.
     void ExecuteRepeated(u64 head);

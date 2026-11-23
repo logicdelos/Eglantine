@@ -405,6 +405,9 @@ const char* GpuSplit::CalleeName(u64 thunk) {
 }
 
 u32 GpuSplit::BackEngineId(Tegra::Engines::EngineInterface* engine) {
+    if (engine->fast_maxwell3d) {
+        return 0;
+    }
     for (size_t i = 0; i < back_engines_seen.size(); ++i) {
         if (back_engines_seen[i] == engine) {
             return static_cast<u32>(i + 1);
