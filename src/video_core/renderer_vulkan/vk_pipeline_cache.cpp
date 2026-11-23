@@ -2495,38 +2495,30 @@ void PipelineCache::EvictUnusedPipelines() {
     // landed). So by default nothing is destroyed (setting free_unused_pipelines off), except in an
     // emergency: with under 512 MiB of physical RAM available the least recently used ones go even
     // with the setting off, down to the low-memory cap, so the process is not killed for memory
-    // (commit use of 90-96% is routine on a 15 GB host and is no reason to evict). With it on,
-    // pipelines are only destroyed above a count cap, least recently used first and only those
-    // unused for 150 s, down to 7/8 of the cap; the cap halves while the host is low on memory
-    // (Nx2Bottleneck::IsLowMemory).
+    // (commit use of 90-96% is routine on a 15 GB host and is no reason to evict). The emergency
+    // ignores the 150 s age and the never-used preloaded pipelines' protection (and runs in the
+    // first 9000 frames too), sparing only the current and unbuilt ones; destruction is still
+    // deferred until the GPU is done with them. With the setting on, pipelines are only destroyed
+    // above a count cap, least recently used first and only those unused for 150 s, down to 7/8 of
+    // the cap; the cap halves while the host is low on memory (Nx2Bottleneck::IsLowMemory).
     constexpr u64 EvictAfterFrames = 9000;
     constexpr size_t PipelineCap = 2048;
     constexpr u64 EmergencyFreeBytes = u64{512} << 20;
-    if (frame_count <= EvictAfterFrames) {
-        return;
-    }
     const auto memory = Nx2Bottleneck::ReadHostMemory();
     const bool keep_all = !Settings::values.free_unused_pipelines.GetValue();
-    const bool low_memory = keep_all ? memory.known && memory.free_bytes < EmergencyFreeBytes
-                                     : Nx2Bottleneck::IsLowMemory(memory);
+    const bool emergency = keep_all && memory.known && memory.free_bytes < EmergencyFreeBytes;
+    if (keep_all && !emergency) {
+        return;
+    }
+    if (!emergency && frame_count <= EvictAfterFrames) {
+        return;
+    }
+    const bool low_memory = emergency || Nx2Bottleneck::IsLowMemory(memory);
     const size_t cap = low_memory ? PipelineCap / 2 : PipelineCap;
     if (graphics_cache.size() <= cap) {
         return;
     }
-    if (keep_all && !low_memory) {
-        return;
-    }
-    if (keep_all && !warned_pipelines_kept) {
-        warned_pipelines_kept = true;
-        LOG_WARNING(Render_Vulkan,
-                    "Host has {} MiB of physical RAM left with {} graphics pipelines kept in memory "
-                    "(about {} MiB of driver memory): evicting the least recently used ones down "
-                    "to {} even though the setting free_unused_pipelines (Free unused shaders "
-                    "from memory) is off",
-                    memory.free_bytes >> 20, graphics_cache.size(),
-                    graphics_cache.size() * 45 / 100, cap - cap / 8);
-    }
-    const u64 cutoff = frame_count - EvictAfterFrames;
+    const u64 cutoff = frame_count > EvictAfterFrames ? frame_count - EvictAfterFrames : 0;
     const u64 tick = scheduler.CurrentTick();
     // Nx2Perf pipeline_keep_preloaded (on by default): the ones built at boot from the used list
     // that this session has not drawn with yet keep LastUse() == 0; they are kept, not evicted
@@ -2538,10 +2530,10 @@ void PipelineCache::EvictUnusedPipelines() {
     for (const auto& [key, owned] : graphics_cache) {
         GraphicsPipeline* const pipeline = owned.get();
         if (pipeline == nullptr || pipeline == current_pipeline || !pipeline->IsBuilt() ||
-            pipeline->LastUse() >= cutoff) {
+            (!emergency && pipeline->LastUse() >= cutoff)) {
             continue;
         }
-        if (keep_preloaded && !used_this_session.contains(pipeline)) {
+        if (keep_preloaded && !emergency && !used_this_session.contains(pipeline)) {
             ++kept;
             continue;
         }
@@ -2585,11 +2577,25 @@ void PipelineCache::EvictUnusedPipelines() {
     graphics_fast_cache.fill(nullptr);
     skipped_geometry = {};
     last_skipped_geometry_frame = ~u64{};
-    LOG_INFO(Render_Vulkan,
-             "Evicted {} least recently used graphics pipelines (unused for {} frames or more), "
-             "{} left, cap {}{}",
-             evict, EvictAfterFrames, graphics_cache.size(), cap,
-             low_memory ? " (halved: host low on memory)" : "");
+    if (emergency && !warned_pipelines_kept) {
+        warned_pipelines_kept = true;
+        LOG_WARNING(Render_Vulkan,
+                    "Host has {} MiB of physical RAM left: evicted {} least recently used graphics "
+                    "pipelines ({} left, about {} MiB of driver memory freed, cap {}) even though "
+                    "the setting free_unused_pipelines (Free unused shaders from memory) is off",
+                    memory.free_bytes >> 20, evict, graphics_cache.size(), evict * 45 / 100, cap);
+    } else if (emergency) {
+        LOG_INFO(Render_Vulkan,
+                 "Host low on physical RAM: evicted {} least recently used graphics pipelines, "
+                 "{} left, cap {}",
+                 evict, graphics_cache.size(), cap);
+    } else {
+        LOG_INFO(Render_Vulkan,
+                 "Evicted {} least recently used graphics pipelines (unused for {} frames or "
+                 "more), {} left, cap {}{}",
+                 evict, EvictAfterFrames, graphics_cache.size(), cap,
+                 low_memory ? " (halved: host low on memory)" : "");
+    }
 }
 
 void PipelineCache::StartShaderPrecache(u64 title_id) {
