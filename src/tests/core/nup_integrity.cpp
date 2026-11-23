@@ -208,6 +208,18 @@ TEST_CASE("NupContainer::MemberPaths polls cancellation and is deterministic",
     REQUIRE(calls == 1);
 }
 
+TEST_CASE("NupContainer::MemberPaths cancels inside a flat directory", "[nup][nup-integrity]") {
+    std::vector<Member> members;
+    for (std::size_t i = 0; i < 600; ++i) {
+        members.push_back(Raw("m" + std::to_string(i), Content(4, i)));
+    }
+    const auto nup = Open(members);
+    int calls = 0;
+    (void)nup->MemberPaths([&](u64) { return ++calls < 2; });
+    // One poll on entering the root, one more inside its child loop; none after cancelling.
+    REQUIRE(calls == 2);
+}
+
 TEST_CASE("NUP integrity cache round trip", "[nup][nup-integrity]") {
     std::vector<Integrity::CacheEntry> entries;
     Integrity::Remember(entries, Entry("C:\\Games\\a b.nup", 1000, -5));

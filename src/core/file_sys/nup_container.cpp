@@ -1282,6 +1282,10 @@ std::vector<std::string> NupContainer::MemberPaths(const std::function<bool(u64)
         const u64 end = std::min<u64>(static_cast<u64>(node.first_child) + node.child_count,
                                       children.size());
         for (u64 slot = node.first_child; slot < end; ++slot) {
+            if (((slot - node.first_child) & 255) == 255 && cancel && !cancel(0)) {
+                cancelled = true;
+                return;
+            }
             const u32 child = children[slot];
             if (child >= dirs.size()) {
                 const std::size_t index = child - dirs.size();
@@ -1290,6 +1294,9 @@ std::vector<std::string> NupContainer::MemberPaths(const std::function<bool(u64)
                 }
             } else {
                 self(self, child, path + '/' + dirs[child].name, depth + 1);
+                if (cancelled) {
+                    return;
+                }
             }
         }
     };
@@ -1307,6 +1314,9 @@ std::vector<std::string> NupContainer::MemberPaths(const std::function<bool(u64)
             break;
         }
         walk(walk, package.root_dir, prefix, 0);
+        if (cancelled) {
+            break;
+        }
     }
     return paths;
 }
