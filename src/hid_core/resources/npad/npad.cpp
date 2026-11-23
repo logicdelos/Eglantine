@@ -153,12 +153,20 @@ void NPad::ControllerUpdate(Kernel::KernelCore& kernel, Core::HID::ControllerTri
         return;
     }
 
+    // The callback is registered in the constructor, but the applet resource only arrives with
+    // SetNpadExternals. A controller event (e.g. DualSense motion polled by the frontend thread)
+    // in that window used to dereference the null resource and crash the host.
+    auto* const applet_resource = applet_resource_holder.applet_resource.get();
+    if (applet_resource == nullptr) {
+        return;
+    }
+
     for (std::size_t aruid_index = 0; aruid_index < AruidIndexMax; aruid_index++) {
         if (controller_idx >= controller_data[aruid_index].size()) {
             return;
         }
 
-        auto* data = applet_resource_holder.applet_resource->GetAruidDataByIndex(aruid_index);
+        auto* data = applet_resource->GetAruidDataByIndex(aruid_index);
 
         if (data == nullptr || !data->flag.is_assigned) {
             continue;
