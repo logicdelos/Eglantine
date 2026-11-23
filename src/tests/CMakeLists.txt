@@ -161,6 +161,7 @@ add_executable(tests
     video_core/indirect_reset.cpp
     video_core/ocarina_upscale.cpp
     video_core/compute_clean_cut.cpp
+    video_core/nx2_profile_lite.cpp
     input_common/calibration_configuration_job.cpp
     frontend_common/ui_e_install_keys.cpp
     frontend_common/ui_e_profile_import.cpp

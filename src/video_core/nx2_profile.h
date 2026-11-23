@@ -11,11 +11,13 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <map>
 #include <mutex>
 #include <numeric>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -27,6 +29,15 @@
 
 // EDEN_NX2_GPU_PROFILE: time where the GPU thread spends its time. Each zone counts its own
 // (exclusive) time, nested zones excluded; every 10 s the thread logs each zone's share.
+//
+// EDEN_NX2_GPU_PROFILE=lite (exactly that value, read once at startup) is the mode for undistorted
+// numbers: the full mode changes the paths it measures (fast_maxwell3d, uniform bind and DMA
+// pusher fast paths are off, see Observing()) and wraps every split back ring entry in a zone
+// (3-5 million clock read pairs a second). Lite keeps every path as it is without the profiler and
+// times one back ring entry in SampleEvery instead (GpuSplit::ProfiledExecute), scaled and
+// attributed by what the entry was (the back* zones, the ring entry and word counters, and per
+// Defer callee for Kind::Call). Zones that run once per draw or less stay exact; the method zone
+// is not timed. Lite is start-up only: SetEnabled() toggles the full mode.
 namespace VideoCommon::Nx2Profile {
 
 enum class Zone : u32 {
@@ -71,6 +82,12 @@ enum class Zone : u32 {
     BindStorage,       ///< Of bind stage buffers: storage buffers (touch, sync, usage, bind)
     BackReplay,   ///< Split back: decoding ring entries (Execute) outside the zones it calls
     BackIdleHook, ///< Split back: the idle hook (deferred submits) outside the zones it calls
+    BackStateRun,   ///< Split back, lite: sampled state register write entries and runs
+    BackExecMethod, ///< Split back, lite: sampled single executable method entries (CallMethod)
+    BackCbWords,    ///< Split back, lite: sampled constant buffer word entries
+    BackMulti,      ///< Split back, lite: sampled multi method entries (Kind::Multi)
+    BackCall,       ///< Split back, lite: sampled deferred calls (Kind::Call)
+    BackOtherEntry, ///< Split back, lite: sampled engine, wrap, repeated and other entries
     Count,
 };
 
@@ -85,7 +102,22 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "list copy wait",
     "bind uniform bank", "bind uniform stream", "bind uniform cached", "bind storage",
     "back replay", "back idle hook",
+    "back state run", "back exec method", "back cb words", "back multi", "back call",
+    "back other entry",
 };
+
+static_assert(zone_names[static_cast<size_t>(Zone::Count) - 1] != nullptr,
+              "a Zone was added without its name");
+static_assert(static_cast<u32>(Zone::BackOtherEntry) - static_cast<u32>(Zone::BackStateRun) + 1 ==
+                  static_cast<u32>(BackEntry::Count),
+              "the back* zones follow BackEntry");
+
+/// EDEN_NX2_GPU_PROFILE=lite: read once, never changes (see the comment above).
+inline bool ReadLite() {
+    const char* const value = std::getenv("EDEN_NX2_GPU_PROFILE");
+    return value != nullptr && std::strcmp(value, "lite") == 0;
+}
+inline const bool g_lite = ReadLite();
 
 // On from startup with EDEN_NX2_GPU_PROFILE; the MCP server can toggle it. Enabled() runs several
 // times per method write: a relaxed load is as cheap as the plain bool it replaced.
@@ -97,11 +129,25 @@ inline bool Enabled() {
     return g_enabled.load(std::memory_order_relaxed);
 }
 
+/// Lite mode (EDEN_NX2_GPU_PROFILE=lite): the profiler counts and times, sampled, without
+/// changing the code paths it measures.
+inline bool Lite() {
+    return g_lite;
+}
+
+/// Profiling with the full mode, which changes code paths: the gates that pick a different
+/// algorithm while profiling (fast_maxwell3d, uniform binds, DmaPusher's fast path) use this, not
+/// Enabled().
+inline bool Observing() {
+    return Enabled() && !g_lite;
+}
+
 /// Bumped on every toggle: threads drop totals from before it (thread_local, so they reset
 /// themselves at their next Report).
 inline std::atomic<u32> g_generation{0};
 
-/// Turns the profiler on or off at runtime (thread-safe). Each thread restarts its window at
+/// Turns the profiler on or off at runtime (thread-safe); on is the full mode, unless the process
+/// started in lite mode (that is start-up only and stays). Each thread restarts its window at
 /// its next Report, so the first numbers after a toggle take one full window.
 inline void SetEnabled(bool enabled) {
     g_generation.fetch_add(1, std::memory_order_relaxed);
@@ -196,6 +242,15 @@ enum class FlushOrigin : u32 {
 inline constexpr std::array<const char*, static_cast<size_t>(FlushOrigin::Count)>
     flush_origin_names{"other", "waited", "gpu idle", "budget", "fence", "list copy", "idle hook"};
 
+/// One Defer callee's totals on the split back, per thunk (AddCallee).
+struct CalleeStat {
+    u64 thunk;
+    u64 inclusive_ns; ///< Scaled: the time of the sampled entries times SampleEvery
+    u64 exclusive_ns; ///< The same without the zones nested in the call
+    u64 calls;        ///< Scaled the same way
+};
+inline constexpr size_t CalleeSlots = 64;
+
 struct ThreadData {
     std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{};
     std::array<u64, static_cast<size_t>(Zone::Count)> count{};
@@ -209,6 +264,10 @@ struct ThreadData {
     std::array<u64, static_cast<size_t>(DrainSite::Count)> drain_ns{};
     std::array<u64, static_cast<size_t>(DrainSite::Count)> drain_count{};
     std::array<MacroCounts, 128> macros{};
+    /// The back's Defer callees, open addressing by thunk; calls past the 64 slots go to
+    /// other_calls.
+    std::array<CalleeStat, CalleeSlots> callees{};
+    CalleeStat other_calls{};
     u64 child_ns{};    ///< Time of the zones nested in the current one
     u64 window_start{};
     u32 generation{};
@@ -273,26 +332,54 @@ inline void Publish(const char* thread_name, u64 now) {
 
 class Scope {
 public:
+    /// Which calls of a zone a Scope times.
+    enum class Sampling : u8 {
+        Exact, ///< every call
+        OneIn, ///< one call in SampleEvery (TakeSample), scaled by SampleEvery
+        Skip,  ///< none
+    };
+
     explicit Scope(Zone zone_) : zone{zone_}, enabled{Enabled()} {
         if (!enabled) {
             return;
         }
-        if (zone == Zone::Method && g_sampled.load(std::memory_order_relaxed)) {
-            if (!TakeSample()) {
-                enabled = false;
-                return;
-            }
-            scale = SampleEvery;
+        if (zone == Zone::Method) {
+            // Lite mode times the split back's entries sampled instead (GpuSplit::ProfiledExecute).
+            Begin(Lite() ? Sampling::Skip
+                         : g_sampled.load(std::memory_order_relaxed) ? Sampling::OneIn
+                                                                     : Sampling::Exact);
+        } else {
+            Begin(Sampling::Exact);
         }
-        parent_child_ns = t_data.child_ns;
-        t_data.child_ns = 0;
-        start = Now();
+    }
+
+    Scope(Zone zone_, Sampling sampling) : zone{zone_}, enabled{Enabled()} {
+        if (enabled) {
+            Begin(sampling);
+        }
     }
 
     ~Scope() {
+        Stop();
+    }
+
+    /// Whether this scope times its zone (the profiler is on and, for OneIn, TakeSample hit);
+    /// until Stop.
+    [[nodiscard]] bool Timed() const {
+        return enabled;
+    }
+
+    /// Changes the zone the time goes to (the entry was only classified while it ran).
+    void SetZone(Zone zone_) {
+        zone = zone_;
+    }
+
+    /// Ends the scope now instead of at its destruction (once).
+    void Stop() {
         if (!enabled) {
             return;
         }
+        enabled = false;
         const u64 elapsed = Now() - start;
         auto& data = t_data;
         const auto index = static_cast<size_t>(zone);
@@ -305,17 +392,46 @@ public:
         t_totals.exclusive_ns[index] += scaled;
         t_totals.count[index] += scale;
         data.child_ns = parent_child_ns + elapsed + (scaled - exclusive);
+        scaled_inclusive_ns = elapsed * scale;
+        scaled_exclusive_ns = scaled;
+    }
+
+    /// After Stop: the time this scope took, with and without its nested zones, and the
+    /// number of calls it stands for (all times SampleEvery for a sampled one).
+    [[nodiscard]] u64 InclusiveNs() const {
+        return scaled_inclusive_ns;
+    }
+    [[nodiscard]] u64 ExclusiveNs() const {
+        return scaled_exclusive_ns;
+    }
+    [[nodiscard]] u32 Scale() const {
+        return scale;
     }
 
     Scope(const Scope&) = delete;
     Scope& operator=(const Scope&) = delete;
 
 private:
+    void Begin(Sampling sampling) {
+        if (sampling != Sampling::Exact) {
+            if (sampling == Sampling::Skip || !TakeSample()) {
+                enabled = false;
+                return;
+            }
+            scale = SampleEvery;
+        }
+        parent_child_ns = t_data.child_ns;
+        t_data.child_ns = 0;
+        start = Now();
+    }
+
     Zone zone;
     bool enabled;
     u32 scale{1};
     u64 start{};
     u64 parent_child_ns{};
+    u64 scaled_inclusive_ns{};
+    u64 scaled_exclusive_ns{};
 };
 
 /// Amounts counted on the GPU thread, logged per second with the zones.
@@ -382,10 +498,34 @@ enum class Counter : u32 {
     /// Of those, drawn after storage writes no barrier ordered yet (RasterizerVulkan::DrawIndirect)
     IndirectRecordsUnordered,
     AcquireMetIssued, ///< Of AcquireChecks: met by an issued release (Nx2Perf acquire_issued)
+    /// Split back ring entries by class (BackEntry order), counted for the entries timed and
+    /// scaled by SampleEvery in lite mode (AddBackEntry)
+    BackEntryStateRun,
+    BackEntryExecMethod,
+    BackEntryCbWords,
+    BackEntryMulti,
+    BackEntryCall,
+    BackEntryOther,
+    /// The ring words those entries took, by class
+    BackWordsStateRun,
+    BackWordsExecMethod,
+    BackWordsCbWords,
+    BackWordsMulti,
+    BackWordsCall,
+    BackWordsOther,
+    /// Register writes in the BackStateRun entries (writes per run is this over the entries)
+    BackStateWrites,
     Count,
 };
 
 static_assert(static_cast<size_t>(Counter::Count) <= std::tuple_size_v<decltype(ThreadData::counters)>);
+static_assert(static_cast<u32>(Counter::BackWordsStateRun) -
+                      static_cast<u32>(Counter::BackEntryStateRun) ==
+                  static_cast<u32>(BackEntry::Count) &&
+              static_cast<u32>(Counter::BackEntryOther) -
+                      static_cast<u32>(Counter::BackEntryStateRun) + 1 ==
+                  static_cast<u32>(BackEntry::Count),
+              "the back counters follow BackEntry");
 
 /// The fencing thread's buffer downloads (BufferCache::PopAsyncBuffers): logged by the thread
 /// that makes the fences.
@@ -402,8 +542,12 @@ inline std::unordered_set<u64>& DmaReadPages() {
 
 inline void Add(Counter counter, u64 amount) {
     if (Enabled()) {
-        t_data.counters[static_cast<size_t>(counter)] += amount;
-        t_totals.counters[static_cast<size_t>(counter)] += amount;
+        const auto index = static_cast<size_t>(counter);
+        t_data.counters[index] += amount;
+        // Only the first counters are published to other threads (Totals).
+        if (index < t_totals.counters.size()) {
+            t_totals.counters[index] += amount;
+        }
     }
 }
 
@@ -448,6 +592,156 @@ inline void AddDrain(DrainSite site, u64 start) {
         t_data.drain_ns[index] += Now() - start;
         ++t_data.drain_count[index];
     }
+}
+
+/// One back ring entry timed (lite: one in SampleEvery, `scale` = SampleEvery; full: every entry,
+/// 1) that ran `words` ring words, of `writes` register writes when it was a BackStateRun.
+/// Counts on the back thread's window only (not in Totals).
+inline void AddBackEntry(BackEntry entry, u64 words, u64 writes, u32 scale) {
+    auto& counters = t_data.counters;
+    const auto index = static_cast<size_t>(entry);
+    counters[static_cast<size_t>(Counter::BackEntryStateRun) + index] += scale;
+    counters[static_cast<size_t>(Counter::BackWordsStateRun) + index] += words * scale;
+    if (entry == BackEntry::StateRun) {
+        counters[static_cast<size_t>(Counter::BackStateWrites)] += writes * scale;
+    }
+}
+
+/// A Kind::Call entry the back timed, per callee thunk (GpuSplit::CalleeName). The times are
+/// already scaled; `calls` is the number of entries the sample stands for.
+inline void AddCallee(u64 thunk, u64 inclusive_ns, u64 exclusive_ns, u64 calls) {
+    auto& data = t_data;
+    const size_t first = static_cast<size_t>((thunk * 0x9e3779b97f4a7c15ULL) >> 58);
+    static_assert(CalleeSlots == 64, "the hash keeps the top 6 bits");
+    CalleeStat* slot = &data.other_calls;
+    for (size_t probe = 0; probe < CalleeSlots; ++probe) {
+        CalleeStat& candidate = data.callees[(first + probe) % CalleeSlots];
+        if (candidate.thunk == thunk || candidate.thunk == 0) {
+            candidate.thunk = thunk;
+            slot = &candidate;
+            break;
+        }
+    }
+    slot->inclusive_ns += inclusive_ns;
+    slot->exclusive_ns += exclusive_ns;
+    slot->calls += calls;
+}
+
+/// A Defer callee's name for the report: the compiler's signature of GpuSplit::CalleeSignature<Func>
+/// cut down to Func (the lambda and its enclosing function where the compiler gives one), calling
+/// conventions and parameter lists dropped, at most 120 characters.
+inline std::string TrimCalleeName(std::string_view signature) {
+    std::string_view name = signature;
+    if (const size_t at = name.find("Func = "); at != std::string_view::npos) {
+        // Clang "[Func = ...]", GCC "[with Func = ...]"
+        name.remove_prefix(at + 7);
+        if (const size_t end = name.rfind(']'); end != std::string_view::npos) {
+            name = name.substr(0, end);
+        }
+    } else if (const size_t at_msvc = name.find("CalleeSignature<");
+               at_msvc != std::string_view::npos) {
+        // MSVC "...CalleeSignature<Func>(void)"
+        name.remove_prefix(at_msvc + 16);
+        if (const size_t end = name.rfind(">(void)"); end != std::string_view::npos) {
+            name = name.substr(0, end);
+        }
+    }
+    const auto identifier_char = [](char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+               c == '_';
+    };
+    static constexpr std::array<std::string_view, 12> noise{
+        "class ",   "struct ",    "enum ",     "__cdecl ", "__thiscall ", "__stdcall ",
+        "__fastcall ", "public: ", "private: ", "protected: ", "static ",   "virtual ",
+    };
+    std::string out;
+    out.reserve(name.size());
+    for (size_t i = 0; i < name.size();) {
+        const std::string_view rest = name.substr(i);
+        const char c = name[i];
+        if (i == 0 || !identifier_char(name[i - 1])) {
+            bool skipped = false;
+            for (const std::string_view word : noise) {
+                if (rest.starts_with(word)) {
+                    i += word.size();
+                    skipped = true;
+                    break;
+                }
+            }
+            if (skipped) {
+                continue;
+            }
+        }
+        if (rest.starts_with("(lambda at ")) {
+            // Clang: "(lambda at C:/dir/file.cpp:12:5)" -> "lambda at file.cpp:12"
+            if (const size_t end = rest.find(')'); end != std::string_view::npos) {
+                std::string_view where = rest.substr(11, end - 11);
+                if (const size_t colon = where.rfind(':'); colon != std::string_view::npos) {
+                    where = where.substr(0, colon);
+                }
+                if (const size_t slash = where.find_last_of("/\\"); slash != std::string_view::npos) {
+                    where.remove_prefix(slash + 1);
+                }
+                out += "lambda at ";
+                out += where;
+                i += end + 1;
+                continue;
+            }
+        }
+        if (rest.starts_with("(anonymous")) {
+            if (const size_t end = rest.find(')'); end != std::string_view::npos) {
+                out += "(anon)";
+                i += end + 1;
+                continue;
+            }
+        }
+        if (c == '(') {
+            // A parameter list, however long: "()"
+            size_t depth = 0;
+            size_t end = i;
+            for (; end < name.size(); ++end) {
+                if (name[end] == '(') {
+                    ++depth;
+                } else if (name[end] == ')' && --depth == 0) {
+                    break;
+                }
+            }
+            out += "()";
+            i = end < name.size() ? end + 1 : name.size();
+            continue;
+        }
+        if (c == '`') {
+            // MSVC's "`2'::" between a function and its local type; other quotes are dropped
+            size_t digits_end = i + 1;
+            while (digits_end < name.size() && name[digits_end] >= '0' && name[digits_end] <= '9') {
+                ++digits_end;
+            }
+            if (digits_end > i + 1 && digits_end < name.size() && name[digits_end] == '\'') {
+                i = digits_end + 1;
+                if (name.substr(i).starts_with("::")) {
+                    i += 2;
+                }
+                continue;
+            }
+            ++i;
+            continue;
+        }
+        if (c == '\'') {
+            ++i;
+            continue;
+        }
+        out += c;
+        ++i;
+    }
+    if (out.empty()) {
+        out = std::string{signature};
+    }
+    constexpr size_t MaxName = 120;
+    if (out.size() > MaxName) {
+        // The end holds the function and the lambda.
+        out = "..." + out.substr(out.size() - (MaxName - 3));
+    }
+    return out;
 }
 
 inline thread_local FlushOrigin t_flush_origin{FlushOrigin::Other};
@@ -566,6 +860,35 @@ inline void Report(const char* thread_name = "GPU thread") {
                             static_cast<double>(data.counters[static_cast<size_t>(Counter::DirectWrites)]) * 1e9 / window,
                             static_cast<double>(data.counters[static_cast<size_t>(Counter::MacroWrites)]) * 1e9 / window);
     }
+    {
+        u64 back_entries{};
+        for (size_t i = 0; i < static_cast<size_t>(BackEntry::Count); ++i) {
+            back_entries += data.counters[static_cast<size_t>(Counter::BackEntryStateRun) + i];
+        }
+        if (back_entries != 0) {
+            std::string entries;
+            std::string words;
+            for (size_t i = 0; i < static_cast<size_t>(BackEntry::Count); ++i) {
+                entries += fmt::format(
+                    " {} {:.0f},", back_entry_names[i],
+                    per_second(static_cast<Counter>(static_cast<size_t>(Counter::BackEntryStateRun) + i)));
+                words += fmt::format(
+                    " {} {:.0f},", back_entry_names[i],
+                    per_second(static_cast<Counter>(static_cast<size_t>(Counter::BackWordsStateRun) + i)));
+            }
+            entries.pop_back();
+            words.pop_back();
+            const double runs =
+                static_cast<double>(data.counters[static_cast<size_t>(Counter::BackEntryStateRun)]);
+            const double writes =
+                static_cast<double>(data.counters[static_cast<size_t>(Counter::BackStateWrites)]);
+            line += fmt::format(" | back ring entries/s{}:{} | back ring words/s:{} | back state "
+                                "runs {:.2f} writes/run ({:.0f} writes/s)",
+                                Lite() ? fmt::format(" (sampled 1 in {})", SampleEvery) : std::string{},
+                                entries, words, runs != 0.0 ? writes / runs : 0.0,
+                                per_second(Counter::BackStateWrites));
+        }
+    }
     if (data.counters[static_cast<size_t>(Counter::IndirectRecords)] != 0 ||
         data.counters[static_cast<size_t>(Counter::IndirectRecordsUnordered)] != 0) {
         line += fmt::format(" | indirect records {:.0f} ({:.0f} after unordered stores)",
@@ -660,6 +983,43 @@ inline void Report(const char* thread_name = "GPU thread") {
         line += " | waits for the back by site:" + drains;
     }
     LOG_INFO(HW_GPU, "{} per second:{}", thread_name, line);
+    {
+        std::array<const CalleeStat*, CalleeSlots> used{};
+        size_t used_count = 0;
+        for (const CalleeStat& callee : data.callees) {
+            if (callee.calls != 0) {
+                used[used_count++] = &callee;
+            }
+        }
+        if (used_count != 0 || data.other_calls.calls != 0) {
+            const size_t top = std::min<size_t>(used_count, 16);
+            std::partial_sort(used.begin(), used.begin() + static_cast<std::ptrdiff_t>(top),
+                              used.begin() + static_cast<std::ptrdiff_t>(used_count),
+                              [](const CalleeStat* a, const CalleeStat* b) {
+                                  return a->exclusive_ns > b->exclusive_ns;
+                              });
+            const double per_s = 1e9 / static_cast<double>(window);
+            const auto format_callee = [&](const std::string& callee_name, const CalleeStat& c) {
+                return fmt::format(" | {}: {:.2f} ms excl, {:.2f} ms incl, {:.0f} calls",
+                                   callee_name,
+                                   static_cast<double>(c.exclusive_ns) * 1e-6 * per_s,
+                                   static_cast<double>(c.inclusive_ns) * 1e-6 * per_s,
+                                   static_cast<double>(c.calls) * per_s);
+            };
+            std::string callees;
+            for (size_t i = 0; i < top; ++i) {
+                const char* const raw = GpuSplit::CalleeName(used[i]->thunk);
+                callees += format_callee(raw != nullptr ? TrimCalleeName(raw)
+                                                       : fmt::format("{:#x}", used[i]->thunk),
+                                         *used[i]);
+            }
+            if (data.other_calls.calls != 0) {
+                callees += format_callee("other calls", data.other_calls);
+            }
+            LOG_INFO(HW_GPU, "{} deferred calls per second (top 16 by exclusive time):{}",
+                     thread_name, callees);
+        }
+    }
     {
         // The first Counter entries, in order.
         static constexpr std::array counter_names{

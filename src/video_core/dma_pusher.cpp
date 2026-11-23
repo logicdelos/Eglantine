@@ -757,7 +757,7 @@ size_t DmaPusher::TryUniformBind(std::span<const CommandHeader> commands, size_t
     }
 
     if (g_semaphore_watch != 0 || VideoCore::Replay::CaptureActive() ||
-        VideoCore::Replay::ReplayGpuRunning() || VideoCommon::Nx2Profile::Enabled() ||
+        VideoCore::Replay::ReplayGpuRunning() || VideoCommon::Nx2Profile::Observing() ||
         VideoCommon::Nx2Perf::Verify()) {
         ++stats.observer;
         return 0;

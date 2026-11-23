@@ -65,6 +65,21 @@ inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> 
     "gp sync fence", "map",           "front start", "front verify",
 };
 
+/// What a split back ring entry was, for the profiler's attribution (GpuSplit::ProfiledExecute).
+enum class BackEntry : u32 {
+    StateRun,   ///< State register writes: CallStateMethodRun, and the single writes that are queued
+    ExecMethod, ///< One executable method, through CallMethod
+    CbWords,    ///< Constant buffer words (CallConstBufferWords, or one word)
+    Multi,      ///< Kind::Multi
+    Call,       ///< Kind::Call (Defer, DeferFunction)
+    Other,      ///< Engine, Wrap, repeated methods
+    Count,
+};
+
+inline constexpr std::array<const char*, static_cast<size_t>(BackEntry::Count)> back_entry_names{
+    "state run", "exec method", "cb words", "multi", "call", "other",
+};
+
 // Splits the GPU thread in two (NX2_GPU_THREAD_SPLIT.md). The GPU thread (the front) takes the
 // CPU's commands, parses command lists and runs the puller; engine method calls and everything
 // behind them (register state, macros, draws, the rasterizer and its caches) run in order on a
@@ -198,6 +213,9 @@ public:
     template <typename Func>
     void Defer(const Func& func, Effect effect = Effect::Unknown) {
         static_assert(std::is_trivially_copyable_v<Func> && alignof(Func) <= alignof(u64));
+        // Once per Func (thread-safe): names the thunk for the profiler (CalleeName).
+        [[maybe_unused]] static const bool registered = RegisterCallee(
+            reinterpret_cast<u64>(&CallThunk<Func>), CalleeSignature<Func>());
         constexpr size_t payload = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
         u64* const entry = Reserve(2 + payload);
         entry[0] = static_cast<u64>(Kind::Call) | (u64{payload} << 8);
@@ -206,6 +224,9 @@ public:
         Commit(2 + payload, effect);
     }
     void DeferFunction(std::function<void()>&& func);
+    /// The compiler's signature of the Defer callee whose thunk is `thunk` (the lambda's enclosing
+    /// function where the compiler gives one), or nullptr if none was deferred. Any thread.
+    [[nodiscard]] static const char* CalleeName(u64 thunk);
 
     /// Runs `func` on the back and waits for it: for work on back-owned state, such as a buffer
     /// cache download that records into the Vulkan scheduler. A drained back still submits from
@@ -361,6 +382,19 @@ private:
         (*reinterpret_cast<const Func*>(payload))();
     }
 
+    /// __FUNCSIG__ / __PRETTY_FUNCTION__ of this helper for `Func`: contains the callee's type, a
+    /// lambda's enclosing function with it.
+    template <typename Func>
+    static const char* CalleeSignature() {
+#ifdef _MSC_VER
+        return __FUNCSIG__;
+#else
+        return __PRETTY_FUNCTION__;
+#endif
+    }
+    /// Records the name of a Defer thunk (any thread, once per Func). Returns true.
+    static bool RegisterCallee(u64 thunk, const char* name);
+
     /// Room for an entry of `words` at the write position (never across the ring's end).
     u64* Reserve(size_t words) {
         const size_t index = write_position & RingMask;
@@ -405,7 +439,21 @@ private:
 
     void BackLoop(std::stop_token stop_token);
     /// Runs the entry at `entry` (of the `words` published before the ring's end), returns its size.
+    /// With `Classify` it also notes what it ran in back_entry (ProfiledExecute).
+    template <bool Classify>
     size_t Execute(const u64* entry, size_t words);
+    /// Execute for the profiler: times the entry (every one in the full mode, one in SampleEvery
+    /// in lite mode, nothing while profiling is off) and counts what it was.
+    size_t ProfiledExecute(const u64* entry, size_t words);
+    /// Execute<Classify>: notes what the entry was and its register writes (nothing unless
+    /// Classify).
+    template <bool Classify>
+    void NoteEntry([[maybe_unused]] BackEntry kind, [[maybe_unused]] u32 writes = 0) {
+        if constexpr (Classify) {
+            back_entry.entry = kind;
+            back_entry.writes = writes;
+        }
+    }
     /// A Method entry with a repeat count (RepeatableMethod): the call, then the repeats.
     void ExecuteRepeated(u64 head);
     /// EDEN_NX2_PERF_VERIFY with draw_begin_coalesce: checks that a Repeatable entry directly
@@ -451,6 +499,13 @@ private:
 
     // Back side.
     Tegra::Engines::EngineInterface* back_engine{};
+    /// What Execute<true> ran last: its class, the register writes of a state run, a call's thunk.
+    struct BackEntryInfo {
+        BackEntry entry{};
+        u32 writes{};
+        u64 thunk{};
+    };
+    BackEntryInfo back_entry{};
     /// VerifyRepeat: the last entry's word, the Repeatable entries seen and those that did not
     /// follow the same word, since the last report
     u64 verify_previous{};

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <mutex>
 #include <thread>
 
 #ifdef _MSC_VER
@@ -57,6 +58,16 @@ void Pause() {
 }
 
 [[maybe_unused]] std::atomic<u32> g_back_thread_id{};
+
+// Defer callees by thunk (GpuSplit::RegisterCallee): appended under the mutex, read without it.
+struct CalleeEntry {
+    u64 thunk;
+    const char* name;
+};
+constexpr size_t MaxCallees = 1024;
+std::array<CalleeEntry, MaxCallees> g_callees{};
+std::atomic<size_t> g_callee_count{};
+std::mutex g_callee_mutex;
 
 } // Anonymous namespace
 
@@ -373,6 +384,26 @@ void GpuSplit::DeferFunction(std::function<void()>&& func) {
     last_function_position = write_position;
 }
 
+bool GpuSplit::RegisterCallee(u64 thunk, const char* name) {
+    std::scoped_lock lock{g_callee_mutex};
+    const size_t count = g_callee_count.load(std::memory_order_relaxed);
+    if (count < g_callees.size()) {
+        g_callees[count] = {thunk, name};
+        g_callee_count.store(count + 1, std::memory_order_release);
+    }
+    return true;
+}
+
+const char* GpuSplit::CalleeName(u64 thunk) {
+    const size_t count = g_callee_count.load(std::memory_order_acquire);
+    for (size_t i = 0; i < count; ++i) {
+        if (g_callees[i].thunk == thunk) {
+            return g_callees[i].name;
+        }
+    }
+    return nullptr;
+}
+
 bool GpuSplit::NoteWrite(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size,
                          WriteKind kind) {
     if (size == 0 || !Nx2Perf::On(Nx2Perf::Opt::MacroReadEarly)) {
@@ -518,6 +549,7 @@ void GpuSplit::VerifyRepeat(u64 head) {
     verify_previous = word;
 }
 
+template <bool Classify>
 size_t GpuSplit::Execute(const u64* entry, size_t words) {
     const u64 head = entry[0];
     if (verify_repeats) [[unlikely]] {
@@ -525,12 +557,15 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
     }
     switch (static_cast<Kind>(head & 0xf)) {
     case Kind::Wrap:
+        NoteEntry<Classify>(BackEntry::Other);
         return 0;
     case Kind::Engine:
+        NoteEntry<Classify>(BackEntry::Other);
         back_engine = reinterpret_cast<Tegra::Engines::EngineInterface*>(entry[1]);
         return 2;
     case Kind::Method: {
         if ((head & RepeatMask) != 0) [[unlikely]] {
+            NoteEntry<Classify>(BackEntry::Other);
             ExecuteRepeated(head);
             return 1;
         }
@@ -545,6 +580,7 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
             constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
             if (method - cb_data < 16 && (head & HasSegment) == 0 &&
                 Nx2Perf::On(Nx2Perf::Opt::CbBatch)) {
+                NoteEntry<Classify>(BackEntry::CbWords);
                 // Single constant buffer words in a row (macros write them one by one) go up in
                 // one write. They are executable: each entry would only consume the sink first.
                 std::array<u32, 64> methods;
@@ -577,14 +613,19 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
                 if (!maxwell3d->method_sink.empty()) [[unlikely]] {
                     maxwell3d->ConsumeSink(*system);
                 }
-                return maxwell3d->CallStateMethodRun(entry, words);
+                const size_t run = maxwell3d->CallStateMethodRun(entry, words);
+                NoteEntry<Classify>(BackEntry::StateRun, static_cast<u32>(run));
+                return run;
             }
             if ((head & Direct) != 0) {
+                NoteEntry<Classify>(BackEntry::ExecMethod);
                 maxwell3d->ConsumeSink(*system);
                 maxwell3d->CallMethod(*system, method, argument, true);
             } else if (!maxwell3d->execution_mask[method]) {
+                NoteEntry<Classify>(BackEntry::StateRun, 1);
                 maxwell3d->method_sink.emplace_back(method, argument);
             } else {
+                NoteEntry<Classify>(BackEntry::ExecMethod);
                 maxwell3d->ConsumeSink(*system);
                 if ((head & HasSegment) != 0) {
                     maxwell3d->current_dma_segment = entry[1];
@@ -603,13 +644,17 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
                 engine->ConsumeSink(*system);
             }
             if (method_fast && !engine->execution_mask[method]) {
+                NoteEntry<Classify>(BackEntry::StateRun, 1);
                 engine->CallStateMethod(*system, method, argument);
             } else {
+                NoteEntry<Classify>(BackEntry::ExecMethod);
                 engine->CallMethod(*system, method, argument, true);
             }
         } else if (!engine->execution_mask[method]) {
+            NoteEntry<Classify>(BackEntry::StateRun, 1);
             engine->method_sink.emplace_back(method, argument);
         } else {
+            NoteEntry<Classify>(BackEntry::ExecMethod);
             Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
             engine->ConsumeSink(*system);
             if ((head & HasSegment) != 0) {
@@ -620,6 +665,7 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
         return (head & HasSegment) != 0 ? 2 : 1;
     }
     case Kind::Multi: {
+        NoteEntry<Classify>(BackEntry::Multi);
         const u32 method = static_cast<u32>((head >> 8) & 0xffff);
         const u32 amount = static_cast<u32>(head >> 32);
         const size_t data = (head & HasSegment) != 0 ? 3 : 2;
@@ -634,12 +680,47 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
         return data + (amount + 1) / 2;
     }
     case Kind::Call: {
+        NoteEntry<Classify>(BackEntry::Call);
+        if constexpr (Classify) {
+            back_entry.thunk = entry[1];
+        }
         const size_t payload = static_cast<size_t>((head >> 8) & 0xffffff);
         reinterpret_cast<void (*)(const u64*)>(entry[1])(entry + 2);
         return 2 + payload;
     }
     }
     return 1;
+}
+
+// Used by BackLoop and ProfiledExecute below, and by the tests (GpuSplitTestAccess).
+template size_t GpuSplit::Execute<false>(const u64*, size_t);
+template size_t GpuSplit::Execute<true>(const u64*, size_t);
+
+size_t GpuSplit::ProfiledExecute(const u64* entry, size_t words) {
+    namespace Profile = Nx2Profile;
+    const bool lite = Profile::Lite();
+    // Lite: one entry in SampleEvery, attributed by what it turned out to be, no clock read for
+    // the others. Full: every entry, in BackReplay as before.
+    Profile::Scope scope{lite ? Profile::Zone::BackOtherEntry : Profile::Zone::BackReplay,
+                         lite ? Profile::Scope::Sampling::OneIn
+                              : Profile::Scope::Sampling::Exact};
+    if (!scope.Timed()) {
+        return Execute<false>(entry, words);
+    }
+    back_entry = {};
+    const size_t size = Execute<true>(entry, words);
+    if (lite) {
+        // The back* zones follow BackEntry (static_assert in nx2_profile.h).
+        scope.SetZone(static_cast<Profile::Zone>(static_cast<u32>(Profile::Zone::BackStateRun) +
+                                                 static_cast<u32>(back_entry.entry)));
+    }
+    scope.Stop();
+    Profile::AddBackEntry(back_entry.entry, size, back_entry.writes, scope.Scale());
+    if (back_entry.entry == BackEntry::Call) {
+        Profile::AddCallee(back_entry.thunk, scope.InclusiveNs(), scope.ExclusiveNs(),
+                           scope.Scale());
+    }
+    return size;
 }
 
 void GpuSplit::RunIdleHook() {
@@ -716,14 +797,13 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         u64 last_store = read_position;
         // Before any entry runs, so a front that sees these entries consumed also sees this.
         back_quiet.store(false, std::memory_order_seq_cst);
+        // Once per batch: a SetEnabled toggle takes effect at the next one.
+        const bool profiling = Nx2Profile::Enabled();
         while (read_position != available) {
             const size_t index = read_position & RingMask;
-            size_t size;
-            {
-                Nx2Profile::Scope replay_scope{Nx2Profile::Zone::BackReplay};
-                size = Execute(&ring[index],
-                               std::min<u64>(available - read_position, RingWords - index));
-            }
+            const size_t words = std::min<u64>(available - read_position, RingWords - index);
+            const size_t size = profiling ? ProfiledExecute(&ring[index], words)
+                                          : Execute<false>(&ring[index], words);
             read_position += size != 0 ? size : RingWords - index;
             if (hook_requested.load(std::memory_order_relaxed) &&
                 idle_hook != nullptr) [[unlikely]] {

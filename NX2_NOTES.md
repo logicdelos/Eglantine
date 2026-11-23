@@ -272,7 +272,10 @@ Run settings used (in `build/bin/user/config/sdl2-config.ini`): `memory_layout_m
 always logs a "Host crash" line and writes `eden_crash.dmp` to the log directory on a crash; this
 moves the dump to `<dir>`), `EDEN_NX2_AUTO_STUB`, `EDEN_NX2_IPC_TRACE`, `EDEN_NX2_SVC_TRACE`,
 `EDEN_NX2_PULLER_TRACE`, `EDEN_NX2_METHOD_TRACE`, `EDEN_NX2_HIDE_WINDOW`,
-`EDEN_NX2_GPU_PROFILE` (GPU-thread zone timers every 10 s), `EDEN_NX2_SAMPLE=<threads>` with
+`EDEN_NX2_GPU_PROFILE` (GPU-thread zone timers every 10 s; `=lite` leaves every code path as it is
+without the profiler and times one split back ring entry in 32, attributed by entry class and per
+deferred callee; any other value is the full mode, which turns off `fast_maxwell3d` and the
+uniform bind and DMA pusher fast paths), `EDEN_NX2_SAMPLE=<threads>` with
 `_START`/`_SECONDS`/`_OUT` (sampling profiler; `C:\dev\nx2work\folded.py` reads its .folded stacks),
 `EDEN_NX2_MME_RECORD=<file>` (macro calls for `C:\dev\nx2work\mme_test`),
 `EDEN_NX2_FENCE_BATCH=0`, `EDEN_NX2_MACRO_COPY=1`, `EDEN_NX2_CNTPCT_PAUSE=0` (turn rows 124, 126, 127 off),

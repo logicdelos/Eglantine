@@ -65,7 +65,7 @@ Maxwell3D::Maxwell3D(MemoryManager& memory_manager_)
     for (size_t i = 0; i < execution_mask.size(); i++)
         execution_mask[i] = IsMethodExecutable(u32(i));
     fast_maxwell3d = VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::Method) && !record_write_history &&
-                     !g_trace_first_method_writes && !VideoCommon::Nx2Profile::Enabled();
+                     !g_trace_first_method_writes && !VideoCommon::Nx2Profile::Observing();
 }
 
 Maxwell3D::~Maxwell3D() = default;
@@ -518,7 +518,7 @@ bool Maxwell3D::CanApplyUniformBind(const UniformBind& bind) const {
     if (executing_macro != 0 || !macro_params.empty() || front_macros || front != nullptr ||
         draw_manager.HasDeferredDraw() ||
         shadow_state.shadow_ram_control == Regs::ShadowRamControl::Replay ||
-        g_trace_first_method_writes || VideoCommon::Nx2Profile::Enabled() ||
+        g_trace_first_method_writes || VideoCommon::Nx2Profile::Observing() ||
         VideoCommon::Nx2Perf::Verify()) {
         return false;
     }
