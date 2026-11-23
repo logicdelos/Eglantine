@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <string_view>
+
 #include "common/common_types.h"
 
 namespace Tegra {
@@ -16,7 +18,7 @@ struct FastGraphicsPreviewStats {
     u64 incomplete_span{};  ///< a word of the bind is not in the current command span
     u64 shape_subchannel{}; ///< not three words, no bind write straight after, another subchannel
     u64 invalid_binding{};  ///< stage, slot, valid bit, reserved bits, size or address
-    u64 backend_engine{};   ///< not a Maxwell3D subchannel, or not the Vulkan renderer
+    u64 backend_engine{};   ///< not Vulkan, not Maxwell3D, or not an NX2 (Ampere) channel
     u64 ordering{};         ///< split GPU thread, pending acquire, macro, deferred draw, replay
     u64 observer{};         ///< something watches the stream: capture, replay, profiling, watch
 
@@ -32,14 +34,24 @@ struct FastGraphicsPreviewStats {
 /// DispatchCalls) and when a pusher is destroyed. For status sampling from any thread.
 [[nodiscard]] FastGraphicsPreviewStats FastGraphicsPreviewTotals();
 
-/// Whether the setting was on the last time a pusher published.
-[[nodiscard]] bool FastGraphicsPreviewActive();
+/// What the process decided at GPU startup: setting and environment, and the renderer. Taken
+/// once; the saved setting is never changed by the environment.
+struct FastGraphicsPreviewSnapshot {
+    bool enabled{};                          ///< the effective value
+    bool vulkan{};                           ///< the renderer is Vulkan
+    std::string_view source{"default"};      ///< "default", "setting", "environment" or "invalid"
+};
 
-/// Applies EDEN_NX2_FAST_GRAPHICS_PREVIEW=0|1 to the setting (once per process; any other value
-/// means off, with a warning) and logs the effective value and where it came from.
-void ApplyFastGraphicsPreviewEnvironment();
+/// Takes the snapshot (once per process): Settings nx2_fast_graphics_preview, overridden by
+/// EDEN_NX2_FAST_GRAPHICS_PREVIEW=0|1 (any other value is "invalid" and means off, with a
+/// warning). Logs the effective value and its source. Called from the GPU constructor.
+void ResolveFastGraphicsPreview();
 
-/// Logs the totals once, when the setting was on at any time. Called at shutdown.
+/// The snapshot; off, source "default", until ResolveFastGraphicsPreview ran. DmaPusher copies it
+/// when it is constructed.
+[[nodiscard]] FastGraphicsPreviewSnapshot FastGraphicsPreviewMode();
+
+/// Logs the totals once, when the snapshot is on. Called at shutdown.
 void LogFastGraphicsPreviewTotals();
 
 } // namespace Tegra

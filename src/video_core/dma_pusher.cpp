@@ -16,7 +16,6 @@
 #include <string_view>
 #include <vector>
 
-#include "common/baseline_settings.h"
 #include "common/nx2_bottleneck.h"
 #include "common/nx2_sampler.h"
 #include "common/scope_exit.h"
@@ -112,9 +111,8 @@ struct PreviewTotals {
     std::atomic<u64> observer{};
 };
 PreviewTotals g_preview_totals;
-std::atomic<bool> g_preview_active{false}; ///< the setting was on at the last publish
-std::atomic<bool> g_preview_ever{false};   ///< the setting was on at some publish
 std::atomic<bool> g_preview_logged{false};
+FastGraphicsPreviewSnapshot g_preview_mode; ///< written once by ResolveFastGraphicsPreview
 
 void PublishCount(std::atomic<u64>& total, u64 now, u64& published) {
     if (now > published) {
@@ -126,12 +124,9 @@ void PublishCount(std::atomic<u64>& total, u64 now, u64& published) {
 } // Anonymous namespace
 
 void DmaPusher::PublishFastGraphicsPreview() {
-    if (!fast_preview_seen) {
+    if (fast_preview_stats == fast_preview_published) {
         return;
     }
-    g_preview_active.store(Settings::values.nx2_fast_graphics_preview.GetValue(),
-                           std::memory_order_relaxed);
-    g_preview_ever.store(true, std::memory_order_relaxed);
     const FastGraphicsPreviewStats& now = fast_preview_stats;
     FastGraphicsPreviewStats& done = fast_preview_published;
     PublishCount(g_preview_totals.accepted, now.accepted, done.accepted);
@@ -157,49 +152,46 @@ FastGraphicsPreviewStats FastGraphicsPreviewTotals() {
     return totals;
 }
 
-bool FastGraphicsPreviewActive() {
-    return g_preview_active.load(std::memory_order_relaxed);
-}
-
-void ApplyFastGraphicsPreviewEnvironment() {
+void ResolveFastGraphicsPreview() {
     static std::once_flag once;
     std::call_once(once, [] {
-        auto& setting = Settings::values.nx2_fast_graphics_preview;
         const char* const text = std::getenv("EDEN_NX2_FAST_GRAPHICS_PREVIEW");
-        const char* source = "setting (default)";
+        FastGraphicsPreviewSnapshot mode;
+        const auto& setting = Settings::values.nx2_fast_graphics_preview;
+        mode.vulkan = Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan;
         if (text == nullptr) {
-            if (setting.GetValue() != setting.GetDefault()) {
-                source = "setting (configuration or command line)";
-            }
+            mode.enabled = setting.GetValue();
+            mode.source = setting.GetValue() != setting.GetDefault() ? "setting" : "default";
         } else if (std::string_view{text} == "0" || std::string_view{text} == "1") {
-            source = "environment";
-            setting.SetValue(text[0] == '1');
-            if (setting.GetValue()) {
-                Settings::Baseline::NoteSource("nx2_fast_graphics_preview", "environment switch");
-            }
+            mode.enabled = text[0] == '1';
+            mode.source = "environment";
         } else {
-            source = "environment (invalid value, treated as off)";
+            mode.enabled = false;
+            mode.source = "invalid";
             LOG_WARNING(HW_GPU,
                         "EDEN_NX2_FAST_GRAPHICS_PREVIEW must be 0 or 1; the fast graphics preview "
                         "is off");
-            setting.SetValue(false);
         }
-        LOG_INFO(HW_GPU, "Fast graphics preview: {} (from {})",
-                 setting.GetValue() ? "on" : "off", source);
+        g_preview_mode = mode;
+        LOG_INFO(HW_GPU, "fast graphics preview: {} (source {}, Vulkan renderer {})",
+                 mode.enabled ? "on" : "off", mode.source, mode.vulkan ? "yes" : "no");
     });
 }
 
+FastGraphicsPreviewSnapshot FastGraphicsPreviewMode() {
+    return g_preview_mode;
+}
+
 void LogFastGraphicsPreviewTotals() {
-    if (!g_preview_ever.load(std::memory_order_relaxed) ||
-        g_preview_logged.exchange(true, std::memory_order_relaxed)) {
+    if (!g_preview_mode.enabled || g_preview_logged.exchange(true, std::memory_order_relaxed)) {
         return;
     }
     const FastGraphicsPreviewStats totals = FastGraphicsPreviewTotals();
     LOG_INFO(HW_GPU,
-             "Fast graphics preview totals (packets, not NVN calls): {} accepted, {} rejected "
-             "(other opcode {}, incomplete span {}, shape or subchannel {}, invalid binding {}, "
-             "backend or engine {}, ordering {}, observer {})",
-             totals.accepted, totals.Rejected(), totals.other_opcode, totals.incomplete_span,
+             "fast graphics preview: accepted {}, rejected {{other_opcode: {}, incomplete_span: {}, "
+             "shape_subchannel: {}, invalid_binding: {}, backend_engine: {}, ordering: {}, "
+             "observer: {}}}",
+             totals.accepted, totals.other_opcode, totals.incomplete_span,
              totals.shape_subchannel, totals.invalid_binding, totals.backend_engine,
              totals.ordering, totals.observer);
 }
@@ -588,11 +580,8 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
 }
 
 size_t DmaPusher::ProcessCommandsImpl(std::span<const CommandHeader> commands, size_t word_offset) {
-    // Read at every call, not cached: the setting can change while a game runs.
-    const bool fast_preview = Settings::values.nx2_fast_graphics_preview.GetValue();
-    if (fast_preview) {
-        fast_preview_seen = true;
-    }
+    // The snapshot taken at GPU startup; the settings are not read here.
+    const bool fast_preview = fast_preview_enabled;
     for (size_t index = 0; index < commands.size();) {
         // Data word of methods command
         if (dma_state.method_count && dma_state.non_incrementing) {
@@ -708,7 +697,8 @@ size_t DmaPusher::ProcessCommandsImpl(std::span<const CommandHeader> commands, s
 //
 // Everything is decided before anything is changed. Rejections count the first reason: another
 // opcode (any header that does not start an increasing write at const_buffer.size), the shape
-// (not three words, no unbound subchannel), the engine (not Maxwell3D, not the Vulkan renderer), a
+// (not three words, no unbound subchannel), the engine (not Maxwell3D, not the Vulkan renderer, not
+// an NX2 Ampere channel), a
 // span that ends inside the bind, the shape of the bind write, an observer (capture, replay,
 // profiling, semaphore watch, Nx2Perf verification), the order of work (split GPU thread, pending
 // acquire), the bind itself, and the engine's state (macro, deferred draw, shadow RAM replay).
@@ -729,8 +719,8 @@ size_t DmaPusher::TryUniformBind(std::span<const CommandHeader> commands, size_t
         ++stats.shape_subchannel;
         return 0;
     }
-    if (subchannel_type[subchannel_id] != Engines::EngineTypes::Maxwell3D ||
-        Settings::values.renderer_backend.GetValue() != Settings::RendererBackend::Vulkan) {
+    if (subchannel_type[subchannel_id] != Engines::EngineTypes::Maxwell3D || !fast_preview_vulkan ||
+        !g_nx2_ampere.load(std::memory_order_relaxed)) {
         ++stats.backend_engine;
         return 0;
     }

@@ -140,10 +140,13 @@ Response Commands::Status() const {
     const int building = shaders_building.load();
     result["shaders_building"] = building >= 0 ? Json(building) : Json(nullptr);
     {
-        // Packets, not NVN calls; published at command-list boundaries (zero while the setting is off).
+        // Packets, not NVN calls; published at command-list boundaries. "enabled" and "source" are
+        // the effective value the GPU took at startup (setting and environment), not the saved one.
         const Tegra::FastGraphicsPreviewStats preview = Tegra::FastGraphicsPreviewTotals();
+        const Tegra::FastGraphicsPreviewSnapshot mode = Tegra::FastGraphicsPreviewMode();
         Json counts = Json::object();
-        counts["enabled"] = Tegra::FastGraphicsPreviewActive();
+        counts["enabled"] = mode.enabled;
+        counts["source"] = std::string{mode.source};
         counts["accepted"] = preview.accepted;
         counts["other_opcode"] = preview.other_opcode;
         counts["incomplete_span"] = preview.incomplete_span;

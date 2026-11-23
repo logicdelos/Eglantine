@@ -64,7 +64,7 @@ struct GPU::Impl {
         , shader_notify()
         , is_async{is_async_}
     {
-        ApplyFastGraphicsPreviewEnvironment();
+        ResolveFastGraphicsPreview();
     }
 
     ~Impl() = default;

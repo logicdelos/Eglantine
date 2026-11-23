@@ -162,7 +162,7 @@ public:
     std::atomic<u64> suspensions{0};
 
     /// Fast graphics preview: this channel's counts (see fast_graphics_preview.h). Only the
-    /// pushing thread writes them; counted only while the setting is on.
+    /// pushing thread writes them; counted only while the snapshot is on.
     [[nodiscard]] const FastGraphicsPreviewStats& FastGraphicsPreviewCounters() const {
         return fast_preview_stats;
     }
@@ -343,7 +343,10 @@ public:
     bool dma_increment_once = false;
     FastGraphicsPreviewStats fast_preview_stats{};
     FastGraphicsPreviewStats fast_preview_published{}; ///< the part already in the totals
-    bool fast_preview_seen = false;                    ///< the setting was on in this pusher
+    /// The process snapshot (ResolveFastGraphicsPreview) as of construction; the decoder never reads
+    /// the settings.
+    bool fast_preview_enabled = FastGraphicsPreviewMode().enabled;
+    bool fast_preview_vulkan = FastGraphicsPreviewMode().vulkan;
     bool signal_sync = false;
     /// Set by the rasterizer's fence callback, which runs on the fence thread; the other fields
     /// are only touched by the pushing thread, so they must not share a storage unit with it.
