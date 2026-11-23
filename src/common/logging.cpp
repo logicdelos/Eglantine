@@ -721,10 +721,21 @@ void Stop() {
 }
 
 void Shutdown() {
-    if (logging_instance) {
-        Stop();
-        logging_instance.reset();
+    if (!logging_instance)
+        return;
+#ifndef __OPENORBIS__
+    // The retention worker logs through the singleton, so stop and join both workers while it is
+    // still fully engaged; only then is it safe to tear down.
+    for (std::jthread* worker : {&logging_instance->retention_thread, &logging_instance->file_flush_thread}) {
+        worker->request_stop();
     }
+    for (std::jthread* worker : {&logging_instance->retention_thread, &logging_instance->file_flush_thread}) {
+        if (worker->joinable())
+            worker->join();
+    }
+#endif
+    Stop();
+    logging_instance.reset();
 }
 
 void FmtCrashMessageImpl(const char* filename, unsigned int line_num, const char* function, fmt::string_view format, const fmt::format_args& args) noexcept {
