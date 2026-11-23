@@ -20,9 +20,11 @@ exe=${EGLANTINE_BIN:-$repo/build/bin/eglantine}
 [ -x "$exe" ] || { echo "no binary at $exe" >&2; exit 1; }
 mkdir -p "$session"
 
-# The emulator rotates its log on launch: keep the previous run's.
-for f in eden_log.txt eden_log.txt.old.txt; do
-    [ -f "$data/log/$f" ] && cp -p "$data/log/$f" "$session/prev-$f"
+# The emulator rotates its log on launch (eden_log.txt becomes eden_log.<stamp>.txt, the newest
+# five are kept, older ones are .zst): keep the previous run's and the run before it.
+newest_archive=$(ls -1 "$data"/log/eden_log.*.txt "$data"/log/eden_log.*.txt.zst 2>/dev/null | sort | tail -n 1)
+for f in "$data/log/eden_log.txt" "$newest_archive"; do
+    [ -f "$f" ] && cp -p "$f" "$session/prev-$(basename "$f")"
 done
 
 # shellcheck disable=SC2086
