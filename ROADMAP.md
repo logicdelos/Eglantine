@@ -85,7 +85,7 @@ Status: in progress; not released.
 Done when: frames over 100 ms in the first two minutes are at least halved on the second launch in both games.
 
 ### 0.6: Replay, regression testing and incident logging
-Status: release candidate; requalification on the release binary is open. Nothing here is a shipped result until the release notes show it measured on that binary. Quick Save and Quick Load are not part of 0.6 and are deferred past 1.0 (see Post-1.0).
+Status: released as [fork-v0.6.0](https://github.com/logicdelos/Eglantine/releases/tag/fork-v0.6.0). Incident logging and the regression check passed on the release binary; the replay picture comparison and the Fire Emblem capture failed and are listed as known problems. Quick Save and Quick Load are not part of 0.6 and are deferred past 1.0 (see Post-1.0).
 
 **Significant change:** a frame's graphics calls can be recorded and replayed without the game, and pictures compared automatically.
 
@@ -97,14 +97,13 @@ Status: release candidate; requalification on the release binary is open. Nothin
 Done when: an injected 5 % slowdown is caught and the call census is complete for both games without per-game code. Exercise a marked visual fault and a non-graphics incident, recover their lead-up and aftermath, and measure normal-play logging overhead separately from diagnostic capture.
 
 ### 0.7: Fast graphics path, preview
-Status: planned. Depends on the measurements above.
+Status: in progress. The fast-path decision (#7) is HOLD; the maintainer recorded a GO for this opt-in preview only. Integration and default selection stay on HOLD until #7's five gates have evidence.
 
-**Significant change:** an experimental switch that sends a game's graphics library calls straight to Vulkan.
+**Significant change:** an experimental, default-off switch (`nx2_fast_graphics_preview`) that takes one bounded set of graphics work, uniform-buffer binds (about a quarter of Fire Emblem's graphics-library calls per frame in the 0.6 census), on a shorter path through the GPU command decoder. Anything else, or anything the shortcut cannot prove safe, goes through the existing path unchanged, and every fallback is counted by reason.
 
-- Direct calls from translated game code into the emulator, with no round trip through the system call path.
-- Data that changes often is kept in video memory and updated by write tracking.
+- This preview shortens the emulator's command processing. It does not yet call Vulkan directly from translated game code or bypass the system call path; that, and keeping often-changed data in video memory with write tracking, move to 0.8.
 
-Done when: Fire Emblem: Fortune's Weave reference scenes match the existing path in the replay comparison, and the frame-rate comparison is published.
+Done when: with the switch on, Fire Emblem: Fortune's Weave's reference scene matches the existing path, and the frame-rate comparison is published. Revision for 0.7 only: the 0.6 Fire Emblem capture cannot be replayed (see the 0.6 known problems), so the replay comparison is replaced by a live comparison of the same scene with the switch on and off (pictures and paired frame rate, thresholds declared before measuring). The replay comparison remains required for 0.8.
 
 ### 0.8: Fast graphics path, integrated
 Status: planned.

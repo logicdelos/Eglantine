@@ -12,7 +12,17 @@ Where a fix is described as a "likely fix", it was written to remove a cause fou
 
 All runs were made on one Windows 11 laptop: AMD Ryzen 9 8940HX, NVIDIA GeForce RTX 5070 Ti Laptop GPU, 16 GB RAM. Only Fire Emblem: Fortune's Weave and Xenoblade Chronicles 2 were run. Fixes marked "Orchid" or "Lichii" were ported from those forks, with the original author named in the commit message.
 
-## 0.6.0 (unreleased)
+## 0.7.0 (unreleased)
+
+Milestone 0.7, "Fast graphics path, preview". Opt-in only; nothing changes with the switch off.
+
+### New
+
+- Fast graphics preview, off by default: `nx2_fast_graphics_preview` (renderer setting; `EDEN_NX2_FAST_GRAPHICS_PREVIEW=0|1` overrides it for one run without changing the saved setting). With it on, Switch 2 games on Vulkan take uniform-buffer binds (a three-word buffer description followed by its bind, on the same subchannel) through a shorter path in the GPU command decoder, with the same effects as the existing path. Anything else, and any bind the shortcut cannot prove safe (other packet shapes, split ranges, an invalid or disabled slot, a pending semaphore wait, GPU split, replay or tracing, other renderers, Switch 1 channels), goes through the existing path and is counted by reason. The effective value and its source are logged at start and reported by the control `status` command; totals are logged at shutdown as `fast graphics preview: accepted N, rejected {...}`.
+- Baseline settings version 3 pins the preview off.
+- Differential tests feed the same command words through the existing decoder and the preview, and compare consumed words, registers, shadow and dirty state, bindings, ordered renderer events and memory seen at the next draw (`[nx2_fast_graphics]`).
+
+## 0.6.0 (2026-11-23)
 
 Milestone 0.6, "Replay, regression testing and incident logging". Qualification is repeated on the release binary; numbers appear in the release notes only once measured on it. Quick Save and Quick Load are not part of 0.6 and are deferred past 1.0.
 
