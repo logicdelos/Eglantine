@@ -12,9 +12,11 @@
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/nx2_bottleneck.h"
 #include "common/system_log.h"
+#include "tests/common/ui_e_restore_eden_path.h"
 
 namespace {
 
@@ -29,6 +31,39 @@ std::vector<nlohmann::json> ReadJsonLines(const std::filesystem::path& path) {
     }
     return rows;
 }
+
+/// Runs the logging backend against a temporary log directory for the length of a test. Initialize
+/// opens the log file under the LogDir path, which is the user's own log folder unless moved:
+/// that rotated and deleted real game logs and put the tests' strings in them. Shutdown closes the
+/// file so the directory can be removed, and the user's path is put back.
+class IsolatedLog {
+public:
+    IsolatedLog()
+        : directory{std::filesystem::temp_directory_path() /
+                    ("eglantine_system_log_logdir_" +
+                     std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()))},
+          previous{Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir)} {
+        std::error_code ec;
+        std::filesystem::create_directories(directory, ec);
+        REQUIRE(std::filesystem::is_directory(directory));
+        Common::FS::SetEdenPath(Common::FS::EdenPath::LogDir, directory);
+        REQUIRE(Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir) == directory);
+        Common::Log::Initialize();
+    }
+    ~IsolatedLog() {
+        Common::Log::Shutdown();
+        Tests::RestoreEdenPath(Common::FS::EdenPath::LogDir, previous);
+        std::error_code ec;
+        std::filesystem::remove_all(directory, ec);
+    }
+
+    IsolatedLog(const IsolatedLog&) = delete;
+    IsolatedLog& operator=(const IsolatedLog&) = delete;
+
+private:
+    const std::filesystem::path directory;
+    const std::filesystem::path previous;
+};
 
 } // Anonymous namespace
 
@@ -164,7 +199,7 @@ TEST_CASE("SystemLog WriteIncidentJsonl and DumpCrashTail produce valid JSONL",
 }
 
 TEST_CASE("SystemLog taps LOG_WARNING and LOG_ERROR automatically", "[common][system_log]") {
-    Common::Log::Initialize();
+    const IsolatedLog isolated_log;
     Common::Log::Filter filter{Common::Log::Level::Info};
     Common::Log::SetGlobalFilter(filter);
     Common::SystemLog::ResetForTests(64);
@@ -287,7 +322,7 @@ TEST_CASE("Nx2Bottleneck::NoteFrame emits FrameHitch with dominant wait on micro
 
 TEST_CASE("SystemLog tap of a long message records where it came from and none of its text",
           "[common][system_log]") {
-    Common::Log::Initialize();
+    const IsolatedLog isolated_log;
     Common::Log::Filter filter{Common::Log::Level::Info};
     Common::Log::SetGlobalFilter(filter);
     Common::SystemLog::ResetForTests(64);

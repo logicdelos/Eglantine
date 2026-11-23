@@ -720,6 +720,13 @@ void Stop() {
         logging_instance->ForEachBackend([](Backend& backend) { backend.Flush(); });
 }
 
+void Shutdown() {
+    if (logging_instance) {
+        Stop();
+        logging_instance.reset();
+    }
+}
+
 void FmtCrashMessageImpl(const char* filename, unsigned int line_num, const char* function, fmt::string_view format, const fmt::format_args& args) noexcept {
 #ifndef __OPENORBIS__
     if (!logging_instance || !logging_instance->file_backend)

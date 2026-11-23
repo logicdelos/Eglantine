@@ -155,6 +155,11 @@ void Start();
 /// Explicitly stops the logger thread and flushes the buffers
 void Stop();
 
+/// Flushes, stops the logger's threads and closes its files, so a later Initialize starts afresh
+/// (and re-reads the log directory). For tests that point the log at a temporary directory: no
+/// other thread may log while this runs.
+void Shutdown();
+
 /// The global filter will prevent any messages from even being processed if they are filtered.
 void SetGlobalFilter(const Filter& filter);
 void SetColorConsoleBackendEnabled(bool enabled);
