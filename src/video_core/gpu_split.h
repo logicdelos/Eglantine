@@ -448,10 +448,10 @@ private:
     /// Execute<Classify>: notes what the entry was and its register writes (nothing unless
     /// Classify).
     template <bool Classify>
-    void NoteEntry([[maybe_unused]] BackEntry kind, [[maybe_unused]] u32 writes = 0) {
+    void NoteEntry([[maybe_unused]] BackEntry kind, [[maybe_unused]] u32 state_writes = 0) {
         if constexpr (Classify) {
             back_entry.entry = kind;
-            back_entry.writes = writes;
+            back_entry.writes = state_writes;
         }
     }
     /// A Method entry with a repeat count (RepeatableMethod): the call, then the repeats.
