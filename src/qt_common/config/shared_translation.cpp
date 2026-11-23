@@ -424,6 +424,13 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(UISettings, update_channel, tr("Update channel"),
            tr("Stable only offers finished releases.\nRelease candidate also offers release "
               "candidates of upcoming versions.\nDaily offers the automatic daily builds."));
+    INSERT(UISettings, show_whats_new, tr("Show what's new after an update"),
+           tr("Shows the list of changes the first time a new version starts."));
+    // Bookkeeping the settings page must not show (a blank name hides a setting)
+    INSERT(UISettings, update_remind_at, QString(), QString());
+    INSERT(UISettings, whats_new_version, QString(), QString());
+    INSERT(UISettings, show_low_ram_warning, QString(), QString());
+    INSERT(UISettings, check_legacy_paths, QString(), QString());
 
     // Linux
     INSERT(UISettings, enable_gamemode, tr("Enable Gamemode"), QString());
