@@ -97,6 +97,13 @@ struct DmaPusherTestAccess {
                           size_t word_offset) {
         return pusher.ProcessCommands(commands, word_offset);
     }
+
+    // The decoder takes the preview switches from a snapshot made at GPU start, not from the
+    // settings, so a test sets them on the pusher.
+    static void Configure(DmaPusher& pusher, bool enabled, bool vulkan) {
+        pusher.fast_preview_enabled = enabled;
+        pusher.fast_preview_vulkan = vulkan;
+    }
 };
 
 } // namespace Tegra
@@ -263,21 +270,17 @@ constexpr size_t MapSize = 0x3000;
 constexpr size_t SnapshotBytes = 16;
 constexpr std::array<bool, 2> EngineModes{true, false}; // fast_maxwell3d
 
-// Switches the preview's inputs the test changes back after it: the renderer must be Vulkan for a
-// bind to be taken.
+// Sets what the preview needs from the process and puts it back after the test: a bind is taken
+// only on an Ampere channel.
 struct PreviewSettings {
-    const bool previous_preview = Settings::values.nx2_fast_graphics_preview.GetValue();
-    const Settings::RendererBackend previous_backend = Settings::values.renderer_backend.GetValue();
     const bool previous_ampere = Tegra::g_nx2_ampere.load();
     const bool previous_replay = VideoCore::Replay::ReplayGpuRunning();
 
     PreviewSettings() {
-        Settings::values.renderer_backend.SetValue(Settings::RendererBackend::Vulkan);
+        Tegra::g_nx2_ampere.store(true);
     }
 
     ~PreviewSettings() {
-        Settings::values.nx2_fast_graphics_preview.SetValue(previous_preview);
-        Settings::values.renderer_backend.SetValue(previous_backend);
         Tegra::g_nx2_ampere.store(previous_ampere);
         VideoCore::Replay::SetReplayGpuRunning(previous_replay);
     }
@@ -526,9 +529,11 @@ struct Arm {
         pusher.dma_state.dma_get = 0x4000;
     }
 
-    // The setting is read at every call, so it is the one the caller names for this call.
-    size_t Run(const std::vector<CommandHeader>& commands, size_t word_offset, bool preview) {
-        Settings::values.nx2_fast_graphics_preview.SetValue(preview);
+    // The decoder's switches are set before each call: whether the preview is on, and whether the
+    // channel runs on the Vulkan renderer. The setting itself is not read by the decoder.
+    size_t Run(const std::vector<CommandHeader>& commands, size_t word_offset, bool preview,
+               bool vulkan = true) {
+        Tegra::DmaPusherTestAccess::Configure(pusher, preview, vulkan);
         return Tegra::DmaPusherTestAccess::Process(pusher, commands, word_offset);
     }
 };
@@ -587,6 +592,7 @@ struct Channel {
     Arm legacy;
     Arm preview;
     bool preview_on = true;
+    bool vulkan = true; ///< The renderer the channel was started with
 
     Channel(Fixture& f, bool fast_engine, s32 bind_id = 0)
         : legacy{f, fast_engine, bind_id}, preview{f, fast_engine, bind_id} {}
@@ -596,7 +602,7 @@ struct Channel {
     size_t Feed(const Words& words, size_t offset = 0) {
         const auto commands = ToHeaders(words);
         const size_t expected = legacy.Run(commands, offset, false);
-        const size_t actual = preview.Run(commands, offset, preview_on);
+        const size_t actual = preview.Run(commands, offset, preview_on, vulkan);
         REQUIRE(actual == expected);
         CompareArms(legacy, preview);
         return expected;
@@ -1622,7 +1628,6 @@ TEST_CASE("Fast graphics preview waits behind a pending semaphore acquire",
     PreviewSettings settings;
     Fixture f;
     MappedMemory mapped{f};
-    Tegra::g_nx2_ampere.store(true);
     constexpr GPUVAddr semaphore = MapAddress + 0x2ff0;
     constexpr u32 acquire_equal = 1; // Puller::GpuSemaphoreOperation::AcquireEqual
     mapped.Write({}, semaphore);
@@ -1697,13 +1702,13 @@ TEST_CASE("Fast graphics preview leaves replay and other renderers to the legacy
         RequireCounters(channel.preview.pusher, {.accepted = 1, .observer = 2});
     }
     SECTION("not the Vulkan renderer") {
-        for (const auto backend :
-             {Settings::RendererBackend::OpenGL_GLSL, Settings::RendererBackend::Null}) {
-            Settings::values.renderer_backend.SetValue(backend);
-            Channel channel{f, true};
-            channel.Feed(BindWords({.stage = 1, .slot = 2}));
-            RequireCounters(channel.preview.pusher, {.backend_engine = 1});
-        }
+        Channel channel{f, true};
+        channel.vulkan = false;
+        channel.Feed(BindWords({.stage = 1, .slot = 2}));
+        RequireCounters(channel.preview.pusher, {.backend_engine = 1});
+        channel.vulkan = true;
+        channel.Feed(BindWords({.stage = 1, .slot = 2}));
+        RequireCounters(channel.preview.pusher, {.accepted = 1, .backend_engine = 1});
     }
 }
 
@@ -1786,5 +1791,36 @@ TEST_CASE("Fast graphics preview shows a write to the bound memory at the next d
             return expected;
         }());
         RequireCounters(channel.preview.pusher, {.accepted = 2});
+    }
+}
+
+TEST_CASE("Fast graphics preview leaves a Switch 1 channel to the legacy path",
+          "[video_core][nx2_fast_graphics]") {
+    PreviewSettings settings;
+    Fixture f;
+    for (const bool fast_engine : EngineModes) {
+        for (const bool inline_form : {true, false}) {
+            CAPTURE(fast_engine, inline_form);
+            Channel channel{f, fast_engine};
+            const Words bind = BindWords({.stage = 2, .slot = 3, .inline_form = inline_form});
+
+            // The identical packet on a Switch 1 channel: the legacy path takes it, whole.
+            Tegra::g_nx2_ampere.store(false);
+            channel.Feed(bind);
+            RequireCounters(channel.preview.pusher, {.backend_engine = 1});
+            channel.Feed(Concat({BindWords({.stage = 0, .slot = 1, .inline_form = inline_form}),
+                                 DrawWords()}));
+            RequireCounters(channel.preview.pusher, {.backend_engine = 2});
+            REQUIRE(channel.preview.recorder.events.size() == 3);
+
+            // On an Ampere channel the same words are taken, and again not on Switch 1.
+            Tegra::g_nx2_ampere.store(true);
+            channel.Feed(bind);
+            RequireCounters(channel.preview.pusher, {.accepted = 1, .backend_engine = 2});
+            Tegra::g_nx2_ampere.store(false);
+            channel.Feed(bind);
+            RequireCounters(channel.preview.pusher, {.accepted = 1, .backend_engine = 3});
+            REQUIRE(channel.preview.recorder.events.size() == 5);
+        }
     }
 }
