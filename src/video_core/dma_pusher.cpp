@@ -11,9 +11,12 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstdio>
+#include <mutex>
 #include <string>
+#include <string_view>
 #include <vector>
 
+#include "common/baseline_settings.h"
 #include "common/nx2_bottleneck.h"
 #include "common/nx2_sampler.h"
 #include "common/scope_exit.h"
@@ -67,7 +70,9 @@ DmaPusher::DmaPusher(Core::System& system_, MemoryManager& memory_manager_, Cont
     , synced{false}
 {}
 
-DmaPusher::~DmaPusher() = default;
+DmaPusher::~DmaPusher() {
+    PublishFastGraphicsPreview();
+}
 
 void DmaPusher::DispatchCalls() {
     // The sub-index is kept: a channel suspended on a semaphore resumes inside its command list.
@@ -77,6 +82,7 @@ void DmaPusher::DispatchCalls() {
             break;
         }
     }
+    PublishFastGraphicsPreview();
     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
         // Submits and releases signaled fences: their writes belong to the entries that queued them.
         split.Defer(
@@ -90,6 +96,112 @@ void DmaPusher::DispatchCalls() {
     }
     system.GPU().FlushCommands();
     system.GPU().OnCommandListEnd();
+}
+
+namespace {
+
+// The process-wide totals of every channel's fast graphics preview counts (fast_graphics_preview.h).
+struct PreviewTotals {
+    std::atomic<u64> accepted{};
+    std::atomic<u64> other_opcode{};
+    std::atomic<u64> incomplete_span{};
+    std::atomic<u64> shape_subchannel{};
+    std::atomic<u64> invalid_binding{};
+    std::atomic<u64> backend_engine{};
+    std::atomic<u64> ordering{};
+    std::atomic<u64> observer{};
+};
+PreviewTotals g_preview_totals;
+std::atomic<bool> g_preview_active{false}; ///< the setting was on at the last publish
+std::atomic<bool> g_preview_ever{false};   ///< the setting was on at some publish
+std::atomic<bool> g_preview_logged{false};
+
+void PublishCount(std::atomic<u64>& total, u64 now, u64& published) {
+    if (now > published) {
+        total.fetch_add(now - published, std::memory_order_relaxed);
+    }
+    published = now;
+}
+
+} // Anonymous namespace
+
+void DmaPusher::PublishFastGraphicsPreview() {
+    if (!fast_preview_seen) {
+        return;
+    }
+    g_preview_active.store(Settings::values.nx2_fast_graphics_preview.GetValue(),
+                           std::memory_order_relaxed);
+    g_preview_ever.store(true, std::memory_order_relaxed);
+    const FastGraphicsPreviewStats& now = fast_preview_stats;
+    FastGraphicsPreviewStats& done = fast_preview_published;
+    PublishCount(g_preview_totals.accepted, now.accepted, done.accepted);
+    PublishCount(g_preview_totals.other_opcode, now.other_opcode, done.other_opcode);
+    PublishCount(g_preview_totals.incomplete_span, now.incomplete_span, done.incomplete_span);
+    PublishCount(g_preview_totals.shape_subchannel, now.shape_subchannel, done.shape_subchannel);
+    PublishCount(g_preview_totals.invalid_binding, now.invalid_binding, done.invalid_binding);
+    PublishCount(g_preview_totals.backend_engine, now.backend_engine, done.backend_engine);
+    PublishCount(g_preview_totals.ordering, now.ordering, done.ordering);
+    PublishCount(g_preview_totals.observer, now.observer, done.observer);
+}
+
+FastGraphicsPreviewStats FastGraphicsPreviewTotals() {
+    FastGraphicsPreviewStats totals;
+    totals.accepted = g_preview_totals.accepted.load(std::memory_order_relaxed);
+    totals.other_opcode = g_preview_totals.other_opcode.load(std::memory_order_relaxed);
+    totals.incomplete_span = g_preview_totals.incomplete_span.load(std::memory_order_relaxed);
+    totals.shape_subchannel = g_preview_totals.shape_subchannel.load(std::memory_order_relaxed);
+    totals.invalid_binding = g_preview_totals.invalid_binding.load(std::memory_order_relaxed);
+    totals.backend_engine = g_preview_totals.backend_engine.load(std::memory_order_relaxed);
+    totals.ordering = g_preview_totals.ordering.load(std::memory_order_relaxed);
+    totals.observer = g_preview_totals.observer.load(std::memory_order_relaxed);
+    return totals;
+}
+
+bool FastGraphicsPreviewActive() {
+    return g_preview_active.load(std::memory_order_relaxed);
+}
+
+void ApplyFastGraphicsPreviewEnvironment() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        auto& setting = Settings::values.nx2_fast_graphics_preview;
+        const char* const text = std::getenv("EDEN_NX2_FAST_GRAPHICS_PREVIEW");
+        const char* source = "setting (default)";
+        if (text == nullptr) {
+            if (setting.GetValue() != setting.GetDefault()) {
+                source = "setting (configuration or command line)";
+            }
+        } else if (std::string_view{text} == "0" || std::string_view{text} == "1") {
+            source = "environment";
+            setting.SetValue(text[0] == '1');
+            if (setting.GetValue()) {
+                Settings::Baseline::NoteSource("nx2_fast_graphics_preview", "environment switch");
+            }
+        } else {
+            source = "environment (invalid value, treated as off)";
+            LOG_WARNING(HW_GPU,
+                        "EDEN_NX2_FAST_GRAPHICS_PREVIEW must be 0 or 1; the fast graphics preview "
+                        "is off");
+            setting.SetValue(false);
+        }
+        LOG_INFO(HW_GPU, "Fast graphics preview: {} (from {})",
+                 setting.GetValue() ? "on" : "off", source);
+    });
+}
+
+void LogFastGraphicsPreviewTotals() {
+    if (!g_preview_ever.load(std::memory_order_relaxed) ||
+        g_preview_logged.exchange(true, std::memory_order_relaxed)) {
+        return;
+    }
+    const FastGraphicsPreviewStats totals = FastGraphicsPreviewTotals();
+    LOG_INFO(HW_GPU,
+             "Fast graphics preview totals (packets, not NVN calls): {} accepted, {} rejected "
+             "(other opcode {}, incomplete span {}, shape or subchannel {}, invalid binding {}, "
+             "backend or engine {}, ordering {}, observer {})",
+             totals.accepted, totals.Rejected(), totals.other_opcode, totals.incomplete_span,
+             totals.shape_subchannel, totals.invalid_binding, totals.backend_engine,
+             totals.ordering, totals.observer);
 }
 
 bool DmaPusher::Step() {
@@ -476,6 +588,11 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
 }
 
 size_t DmaPusher::ProcessCommandsImpl(std::span<const CommandHeader> commands, size_t word_offset) {
+    // Read at every call, not cached: the setting can change while a game runs.
+    const bool fast_preview = Settings::values.nx2_fast_graphics_preview.GetValue();
+    if (fast_preview) {
+        fast_preview_seen = true;
+    }
     for (size_t index = 0; index < commands.size();) {
         // Data word of methods command
         if (dma_state.method_count && dma_state.non_incrementing) {
@@ -537,6 +654,12 @@ size_t DmaPusher::ProcessCommandsImpl(std::span<const CommandHeader> commands, s
             dma_state.method_count--;
             index++;
         } else {
+            if (fast_preview) {
+                if (const size_t used = TryUniformBind(commands, word_offset, index); used != 0) {
+                    index += used;
+                    continue;
+                }
+            }
             auto const command_header = commands[index]; //can copy
             // No command active - this is the first word of a new one
             switch (command_header.mode) {
@@ -573,6 +696,130 @@ size_t DmaPusher::ProcessCommandsImpl(std::span<const CommandHeader> commands, s
         }
     }
     return commands.size();
+}
+
+// Fast graphics preview. NVN binds a uniform buffer as an increasing write of three words from
+// const_buffer.size (size, address high, address low) and a write to bind_groups[stage].raw_config
+// (an inline header, or an increasing header of one word and the word). The legacy path queues the
+// three state words in the engine's sink (method batching), drains the sink at the bind and runs
+// ProcessCBBind. This does the same in one step, leaving the decoder where the legacy path would:
+// the inline form ends non-incrementing at the bind method with is_last_call as it was, the
+// increasing form one method higher with is_last_call set.
+//
+// Everything is decided before anything is changed. Rejections count the first reason: another
+// opcode (any header that does not start an increasing write at const_buffer.size), the shape
+// (not three words, no unbound subchannel), the engine (not Maxwell3D, not the Vulkan renderer), a
+// span that ends inside the bind, the shape of the bind write, an observer (capture, replay,
+// profiling, semaphore watch, Nx2Perf verification), the order of work (split GPU thread, pending
+// acquire), the bind itself, and the engine's state (macro, deferred draw, shadow RAM replay).
+size_t DmaPusher::TryUniformBind(std::span<const CommandHeader> commands, size_t word_offset,
+                                 size_t index) {
+    using Maxwell = Engines::Maxwell3D;
+    FastGraphicsPreviewStats& stats = fast_preview_stats;
+
+    const CommandHeader header = commands[index];
+    if (header.mode.Value() != SubmissionMode::Increasing ||
+        header.method.Value() != Maxwell::UniformBindFirstMethod) {
+        ++stats.other_opcode;
+        return 0;
+    }
+    const u32 subchannel_id = header.subchannel.Value();
+    Engines::EngineInterface* const engine = subchannels[subchannel_id];
+    if (header.method_count.Value() != Maxwell::UniformBindStateWords || engine == nullptr) {
+        ++stats.shape_subchannel;
+        return 0;
+    }
+    if (subchannel_type[subchannel_id] != Engines::EngineTypes::Maxwell3D ||
+        Settings::values.renderer_backend.GetValue() != Settings::RendererBackend::Vulkan) {
+        ++stats.backend_engine;
+        return 0;
+    }
+
+    // The header, the three state words, then the bind: an inline header, or an increasing header
+    // of one word and that word.
+    constexpr size_t state_words = 1 + Maxwell::UniformBindStateWords;
+    const size_t remaining = commands.size() - index;
+    if (remaining <= state_words) {
+        ++stats.incomplete_span;
+        return 0;
+    }
+    const CommandHeader bind_header = commands[index + state_words];
+    const bool inline_form = bind_header.mode.Value() == SubmissionMode::Inline;
+    if (!inline_form &&
+        (bind_header.mode.Value() != SubmissionMode::Increasing ||
+         bind_header.method_count.Value() != 1)) {
+        ++stats.shape_subchannel;
+        return 0;
+    }
+    const u32 bind_method = bind_header.method.Value();
+    const u32 group_offset = bind_method - Maxwell::UniformBindGroupFirstMethod;
+    if (bind_header.subchannel.Value() != subchannel_id ||
+        bind_method < Maxwell::UniformBindGroupFirstMethod ||
+        group_offset >= Maxwell::UniformBindGroupCount * Maxwell::UniformBindGroupStride ||
+        group_offset % Maxwell::UniformBindGroupStride != 0) {
+        ++stats.shape_subchannel;
+        return 0;
+    }
+    const size_t used = state_words + (inline_form ? 1 : 2);
+    if (remaining < used) {
+        ++stats.incomplete_span;
+        return 0;
+    }
+
+    if (g_semaphore_watch != 0 || VideoCore::Replay::CaptureActive() ||
+        VideoCore::Replay::ReplayGpuRunning() || VideoCommon::Nx2Profile::Enabled() ||
+        VideoCommon::Nx2Perf::Verify()) {
+        ++stats.observer;
+        return 0;
+    }
+    if (VideoCommon::GpuSplit::Get().Active() || puller.HasPendingAcquire()) {
+        ++stats.ordering;
+        return 0;
+    }
+
+    const u32 config =
+        inline_form ? bind_header.arg_count.Value() : commands[index + state_words + 1].argument;
+    const Maxwell::UniformBind bind{
+        .stage = group_offset / Maxwell::UniformBindGroupStride,
+        .size = commands[index + 1].argument,
+        .address_high = commands[index + 2].argument,
+        .address_low = commands[index + 3].argument,
+        .config = config,
+        .is_last_call = inline_form ? dma_state.is_last_call : true,
+    };
+    if (!Maxwell::IsValidUniformBind(bind)) {
+        ++stats.invalid_binding;
+        return 0;
+    }
+    auto* const maxwell3d = static_cast<Maxwell*>(engine);
+    if (!maxwell3d->CanApplyUniformBind(bind)) {
+        ++stats.ordering;
+        return 0;
+    }
+
+    // Committed: nothing below rejects.
+    VideoCommon::Nx2Census::NoteHostWords(census_slots[subchannel_id],
+                                          Maxwell::UniformBindFirstMethod,
+                                          &commands[index + 1].argument,
+                                          Maxwell::UniformBindStateWords, true);
+    dma_state.subchannel = subchannel_id;
+    dma_state.method_count = 0;
+    dma_increment_once = false;
+    if (inline_form) {
+        dma_state.method = bind_method;
+        dma_state.dma_word_offset = u64(-s64(dma_state.dma_get)); // negate to set address as 0
+        dma_state.non_incrementing = true;
+    } else {
+        dma_state.method = bind_method + 1;
+        dma_state.dma_word_offset = u64((word_offset + index + state_words + 1) * sizeof(u32));
+        dma_state.non_incrementing = false;
+        dma_state.is_last_call = true;
+    }
+    VideoCommon::Nx2Census::NoteHostWords(census_slots[subchannel_id], bind_method, &bind.config, 1,
+                                          true);
+    maxwell3d->ApplyUniformBind(system, bind, dma_state.dma_get + dma_state.dma_word_offset);
+    ++stats.accepted;
+    return used;
 }
 
 // Nx2Perf FrontRun: the rest of an incrementing 3D command below the macro range, all of it in

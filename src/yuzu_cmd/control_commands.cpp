@@ -22,6 +22,7 @@
 #include "input_common/drivers/keyboard.h"
 #include "input_common/main.h"
 #include "video_core/gpu.h"
+#include "video_core/fast_graphics_preview.h"
 #include "video_core/shader_notify.h"
 #include "yuzu_cmd/cli_settings.h"
 #include "yuzu_cmd/control_commands.h"
@@ -138,6 +139,21 @@ Response Commands::Status() const {
     result["run_seconds"] = active ? Json(Common::RunOutcome::ElapsedSeconds()) : Json(nullptr);
     const int building = shaders_building.load();
     result["shaders_building"] = building >= 0 ? Json(building) : Json(nullptr);
+    {
+        // Packets, not NVN calls; published at command-list boundaries (zero while the setting is off).
+        const Tegra::FastGraphicsPreviewStats preview = Tegra::FastGraphicsPreviewTotals();
+        Json counts = Json::object();
+        counts["enabled"] = Tegra::FastGraphicsPreviewActive();
+        counts["accepted"] = preview.accepted;
+        counts["other_opcode"] = preview.other_opcode;
+        counts["incomplete_span"] = preview.incomplete_span;
+        counts["shape_subchannel"] = preview.shape_subchannel;
+        counts["invalid_binding"] = preview.invalid_binding;
+        counts["backend_engine"] = preview.backend_engine;
+        counts["ordering"] = preview.ordering;
+        counts["observer"] = preview.observer;
+        result["fast_graphics_preview"] = std::move(counts);
+    }
     if (const Common::KeyScript::Runner* script = Common::KeyScript::Current()) {
         const Common::KeyScript::Progress progress = script->GetProgress();
         Json steps = Json::object();

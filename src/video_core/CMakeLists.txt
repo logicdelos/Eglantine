@@ -120,6 +120,7 @@ add_library(video_core STATIC
     macro.h
     macro_memo.h
     macro_turing.h
+    fast_graphics_preview.h
     fence_manager.h
     gpu.cpp
     gpu.h

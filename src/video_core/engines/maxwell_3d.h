@@ -3249,6 +3249,43 @@ public:
 
     void CallStateMethod(Core::System& system, u32 method, u32 argument) override;
 
+    /// Fast graphics preview (DmaPusher::TryUniformBind): the uniform buffer bind the guest writes
+    /// as three increasing words from const_buffer.size (size, address high, address low)
+    /// followed by a write to bind_groups[stage].raw_config.
+    static constexpr u32 UniformBindFirstMethod =
+        static_cast<u32>(offsetof(Regs, const_buffer.size) / sizeof(u32));
+    static constexpr u32 UniformBindStateWords = 3;
+    static constexpr u32 UniformBindGroupFirstMethod =
+        static_cast<u32>(offsetof(Regs, bind_groups[0].raw_config) / sizeof(u32));
+    static constexpr u32 UniformBindGroupStride = static_cast<u32>(sizeof(Regs::BindGroup) / sizeof(u32));
+    static constexpr u32 UniformBindGroupCount = static_cast<u32>(Regs::MaxShaderStage);
+
+    struct UniformBind {
+        u32 stage;         ///< 0 to UniformBindGroupCount - 1, from the raw_config method
+        u32 size;          ///< const_buffer.size
+        u32 address_high;  ///< const_buffer.address_high
+        u32 address_low;   ///< const_buffer.address_low
+        u32 config;        ///< the value written to bind_groups[stage].raw_config
+        bool is_last_call; ///< is_last_call of the bind word's CallMethod
+    };
+
+    /// Whether the bind is one the preview takes: stage 0 to 4, bind_groups raw_config with the
+    /// valid bit, a slot below Regs::MaxConstBuffers and no other bit, a nonzero size and
+    /// address, and an address range that does not wrap. Pure.
+    [[nodiscard]] static bool IsValidUniformBind(const UniformBind& bind);
+
+    /// Whether ApplyUniformBind gives the result CallMethod gives the same words in the same
+    /// order: a valid bind (IsValidUniformBind) and no engine state the legacy path treats
+    /// differently (macro being fed, deferred draw, shadow RAM replay, split GPU thread front,
+    /// write tracing, profiling, Nx2Perf verification). Changes nothing.
+    [[nodiscard]] bool CanApplyUniformBind(const UniformBind& bind) const;
+
+    /// The effects of the three state writes and the bind write: earlier queued state writes are
+    /// drained once, the state writes follow in order, then the bind register is written and
+    /// ProcessCBBind runs once. Only after CanApplyUniformBind returned true; never rejects.
+    /// `segment` is the guest address of the bind word.
+    void ApplyUniformBind(Core::System& system, const UniformBind& bind, GPUVAddr segment);
+
     /// Write multiple values to the register identified by method.
     void CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) override;
 

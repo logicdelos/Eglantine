@@ -63,7 +63,9 @@ struct GPU::Impl {
         , use_nvdec{use_nvdec_}
         , shader_notify()
         , is_async{is_async_}
-    {}
+    {
+        ApplyFastGraphicsPreviewEnvironment();
+    }
 
     ~Impl() = default;
 
@@ -428,6 +430,14 @@ struct GPU::Impl {
 
         return out;
     }
+
+    /// Logs the fast graphics preview totals once, after every member below (the channels'
+    /// pushers included) is gone.
+    struct FastPreviewShutdownLog {
+        ~FastPreviewShutdownLog() {
+            LogFastGraphicsPreviewTotals();
+        }
+    } fast_preview_shutdown_log;
 
     Core::System& system;
 

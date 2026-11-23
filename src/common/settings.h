@@ -420,6 +420,13 @@ struct Values {
                                                        Specialization::Default,
                                                        true,
                                                        true};
+    // Off (default): the command stream decoder runs every method as it always has. On
+    // (preview): a uniform buffer bind written as the three words from const_buffer.size and a
+    // bind_groups[stage].raw_config write is applied in one step, with the same registers and
+    // renderer calls. General, never per game. EDEN_NX2_FAST_GRAPHICS_PREVIEW=0|1 overrides it
+    // at startup.
+    Setting<bool> nx2_fast_graphics_preview{linkage, false, "nx2_fast_graphics_preview",
+                                            Category::Renderer};
     SwitchableSetting<AspectRatio, true> aspect_ratio{linkage,
                                                       AspectRatio::R16_9,
                                                       "aspect_ratio",

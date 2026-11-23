@@ -24,9 +24,9 @@ constexpr bool kPinsPlatformSettings = true;
 constexpr bool kPinsPlatformSettings = false;
 #endif
 
-constexpr u32 kPinnedVersion = 2;
+constexpr u32 kPinnedVersion = 3;
 
-// Baseline version 2: the default of every persisted emulation setting, sorted by key. This is the
+// Baseline version 3: the default of every persisted emulation setting, sorted by key. This is the
 // list in fork-notes/baseline.md. Do not edit it to make the test pass: a default that changes, or a
 // setting that is added or removed, makes a new baseline. Raise Baseline::kBaselineVersion, add a
 // line to the baseline history in fork-notes/baseline.md and write the new list as the pinned one.
@@ -111,6 +111,7 @@ constexpr std::string_view kPinnedCommon[] = {
     "nvdec_emulation=1",
     "nvidia_dlss=false",
     "nvidia_dlss_quality=2",
+    "nx2_fast_graphics_preview=false",
     "output_device=auto",
     "output_engine=0",
     "perform_vulkan_check=true",
@@ -170,10 +171,10 @@ constexpr std::string_view kPinnedPlatform[] = {
 
 #ifdef _WIN32
 constexpr std::string_view kPinnedHash =
-    "9ee81aaf5956e607be1c470bad3b6931ee8f5c2248b2dabba0bc5edd0ba12c2b";
+    "933b129fc1a0380368efdeec19a29e93ea28eff2f06aad4278bed65179153acf";
 #else
 constexpr std::string_view kPinnedHash =
-    "1fc9705cd5f66daa06667051b8c62af9909b960019a8557be052835bd36faa0e";
+    "248177c936ee884e85f7380c93a72a180fe63436b0e894c0381d79c1d87bb9a7";
 #endif
 
 bool IsPlatformKey(std::string_view key) {
@@ -240,7 +241,7 @@ const Settings::Baseline::Deviation* Find(const std::vector<Settings::Baseline::
 
 } // namespace
 
-TEST_CASE("Baseline version 2 is pinned", "[baseline_settings]") {
+TEST_CASE("Baseline version 3 is pinned", "[baseline_settings]") {
     // The pinned list below belongs to one version. When the version is raised the list has to be
     // rewritten for it.
     REQUIRE(Settings::Baseline::kBaselineVersion == kPinnedVersion);

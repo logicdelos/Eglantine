@@ -24,6 +24,7 @@
 #include "common/scratch_buffer.h"
 #include "video_core/engines/engine_interface.h"
 #include "video_core/engines/puller.h"
+#include "video_core/fast_graphics_preview.h"
 
 namespace Core {
 class System;
@@ -160,6 +161,17 @@ public:
     /// the channel is suspended (see CommandList::snapshot_suspensions).
     std::atomic<u64> suspensions{0};
 
+    /// Fast graphics preview: this channel's counts (see fast_graphics_preview.h). Only the
+    /// pushing thread writes them; counted only while the setting is on.
+    [[nodiscard]] const FastGraphicsPreviewStats& FastGraphicsPreviewCounters() const {
+        return fast_preview_stats;
+    }
+    void ResetFastGraphicsPreviewCounters() {
+        fast_preview_stats = {};
+        fast_preview_published = {};
+    }
+    friend struct DmaPusherTestAccess;
+
     explicit DmaPusher(Core::System& system_, MemoryManager& memory_manager_, Control::ChannelState& channel_state_);
     ~DmaPusher();
 
@@ -218,6 +230,14 @@ private:
     size_t command_resume_offset{}; ///< Words of the current entry done before a suspension
 
     void SetState(const CommandHeader& command_header);
+    /// Fast graphics preview, at an idle header of `commands` (at `index`): the three increasing
+    /// words from const_buffer.size and the bind write straight after, applied in one step. Returns
+    /// the words consumed, or zero having changed nothing: the legacy path then processes the
+    /// header. A rejection counts the first reason found (see TryUniformBind).
+    size_t TryUniformBind(std::span<const CommandHeader> commands, size_t word_offset,
+                          size_t index);
+    /// Adds this channel's counts since the last publish to the process-wide totals.
+    void PublishFastGraphicsPreview();
 
     void CallMethod(u32 argument);
     void CallMultiMethod(const u32* base_start, u32 num_methods);
@@ -321,6 +341,9 @@ public:
 
     const bool ib_enable = true; ///< IB mode enabled
     bool dma_increment_once = false;
+    FastGraphicsPreviewStats fast_preview_stats{};
+    FastGraphicsPreviewStats fast_preview_published{}; ///< the part already in the totals
+    bool fast_preview_seen = false;                    ///< the setting was on in this pusher
     bool signal_sync = false;
     /// Set by the rasterizer's fence callback, which runs on the fence thread; the other fields
     /// are only touched by the pushing thread, so they must not share a storage unit with it.

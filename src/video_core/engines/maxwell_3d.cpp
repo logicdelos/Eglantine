@@ -496,6 +496,56 @@ void Maxwell3D::CallStateMethod(Core::System&, u32 method, u32 method_argument) 
     }
 }
 
+bool Maxwell3D::IsValidUniformBind(const UniformBind& bind) {
+    // The register as the emulator defines it (Regs::BindGroup): bit 0 valid, bits 4 to 8 the
+    // slot, nothing else.
+    constexpr u32 known_bits = 0x1u | (0x1Fu << 4);
+    if (bind.stage >= UniformBindGroupCount || (bind.config & ~known_bits) != 0 ||
+        (bind.config & 1) == 0) {
+        return false;
+    }
+    const u32 slot = (bind.config >> 4) & 0x1F;
+    if (slot >= Regs::MaxConstBuffers) {
+        return false;
+    }
+    const GPUVAddr address = (GPUVAddr{bind.address_high} << 32) | GPUVAddr{bind.address_low};
+    return bind.size != 0 && address != 0 &&
+           address <= (std::numeric_limits<GPUVAddr>::max)() - GPUVAddr{bind.size};
+}
+
+bool Maxwell3D::CanApplyUniformBind(const UniformBind& bind) const {
+    // Engine state the legacy path handles differently or observes.
+    if (executing_macro != 0 || !macro_params.empty() || front_macros || front != nullptr ||
+        draw_manager.HasDeferredDraw() ||
+        shadow_state.shadow_ram_control == Regs::ShadowRamControl::Replay ||
+        g_trace_first_method_writes || VideoCommon::Nx2Profile::Enabled() ||
+        VideoCommon::Nx2Perf::Verify()) {
+        return false;
+    }
+    return IsValidUniformBind(bind);
+}
+
+void Maxwell3D::ApplyUniformBind(Core::System& system, const UniformBind& bind, GPUVAddr segment) {
+    // CallMethod of the three words queues them (they are state writes) and the bind word, an
+    // executable method, drains the queue: the words queued before and these three, in one pass
+    // (ConsumeSinkImpl: shadow RAM, same-value skip, dirty flags).
+    constexpr u32 first = UniformBindFirstMethod;
+    method_sink.emplace_back(first, bind.size);
+    method_sink.emplace_back(first + 1, bind.address_high);
+    method_sink.emplace_back(first + 2, bind.address_low);
+    ConsumeSink(system);
+
+    const u32 method = UniformBindGroupFirstMethod + bind.stage * UniformBindGroupStride;
+    current_dma_segment = segment;
+    // CallMethodSlow records the write; CallMethodFast (fast_maxwell3d) does not.
+    if (!fast_maxwell3d) {
+        RecordWrite(method, bind.config, 1, bind.is_last_call ? 1 : 2);
+    }
+    const u32 argument = ProcessShadowRam(method, bind.config);
+    ProcessDirtyRegisters(method, argument);
+    ProcessCBBind(bind.stage);
+}
+
 void Maxwell3D::CallMethod(Core::System& system, u32 method, u32 method_argument, bool is_last_call) {
     if (front_macros && !VideoCommon::GpuSplit::OnBackThread()) [[unlikely]] {
         ReleaseFront();
