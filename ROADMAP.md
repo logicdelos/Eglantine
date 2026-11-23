@@ -92,6 +92,7 @@ Status: release candidate; requalification on the release binary is open. Nothin
 - A census of the graphics library calls each game makes per frame, built into the emulator.
 - A check that fails a change when median or low-end frame rate drops beyond measured noise.
 - Normal play keeps a bounded local history. A marker preserves evidence from before and after an incident, with monotonic time and frame/present identifiers where available. Diagnostic mode adds scheduling, service/IPC, filesystem, input, audio and GPU evidence (submissions, passes, fences and presents). Identify missing sources and dropped events instead of treating missing data as success.
+- Xenoblade Chronicles 2 fixes: area changes no longer leave only the interface (a reused GPU memory range now follows its new pages), cutscene draws are no longer dropped on shaders rejected too early, graphics pipelines are kept for the session (opt-in `free_unused_pipelines` frees them), and the log explains a bad session. Checked on one machine in one save; not a speed claim.
 
 Done when: an injected 5 % slowdown is caught and the call census is complete for both games without per-game code. Exercise a marked visual fault and a non-graphics incident, recover their lead-up and aftermath, and measure normal-play logging overhead separately from diagnostic capture.
 
