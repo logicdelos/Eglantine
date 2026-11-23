@@ -22,7 +22,7 @@ constexpr Instruction BRA_SELF{{0x00007947, 0xfffffff0, 0x0383ffff, 0}};
 // BRA (PT) back to instruction 1 from instruction 4: offset -64.
 constexpr Instruction BRA_BACK{{0x00007947, 0xffffffc0, 0x0383ffff, 0}};
 
-// What follows a program in memory: the offending words of Xenoblade 2's rejected cutscene
+// What follows a program in memory: the offending words of logged rejected cutscene
 // programs, each of which decodes as a branch or call with an impossible target.
 constexpr Instruction LOGGED_DATA[] = {
     {{0x3f42f947, 0xc04d97f5, 0x3fe0dc04, 0x00000000}}, // BRA @!PT, offset beyond 48 bits
@@ -204,7 +204,7 @@ TEST_CASE("Ampere capture still rejects a branch target outside the program",
 
 TEST_CASE("Ampere capture reads the data after a program as invalid targets",
           "[video_core][ampere][capture]") {
-    // Words of the rejected Xenoblade 2 programs, each at the index it was met (+0x330 = 51).
+    // Words of the logged rejected programs, each at the index it was met (+0x330 = 51).
     for (const Instruction& data : LOGGED_DATA) {
         ProgramCaptureState capture;
         CHECK(capture.Observe(data, 51) == Result::InvalidTarget);

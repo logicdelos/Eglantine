@@ -2487,10 +2487,10 @@ void PipelineCache::EvictUnusedPipelines() {
         return;
     }
     // Each built pipeline holds ~0.45 MB of driver memory and none was ever destroyed, so it grew
-    // with every place a session went (title 1: 1,500 on its title screen alone). Rebuilding one
+    // with every place a session went (one game: 1,500 on its title screen alone). Rebuilding one
     // later costs a shader translation plus a driver pipeline cache hit, and its draws are skipped
     // until the rebuild lands. Destroying every pipeline unused for 150 s made a game that comes
-    // back to its areas rebuild the same ones over and over (Xenoblade 2, 68 min: 1,886 distinct
+    // back to its areas rebuild the same ones over and over (another game, 68 min: 1,886 distinct
     // pipelines, 4,744 evictions, 66% of all builds were rebuilds, 10,825 draws skipped while they
     // landed). So by default nothing is destroyed (setting free_unused_pipelines off), except in an
     // emergency: with under 512 MiB of physical RAM available the least recently used ones go even

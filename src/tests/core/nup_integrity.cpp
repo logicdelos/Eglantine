@@ -277,17 +277,17 @@ TEST_CASE("NUP integrity warning lists every member", "[nup][nup-integrity]") {
     for (int i = 0; i < 19; ++i) {
         bad.push_back({"base/romfs/m" + std::to_string(i), "SHA-256 mismatch"});
     }
-    const auto lines = Integrity::FormatBadMembers("xc2.nup", bad);
+    const auto lines = Integrity::FormatBadMembers("game.nup", bad);
     REQUIRE(lines.size() == 2);
-    REQUIRE(lines[0].starts_with("NUP integrity: xc2.nup has 19 corrupt member(s), 1-12:"));
-    REQUIRE(lines[1].starts_with("NUP integrity: xc2.nup has 19 corrupt member(s), 13-19:"));
+    REQUIRE(lines[0].starts_with("NUP integrity: game.nup has 19 corrupt member(s), 1-12:"));
+    REQUIRE(lines[1].starts_with("NUP integrity: game.nup has 19 corrupt member(s), 13-19:"));
     for (const auto& member : bad) {
         const bool listed = std::ranges::any_of(lines, [&](const std::string& line) {
             return line.find(member.path + " (") != std::string::npos;
         });
         REQUIRE(listed);
     }
-    REQUIRE(Integrity::FormatBadMembers("xc2.nup", {}).empty());
+    REQUIRE(Integrity::FormatBadMembers("game.nup", {}).empty());
 }
 
 TEST_CASE("NUP integrity reads are paced and wait for the game", "[nup][nup-integrity]") {
@@ -320,8 +320,8 @@ TEST_CASE("NUP integrity reads are paced and wait for the game", "[nup][nup-inte
 TEST_CASE("Game file identity line", "[nup][nup-integrity]") {
     namespace Identity = FileSys::GameFileIdentity;
     const std::vector<std::string> labels{
-        "0|0100e95004038800|65536|Update|1.1.0",
-        "1|0100e95004039001|0|Expansion Pass|0",
+        "0|0100000000001800|65536|Update|1.1.0",
+        "1|0100000000001001|0|Expansion Pass|0",
         "file|x.nca|123",
         "2|0000000000000000|0|a|b|c|3",
     };
@@ -334,12 +334,12 @@ TEST_CASE("Game file identity line", "[nup][nup-integrity]") {
     REQUIRE(addons.entries[2] == "mod \"a|b|c\" v3");
 
     Identity::FileFacts facts;
-    facts.path = "D:\\Games\\xc2.nup";
+    facts.path = "D:\\Games\\game.nup";
     facts.exists = true;
     facts.size = 15245867008ull;
     REQUIRE(Identity::KindOf(facts) == "nup");
-    REQUIRE(Identity::FormatIdentity(facts, 0x0100E95004038000ull, 65536, addons, 0xABCDEF) ==
-            "Game file: title=0100E95004038000 version=65536 kind=nup path=\"D:\\Games\\xc2.nup\" "
+    REQUIRE(Identity::FormatIdentity(facts, 0x0100000000001000ull, 65536, addons, 0xABCDEF) ==
+            "Game file: title=0100000000001000 version=65536 kind=nup path=\"D:\\Games\\game.nup\" "
             "size=14.20 GiB (15245867008 bytes) addons=3 (1 update, 1 dlc, 1 mod: update "
             "\"Update\" v1.1.0, dlc \"Expansion Pass\" v0, mod \"a|b|c\" v3) content=0000000000abcdef");
 
