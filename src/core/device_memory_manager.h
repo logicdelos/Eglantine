@@ -139,8 +139,8 @@ public:
 
     /// Traps the next guest CPU read of these pages, to learn which GPU writes the CPU reads.
     /// Returns whether every page is trapped now (or was): false when a page has no guest mapping
-    /// the core tracks as GPU cached, and the caller must then not record the range as armed.
-    /// Always true unless EDEN_NX2_REACTIVE_MODE is precise or verify.
+    /// the core tracks (unmapped pages), and the caller must then not record the range as armed.
+    /// Always true in the Blanket mode.
     bool ArmReadTraps(DAddr addr, size_t size);
 
 private:

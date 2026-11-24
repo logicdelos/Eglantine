@@ -243,32 +243,50 @@ std::string DescribeBufferFacts(u32 facts) {
 
 } // Anonymous namespace
 
-ReactiveFlushMode ReactiveFlushModeFromEnvironment() {
+ReactiveFlushMode SelectReactiveFlushMode() {
+    const auto choose = [](ReactiveFlushMode mode, const char* source) {
+        const char* name = "blanket";
+        switch (mode) {
+        case ReactiveFlushMode::Blanket:
+            break;
+        case ReactiveFlushMode::Verify:
+            name = "verify (blanket read protection, with a check of what precise flushing would "
+                   "have covered)";
+            break;
+        case ReactiveFlushMode::Precise:
+            name = "precise (only pages the GPU modified and has not written back lose read "
+                   "permission)";
+            break;
+        }
+        LOG_INFO(HW_Memory, "reactive flushing mode: {}, chosen by {}{}", name, source,
+                 Settings::values.use_reactive_flushing.GetValue()
+                     ? ""
+                     : " (use_reactive_flushing is off: no effect)");
+        return mode;
+    };
     const char* const value = std::getenv("EDEN_NX2_REACTIVE_MODE");
-    if (value == nullptr || value[0] == '\0') {
-        return ReactiveFlushMode::Blanket;
+    if (value != nullptr && value[0] != '\0') {
+        std::string text{value};
+        std::ranges::transform(text, text.begin(), [](char c) {
+            return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        });
+        if (text == "blanket") {
+            return choose(ReactiveFlushMode::Blanket, "EDEN_NX2_REACTIVE_MODE");
+        }
+        if (text == "verify") {
+            return choose(ReactiveFlushMode::Verify, "EDEN_NX2_REACTIVE_MODE");
+        }
+        if (text == "precise") {
+            return choose(ReactiveFlushMode::Precise, "EDEN_NX2_REACTIVE_MODE");
+        }
+        LOG_WARNING(HW_Memory,
+                    "EDEN_NX2_REACTIVE_MODE={} is not blanket, verify or precise; the "
+                    "precise_reactive_flushing setting decides",
+                    value);
     }
-    std::string text{value};
-    std::ranges::transform(text, text.begin(), [](char c) {
-        return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    });
-    if (text == "blanket") {
-        return ReactiveFlushMode::Blanket;
-    }
-    if (text == "verify") {
-        LOG_INFO(HW_Memory, "EDEN_NX2_REACTIVE_MODE=verify: blanket read protection, with a check "
-                            "of what precise flushing would have covered");
-        return ReactiveFlushMode::Verify;
-    }
-    if (text == "precise") {
-        LOG_INFO(HW_Memory, "EDEN_NX2_REACTIVE_MODE=precise: only pages the GPU modified and has "
-                            "not written back lose read permission");
-        return ReactiveFlushMode::Precise;
-    }
-    LOG_WARNING(HW_Memory, "EDEN_NX2_REACTIVE_MODE={} is not blanket, verify or precise; using "
-                           "blanket",
-                value);
-    return ReactiveFlushMode::Blanket;
+    return Settings::values.precise_reactive_flushing.GetValue()
+               ? choose(ReactiveFlushMode::Precise, "the precise_reactive_flushing setting (on)")
+               : choose(ReactiveFlushMode::Blanket, "the precise_reactive_flushing setting (off)");
 }
 
 bool ReactiveFlushingActive() {
@@ -952,9 +970,10 @@ struct Memory::Impl {
         }
     }
 
-    /// The mode that is in force for this process: Blanket unless EDEN_NX2_REACTIVE_MODE asks for
-    /// more, reactive flushing is on, a fastmem arena exists and the CPU backend is not NCE (under
-    /// NCE every fault is taken as a write, so a read trap cannot work).
+    /// The mode that is in force for this process: Blanket when the boot-time mode is Blanket (see
+    /// SelectReactiveFlushMode), when reactive flushing is off, when no fastmem arena exists or
+    /// when the CPU backend is NCE (under NCE every fault is taken as a write, so a read trap
+    /// cannot work).
     [[nodiscard]] ReactiveFlushMode ActiveReactiveMode() const {
         const ReactiveFlushMode mode = GetReactiveFlushMode();
         if (mode == ReactiveFlushMode::Blanket || current_page_table == nullptr ||
@@ -968,8 +987,8 @@ struct Memory::Impl {
     /// Read traps replace reactive flushing's blanket read protection of every cached page: only
     /// pages the GPU writes are protected, and each one only until its first read
     /// (EDEN_NX2_READ_TRAPS=0 turns them off). Under NCE every fault is taken as a write, so they
-    /// are not used there. With EDEN_NX2_REACTIVE_MODE=precise or verify they are used with
-    /// reactive flushing on, and EDEN_NX2_READ_TRAPS=0 does not apply.
+    /// are not used there. In the Precise and Verify modes they are used with reactive flushing
+    /// on, and EDEN_NX2_READ_TRAPS=0 does not apply.
     bool ReadTrapsEnabled() const {
         if (ActiveReactiveMode() != ReactiveFlushMode::Blanket) {
             return true;

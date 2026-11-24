@@ -354,6 +354,11 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "cannot change the result.\nLowers graphics card load, most in games that draw "
               "many shadow or depth-only passes.\nTurn off only if a game shows wrong shadows, "
               "reflections or decals with it on.\nTakes effect the next time the game starts."));
+    INSERT(Settings, precise_reactive_flushing, tr("Precise reactive flushing"),
+           tr("With reactive flushing on, only memory the GPU has changed is guarded against "
+              "game reads, instead of all GPU-cached memory.\nLowers the cost of games reading "
+              "memory the GPU has cached.\nTurn off to return to the previous behavior.\nTakes "
+              "effect the next time the emulator starts."));
     INSERT(Settings, enable_buffer_history, tr("Enable buffer history"),
            tr("Enables access to previous buffer states.\nThis option may improve rendering "
               "quality and performance consistency in some games."));

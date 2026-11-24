@@ -60,12 +60,14 @@ enum class ReactiveFlushMode : u8 {
     Precise,
 };
 
-/// Reads EDEN_NX2_REACTIVE_MODE (blanket | verify | precise; default and unknown: blanket).
-ReactiveFlushMode ReactiveFlushModeFromEnvironment();
+/// The mode for this process: EDEN_NX2_REACTIVE_MODE (blanket | verify | precise) when it is set
+/// to one of them, else precise with the precise_reactive_flushing setting on and blanket with it
+/// off. Logs the choice and its source.
+ReactiveFlushMode SelectReactiveFlushMode();
 
 /// The boot-time mode. Blanket costs the callers one predictable branch.
 [[nodiscard]] inline ReactiveFlushMode GetReactiveFlushMode() {
-    static const ReactiveFlushMode mode = ReactiveFlushModeFromEnvironment();
+    static const ReactiveFlushMode mode = SelectReactiveFlushMode();
     return mode;
 }
 
@@ -580,10 +582,10 @@ public:
      * Makes the next guest read of each rasterizer cached page in the range take the slow path
      * (fastmem only), so that the read reaches the GPU's reactive flush once.
      *
-     * With EDEN_NX2_REACTIVE_MODE=precise or verify the returned value says whether every page of
-     * the range is now armed (or already was). False means some page was not a rasterizer cached
-     * page, and the caller must not remember the range as armed. Every other configuration
-     * returns true.
+     * In the Precise and Verify modes the returned value says whether every page of the range is
+     * now armed (or already was). False means some page was unmapped, and the caller must not
+     * remember the range as armed. A mapped page that is not GPU cached yet is armed parked. Every
+     * other configuration returns true.
      */
     bool RasterizerArmReadTraps(Common::ProcessAddress vaddr, u64 size);
 

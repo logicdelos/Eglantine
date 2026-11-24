@@ -723,6 +723,13 @@ struct Values {
                                                         "skip_unneeded_target_copies",
                                                         Category::RendererAdvanced};
 
+    // On (default): with use_reactive_flushing, only the pages the GPU modified and has not written
+    // back lose read permission (core/memory.h, ReactiveFlushMode::Precise). Off: every GPU cached
+    // page does, as before. EDEN_NX2_REACTIVE_MODE overrides it. The mode is chosen the first time
+    // the core needs it and then holds for the process (Core::Memory::SelectReactiveFlushMode).
+    SwitchableSetting<bool> precise_reactive_flushing{linkage, true, "precise_reactive_flushing",
+                                                      Category::RendererAdvanced};
+
     SwitchableSetting<bool> enable_buffer_history{linkage,
                                                   false,
                                                   "enable_buffer_history",

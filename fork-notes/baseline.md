@@ -44,10 +44,10 @@ Four defaults depend on the platform: `cpu_backend`, `cpuopt_unsafe_host_mmu`, `
 
 The baseline has a version number and a hash (SHA-256 of the sorted `key=value` lines). The hash changes whenever a baseline default changes, a baseline setting is added or removed, or the platform changes one of the four platform-dependent defaults. Raise the version and add a history line below whenever the list changes; the test fails until the pinned list and the pinned hash match.
 
-| Platform | Version 4 hash (129 entries) |
+| Platform | Version 5 hash (130 entries) |
 |---|---|
-| Windows x86-64 | `6f63aa6d5735a851f665382c1b34f8eb10d23a96f455cd0b6f5264bc5ecf0707` |
-| Linux x86-64 | `dbfecdb8b89b143a2b2f661a74be1a6778a6af85d2f908a66c6d64950e065ecb` |
+| Windows x86-64 | `810b15e7d472f10e301efcbb35ee53e4a871c16f723cfba77cb7113829947381` |
+| Linux x86-64 | `0dd86eec8b52b32d6aaa0b446d3cfa8c31efed722e74644c6527a399ee7f07ad` |
 
 ## History
 
@@ -57,6 +57,7 @@ The baseline has a version number and a hash (SHA-256 of the sorted `key=value` 
 | 2 | Adds `free_unused_pipelines` (off): every graphics pipeline built in a session stays in memory. Before, every pipeline unused for 150 s was destroyed and built again when the game came back to it; on, the setting destroys the least recently used ones only above 2048 (1024 while the host is low on memory). |
 | 3 | Adds `nx2_fast_graphics_preview` (off): a preview of a faster command stream decoder for graphics uniform buffer binds. Off, the decoder is the one every earlier release ran. On, a bind written as the three words from `const_buffer.size` and a `bind_groups[stage].raw_config` write is applied in one step; anything else, or any bind the step cannot prove identical, takes the old path (it is taken only on the Vulkan renderer and an NX2 Ampere channel). The effective value is taken once when the GPU starts, so changing the setting during a run has no effect. `EDEN_NX2_FAST_GRAPHICS_PREVIEW=0\|1` overrides the setting for that run without changing the saved setting (any other value counts as off, source "invalid", with a warning) and is an ordinary `EDEN_NX2_*` switch, so `--baseline` refuses it unless declared. The run log has one line with the effective value and its source (default, setting, environment, invalid), the control status reply carries the same, and one line at shutdown with the counts of accepted binds and rejected attempts by reason (packets, not NVN calls). |
 | 4 | Adds `skip_unneeded_target_copies` (on; Graphics > Advanced, per game allowed): the texture cache's three colour target copy cuts (`feedback_shadow_share`, `feedback_skip_unwritten`, `masked_target_unmodified`) now run by default, where before they ran only with `EDEN_NX2_PERF_ON` naming them. A draw that cannot write to a colour target no longer copies it before sampling it, and one draw makes at most one copy of the same target. Off, all three are off whatever the environment says and every draw copies as before. The value in effect is read when a game's GPU is created, so a change applies from the next start of the game. |
+| 5 | Adds `precise_reactive_flushing` (on; Graphics > Advanced, per game allowed): with `use_reactive_flushing` on, a guest CPU read only meets a read trap on the pages the GPU has modified and not written back yet, each until a read has flushed it; before, every GPU-cached page lost its read permission, which moved guest loads of cached pages off fast memory for good. Off, the previous behaviour. Ignored when reactive flushing is off, under NCE and without a fast memory arena. The mode is chosen the first time the core needs it and then holds for the process, so a change applies from the next start of the emulator. `EDEN_NX2_REACTIVE_MODE=blanket\|verify\|precise` overrides the setting (an unknown value is ignored with a warning); the choice and its source are logged once. |
 
 ## Command line (`eden-cli`)
 
