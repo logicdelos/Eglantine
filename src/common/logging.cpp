@@ -373,6 +373,10 @@ struct FileBackend final : public Backend {
     [[nodiscard]] const std::filesystem::path& Path() const noexcept {
         return log_path;
     }
+    /// When this process opened the log: the start of the session whose crash dump may be zipped.
+    [[nodiscard]] std::time_t SessionStart() const noexcept {
+        return session_start;
+    }
     [[nodiscard]] std::size_t BytesWritten() const noexcept {
         return bytes_written.load(std::memory_order_relaxed);
     }
@@ -447,6 +451,7 @@ private:
     std::mutex write_mutex;
     std::optional<FS::IOFile> file;
     std::filesystem::path log_path;
+    std::time_t session_start = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
     std::atomic<std::size_t> bytes_written{0};
     std::atomic<bool> limit_reached{false};
     std::atomic<bool> enabled{true};
@@ -691,6 +696,12 @@ void Initialize() {
 #ifdef _WIN32
                     ::SetThreadPriority(::GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
 #endif
+                    // The newest archive is the session that ended before this one. If it was
+                    // not zipped (a crash or a kill), zip it now, before the compression below.
+                    if (Retention::SessionZipEnabled() &&
+                        Retention::WriteSessionZipFromArchive(log_path, token))
+                        LOG_INFO(Log, "Log retention: wrote {} from the previous session log",
+                                 Retention::SessionZipName);
                     const auto count = Retention::CompressOlderArchives(log_path, token);
                     if (count != 0)
                         LOG_INFO(Log, "Log retention: compressed {} older session log(s) to .zst",
@@ -718,6 +729,17 @@ void Start() {
 void Stop() {
     if (logging_instance)
         logging_instance->ForEachBackend([](Backend& backend) { backend.Flush(); });
+}
+
+void WriteSessionZipAtExit() noexcept {
+#ifndef __OPENORBIS__
+    if (!logging_instance || !logging_instance->file_backend || !Retention::SessionZipEnabled())
+        return;
+    // Flush first: the zip holds what the file holds when its size is taken.
+    Stop();
+    const FileBackend& file = *logging_instance->file_backend;
+    static_cast<void>(Retention::WriteSessionZip(file.Path(), file.SessionStart(), {}));
+#endif
 }
 
 void Shutdown() {

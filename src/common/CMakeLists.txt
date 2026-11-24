@@ -316,6 +316,13 @@ endif()
 target_link_libraries(common PUBLIC fmt::fmt stb::headers Threads::Threads)
 target_link_libraries(common PRIVATE lz4::lz4 zstd::zstd)
 
+# The session log zip (log_retention.cpp) uses zlib. The static room build has no zlib and writes
+# no session zip. PUBLIC so that tests/common/log_retention.cpp can inflate what it wrote.
+if (TARGET ZLIB::ZLIB)
+    target_link_libraries(common PUBLIC ZLIB::ZLIB)
+    target_compile_definitions(common PRIVATE COMMON_HAS_ZLIB)
+endif()
+
 # Please refer to src/common/demangle.cpp
 if (WIN32)
     target_link_libraries(common PRIVATE LLVM::Demangle)

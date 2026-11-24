@@ -160,6 +160,11 @@ void Stop();
 /// other thread may log while this runs.
 void Shutdown();
 
+/// Flushes the log, then writes eglantine-last-session.zip next to it from the file this process
+/// logs to (see common/log_retention.h). For a clean exit, after everything that logs has been
+/// torn down. Does nothing when EDEN_NX2_SESSION_ZIP=0; failures are ignored.
+void WriteSessionZipAtExit() noexcept;
+
 /// The global filter will prevent any messages from even being processed if they are filtered.
 void SetGlobalFilter(const Filter& filter);
 void SetColorConsoleBackendEnabled(bool enabled);

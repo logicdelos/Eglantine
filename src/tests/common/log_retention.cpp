@@ -10,8 +10,12 @@
 #include <stop_token>
 #include <string>
 #include <vector>
+#include <cstdint>
+#include <ctime>
+#include <optional>
 
 #include <catch2/catch_test_macros.hpp>
+#include <zlib.h>
 
 #include "common/log_retention.h"
 
@@ -211,4 +215,336 @@ TEST_CASE("Session log compression keeps the newest archive plain", "[common][lo
     REQUIRE(plain == 1);
     REQUIRE(packed == 2);
     REQUIRE(Retention::CompressOlderArchives(log, std::stop_token{}) == 0);
+}
+
+namespace {
+
+struct ZipEntry {
+    std::string name;
+    std::string data;
+    std::uint32_t crc{};
+};
+
+std::uint32_t Le(const std::string& bytes, std::size_t at, std::size_t width) {
+    std::uint32_t value = 0;
+    for (std::size_t i = 0; i < width; ++i) {
+        value |= static_cast<std::uint32_t>(static_cast<unsigned char>(bytes[at + i])) << (8 * i);
+    }
+    return value;
+}
+
+std::uint32_t Crc(const std::string& data) {
+    return static_cast<std::uint32_t>(crc32_z(crc32_z(0, nullptr, 0),
+                                              reinterpret_cast<const Bytef*>(data.data()),
+                                              data.size()));
+}
+
+/// Reads a zip the way an extractor does: the end record from the back, then the central
+/// directory, then each local header and its deflate data, checking the fields that Explorer and
+/// Python's zipfile rely on.
+std::vector<ZipEntry> ReadZip(const fs::path& zip) {
+    const std::string bytes = Read(zip);
+    REQUIRE(bytes.size() >= 22);
+    const std::size_t end = bytes.size() - 22;
+    REQUIRE(Le(bytes, end, 4) == 0x06054b50);
+    REQUIRE(Le(bytes, end + 4, 2) == 0); // this disk
+    REQUIRE(Le(bytes, end + 6, 2) == 0); // disk of the central directory
+    const std::size_t count = Le(bytes, end + 8, 2);
+    REQUIRE(Le(bytes, end + 10, 2) == count);
+    const std::size_t central_size = Le(bytes, end + 12, 4);
+    const std::size_t central_offset = Le(bytes, end + 16, 4);
+    REQUIRE(Le(bytes, end + 20, 2) == 0); // no comment
+    REQUIRE(central_offset + central_size == end);
+
+    std::vector<ZipEntry> entries;
+    std::size_t at = central_offset;
+    for (std::size_t i = 0; i < count; ++i) {
+        REQUIRE(Le(bytes, at, 4) == 0x02014b50);
+        REQUIRE(Le(bytes, at + 10, 2) == 8); // deflate
+        const std::uint32_t crc = Le(bytes, at + 16, 4);
+        const std::size_t packed = Le(bytes, at + 20, 4);
+        const std::size_t size = Le(bytes, at + 24, 4);
+        const std::size_t name_length = Le(bytes, at + 28, 2);
+        const std::size_t extra_length = Le(bytes, at + 30, 2);
+        const std::size_t comment_length = Le(bytes, at + 32, 2);
+        const std::size_t local = Le(bytes, at + 42, 4);
+        ZipEntry entry;
+        entry.name = bytes.substr(at + 46, name_length);
+        entry.crc = crc;
+
+        REQUIRE(Le(bytes, local, 4) == 0x04034b50);
+        REQUIRE(Le(bytes, local + 8, 2) == 8);
+        REQUIRE(Le(bytes, local + 14, 4) == crc);
+        REQUIRE(Le(bytes, local + 18, 4) == packed);
+        REQUIRE(Le(bytes, local + 22, 4) == size);
+        REQUIRE(Le(bytes, local + 26, 2) == name_length);
+        REQUIRE(bytes.substr(local + 30, name_length) == entry.name);
+        const std::size_t data = local + 30 + name_length + Le(bytes, local + 28, 2);
+        REQUIRE(data + packed <= central_offset);
+
+        z_stream stream{};
+        REQUIRE(inflateInit2(&stream, -MAX_WBITS) == Z_OK);
+        entry.data.assign(size + 1, '\0');
+        stream.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(bytes.data() + data));
+        stream.avail_in = static_cast<uInt>(packed);
+        stream.next_out = reinterpret_cast<Bytef*>(entry.data.data());
+        stream.avail_out = static_cast<uInt>(entry.data.size());
+        const int result = inflate(&stream, Z_FINISH);
+        const std::size_t produced = stream.total_out;
+        inflateEnd(&stream);
+        REQUIRE(result == Z_STREAM_END);
+        REQUIRE(produced == size);
+        entry.data.resize(produced);
+        REQUIRE(Crc(entry.data) == crc);
+        entries.push_back(std::move(entry));
+        at += 46 + name_length + extra_length + comment_length;
+    }
+    REQUIRE(at == end);
+    return entries;
+}
+
+/// More than a few of the writer's chunks, and not a repeat of one byte.
+std::string LogLines(int count) {
+    std::string text;
+    for (int i = 0; i < count; ++i) {
+        text += "[" + std::to_string(i) + "] Log <Info> core/x.cpp:" +
+                std::to_string((i * 7919) % 100003) + ": line\n";
+    }
+    return text;
+}
+
+fs::file_time_type Ago(int minutes) {
+    return fs::file_time_type::clock::now() - std::chrono::minutes{minutes};
+}
+
+} // namespace
+
+TEST_CASE("Session zip round trip", "[common][log_retention]") {
+    TempDir dir;
+    const fs::path log = dir.path / "eden_log.txt";
+    const fs::path zip = dir.path / std::string{Retention::SessionZipName};
+
+    SECTION("a log of several chunks") {
+        const std::string text = LogLines(20000);
+        REQUIRE(text.size() > 3 * 256 * 1024);
+        Write(log, text, 1);
+        REQUIRE(Retention::WriteSessionZip(log, std::nullopt, std::stop_token{}));
+        const auto entries = ReadZip(zip);
+        REQUIRE(entries.size() == 1);
+        REQUIRE(entries[0].name == "eden_log.txt");
+        REQUIRE(entries[0].data == text);
+        REQUIRE(entries[0].crc == Crc(text));
+        REQUIRE(fs::file_size(zip) < text.size() / 2);
+    }
+
+    SECTION("an empty log") {
+        Write(log, "", 1);
+        REQUIRE(Retention::WriteSessionZip(log, std::nullopt, std::stop_token{}));
+        const auto entries = ReadZip(zip);
+        REQUIRE(entries.size() == 1);
+        REQUIRE(entries[0].data.empty());
+    }
+
+    SECTION("the log of another name is stored as eden_log.txt, even while it is open") {
+        const fs::path second = dir.path / "eden_log_2.txt";
+        std::ofstream live{second, std::ios::binary};
+        live << "written by this process\n";
+        live.flush();
+        REQUIRE(Retention::WriteSessionZip(second, std::nullopt, std::stop_token{}));
+        const auto entries = ReadZip(zip);
+        REQUIRE(entries.size() == 1);
+        REQUIRE(entries[0].name == "eden_log.txt");
+        REQUIRE(entries[0].data == "written by this process\n");
+    }
+
+    SECTION("no log, no zip") {
+        REQUIRE_FALSE(Retention::WriteSessionZip(log, std::nullopt, std::stop_token{}));
+        REQUIRE(Names(dir.path).empty());
+    }
+}
+
+TEST_CASE("Session zip holds exactly the snapshot of a growing log", "[common][log_retention]") {
+    TempDir dir;
+    const fs::path log = dir.path / "eden_log.txt";
+    const fs::path zip = dir.path / "out.zip";
+    const std::string text = LogLines(15000);
+    Write(log, text, 1);
+    const std::vector<Retention::ZipInput> inputs{
+        {log, "eden_log.txt", fs::file_size(log), Retention::ToTimeT(Ago(60))}};
+    {
+        // The log grows after the size was taken.
+        std::ofstream more{log, std::ios::binary | std::ios::app};
+        more << LogLines(5000);
+    }
+    REQUIRE(fs::file_size(log) > text.size());
+    REQUIRE(Retention::WriteZip(zip, inputs, std::stop_token{}));
+    const auto entries = ReadZip(zip);
+    REQUIRE(entries.size() == 1);
+    REQUIRE(entries[0].data == text);
+    REQUIRE(entries[0].crc == Crc(text));
+
+    SECTION("a file that got shorter than its snapshot fails and leaves nothing") {
+        fs::remove(zip);
+        Write(log, "short", 1);
+        REQUIRE_FALSE(Retention::WriteZip(zip, inputs, std::stop_token{}));
+        REQUIRE(Names(dir.path) == std::set<std::string>{"eden_log.txt"});
+    }
+
+    SECTION("a stop request leaves nothing") {
+        fs::remove(zip);
+        std::stop_source source;
+        source.request_stop();
+        REQUIRE_FALSE(Retention::WriteZip(zip, inputs, source.get_token()));
+        REQUIRE(Names(dir.path) == std::set<std::string>{"eden_log.txt"});
+    }
+}
+
+TEST_CASE("Session zip is written from an archive only when it is missing or older",
+          "[common][log_retention]") {
+    const std::string newest = "eden_log.20260105-000000.txt";
+    std::vector<Retention::FileTime> files{
+        {newest, Ago(10)},
+        {"eden_log.20260104-000000.txt", Ago(100)},
+        {"eden_log.txt", Ago(0)},
+        {"eglantine-last-session.zip", Ago(5)},
+        {"eglantine-last-session.zip.part", Ago(0)},
+    };
+    const auto pick = [&](std::optional<fs::file_time_type> zip) {
+        return Retention::SelectArchiveForSessionZip("eden_log", files, zip);
+    };
+
+    REQUIRE(pick(std::nullopt) == newest);   // no zip yet
+    REQUIRE(pick(Ago(20)) == newest);        // the zip is older than the archive
+    REQUIRE_FALSE(pick(Ago(5)));             // the zip is newer
+    REQUIRE_FALSE(pick(files[0].modified));  // the same time is not newer
+
+    SECTION("the newest archive of all is the one, by name") {
+        files.push_back({"eden_log.20260105-000000-1.txt", Ago(50)});
+        REQUIRE(pick(Ago(60)) == "eden_log.20260105-000000-1.txt");
+        REQUIRE_FALSE(pick(Ago(40)));
+    }
+
+    SECTION("no archive") {
+        files.erase(files.begin(), files.begin() + 2);
+        REQUIRE_FALSE(pick(std::nullopt));
+        REQUIRE_FALSE(pick(Ago(20)));
+    }
+
+    SECTION("the newest archive is already compressed") {
+        files.push_back({"eden_log.20260106-000000.txt.zst", Ago(1)});
+        REQUIRE_FALSE(pick(std::nullopt));
+    }
+
+    SECTION("another log's archives are not this log's") {
+        files.erase(files.begin(), files.begin() + 2);
+        files.push_back({"eden_log_2.20260105-000000.txt", Ago(10)});
+        REQUIRE_FALSE(pick(std::nullopt));
+    }
+}
+
+TEST_CASE("Session zip is written from the rotated log after a crash", "[common][log_retention]") {
+    TempDir dir;
+    const fs::path log = dir.path / "eden_log.txt";
+    const fs::path zip = dir.path / std::string{Retention::SessionZipName};
+    const fs::path archive = dir.path / "eden_log.20260105-000000.txt";
+    Write(archive, "crashed session\n", 120);
+
+    REQUIRE(Retention::WriteSessionZipFromArchive(log, std::stop_token{}));
+    auto entries = ReadZip(zip);
+    REQUIRE(entries.size() == 1);
+    REQUIRE(entries[0].name == "eden_log.txt");
+    REQUIRE(entries[0].data == "crashed session\n");
+
+    // The zip is newer than the log it was written from: nothing to do at the next start.
+    REQUIRE_FALSE(Retention::WriteSessionZipFromArchive(log, std::stop_token{}));
+
+    // A later session ended without a zip (killed): the existing zip is replaced.
+    fs::last_write_time(zip, Ago(60));
+    Write(archive, "killed session\n", 0);
+    REQUIRE(Retention::WriteSessionZipFromArchive(log, std::stop_token{}));
+    entries = ReadZip(zip);
+    REQUIRE(entries.size() == 1);
+    REQUIRE(entries[0].data == "killed session\n");
+    REQUIRE(Names(dir.path) ==
+            std::set<std::string>{"eden_log.20260105-000000.txt", "eglantine-last-session.zip"});
+}
+
+TEST_CASE("Session zip replaces an existing one without leaving a part", "[common][log_retention]") {
+    TempDir dir;
+    const fs::path log = dir.path / "eden_log.txt";
+    const fs::path zip = dir.path / std::string{Retention::SessionZipName};
+    Write(zip, "not a zip", 24);
+    Write(log, "this session\n", 1);
+    REQUIRE(Retention::WriteSessionZip(log, std::nullopt, std::stop_token{}));
+    const auto entries = ReadZip(zip);
+    REQUIRE(entries.size() == 1);
+    REQUIRE(entries[0].data == "this session\n");
+    REQUIRE(Names(dir.path) == std::set<std::string>{"eden_log.txt", "eglantine-last-session.zip"});
+}
+
+TEST_CASE("Session zip takes the crash dump of the same session only", "[common][log_retention]") {
+    REQUIRE(Retention::DumpBelongsToSession(100, 100));
+    REQUIRE(Retention::DumpBelongsToSession(101, 100));
+    REQUIRE_FALSE(Retention::DumpBelongsToSession(99, 100));
+    REQUIRE_FALSE(Retention::DumpBelongsToSession(100, std::nullopt));
+
+    // Without a creation time the start is a minute before the last write; a creation time
+    // earlier than that does not move it (it may be inherited from a renamed file).
+    REQUIRE(Retention::ArchiveSessionStart(std::nullopt, 1000) == 940);
+    REQUIRE(Retention::ArchiveSessionStart(100, 1000) == 940);
+    REQUIRE(Retention::ArchiveSessionStart(990, 1000) == 990);
+
+    TempDir dir;
+    const fs::path log = dir.path / "eden_log.txt";
+    const fs::path zip = dir.path / std::string{Retention::SessionZipName};
+    const fs::path dump = dir.path / "eden_crash.dmp";
+    Write(log, "session\n", 0);
+    const std::time_t start = Retention::ToTimeT(Ago(60));
+    const std::string dump_bytes = LogLines(300); // stands in for the minidump
+
+    SECTION("written during the session") {
+        Write(dump, dump_bytes, 0);
+        fs::last_write_time(dump, Ago(30));
+        REQUIRE(Retention::WriteSessionZip(log, start, std::stop_token{}));
+        const auto entries = ReadZip(zip);
+        REQUIRE(entries.size() == 2);
+        REQUIRE(entries[0].name == "eden_log.txt");
+        REQUIRE(entries[1].name == "eden_crash.dmp");
+        REQUIRE(entries[1].data == dump_bytes);
+    }
+
+    SECTION("left by an earlier session") {
+        Write(dump, dump_bytes, 0);
+        fs::last_write_time(dump, Ago(180));
+        REQUIRE(Retention::WriteSessionZip(log, start, std::stop_token{}));
+        const auto entries = ReadZip(zip);
+        REQUIRE(entries.size() == 1);
+        REQUIRE(entries[0].name == "eden_log.txt");
+    }
+
+    SECTION("without a start time") {
+        Write(dump, dump_bytes, 0);
+        REQUIRE(Retention::WriteSessionZip(log, std::nullopt, std::stop_token{}));
+        REQUIRE(ReadZip(zip).size() == 1);
+    }
+
+    SECTION("no dump") {
+        REQUIRE(Retention::WriteSessionZip(log, start, std::stop_token{}));
+        REQUIRE(ReadZip(zip).size() == 1);
+    }
+}
+
+TEST_CASE("The session zip is not a session log archive", "[common][log_retention]") {
+    REQUIRE_FALSE(Retention::ParseArchiveName("eden_log", "eglantine-last-session.zip"));
+    REQUIRE_FALSE(Retention::ParseArchiveName("eden_log", "eglantine-last-session.zip.part"));
+
+    const std::vector<std::string> names{
+        "eden_log.20260105-000000.txt",
+        "eden_log.20260104-000000.txt",
+        "eglantine-last-session.zip",
+        "eglantine-last-session.zip.part",
+    };
+    REQUIRE(Retention::SelectForDeletion("eden_log", names, 5).empty());
+    REQUIRE(Retention::SelectForCompression("eden_log", names) ==
+            std::vector<std::string>{"eden_log.20260104-000000.txt"});
 }

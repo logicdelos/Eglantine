@@ -18,6 +18,7 @@
 #include "common/nx2_sampler.h"
 #include "common/fs/fs_paths.h"
 #include "common/fs/path_util.h"
+#include "common/logging.h"
 #include "common/settings.h"
 #ifdef _WIN32
 #include "common/windows/crash_handler.h"
@@ -321,17 +322,24 @@ int main(int argc, char* argv[]) {
 
     // A failure while the main window is built (settings, paths, renderer probing) is shown
     // instead of ending the process without a word.
+    int result = EXIT_SUCCESS;
     try {
-        MainWindow main_window{has_broken_vulkan};
-        // After settings have been loaded by GMainWindow, apply the filter
-        main_window.show();
+        {
+            MainWindow main_window{has_broken_vulkan};
+            // After settings have been loaded by GMainWindow, apply the filter
+            main_window.show();
 
-        app.connect(&app, &QGuiApplication::applicationStateChanged, &main_window,
-                    &MainWindow::OnAppFocusStateChanged);
-        return app.exec();
+            app.connect(&app, &QGuiApplication::applicationStateChanged, &main_window,
+                        &MainWindow::OnAppFocusStateChanged);
+            result = app.exec();
+        } // The window is gone, and with it the emulation (closeEvent shut it down).
     } catch (const std::exception& exception) {
         QMessageBox::critical(nullptr, QObject::tr("Eglantine startup stopped"),
                               QString::fromUtf8(exception.what()));
         return EXIT_FAILURE;
     }
+    // The clean exit: the log of this session as eglantine-last-session.zip. A crash or a kill
+    // does not get here; the next start zips the rotated log instead.
+    Common::Log::WriteSessionZipAtExit();
+    return result;
 }
