@@ -13,6 +13,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "core/armed_read_traps.h"
 #include "common/common_types.h"
 #include "common/range_sets.h"
 #include "video_core/buffer_cache/read_trap_tracker.h"
@@ -629,6 +630,72 @@ TEST_CASE("A GPU write notifies the core of its unarmed pages only", "[cpu_readb
     parts.clear();
     REQUIRE_FALSE(traps.Arm(c, PAGE * 6, collect));
     REQUIRE(parts.empty());
+}
+
+TEST_CASE("A part the core could not arm is offered again", "[cpu_readback][read_traps]") {
+    VideoCommon::ReadTrapTracker traps;
+    std::vector<Range> parts;
+    const auto collect = [&](u64 address, u64 size) {
+        parts.emplace_back(address, size);
+        return true;
+    };
+    REQUIRE(traps.Arm(c + PAGE, PAGE, collect));
+    REQUIRE(traps.Arm(c + PAGE * 3, PAGE, collect));
+    parts.clear();
+
+    // The core refuses the first part (a page it does not cache): only the second is recorded.
+    const auto refuse_first = [&](u64 address, u64 size) {
+        parts.emplace_back(address, size);
+        return address != c;
+    };
+    REQUIRE(traps.Arm(c, PAGE * 4, refuse_first));
+    REQUIRE(parts == std::vector<Range>{{c, PAGE}, {c + PAGE * 2, PAGE}});
+
+    parts.clear();
+    REQUIRE(traps.Arm(c, PAGE * 4, collect));
+    REQUIRE(parts == std::vector<Range>{{c, PAGE}});
+    parts.clear();
+    REQUIRE_FALSE(traps.Arm(c, PAGE * 4, collect));
+    REQUIRE(parts.empty());
+}
+
+TEST_CASE("A stale read trap release is dropped after a rearm", "[read_traps]") {
+    Core::Memory::ArmedReadTraps armed;
+    REQUIRE(armed.Arm(10));
+    const auto first = armed.Version(10);
+    REQUIRE(first.has_value());
+
+    // The GPU writes the page again while a reader holds the old version.
+    REQUIRE_FALSE(armed.Arm(10));
+    const auto second = armed.Version(10);
+    REQUIRE(second.has_value());
+    REQUIRE(*second != *first);
+    REQUIRE_FALSE(armed.Release(10, *first));
+    REQUIRE(armed.Version(10) == second);
+    REQUIRE(armed.Release(10, *second));
+    REQUIRE_FALSE(armed.Version(10).has_value());
+    REQUIRE_FALSE(armed.Release(10, *second));
+}
+
+TEST_CASE("Armed read traps drop whole ranges", "[read_traps]") {
+    Core::Memory::ArmedReadTraps armed;
+    for (u64 page = 4; page < 10; ++page) {
+        REQUIRE(armed.Arm(page));
+    }
+    REQUIRE(armed.Size() == 6);
+
+    std::vector<u64> seen;
+    armed.ForEachInRange(5, 8, [&](u64 page, u64) { seen.push_back(page); });
+    REQUIRE(seen == std::vector<u64>{5, 6, 7});
+
+    // [first, end) is half open.
+    REQUIRE(armed.Erase(8, 10) == 2);
+    REQUIRE(armed.Size() == 4);
+    seen.clear();
+    armed.EraseEach(0, 6, [&](u64 page) { seen.push_back(page); });
+    REQUIRE(seen == std::vector<u64>{4, 5});
+    REQUIRE(armed.Size() == 2);
+    REQUIRE(armed.Erase(0, 4) == 0);
 }
 
 TEST_CASE("MemoryTracker: a GPU rewrite needs a fresh CPU readback", "[cpu_readback]") {

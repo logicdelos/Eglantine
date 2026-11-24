@@ -26,6 +26,7 @@
 #include "core/frontend/emu_window.h"
 #include "core/frontend/graphics_context.h"
 #include "core/gpu_dirty_memory_manager.h"
+#include "core/memory.h"
 #include "core/hle/service/nvdrv/nvdata.h"
 #include "core/perf_stats.h"
 #include "video_core/cdma_pusher.h"
@@ -310,6 +311,13 @@ struct GPU::Impl {
 
     VideoCore::RasterizerDownloadArea OnCPURead(DAddr addr, u64 size) {
         auto raster_area = renderer->ReadRasterizer()->GetFlushArea(addr, size);
+        if (Core::Memory::GetReactiveFlushMode() == Core::Memory::ReactiveFlushMode::Verify)
+            [[unlikely]] {
+            // Verify mode: does the precise scheme's armed set cover this flush request?
+            Core::Memory::ReactiveVerifyDecision(addr, size, !raster_area.preemtive,
+                                                 raster_area.start_address,
+                                                 raster_area.end_address);
+        }
         if (raster_area.preemtive) {
             return raster_area;
         }

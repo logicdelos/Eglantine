@@ -138,7 +138,10 @@ public:
     void UpdatePagesCachedBatch(std::span<const std::pair<DAddr, size_t>> ranges, s32 delta);
 
     /// Traps the next guest CPU read of these pages, to learn which GPU writes the CPU reads.
-    void ArmReadTraps(DAddr addr, size_t size);
+    /// Returns whether every page is trapped now (or was): false when a page has no guest mapping
+    /// the core tracks as GPU cached, and the caller must then not record the range as armed.
+    /// Always true unless EDEN_NX2_REACTIVE_MODE is precise or verify.
+    bool ArmReadTraps(DAddr addr, size_t size);
 
 private:
     struct TranslationEntry {
@@ -204,6 +207,9 @@ private:
     void CutContinuityAt(size_t page);
 
     void InnerGatherDeviceAddresses(Common::ScratchBuffer<u32>& buffer, PAddr address);
+
+    /// Arms the other guest mappings of the physical page behind a device page (see ArmReadTraps).
+    void ArmAliasReadTraps(size_t page);
 
     std::unique_ptr<DeviceMemoryManagerAllocator<Traits>> impl;
 

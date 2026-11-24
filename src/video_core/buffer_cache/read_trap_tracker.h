@@ -7,6 +7,10 @@
 #pragma once
 
 #include <algorithm>
+#include <type_traits>
+#include <utility>
+
+#include <boost/container/small_vector.hpp>
 
 #include "common/common_types.h"
 #include "common/range_sets.h"
@@ -18,24 +22,38 @@ class ReadTrapTracker {
 public:
     /// Arms this page-aligned range. Calls `arm(address, size)` for each part that was not armed
     /// yet, the parts the core must be notified of, and returns whether there was any.
+    ///
+    /// `arm` may return a bool: false says the core could not arm that part (a page it does not
+    /// track as GPU cached), and the part is then not recorded, so the next Arm offers it again.
+    /// A callback returning void records every part.
     template <typename Func>
     bool Arm(DAddr address, u64 size, Func&& arm) {
         const DAddr end = address + size;
         DAddr next = address;
         bool any = false;
+        boost::container::small_vector<std::pair<DAddr, u64>, 4> armed_parts;
+        const auto notify = [&](DAddr part_address, u64 part_size) {
+            any = true;
+            if constexpr (std::is_same_v<std::invoke_result_t<Func&, DAddr, u64>, bool>) {
+                if (!arm(part_address, part_size)) {
+                    return;
+                }
+            } else {
+                arm(part_address, part_size);
+            }
+            armed_parts.emplace_back(part_address, part_size);
+        };
         ranges.ForEachInRange(address, size, [&](DAddr lower, DAddr upper) {
             if (lower > next) {
-                arm(next, lower - next);
-                any = true;
+                notify(next, lower - next);
             }
             next = (std::max)(next, upper);
         });
         if (next < end) {
-            arm(next, end - next);
-            any = true;
+            notify(next, end - next);
         }
-        if (any) {
-            ranges.Add(address, size);
+        for (const auto& [part_address, part_size] : armed_parts) {
+            ranges.Add(part_address, part_size);
         }
         return any;
     }

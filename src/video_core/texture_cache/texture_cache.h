@@ -935,7 +935,7 @@ typename P::ImageView& TextureCache<P>::GetImageView(u32 index) noexcept {
 
 template <class P>
 void TextureCache<P>::MarkModification(ImageId id) noexcept {
-    MarkModification(slot_images[id]);
+    MarkModification(slot_images[id], id);
 }
 
 template <class P>
@@ -1808,6 +1808,10 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
 template <class P>
 std::optional<VideoCore::RasterizerDownloadArea> TextureCache<P>::GetFlushArea(DAddr cpu_addr,
                                                                                u64 size) {
+    // A guest read consumes the core's traps of the pages it touches (the reader flushes them
+    // below). Only that range: the image's other pages are still armed, and the next GPU write
+    // to one of the pages read arms it again.
+    ForgetReadTrapRange(cpu_addr, size);
     std::optional<VideoCore::RasterizerDownloadArea> area{};
     ForEachImageInRegion(cpu_addr, size, [&](ImageId, ImageBase& image) {
         if (False(image.flags & ImageFlagBits::GpuModified)) {
@@ -4170,6 +4174,10 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     }
 
     RegisterImage(new_image_id);
+    if (True(new_image.flags & ImageFlagBits::GpuModified)) {
+        // The joined image holds GPU data of its overlaps over its whole range.
+        ArmImageReadTraps(new_image, new_image_id);
+    }
     return new_image_id;
 }
 
@@ -4738,6 +4746,9 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
                 page_table.erase(page_it);
             }
         });
+        if (image.cpu_addr < ~(1ULL << 40)) {
+            ForgetReadTrapRange(image.cpu_addr, image.guest_size_bytes);
+        }
         slot_map_views.erase(map_id);
         return;
     }
@@ -4771,6 +4782,7 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
                 vector_it = image_map_ids.erase(vector_it);
             }
         });
+        ForgetReadTrapRange(cpu_addr, size);
         slot_map_views.erase(map_view_id);
     }
     sparse_views.erase(it);
@@ -4815,6 +4827,8 @@ void TextureCache<P>::UntrackImage(ImageBase& image, ImageId image_id) {
     image.flags &= ~ImageFlagBits::Tracked;
     if (False(image.flags & ImageFlagBits::Sparse)) {
         if (image.cpu_addr < ~(1ULL << 40)) {
+            // The pages stop being GPU cached: the core drops their traps, so must the tracker.
+            ForgetReadTrapRange(image.cpu_addr, image.guest_size_bytes);
             device_memory.UpdatePagesCachedCount(image.cpu_addr, image.guest_size_bytes, -1);
         }
         return;
@@ -4827,6 +4841,7 @@ void TextureCache<P>::UntrackImage(ImageBase& image, ImageId image_id) {
         const auto& map = slot_map_views[map_view_id];
         const DAddr cpu_addr = map.cpu_addr;
         const std::size_t size = map.size;
+        ForgetReadTrapRange(cpu_addr, size);
         device_memory.UpdatePagesCachedCount(cpu_addr, size, -1);
     }
 }
@@ -4997,9 +5012,59 @@ void TextureCache<P>::RemoveFramebuffers(std::span<const ImageViewId> removed_vi
 }
 
 template <class P>
-void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
+void TextureCache<P>::MarkModification(ImageBase& image, ImageId image_id) noexcept {
     image.flags |= ImageFlagBits::GpuModified;
     image.modification_tick = ++modification_tick;
+    ArmImageReadTraps(image, image_id);
+}
+
+template <class P>
+void TextureCache<P>::ArmImageReadTraps(const ImageBase& image, ImageId image_id) {
+    if (!Core::Memory::ReactiveTrapsPublished()) [[likely]] {
+        return;
+    }
+    // Precise reactive flushing: a guest read of the pages the GPU wrote must flush them first.
+    if (True(image.flags & ImageFlagBits::Sparse)) {
+        // Only the mapped segments hold data; the holes between them are not the image's.
+        const auto it = sparse_views.find(image_id);
+        if (it == sparse_views.end()) {
+            return;
+        }
+        for (const auto& map_view_id : it->second) {
+            const auto& map = slot_map_views[map_view_id];
+            ArmReadTrapRange(map.cpu_addr, map.size);
+        }
+        return;
+    }
+    if (image.cpu_addr >= ~(1ULL << 40)) {
+        return; // A stand-in address (ImageCpuAddress), with no guest memory behind it.
+    }
+    ArmReadTrapRange(image.cpu_addr, image.guest_size_bytes);
+}
+
+template <class P>
+void TextureCache<P>::ArmReadTrapRange(DAddr cpu_addr, u64 size) {
+    if (size == 0) {
+        return;
+    }
+    const DAddr begin = Common::AlignDown(cpu_addr, Core::DEVICE_PAGESIZE);
+    const DAddr end = Common::AlignUp(cpu_addr + size, Core::DEVICE_PAGESIZE);
+    // Only the parts not armed yet reach the core; a render target written every frame stays
+    // armed until the guest reads a page of it.
+    texture_read_trapped_ranges.Arm(begin, end - begin, [this](DAddr part, u64 part_size) {
+        return device_memory.ArmReadTraps(part, part_size);
+    });
+}
+
+template <class P>
+void TextureCache<P>::ForgetReadTrapRange(DAddr cpu_addr, u64 size) {
+    // The mode, not the setting: ranges armed before use_reactive_flushing changed still count.
+    if (size == 0 || Core::Memory::GetReactiveFlushMode() == Core::Memory::ReactiveFlushMode::Blanket) {
+        return;
+    }
+    const DAddr begin = Common::AlignDown(cpu_addr, Core::DEVICE_PAGESIZE);
+    const DAddr end = Common::AlignUp(cpu_addr + size, Core::DEVICE_PAGESIZE);
+    texture_read_trapped_ranges.Subtract(begin, end - begin);
 }
 
 template <class P>
@@ -5038,6 +5103,8 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
     image.modification_tick = most_recent_tick;
     if (any_modified) {
         image.flags |= ImageFlagBits::GpuModified;
+        // The copies below write GPU data into this image's guest range.
+        ArmImageReadTraps(image, image_id);
     }
     std::ranges::sort(aliased_images, [this](const AliasedImage* lhs, const AliasedImage* rhs) {
         const ImageBase& lhs_image = slot_images[lhs->id];
@@ -5142,7 +5209,7 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
             Tegra::Nx2SparseMarkWritten(image.gpu_addr, image.guest_size_bytes);
             image.flags |= ImageFlagBits::CpuModified | ImageFlagBits::Remapped;
         }
-        MarkModification(image);
+        MarkModification(image, image_id);
         if (!clearing_render_targets) {
             const u64 current_frame = frame_tick + 1;
             if (image.first_written_frame == 0) {

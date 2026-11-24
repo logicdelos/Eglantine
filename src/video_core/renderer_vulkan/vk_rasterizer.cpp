@@ -2323,21 +2323,46 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
             }
         }
     }
+    // The buffer cache answers CPU reads only when it flushes them on demand, and on Ampere only
+    // for pages the GPU may have written.
+    const auto buffer_may_flush = [&] {
+        return buffer_cache.FlushesOnCpuRead() &&
+               (!Tegra::g_nx2_ampere.load(std::memory_order_relaxed) ||
+                Tegra::Nx2MayBeGpuWritten(addr, size));
+    };
+    const bool reactive_mode =
+        Core::Memory::GetReactiveFlushMode() != Core::Memory::ReactiveFlushMode::Blanket;
     if (texture_area) {
-        // The core disarmed the read's pages before asking: the buffer cache arms only pages it
-        // doesn't count as armed, so it must forget these.
         std::scoped_lock lock{buffer_cache.mutex};
-        buffer_cache.ForgetReadTraps(addr, size);
+        if (reactive_mode && Core::Memory::ReactivePageConsumeActive() && buffer_may_flush()) {
+            // Flushing a whole armed page: the buffer cache may hold dirty data on it too, and
+            // one answer must cover both caches (the buffer cache forgets its traps itself).
+            if (const auto buffer_area = buffer_cache.GetFlushArea(addr, size)) {
+                texture_area->start_address =
+                    (std::min)(texture_area->start_address, buffer_area->start_address);
+                texture_area->end_address =
+                    (std::max)(texture_area->end_address, buffer_area->end_address);
+                texture_area->preemtive = texture_area->preemtive && buffer_area->preemtive;
+            }
+        } else {
+            // The core disarmed the read's pages before asking: the buffer cache arms only pages
+            // it doesn't count as armed, so it must forget these.
+            buffer_cache.ForgetReadTraps(addr, size);
+        }
+        Core::Memory::NoteReactiveFlushSource(Core::Memory::ReactiveFlushSource::Texture);
         return *texture_area;
     }
-    if (buffer_cache.FlushesOnCpuRead() &&
-        (!Tegra::g_nx2_ampere.load(std::memory_order_relaxed) ||
-         Tegra::Nx2MayBeGpuWritten(addr, size))) {
+    if (buffer_may_flush()) {
         std::scoped_lock lock{buffer_cache.mutex};
         auto area = buffer_cache.GetFlushArea(addr, size);
         if (area) {
+            Core::Memory::NoteReactiveFlushSource(Core::Memory::ReactiveFlushSource::Buffer);
             return *area;
         }
+    } else if (reactive_mode) {
+        // Not asked: the pages' traps are consumed all the same (the next GPU write arms them).
+        std::scoped_lock lock{buffer_cache.mutex};
+        buffer_cache.ForgetReadTraps(addr, size);
     }
     VideoCore::RasterizerDownloadArea new_area{
         .start_address = Common::AlignDown(addr, Core::DEVICE_PAGESIZE),

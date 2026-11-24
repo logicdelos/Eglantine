@@ -36,6 +36,7 @@
 #include "common/settings.h"
 #include "common/slot_vector.h"
 #include "common/spin_recursive_mutex.h"
+#include "core/memory.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/buffer_cache/buffer_base.h"
 #include "video_core/buffer_cache/buffer_dependency_trace.h"
@@ -957,6 +958,11 @@ private:
     /// of the rest. Queuing the whole range when any page of it was Preflushable copied whole
     /// written storage buffers (up to 8 MiB) back at every fence: ~5 GB/s in title 1's forest.
     void QueueGpuWrite(DAddr device_addr, u64 size) {
+        if (Core::Memory::ReactiveTrapsPublished()) [[unlikely]] {
+            // Precise reactive flushing protects exactly the pages the GPU wrote, however their
+            // data is written back: arm before the early return for small and async downloads.
+            ArmReadTraps(device_addr, size);
+        }
         if (AsyncBufferDownloads() || size <= SmallDownloadLimit()) {
             uncommitted_gpu_modified_ranges.Add(device_addr, size);
             return;
@@ -993,7 +999,7 @@ private:
         // Only the parts not armed yet: the core visits each page it is given, and a buffer the
         // GPU rewrites every frame is mostly still armed (the guest read a few of its pages).
         read_trapped_ranges.Arm(begin, end - begin, [this](DAddr part, u64 part_size) {
-            device_memory.ArmReadTraps(part, part_size);
+            return device_memory.ArmReadTraps(part, part_size);
         });
     }
 

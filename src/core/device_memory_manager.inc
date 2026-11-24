@@ -818,15 +818,21 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedBatch(std::span<const std::pa
 }
 
 template <typename Traits>
-void DeviceMemoryManager<Traits>::ArmReadTraps(DAddr addr, size_t size) {
+bool DeviceMemoryManager<Traits>::ArmReadTraps(DAddr addr, size_t size) {
     const auto MarkRegionReadTrap = &DeviceMemoryManager<Traits>::DeviceMethods::MarkRegionReadTrap;
     Memory::Memory* run_inter = nullptr;
     u64 run_begin = 0;
     u64 run_pages = 0;
+    bool complete = true;
     const auto release_run = [&] {
-        if (run_pages > 0 && run_inter != nullptr) {
-            MarkRegionReadTrap(run_inter, run_begin << Memory::YUZU_PAGEBITS,
-                               run_pages << Memory::YUZU_PAGEBITS);
+        if (run_pages > 0) {
+            if (run_inter != nullptr) {
+                const bool armed = MarkRegionReadTrap(run_inter, run_begin << Memory::YUZU_PAGEBITS,
+                                                      run_pages << Memory::YUZU_PAGEBITS);
+                complete = complete && armed;
+            } else {
+                complete = false;
+            }
         }
         run_pages = 0;
     };
@@ -836,6 +842,7 @@ void DeviceMemoryManager<Traits>::ArmReadTraps(DAddr addr, size_t size) {
         const u64 vpage = vaddr >> Memory::YUZU_PAGEBITS;
         if (vpage == 0) {
             release_run();
+            complete = false;
             continue;
         }
         auto* const inter = registered_processes[asid.id];
@@ -845,8 +852,45 @@ void DeviceMemoryManager<Traits>::ArmReadTraps(DAddr addr, size_t size) {
             run_begin = vpage;
         }
         ++run_pages;
+        if (Memory::GetReactiveFlushMode() != Memory::ReactiveFlushMode::Blanket) [[unlikely]] {
+            ArmAliasReadTraps(page);
+        }
     }
     release_run();
+    // Blanket mode records every range, as it always did.
+    return complete || Memory::GetReactiveFlushMode() == Memory::ReactiveFlushMode::Blanket;
+}
+
+template <typename Traits>
+void DeviceMemoryManager<Traits>::ArmAliasReadTraps(size_t page) {
+    // The CPU backing recorded for a device page is one of the guest mappings of its physical
+    // page. When several device pages share the physical page (compressed_device_addr has its
+    // multi flag), a guest read can come through any of their recorded mappings, so arm them all.
+    // Coverage is best effort: a guest mapping of the physical page that no device page records
+    // is not reachable from here, and nothing can arm it.
+    const u32 compressed = tracked_entries[page].compressed_physical_ptr;
+    if (compressed == 0) {
+        return;
+    }
+    const u32 physical_page = compressed - 1U;
+    if ((compressed_device_addr[physical_page] >> MULTI_FLAG_BITS) == 0) [[likely]] {
+        return;
+    }
+    Common::ScratchBuffer<u32> aliases;
+    InnerGatherDeviceAddresses(aliases, static_cast<PAddr>(physical_page) << page_bits);
+    const auto MarkRegionReadTrap = &DeviceMemoryManager<Traits>::DeviceMethods::MarkRegionReadTrap;
+    for (const u32 alias : aliases) {
+        if (alias == page) {
+            continue;
+        }
+        const auto [asid, vaddr] = ExtractCPUBacking(alias);
+        const u64 vpage = vaddr >> Memory::YUZU_PAGEBITS;
+        Memory::Memory* const inter = registered_processes[asid.id];
+        if (vpage == 0 || inter == nullptr) {
+            continue;
+        }
+        (void)MarkRegionReadTrap(inter, vpage << Memory::YUZU_PAGEBITS, Memory::YUZU_PAGESIZE);
+    }
 }
 
 } // namespace Core

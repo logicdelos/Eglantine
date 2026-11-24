@@ -8,9 +8,11 @@
 // SPDX-FileCopyrightText: 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <atomic>
-#include <chrono>
 #include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <string>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -31,6 +33,7 @@
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/swap.h"
+#include "core/armed_read_traps.h"
 #include "core/core.h"
 #include "core/device_memory.h"
 #include "core/gpu_dirty_memory_manager.h"
@@ -51,6 +54,168 @@ namespace Core::Memory {
 u32& UnmappedReadFlag() {
     thread_local u32 flag{};
     return flag;
+}
+
+namespace {
+
+/// EDEN_NX2_NO_REACTIVE=1 turns reactive flushing off for Switch 2 titles (read once).
+bool NoReactiveRequested() {
+    static const bool requested = [] {
+        const char* const value = std::getenv("EDEN_NX2_NO_REACTIVE");
+        return value != nullptr && value[0] == '1';
+    }();
+    return requested;
+}
+
+/// One guest read audited by Verify: what the shadow of armed pages says about its page.
+struct VerifyAccess {
+    bool active{};
+    bool shadow_armed{};
+    u64 vaddr{};
+};
+
+thread_local VerifyAccess t_verify_access{};
+thread_local ReactiveFlushSource t_flush_source{ReactiveFlushSource::None};
+thread_local bool t_page_consume{};
+
+std::atomic<u64> g_verify_checks{};
+std::atomic<u64> g_verify_requested{};
+std::atomic<u64> g_verify_uncovered{};
+std::atomic<u64> g_verify_last_miss_log_ns{};
+std::atomic<u64> g_verify_last_summary_ns{};
+
+constexpr u64 VERIFY_MISS_LOG_INTERVAL_NS = 1'000'000'000;
+constexpr u64 VERIFY_SUMMARY_INTERVAL_NS = 10'000'000'000;
+
+u64 SteadyNowNs() {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+}
+
+const char* SourceName(ReactiveFlushSource source) {
+    switch (source) {
+    case ReactiveFlushSource::Texture:
+        return "texture";
+    case ReactiveFlushSource::Buffer:
+        return "buffer";
+    case ReactiveFlushSource::None:
+        break;
+    }
+    return "unknown";
+}
+
+/// Sets t_page_consume for the scope of one page-wide flush.
+struct PageConsumeScope {
+    PageConsumeScope() {
+        t_page_consume = true;
+    }
+    ~PageConsumeScope() {
+        t_page_consume = false;
+    }
+    PageConsumeScope(const PageConsumeScope&) = delete;
+    PageConsumeScope& operator=(const PageConsumeScope&) = delete;
+};
+
+/// Sets t_verify_access for the scope of one audited read.
+struct VerifyAccessScope {
+    VerifyAccessScope(bool shadow_armed, u64 vaddr) {
+        t_verify_access = VerifyAccess{true, shadow_armed, vaddr};
+        t_flush_source = ReactiveFlushSource::None;
+    }
+    ~VerifyAccessScope() {
+        t_verify_access = VerifyAccess{};
+        t_flush_source = ReactiveFlushSource::None;
+    }
+    VerifyAccessScope(const VerifyAccessScope&) = delete;
+    VerifyAccessScope& operator=(const VerifyAccessScope&) = delete;
+};
+
+} // Anonymous namespace
+
+ReactiveFlushMode ReactiveFlushModeFromEnvironment() {
+    const char* const value = std::getenv("EDEN_NX2_REACTIVE_MODE");
+    if (value == nullptr || value[0] == '\0') {
+        return ReactiveFlushMode::Blanket;
+    }
+    std::string text{value};
+    std::ranges::transform(text, text.begin(), [](char c) {
+        return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    });
+    if (text == "blanket") {
+        return ReactiveFlushMode::Blanket;
+    }
+    if (text == "verify") {
+        LOG_INFO(HW_Memory, "EDEN_NX2_REACTIVE_MODE=verify: blanket read protection, with a check "
+                            "of what precise flushing would have covered");
+        return ReactiveFlushMode::Verify;
+    }
+    if (text == "precise") {
+        LOG_INFO(HW_Memory, "EDEN_NX2_REACTIVE_MODE=precise: only pages the GPU modified and has "
+                            "not written back lose read permission");
+        return ReactiveFlushMode::Precise;
+    }
+    LOG_WARNING(HW_Memory, "EDEN_NX2_REACTIVE_MODE={} is not blanket, verify or precise; using "
+                           "blanket",
+                value);
+    return ReactiveFlushMode::Blanket;
+}
+
+bool ReactiveFlushingActive() {
+    return Settings::values.use_reactive_flushing.GetValue() &&
+           !(NoReactiveRequested() && Settings::CurrentProgramIsSwitch2());
+}
+
+void SetReactiveFlushSource(ReactiveFlushSource source) {
+    t_flush_source = source;
+}
+
+bool ReactivePageConsumeActive() {
+    return t_page_consume;
+}
+
+void ReactiveVerifyDecision(DAddr addr, u64 size, bool requested_sync, u64 area_begin,
+                            u64 area_end) {
+    const VerifyAccess access = t_verify_access;
+    const ReactiveFlushSource source = std::exchange(t_flush_source, ReactiveFlushSource::None);
+    if (!access.active) {
+        return;
+    }
+    g_verify_checks.fetch_add(1, std::memory_order_relaxed);
+    if (requested_sync) {
+        g_verify_requested.fetch_add(1, std::memory_order_relaxed);
+        if (!access.shadow_armed) {
+            // The blanket path flushes here but the precise one would have let the read through:
+            // a producer did not arm this page (or released it too early).
+            g_verify_uncovered.fetch_add(1, std::memory_order_relaxed);
+            const u64 now = SteadyNowNs();
+            u64 last = g_verify_last_miss_log_ns.load(std::memory_order_relaxed);
+            if ((last == 0 || now - last >= VERIFY_MISS_LOG_INTERVAL_NS) &&
+                g_verify_last_miss_log_ns.compare_exchange_strong(last, now,
+                                                                  std::memory_order_relaxed)) {
+                LOG_WARNING(HW_GPU,
+                            "reactive verify: flush at guest page {:#x} (device {:#x}, {} bytes, "
+                            "area [{:#x}, {:#x}), source {}) was not covered by an armed trap",
+                            access.vaddr & ~YUZU_PAGEMASK, addr, size, area_begin, area_end,
+                            SourceName(source));
+            }
+        }
+    }
+    const u64 now = SteadyNowNs();
+    u64 last_summary = g_verify_last_summary_ns.load(std::memory_order_relaxed);
+    if (last_summary == 0) {
+        g_verify_last_summary_ns.compare_exchange_strong(last_summary, now,
+                                                         std::memory_order_relaxed);
+    } else if (now - last_summary >= VERIFY_SUMMARY_INTERVAL_NS &&
+               g_verify_last_summary_ns.compare_exchange_strong(last_summary, now,
+                                                                std::memory_order_relaxed)) {
+        LOG_INFO(HW_GPU,
+                 "reactive verify: {} guest reads checked, {} requested a flush, {} of those not "
+                 "covered by an armed trap",
+                 g_verify_checks.load(std::memory_order_relaxed),
+                 g_verify_requested.load(std::memory_order_relaxed),
+                 g_verify_uncovered.load(std::memory_order_relaxed));
+    }
 }
 
 static inline bool AddressSpaceContains(const Common::PageTable& table, const Common::ProcessAddress addr, const std::size_t size) {
@@ -93,6 +258,18 @@ struct Memory::Impl {
 #endif
     }
 
+    /// A page the core remaps or unmaps is no longer GPU cached: its armed trap is dropped, as
+    /// the later mapping does not restore the page's protection.
+    void ForgetArmedPagesOnRemap(const Common::PageTable& page_table, u64 vaddr, u64 size) {
+        if (&page_table != current_page_table ||
+            GetReactiveFlushMode() == ReactiveFlushMode::Blanket ||
+            armed_read_trap_count.load(std::memory_order_relaxed) == 0) {
+            return;
+        }
+        std::scoped_lock lk{read_trap_mutex};
+        EraseArmedPagesLocked(vaddr, size);
+    }
+
     void MapMemoryRegion(Common::PageTable& page_table, Common::ProcessAddress base, u64 size,
                          Common::PhysicalAddress target, Common::MemoryPermission perms,
                          bool separate_heap) {
@@ -100,6 +277,7 @@ struct Memory::Impl {
         ASSERT_MSG((base & YUZU_PAGEMASK) == 0, "non-page aligned base: {:016X}", GetInteger(base));
         ASSERT_MSG(target >= DramMemoryMap::Base, "Out of bounds target: {:016X}",
                    GetInteger(target));
+        ForgetArmedPagesOnRemap(page_table, GetInteger(base), size);
         MapPages(page_table, base / YUZU_PAGESIZE, size / YUZU_PAGESIZE, target,
                  Common::PageType::Memory);
 
@@ -112,6 +290,7 @@ struct Memory::Impl {
                      bool separate_heap) {
         ASSERT_MSG((size & YUZU_PAGEMASK) == 0, "non-page aligned size: {:016X}", size);
         ASSERT_MSG((base & YUZU_PAGEMASK) == 0, "non-page aligned base: {:016X}", GetInteger(base));
+        ForgetArmedPagesOnRemap(page_table, GetInteger(base), size);
         MapPages(page_table, base / YUZU_PAGESIZE, size / YUZU_PAGESIZE, 0,
                  Common::PageType::Unmapped);
 
@@ -443,6 +622,11 @@ struct Memory::Impl {
             return;
         }
 
+        if (debug) {
+            // A watchpoint takes every permission away: no trap release may give them back.
+            ForgetArmedPagesOnRemap(*current_page_table, vaddr, size);
+        }
+
         if (current_page_table->fastmem_arena) {
             const auto perm{debug ? Common::MemoryPermission{}
                                   : Common::MemoryPermission::ReadWrite};
@@ -500,18 +684,27 @@ struct Memory::Impl {
             return;
         }
 
+        // Precise and Verify keep a set of armed pages. The lock covers the protection change and
+        // the page type update, so an arm never sees a half-cached page and a cached armed page
+        // is never readable.
+        const ReactiveFlushMode trap_mode = ActiveReactiveMode();
+        const bool precise = trap_mode == ReactiveFlushMode::Precise;
+        std::unique_lock<std::mutex> trap_lock;
+        if (trap_mode != ReactiveFlushMode::Blanket) {
+            trap_lock = std::unique_lock<std::mutex>{read_trap_mutex};
+            if (!cached) {
+                // The pages are not GPU cached any more: their traps go with them.
+                EraseArmedPagesLocked(vaddr, size);
+            }
+        }
+
         if (current_page_table->fastmem_arena) {
             Common::MemoryPermission perm{};
             // EDEN_NX2_NO_REACTIVE=1 drops the read traps on Switch 2 programs. Opt-in: without
             // them a CPU read of GPU-written memory can see stale data.
-            static const bool nx2_no_reactive = [] {
-                const char* value = std::getenv("EDEN_NX2_NO_REACTIVE");
-                return value != nullptr && value[0] == '1';
-            }();
-            const bool reactive_flushing =
-                Settings::values.use_reactive_flushing.GetValue() &&
-                !(nx2_no_reactive && Settings::CurrentProgramIsSwitch2());
-            if (!reactive_flushing || !cached) {
+            const bool reactive_flushing = ReactiveFlushingActive();
+            // Precise keeps cached pages readable: only armed pages lose read permission.
+            if (!reactive_flushing || !cached || precise) {
                 perm |= Common::MemoryPermission::Read;
             }
             if (!cached) {
@@ -524,7 +717,11 @@ struct Memory::Impl {
             const auto stats_start = stats_enabled || spikes
                                          ? std::chrono::steady_clock::now()
                                          : std::chrono::steady_clock::time_point{};
-            host_buffer->Protect(vaddr, size, perm);
+            if (precise && cached) {
+                ProtectCachedReadOnlyAroundArmed(vaddr, size);
+            } else {
+                host_buffer->Protect(vaddr, size, perm);
+            }
             if (spikes) {
                 VideoCommon::Nx2Spikes::Note(VideoCommon::Nx2Spikes::Event::ProtectChange,
                                              std::chrono::steady_clock::now() - stats_start,
@@ -562,7 +759,7 @@ struct Memory::Impl {
                              static_cast<double>(nanos[0].exchange(0)) / 1e6 / seconds);
                 }
             }
-            if (cached && perm != Common::MemoryPermission{}) {
+            if (!precise && cached && perm != Common::MemoryPermission{}) {
                 ProtectArmedPages(vaddr, size);
             }
         }
@@ -625,11 +822,28 @@ struct Memory::Impl {
         }
     }
 
+    /// The mode that is in force for this process: Blanket unless EDEN_NX2_REACTIVE_MODE asks for
+    /// more, reactive flushing is on, a fastmem arena exists and the CPU backend is not NCE (under
+    /// NCE every fault is taken as a write, so a read trap cannot work).
+    [[nodiscard]] ReactiveFlushMode ActiveReactiveMode() const {
+        const ReactiveFlushMode mode = GetReactiveFlushMode();
+        if (mode == ReactiveFlushMode::Blanket || current_page_table == nullptr ||
+            !current_page_table->fastmem_arena || !ReactiveFlushingActive() ||
+            Settings::values.cpu_backend.GetValue() == Settings::CpuBackend::Nce) {
+            return ReactiveFlushMode::Blanket;
+        }
+        return mode;
+    }
+
     /// Read traps replace reactive flushing's blanket read protection of every cached page: only
     /// pages the GPU writes are protected, and each one only until its first read
     /// (EDEN_NX2_READ_TRAPS=0 turns them off). Under NCE every fault is taken as a write, so they
-    /// are not used there.
+    /// are not used there. With EDEN_NX2_REACTIVE_MODE=precise or verify they are used with
+    /// reactive flushing on, and EDEN_NX2_READ_TRAPS=0 does not apply.
     bool ReadTrapsEnabled() const {
+        if (ActiveReactiveMode() != ReactiveFlushMode::Blanket) {
+            return true;
+        }
         static const bool disabled = [] {
             const char* value = std::getenv("EDEN_NX2_READ_TRAPS");
             return value != nullptr && value[0] == '0';
@@ -639,42 +853,95 @@ struct Memory::Impl {
                Settings::values.cpu_backend.GetValue() != Settings::CpuBackend::Nce;
     }
 
-    void RasterizerArmReadTraps(u64 vaddr, u64 size) {
+    /// Keeps the lock-free count in step with the armed pages. The caller holds read_trap_mutex.
+    void SyncArmedReadTrapCount() {
+        armed_read_trap_count.store(armed_read_traps.Size(), std::memory_order_relaxed);
+    }
+
+    /// Forgets the armed pages of a range without touching their protection. The caller holds
+    /// read_trap_mutex.
+    void EraseArmedPagesLocked(u64 vaddr, u64 size) {
+        if (size == 0) {
+            return;
+        }
+        armed_read_traps.Erase(vaddr >> YUZU_PAGEBITS, ((vaddr + size - 1) >> YUZU_PAGEBITS) + 1);
+        SyncArmedReadTrapCount();
+    }
+
+    /// Precise mode: gives read permission to the pages of a just cached range, except the armed
+    /// ones, which stay without any. The caller holds read_trap_mutex, so no page is ever
+    /// readable while armed.
+    void ProtectCachedReadOnlyAroundArmed(u64 vaddr, u64 size) {
+        const u64 first = vaddr >> YUZU_PAGEBITS;
+        const u64 end = ((vaddr + size - 1) >> YUZU_PAGEBITS) + 1;
+        u64 cursor = first;
+        armed_read_traps.ForEachInRange(first, end, [&](u64 page, u64) {
+            if (page > cursor) {
+                host_buffer->Protect(cursor << YUZU_PAGEBITS, (page - cursor) << YUZU_PAGEBITS,
+                                     Common::MemoryPermission::Read);
+            }
+            host_buffer->Protect(page << YUZU_PAGEBITS, YUZU_PAGESIZE, Common::MemoryPermission{});
+            cursor = page + 1;
+        });
+        if (cursor < end) {
+            host_buffer->Protect(cursor << YUZU_PAGEBITS, (end - cursor) << YUZU_PAGEBITS,
+                                 Common::MemoryPermission::Read);
+        }
+    }
+
+    /// Returns whether every page of the range is now armed (or already was).
+    ///
+    /// Precise mode takes read permission away from the pages that were not armed yet. Verify
+    /// mode only records them in the shadow set: its pages keep the blanket protection.
+    bool RasterizerArmReadTraps(u64 vaddr, u64 size) {
         if (Settings::values.use_reactive_flushing.GetValue()) {
             // Clean cached read areas also need invalidation when reactive flushing is enabled.
             read_trap_generation.fetch_add(1, std::memory_order_release);
         }
         if (vaddr == 0 || size == 0 || !AddressSpaceContains(*current_page_table, vaddr, size) ||
             !ReadTrapsEnabled()) {
-            return;
+            return true;
         }
+        const ReactiveFlushMode mode = ActiveReactiveMode();
+        const bool protect_pages = mode != ReactiveFlushMode::Verify;
         const u64 page_end = ((vaddr + size - 1) >> YUZU_PAGEBITS) + 1;
         std::scoped_lock lk{read_trap_mutex};
         u64 run_begin = 0;
         u64 run_pages = 0;
+        bool complete = true;
         const auto protect_run = [&] {
             if (run_pages > 0) {
                 // Reads that hit a cached read area must not skip the flush of a new trap.
                 read_trap_generation.fetch_add(1, std::memory_order_release);
-                host_buffer->Protect(run_begin << YUZU_PAGEBITS, run_pages << YUZU_PAGEBITS,
-                                     Common::MemoryPermission{});
+                if (protect_pages) {
+                    host_buffer->Protect(run_begin << YUZU_PAGEBITS, run_pages << YUZU_PAGEBITS,
+                                         Common::MemoryPermission{});
+                }
                 run_pages = 0;
             }
         };
         for (u64 page = vaddr >> YUZU_PAGEBITS; page != page_end; ++page) {
             const bool cached = std::as_const(current_page_table->entries)[page].Type() ==
                                 Common::PageType::RasterizerCachedMemory;
-            if (!cached || !armed_read_traps.insert(page).second) {
+            if (!cached) {
+                // Not a page the GPU caches (or the core does not map): nothing to trap.
+                complete = false;
                 protect_run();
                 continue;
             }
-            armed_read_trap_count.fetch_add(1, std::memory_order_relaxed);
+            if (!armed_read_traps.Arm(page)) {
+                // Armed already; Arm gave it a new version, which cancels a release in flight.
+                protect_run();
+                continue;
+            }
             if (run_pages == 0) {
                 run_begin = page;
             }
             ++run_pages;
         }
         protect_run();
+        SyncArmedReadTrapCount();
+        return mode == ReactiveFlushMode::Blanket || complete;
     }
 
     /// Takes read permission away again from armed pages that were just cached again.
@@ -684,10 +951,9 @@ struct Memory::Impl {
         }
         std::scoped_lock lk{read_trap_mutex};
         const u64 page_end = ((vaddr + size - 1) >> YUZU_PAGEBITS) + 1;
-        for (auto it = armed_read_traps.lower_bound(vaddr >> YUZU_PAGEBITS);
-             it != armed_read_traps.end() && *it < page_end; ++it) {
-            host_buffer->Protect(*it << YUZU_PAGEBITS, YUZU_PAGESIZE, Common::MemoryPermission{});
-        }
+        armed_read_traps.ForEachInRange(vaddr >> YUZU_PAGEBITS, page_end, [&](u64 page, u64) {
+            host_buffer->Protect(page << YUZU_PAGEBITS, YUZU_PAGESIZE, Common::MemoryPermission{});
+        });
     }
 
     /// A slow-path read of a cached page: its trap, if any, has done its job.
@@ -697,15 +963,13 @@ struct Memory::Impl {
         }
         std::scoped_lock lk{read_trap_mutex};
         const u64 page_end = ((vaddr + size - 1) >> YUZU_PAGEBITS) + 1;
-        auto it = armed_read_traps.lower_bound(vaddr >> YUZU_PAGEBITS);
-        while (it != armed_read_traps.end() && *it < page_end) {
+        armed_read_traps.EraseEach(vaddr >> YUZU_PAGEBITS, page_end, [&](u64 page) {
             // Still cached (this read came through the rasterizer path): writes stay trapped.
-            host_buffer->Protect(*it << YUZU_PAGEBITS, YUZU_PAGESIZE,
+            host_buffer->Protect(page << YUZU_PAGEBITS, YUZU_PAGESIZE,
                                  Common::MemoryPermission::Read);
-            it = armed_read_traps.erase(it);
-            armed_read_trap_count.fetch_sub(1, std::memory_order_relaxed);
             VideoCommon::Nx2Spikes::Note(VideoCommon::Nx2Spikes::Event::ReadTrapHit);
-        }
+        });
+        SyncArmedReadTrapCount();
     }
 
     /**
@@ -916,6 +1180,19 @@ struct Memory::Impl {
     }
 
     void HandleRasterizerDownload(VAddr v_address, size_t size) {
+        if (GetReactiveFlushMode() != ReactiveFlushMode::Blanket) [[unlikely]] {
+            if (const ReactiveFlushMode mode = ActiveReactiveMode();
+                mode != ReactiveFlushMode::Blanket) {
+                HandleReactiveDownload(mode, v_address, size);
+                return;
+            }
+        }
+        HandleCachedPageRead(v_address, size, true);
+    }
+
+    /// A slow-path read of a cached page asks the GPU to flush what it wrote there. `disarm`
+    /// drops the page's legacy read trap first (Blanket mode, and reactive-off read traps).
+    void HandleCachedPageRead(VAddr v_address, size_t size, bool disarm) {
         const auto* p = GetPointerImpl(
             v_address, []() {}, []() {});
         if (!gpu_device_memory) [[unlikely]] {
@@ -930,7 +1207,9 @@ struct Memory::Impl {
             }
             Common::ScratchBuffer<u32> scratch;
             gpu_device_memory->ApplyOpOnPointer(p, scratch, [&](DAddr address) {
-                DisarmReadTraps(v_address, size);
+                if (disarm) {
+                    DisarmReadTraps(v_address, size);
+                }
                 (void)system.GPU().OnCPURead(address, size);
             });
             return;
@@ -947,9 +1226,98 @@ struct Memory::Impl {
                 [[likely]] {
                 return;
             }
-            DisarmReadTraps(v_address, size);
+            if (disarm) {
+                DisarmReadTraps(v_address, size);
+            }
             current_area = system.GPU().OnCPURead(address, size);
         });
+    }
+
+    /// EDEN_NX2_REACTIVE_MODE=precise or verify. The caller took the read through the slow path
+    /// of a cached page; one access never crosses a page (WalkBlock calls per page).
+    ///
+    /// Precise: an unarmed page has no GPU data owed to it (the legacy read-area check covers
+    /// slow reads like HLE ReadBlock). An armed page is flushed whole, so a read of clean data
+    /// cannot release a trap that protects other dirty data of the page, and is released after
+    /// the flush only if no GPU write armed it again meanwhile.
+    ///
+    /// Verify: the blanket request is made as always, with no read area shortcut, and compared
+    /// with the shadow set; an armed page is then consumed the way Precise would.
+    void HandleReactiveDownload(ReactiveFlushMode mode, VAddr v_address, size_t size) {
+        const u64 page = v_address >> YUZU_PAGEBITS;
+        bool armed = false;
+        u64 version = 0;
+        if (armed_read_trap_count.load(std::memory_order_relaxed) != 0) {
+            std::scoped_lock lk{read_trap_mutex};
+            if (const std::optional<u64> found = armed_read_traps.Version(page)) {
+                armed = true;
+                version = *found;
+            }
+        }
+        if (mode == ReactiveFlushMode::Precise) {
+            if (!armed) {
+                HandleCachedPageRead(v_address, size, false);
+                return;
+            }
+            FlushCachedPage(v_address);
+            ReleaseReadTrap(page, version, true);
+            return;
+        }
+
+        const u8* const p = GetPointerImpl(
+            v_address, []() {}, []() {});
+        if (p == nullptr) [[unlikely]] {
+            return;
+        }
+        if (!gpu_device_memory) [[unlikely]] {
+            gpu_device_memory = &system.Host1x().MemoryManager();
+        }
+        {
+            const VerifyAccessScope audit{armed, v_address};
+            Common::ScratchBuffer<u32> scratch;
+            gpu_device_memory->ApplyOpOnPointer(p, scratch, [&](DAddr address) {
+                (void)system.GPU().OnCPURead(address, size);
+            });
+        }
+        if (armed) {
+            FlushCachedPage(v_address);
+            ReleaseReadTrap(page, version, false);
+        }
+    }
+
+    /// Flushes everything the GPU owes the whole page of v_address, in each of its device
+    /// aliases.
+    void FlushCachedPage(VAddr v_address) {
+        const u8* const p = GetPointerImpl(
+            v_address, []() {}, []() {});
+        if (p == nullptr) [[unlikely]] {
+            return;
+        }
+        if (!gpu_device_memory) [[unlikely]] {
+            gpu_device_memory = &system.Host1x().MemoryManager();
+        }
+        const u8* const page_start = p - (v_address & YUZU_PAGEMASK);
+        Common::ScratchBuffer<u32> scratch;
+        const PageConsumeScope consume;
+        gpu_device_memory->ApplyOpOnPointer(page_start, scratch, [&](DAddr address) {
+            (void)system.GPU().OnCPURead(address, YUZU_PAGESIZE);
+        });
+    }
+
+    /// Ends the trap of a page that was flushed for a reader, unless a GPU write armed it again
+    /// since the reader saw `version`. `restore_read` gives the page its read permission back
+    /// (Verify's shadow set never took it).
+    void ReleaseReadTrap(u64 page, u64 version, bool restore_read) {
+        std::scoped_lock lk{read_trap_mutex};
+        if (!armed_read_traps.Release(page, version)) {
+            return;
+        }
+        if (restore_read) {
+            host_buffer->Protect(page << YUZU_PAGEBITS, YUZU_PAGESIZE,
+                                 Common::MemoryPermission::Read);
+        }
+        SyncArmedReadTrapCount();
+        VideoCommon::Nx2Spikes::Note(VideoCommon::Nx2Spikes::Event::ReadTrapHit);
     }
 
     void HandleRasterizerWrite(VAddr v_address, size_t size) {
@@ -1026,7 +1394,7 @@ struct Memory::Impl {
     std::array<VideoCore::RasterizerDownloadArea, Core::Hardware::NUM_CPU_CORES> rasterizer_read_areas{};
     std::array<u64, Core::Hardware::NUM_CPU_CORES> read_area_generations{};
     std::atomic<u64> read_trap_generation{};
-    std::set<u64> armed_read_traps;
+    ArmedReadTraps armed_read_traps;
     std::atomic<size_t> armed_read_trap_count{};
     std::mutex read_trap_mutex;
     std::array<GPUDirtyState, Core::Hardware::NUM_CPU_CORES> rasterizer_write_areas{};
@@ -1229,8 +1597,8 @@ void Memory::RasterizerMarkRegionCached(Common::ProcessAddress vaddr, u64 size, 
     impl->RasterizerMarkRegionCached(GetInteger(vaddr), size, cached);
 }
 
-void Memory::RasterizerArmReadTraps(Common::ProcessAddress vaddr, u64 size) {
-    impl->RasterizerArmReadTraps(GetInteger(vaddr), size);
+bool Memory::RasterizerArmReadTraps(Common::ProcessAddress vaddr, u64 size) {
+    return impl->RasterizerArmReadTraps(GetInteger(vaddr), size);
 }
 
 void Memory::MarkRegionDebug(Common::ProcessAddress vaddr, u64 size, bool debug) {

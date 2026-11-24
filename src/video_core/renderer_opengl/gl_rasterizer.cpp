@@ -520,16 +520,31 @@ VideoCore::RasterizerDownloadArea RasterizerOpenGL::GetFlushArea(DAddr addr, u64
         texture_area = texture_cache.GetFlushArea(addr, size);
     }
     if (texture_area) {
-        // The core disarmed the read's pages before asking: the buffer cache arms only pages it
-        // doesn't count as armed, so it must forget these.
         std::scoped_lock lock{buffer_cache.mutex};
-        buffer_cache.ForgetReadTraps(addr, size);
+        if (Core::Memory::GetReactiveFlushMode() != Core::Memory::ReactiveFlushMode::Blanket &&
+            Core::Memory::ReactivePageConsumeActive()) {
+            // Flushing a whole armed page: the buffer cache may hold dirty data on it too, and
+            // one answer must cover both caches (the buffer cache forgets its traps itself).
+            if (const auto buffer_area = buffer_cache.GetFlushArea(addr, size)) {
+                texture_area->start_address =
+                    (std::min)(texture_area->start_address, buffer_area->start_address);
+                texture_area->end_address =
+                    (std::max)(texture_area->end_address, buffer_area->end_address);
+                texture_area->preemtive = texture_area->preemtive && buffer_area->preemtive;
+            }
+        } else {
+            // The core disarmed the read's pages before asking: the buffer cache arms only pages
+            // it doesn't count as armed, so it must forget these.
+            buffer_cache.ForgetReadTraps(addr, size);
+        }
+        Core::Memory::NoteReactiveFlushSource(Core::Memory::ReactiveFlushSource::Texture);
         return *texture_area;
     }
     {
         std::scoped_lock lock{buffer_cache.mutex};
         auto area = buffer_cache.GetFlushArea(addr, size);
         if (area) {
+            Core::Memory::NoteReactiveFlushSource(Core::Memory::ReactiveFlushSource::Buffer);
             return *area;
         }
     }

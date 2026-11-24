@@ -37,6 +37,8 @@
 #include "common/slot_vector.h"
 #include "video_core/texture_cache/pending_download.h"
 #include "common/thread_worker.h"
+#include "core/memory.h"
+#include "video_core/buffer_cache/read_trap_tracker.h"
 #include "video_core/compatible_formats.h"
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/delayed_destruction_ring.h"
@@ -576,7 +578,17 @@ private:
     void RemoveFramebuffers(std::span<const ImageViewId> removed_views);
 
     /// Mark an image as modified from the GPU
-    void MarkModification(ImageBase& image) noexcept;
+    void MarkModification(ImageBase& image, ImageId image_id) noexcept;
+
+    /// Tells the core to trap guest reads of the guest memory a GPU-modified image covers (only
+    /// with EDEN_NX2_REACTIVE_MODE=precise or verify).
+    void ArmImageReadTraps(const ImageBase& image, ImageId image_id);
+
+    /// Arms the pages of [cpu_addr, cpu_addr + size) that are not armed yet.
+    void ArmReadTrapRange(DAddr cpu_addr, u64 size);
+
+    /// Forgets that the pages of [cpu_addr, cpu_addr + size) are armed.
+    void ForgetReadTrapRange(DAddr cpu_addr, u64 size);
 
     /// Synchronize image aliases, copying data if needed
     void SynchronizeAliases(ImageId image_id);
@@ -648,6 +660,11 @@ private:
     Runtime& runtime;
 
     Tegra::MaxwellDeviceMemoryManager& device_memory;
+
+    /// Device pages this cache told the core to trap (precise reactive flushing): the GPU wrote
+    /// them and no guest read has flushed them yet. A guest read forgets its pages
+    /// (GetFlushArea), so the next GPU write arms them again.
+    ReadTrapTracker texture_read_trapped_ranges;
     std::deque<TextureCacheGPUMap> gpu_page_table_storage;
 
     RenderTargets render_targets;

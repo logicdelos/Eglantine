@@ -45,6 +45,66 @@ namespace Core::Memory {
 u32& UnmappedReadFlag();
 
 /**
+ * How use_reactive_flushing treats guest reads of rasterizer cached pages
+ * (EDEN_NX2_REACTIVE_MODE, read once at boot):
+ *  - Blanket: every cached page loses read permission (the original behaviour).
+ *  - Precise: cached pages stay readable. Only pages the GPU modified and has not written back
+ *    are armed (no read permission), each until a guest read has flushed it.
+ *  - Verify: Blanket behaviour, plus a shadow of the armed pages checks that every flush the
+ *    blanket path requests would also have been requested by the precise one.
+ * Only matters with use_reactive_flushing, a fastmem arena and a non NCE CPU backend.
+ */
+enum class ReactiveFlushMode : u8 {
+    Blanket,
+    Verify,
+    Precise,
+};
+
+/// Reads EDEN_NX2_REACTIVE_MODE (blanket | verify | precise; default and unknown: blanket).
+ReactiveFlushMode ReactiveFlushModeFromEnvironment();
+
+/// The boot-time mode. Blanket costs the callers one predictable branch.
+[[nodiscard]] inline ReactiveFlushMode GetReactiveFlushMode() {
+    static const ReactiveFlushMode mode = ReactiveFlushModeFromEnvironment();
+    return mode;
+}
+
+/// use_reactive_flushing is on (and EDEN_NX2_NO_REACTIVE does not turn it off).
+[[nodiscard]] bool ReactiveFlushingActive();
+
+/// True when GPU producers (the buffer and texture caches) must tell the core which pages the GPU
+/// modified: the mode is not Blanket and reactive flushing is on.
+[[nodiscard]] inline bool ReactiveTrapsPublished() {
+    return GetReactiveFlushMode() != ReactiveFlushMode::Blanket && ReactiveFlushingActive();
+}
+
+/// Which cache answered the latest GetFlushArea on this thread (Verify diagnostics only).
+enum class ReactiveFlushSource : u8 {
+    None,
+    Texture,
+    Buffer,
+};
+
+void SetReactiveFlushSource(ReactiveFlushSource source);
+
+/// Rasterizers call this where GetFlushArea returns an answer; only Verify keeps it.
+inline void NoteReactiveFlushSource(ReactiveFlushSource source) {
+    if (GetReactiveFlushMode() == ReactiveFlushMode::Verify) [[unlikely]] {
+        SetReactiveFlushSource(source);
+    }
+}
+
+/// True while this thread's guest read is flushing a whole armed page (Precise, and Verify's
+/// simulated precise consume). GetFlushArea then reports the union of every cache's answer
+/// instead of the first one, so a clean texture cannot hide a dirty buffer on the same page.
+[[nodiscard]] bool ReactivePageConsumeActive();
+
+/// Verify only: compares one guest read's flush request with the shadow of armed pages.
+/// GPU::OnCPURead calls it with the GetFlushArea answer, before it acts on it.
+void ReactiveVerifyDecision(DAddr addr, u64 size, bool requested_sync, u64 area_begin,
+                            u64 area_end);
+
+/**
  * Page size used by the ARM architecture. This is the smallest granularity with which memory can
  * be mapped.
  */
@@ -496,8 +556,13 @@ public:
     /**
      * Makes the next guest read of each rasterizer cached page in the range take the slow path
      * (fastmem only), so that the read reaches the GPU's reactive flush once.
+     *
+     * With EDEN_NX2_REACTIVE_MODE=precise or verify the returned value says whether every page of
+     * the range is now armed (or already was). False means some page was not a rasterizer cached
+     * page, and the caller must not remember the range as armed. Every other configuration
+     * returns true.
      */
-    void RasterizerArmReadTraps(Common::ProcessAddress vaddr, u64 size);
+    bool RasterizerArmReadTraps(Common::ProcessAddress vaddr, u64 size);
 
     /**
      * Marks each page within the specified address range as debug or non-debug.
