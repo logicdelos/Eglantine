@@ -19,8 +19,8 @@ body:
     id: build
     attributes:
       label: Emulator build
-      description: Version or commit hash (shown in Help > About)
-      placeholder: "e.g. build 107 or a1b2c3d"
+      description: Release version (shown in the window title and in Help > About)
+      placeholder: "e.g. 0.7.0"
     validations:
       required: true
 
@@ -95,5 +95,8 @@ body:
   - type: textarea
     id: logs
     attributes:
-      label: Log / crash dump
-      render: shell
+      label: Log
+      description: |
+        Close the emulator after the problem, then open the log folder (in the emulator: File > Open Eglantine Folders > Log Folder) and drag `eglantine-last-session.zip` into this box. On releases before 0.7, attach `eden_log.txt` instead. GitHub accepts files up to 25 MB.
+    validations:
+      required: true

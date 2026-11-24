@@ -75,7 +75,7 @@ Status: released as [fork-v0.4.0](https://github.com/logicdelos/Eglantine/releas
 Done when: every candidate has a recorded result on both games, the release notes carry the table, and the release gate passes against 0.3.0.
 
 ### 0.5: Smoother first minutes
-Status: in progress; not released.
+Status: released as [fork-v0.5.0](https://github.com/logicdelos/Eglantine/releases/tag/fork-v0.5.0) on 2026-11-20. The release notes say what was measured against the exit test below.
 
 **Significant change:** shaders and pipelines are recorded on the first run and prepared ahead on later runs, so the second launch has far fewer long frames.
 
@@ -97,7 +97,7 @@ Status: released as [fork-v0.6.0](https://github.com/logicdelos/Eglantine/releas
 Done when: an injected 5 % slowdown is caught and the call census is complete for both games without per-game code. Exercise a marked visual fault and a non-graphics incident, recover their lead-up and aftermath, and measure normal-play logging overhead separately from diagnostic capture.
 
 ### 0.7: Fast graphics path, preview
-Status: in progress. The fast-path decision (#7) is HOLD; the maintainer recorded a GO for this opt-in preview only. Integration and default selection stay on HOLD until #7's five gates have evidence.
+Status: released as [fork-v0.7.0](https://github.com/logicdelos/Eglantine/releases/tag/fork-v0.7.0) on 2026-11-24. The preview switch took 6 binds per run in Fire Emblem: Fortune's Weave and gave no measurable gain, and the picture match in the exit test below was not demonstrated. The release also carries two changes that are on by default: render target copy cuts and precise reactive flushing. The fast-path decision stays on HOLD.
 
 **Significant change:** an experimental, default-off switch (`nx2_fast_graphics_preview`) that takes one bounded set of graphics work, uniform-buffer binds (about a quarter of Fire Emblem's graphics-library calls per frame in the 0.6 census), on a shorter path through the GPU command decoder. Anything else, or anything the shortcut cannot prove safe, goes through the existing path unchanged, and every fallback is counted by reason.
 

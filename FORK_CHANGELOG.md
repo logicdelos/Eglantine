@@ -10,11 +10,11 @@ This file lists the changes made in this fork. Upstream's [CHANGELOG.md](CHANGEL
 
 Where a fix is described as a "likely fix", it was written to remove a cause found in the code or in a log. It has not been confirmed in the game. Where a fix says "checked" or "measured", the run is named in the line.
 
-All runs were made on one Windows 11 laptop: AMD Ryzen 9 8940HX, NVIDIA GeForce RTX 5070 Ti Laptop GPU, 16 GB RAM. Only Fire Emblem: Fortune's Weave and Xenoblade Chronicles 2 were run. Fixes marked "Orchid" or "Lichii" were ported from those forks, with the original author named in the commit message.
+All runs were made on one Windows 11 laptop: AMD Ryzen 9 8940HX, NVIDIA GeForce RTX 5070 Ti Laptop GPU, 16 GB RAM. Before 0.7, only Fire Emblem: Fortune's Weave and Xenoblade Chronicles 2 were run; from 0.7, Donkey Kong Bananza and Splatoon Raiders were run as well. Fixes marked "Orchid" or "Lichii" were ported from those forks, with the original author named in the commit message.
 
-## 0.7.0 (unreleased)
+## 0.7.0 (2026-11-24)
 
-Milestone 0.7, "Fast graphics path, preview". Opt-in only (the render target copy cuts and precise reactive flushing below are the exceptions); nothing changes with the switch off.
+Milestone 0.7, "Fast graphics path, preview". The preview switch is off by default and gave no measurable gain in Fire Emblem: Fortune's Weave. Render target copy cuts and precise reactive flushing are on by default, and each has a setting that restores the old behaviour.
 
 ### New
 
@@ -24,6 +24,7 @@ Milestone 0.7, "Fast graphics path, preview". Opt-in only (the render target cop
 - Precise reactive flushing, on by default: new setting `precise_reactive_flushing` (Graphics > Advanced, per game allowed, default on; takes effect the next time the emulator starts). With reactive flushing on, only memory the GPU has changed and not written back yet is guarded against game reads, each page until a read has flushed it, instead of all GPU-cached memory. Before, every cached page lost its read permission, so guest loads of any cached page left fast memory for good and every later read took the slow callback (about 12 ms per affected frame in Xenoblade Chronicles 2). A check mode (`EDEN_NX2_REACTIVE_MODE=verify`) compared every flush the old path requested with what the precise one covers: no flush was missed on Xenoblade Chronicles 2, Fire Emblem: Fortune's Weave, Bananza and Splatoon Raiders. Xenoblade Chronicles 2, same scene: 0 late frames precise, 14 with the previous behaviour. Turn the setting off to return to the previous behaviour; `EDEN_NX2_REACTIVE_MODE=blanket|verify|precise` overrides it for one run. No effect with reactive flushing off, under NCE or without fast memory.
 - Baseline settings version 5 pins the setting on.
 - Differential tests feed the same command words through the existing decoder and the preview, and compare consumed words, registers, shadow and dirty state, bindings, ordered renderer events and memory seen at the next draw (`[nx2_fast_graphics]`).
+- Session log zip, on by default: when the windowed build closes normally it writes `eglantine-last-session.zip` in the log folder, holding that session's `eden_log.txt`, for attaching to a bug report. After a crash or a kill, the next start writes it from the previous session's log and adds `eden_crash.dmp` when the dump was written during that session. One file, replaced each time. `EDEN_NX2_SESSION_ZIP=0` turns it off. The existing log files and their retention do not change.
 
 ## 0.6.0 (2026-11-23)
 
@@ -60,7 +61,7 @@ Milestone 0.6, "Replay, regression testing and incident logging". Qualification 
 - A `Game reads in the last 10.0 s: ...` line when a 10 s window holds 500 or more reads, or 64 MiB, of one kind (storage, file, NUP member), with the top 5 sources by bytes (NUP member name, file path or storage id). Counting is two relaxed adds into a per-source slot plus two into the totals, names are looked up once per open handle, and a quiet window writes nothing. The line is written by `Common::ReadAttribution::EmitWindowReport()` from the 10 s report loop.
 - A `Game file: ...` line at launch with the game's path, size, modification time, kind, add-on summary and cache content stamp, and a background SHA-256 check of every member of a `.nup` (low priority, at most 32 MiB/s, paused while the game reads heavily, cancelled at stop, not repeated for an unchanged file). It logs one summary and a Warning naming every corrupt member. `NupContainer::VerifyMembers` streams the members; the existing `VerifyIntegrity` reads each whole member into memory.
 
-## 0.5.0 (unreleased)
+## 0.5.0 (2026-11-20)
 
 Milestone 0.5, "Smoother first minutes": the report accounts for long frames and the shader caches check the game, update, add-ons and settings before reuse. Qualification remains open; a successful warm launch is not a two-title performance result.
 
