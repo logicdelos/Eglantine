@@ -61,7 +61,11 @@ u64 InitOffMask() {
 void ApplySettings() {
     // The first call (or the first On() before it) logs the full switch list.
     static_cast<void>(detail::InitOffMask());
-    const u64 mask = EffectiveOffMask();
+    // Only the three copy cut bits follow the setting; every other bit keeps its live value (a
+    // switch a verify mismatch turned off stays off).
+    const u64 cuts = TargetCopyCutsMask();
+    const u64 live = detail::live_off_mask.load(std::memory_order_relaxed);
+    const u64 mask = (live & ~cuts) | (EffectiveOffMask() & cuts);
     detail::live_off_mask.store(mask, std::memory_order_relaxed);
     LOG_INFO(HW_GPU, "Nx2Perf: skip_unneeded_target_copies={} feedback_shadow_share={} "
                      "feedback_skip_unwritten={} masked_target_unmodified={}",

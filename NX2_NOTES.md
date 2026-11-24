@@ -347,10 +347,10 @@ Xenoblade 2 and Bananza clean, verify mode found no mismatch). They are controll
 4): off, the three read as off whatever the environment says. On, the environment decides as for
 any switch: they are in `DefaultOffMask()`, so `EDEN_NX2_PERF_SAFE=1` turns them off unless
 `EDEN_NX2_PERF_ON=<names>` names them, `EDEN_NX2_PERF_OFF=<name>` turns one off and
-`EDEN_NX2_PERF_OPT=0` turns every switch off. `Nx2Perf::ApplySettings()` recomputes the mask from
+`EDEN_NX2_PERF_OPT=0` turns every switch off. `Nx2Perf::ApplySettings()` sets these three bits from
 the environment and the setting when a game's GPU is created (`GPU::Impl`, before any draw), so
-the value in effect for that game applies from its start; it also forgets verify disables of an
-earlier session. `EDEN_NX2_PERF_VERIFY=1` makes B and C keep the old output and only check.
+the value in effect for that game applies from its start; the other switches keep their live
+state. `EDEN_NX2_PERF_VERIFY=1` makes B and C keep the old output and only check.
 `feedback_shadow_share` (A): within one draw the 2nd and
 later descriptors sampling the same source image reuse the shadow already copied, each with its
 own view. `feedback_skip_unwritten` (B): a draw whose colour write mask is 0 for every render

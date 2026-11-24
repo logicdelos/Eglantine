@@ -292,17 +292,17 @@ inline bool Verify() {
     return verify;
 }
 
-/// Turns one switch off for the rest of the session: a verify mismatch found it unsafe. The next
-/// ApplySettings (the next session's GPU) recomputes the mask and forgets it.
+/// Turns one switch off for the rest of the process: a verify mismatch found it unsafe. A copy
+/// cut turned off this way comes back at the next ApplySettings (the next session's GPU).
 inline void Disable(Opt opt) {
     static_cast<void>(On(opt)); // publishes the environment's mask first
     detail::live_off_mask.fetch_or(Bit(opt), std::memory_order_relaxed);
 }
 
-/// Recomputes the off-mask from the environment and the setting skip_unneeded_target_copies as
-/// they are now (per-game values included) and publishes it, dropping the switches a verify
-/// mismatch turned off in an earlier session. Called where a session's GPU is created, before
-/// any draw; the hot On() stays one atomic load.
+/// Sets the three copy cut bits of the off-mask from the environment and the setting
+/// skip_unneeded_target_copies as they are now (per-game values included); the other bits keep
+/// their live value. Called where a session's GPU is created, before any draw; the hot On()
+/// stays one atomic load.
 void ApplySettings();
 
 } // namespace VideoCommon::Nx2Perf
