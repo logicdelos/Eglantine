@@ -334,7 +334,7 @@ done, a few frames later), `EDEN_NX2_SAMPLE=<threads>` with
 `EDEN_NX2_MME_JIT=0` (row 140),
 `EDEN_NX2_SPLIT=0/1` (default 2), `EDEN_NX2_SPLIT_VERIFY=1`, `EDEN_NX2_SPLIT_CHECK=1`, `EDEN_NX2_SPLIT_SKIP=0` (rows 142-145),
 `EDEN_NX2_READ_TRAPS=0` (row 150),
-`EDEN_NX2_REACTIVE_MODE=blanket|verify|precise` (row 163; default `blanket`, today's behaviour; a `verify` miss warning also prints the page's arm/consume/refusal history, whether it is armed by now (a race, counted in the 10 s summary) and what the buffer cache's trackers said),
+`EDEN_NX2_REACTIVE_MODE=blanket|verify|precise` (row 163; default `blanket`, today's behaviour; an armed page that stops being GPU cached stays armed, parked, and is read-trapped again when it is re-cached, until a remap; a `verify` miss warning also prints the page's arm/park/consume/refusal history, whether it is armed by now (a race, counted in the 10 s summary) and what the buffer cache's trackers said),
 `EDEN_NX2_FRAME_CAPTURE=<dir>` (every 120th presented frame as TGA),
 `EDEN_NX2_CAPTURE_SIZE=<w>x<h>` (capture size, default 1280x720; the window filter only shows in
 a capture larger than the game's image, Fortune's Weave presents 3840x2160), `EDEN_NX2_PB_CHECK`

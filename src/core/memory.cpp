@@ -70,11 +70,11 @@ bool NoReactiveRequested() {
     return requested;
 }
 
-/// How an armed page stopped being armed (Verify's page history).
+/// How an armed page stopped being armed (Verify's page history). A page that is uncached while
+/// armed stays armed (parked), so it is not an end.
 enum class VerifyPageEnd : u8 {
     None,
     Read,
-    Uncached,
     Remapped,
 };
 
@@ -84,6 +84,9 @@ struct VerifyPageHistory {
     u64 last_arm_ns{};
     u64 refused{};
     u64 last_refused_ns{};
+    u64 parks{};
+    u64 last_park_ns{};
+    u64 last_recache_ns{};
     u64 last_end_ns{};
     VerifyPageEnd last_end{VerifyPageEnd::None};
 };
@@ -98,6 +101,9 @@ struct VerifyPageReport {
     u64 last_arm_age_ms{};
     u64 refused{};
     u64 last_refused_age_ms{};
+    u64 parks{};
+    u64 last_park_age_ms{};
+    u64 last_recache_age_ms{};
     u64 last_end_age_ms{};
     VerifyPageEnd last_end{VerifyPageEnd::None};
 };
@@ -181,8 +187,6 @@ const char* VerifyEndName(VerifyPageEnd end) {
         return "never";
     case VerifyPageEnd::Read:
         return "a guest read";
-    case VerifyPageEnd::Uncached:
-        return "the page leaving the GPU caches";
     case VerifyPageEnd::Remapped:
         return "a remap";
     }
@@ -193,15 +197,17 @@ const char* VerifyEndName(VerifyPageEnd end) {
 std::string DescribeVerifyPage(const VerifyPageReport& report) {
     std::string text = report.armed_now ? "is armed now (armed after the read looked), "
                                         : "is not armed, ";
-    text += report.cached_now ? "cached" : "NOT cached";
+    text += report.cached_now ? "cached" : "NOT cached (armed pages wait for a re-cache)";
     text += fmt::format(" ({} armed pages in all); ", report.armed_total);
     if (!report.known) {
         return text + "never armed or refused";
     }
-    text += fmt::format("armed {}x, last {} ms ago; ended by {} {} ms ago; arm refused {}x, last {} "
-                        "ms ago",
+    text += fmt::format("armed {}x, last {} ms ago; ended by {} {} ms ago; parked {}x while "
+                        "armed, last {} ms ago, re-cached {} ms ago; arm refused {}x, last {} ms "
+                        "ago",
                         report.arms, report.last_arm_age_ms, VerifyEndName(report.last_end),
-                        report.last_end_age_ms, report.refused, report.last_refused_age_ms);
+                        report.last_end_age_ms, report.parks, report.last_park_age_ms,
+                        report.last_recache_age_ms, report.refused, report.last_refused_age_ms);
     return text;
 }
 
@@ -804,15 +810,18 @@ struct Memory::Impl {
 
         // Precise and Verify keep a set of armed pages. The lock covers the protection change and
         // the page type update, so an arm never sees a half-cached page and a cached armed page
-        // is never readable.
+        // is never readable. An armed page that stops being cached stays in the set, parked:
+        // the GPU data it holds is not written back yet, so when the page is cached again its
+        // first guest read must still flush it (Blanket would). While parked the page is plain
+        // read-write; a remap still forgets it (ForgetArmedPagesOnRemap), and a parked page that
+        // is cached again after its data went elsewhere costs one empty flush on its next read.
         const ReactiveFlushMode trap_mode = ActiveReactiveMode();
         const bool precise = trap_mode == ReactiveFlushMode::Precise;
         std::unique_lock<std::mutex> trap_lock;
         if (trap_mode != ReactiveFlushMode::Blanket) {
             trap_lock = std::unique_lock<std::mutex>{read_trap_mutex};
-            if (!cached) {
-                // The pages are not GPU cached any more: their traps go with them.
-                EraseArmedPagesLocked(vaddr, size, VerifyPageEnd::Uncached);
+            if (ReactiveVerifyActive()) [[unlikely]] {
+                NoteVerifyParking(vaddr, size, cached);
             }
         }
 
@@ -1012,6 +1021,31 @@ struct Memory::Impl {
         }
     }
 
+    /// Verify's history of the armed pages of a range that is about to be uncached (parked) or
+    /// cached again. The caller holds read_trap_mutex.
+    void NoteVerifyParking(u64 vaddr, u64 size, bool cached) {
+        if (size == 0) {
+            return;
+        }
+        const u64 now = SteadyNowNs();
+        const u64 first = vaddr >> YUZU_PAGEBITS;
+        const u64 end = ((vaddr + size - 1) >> YUZU_PAGEBITS) + 1;
+        armed_read_traps.ForEachInRange(first, end, [&](u64 page, u64) {
+            VerifyPageHistory* const history = VerifyHistoryFor(page);
+            if (history == nullptr) {
+                return;
+            }
+            const bool was_cached = std::as_const(current_page_table->entries)[page].Type() ==
+                                    Common::PageType::RasterizerCachedMemory;
+            if (!cached) {
+                ++history->parks;
+                history->last_park_ns = now;
+            } else if (!was_cached) {
+                history->last_recache_ns = now;
+            }
+        });
+    }
+
     static constexpr size_t VERIFY_HISTORY_LIMIT = size_t{1} << 21;
 
     /// VerifyProbe: the shadow set and history of the page of a missed read.
@@ -1040,6 +1074,9 @@ struct Memory::Impl {
         report.last_refused_age_ms = age_ms(history.last_refused_ns);
         report.last_end = history.last_end;
         report.last_end_age_ms = age_ms(history.last_end_ns);
+        report.parks = history.parks;
+        report.last_park_age_ms = age_ms(history.last_park_ns);
+        report.last_recache_age_ms = age_ms(history.last_recache_ns);
     }
 
     /// Precise mode: gives read permission to the pages of a just cached range, except the armed
