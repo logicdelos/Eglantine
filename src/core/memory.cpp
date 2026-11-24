@@ -81,6 +81,7 @@ enum class VerifyPageEnd : u8 {
 /// Verify only: the life of a page in the shadow set, kept after it is released.
 struct VerifyPageHistory {
     u64 arms{};
+    u64 parked_arms{};
     u64 last_arm_ns{};
     u64 refused{};
     u64 last_refused_ns{};
@@ -98,6 +99,7 @@ struct VerifyPageReport {
     bool cached_now{};
     u64 armed_total{};
     u64 arms{};
+    u64 parked_arms{};
     u64 last_arm_age_ms{};
     u64 refused{};
     u64 last_refused_age_ms{};
@@ -202,12 +204,13 @@ std::string DescribeVerifyPage(const VerifyPageReport& report) {
     if (!report.known) {
         return text + "never armed or refused";
     }
-    text += fmt::format("armed {}x, last {} ms ago; ended by {} {} ms ago; parked {}x while "
-                        "armed, last {} ms ago, re-cached {} ms ago; arm refused {}x, last {} ms "
-                        "ago",
-                        report.arms, report.last_arm_age_ms, VerifyEndName(report.last_end),
-                        report.last_end_age_ms, report.parks, report.last_park_age_ms,
-                        report.last_recache_age_ms, report.refused, report.last_refused_age_ms);
+    text += fmt::format("armed {}x ({}x while uncached), last {} ms ago; ended by {} {} ms ago; "
+                        "parked {}x while armed, last {} ms ago, re-cached {} ms ago; arm refused "
+                        "(unmapped) {}x, last {} ms ago",
+                        report.arms, report.parked_arms, report.last_arm_age_ms,
+                        VerifyEndName(report.last_end), report.last_end_age_ms, report.parks,
+                        report.last_park_age_ms, report.last_recache_age_ms, report.refused,
+                        report.last_refused_age_ms);
     return text;
 }
 
@@ -1077,6 +1080,7 @@ struct Memory::Impl {
         report.parks = history.parks;
         report.last_park_age_ms = age_ms(history.last_park_ns);
         report.last_recache_age_ms = age_ms(history.last_recache_ns);
+        report.parked_arms = history.parked_arms;
     }
 
     /// Precise mode: gives read permission to the pages of a just cached range, except the armed
@@ -1102,8 +1106,10 @@ struct Memory::Impl {
 
     /// Returns whether every page of the range is now armed (or already was).
     ///
-    /// Precise mode takes read permission away from the pages that were not armed yet. Verify
-    /// mode only records them in the shadow set: its pages keep the blanket protection.
+    /// Precise mode takes read permission away from the cached pages that were not armed yet. A
+    /// mapped page that is not cached is armed parked (see RasterizerMarkRegionCached); only
+    /// unmapped pages refuse. Verify mode only records the pages in the shadow set: its cached
+    /// pages keep the blanket protection.
     bool RasterizerArmReadTraps(u64 vaddr, u64 size) {
         if (Settings::values.use_reactive_flushing.GetValue()) {
             // Clean cached read areas also need invalidation when reactive flushing is enabled.
@@ -1133,10 +1139,11 @@ struct Memory::Impl {
         };
         const u64 now = ReactiveVerifyActive() ? SteadyNowNs() : 0;
         for (u64 page = vaddr >> YUZU_PAGEBITS; page != page_end; ++page) {
-            const bool cached = std::as_const(current_page_table->entries)[page].Type() ==
-                                Common::PageType::RasterizerCachedMemory;
-            if (!cached) {
-                // Not a page the GPU caches (or the core does not map): nothing to trap.
+            const Common::PageType type = std::as_const(current_page_table->entries)[page].Type();
+            const bool cached = type == Common::PageType::RasterizerCachedMemory;
+            if (!cached && type != Common::PageType::Memory &&
+                type != Common::PageType::DebugMemory) {
+                // The core maps nothing here (and the GPU caches never cover it): nothing to trap.
                 complete = false;
                 if (VerifyPageHistory* const history = VerifyHistoryFor(page)) {
                     ++history->refused;
@@ -1148,8 +1155,14 @@ struct Memory::Impl {
             if (VerifyPageHistory* const history = VerifyHistoryFor(page)) {
                 ++history->arms;
                 history->last_arm_ns = now;
+                if (!cached) {
+                    ++history->parked_arms;
+                }
             }
-            if (!armed_read_traps.Arm(page)) {
+            // A mapped page the GPU does not cache yet is armed parked: it stays plain read-write
+            // until RasterizerMarkRegionCached caches it, which then takes its read permission.
+            const bool newly_armed = armed_read_traps.Arm(page);
+            if (!newly_armed || !cached) {
                 // Armed already; Arm gave it a new version, which cancels a release in flight.
                 protect_run();
                 continue;
