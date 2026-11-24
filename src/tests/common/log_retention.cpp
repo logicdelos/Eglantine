@@ -10,6 +10,7 @@
 #include <stop_token>
 #include <string>
 #include <vector>
+#include <string_view>
 #include <cstdint>
 #include <ctime>
 #include <optional>
@@ -118,6 +119,23 @@ TEST_CASE("Session log retention compresses all but the newest", "[common][log_r
                                                "eden_log.20260104-000000.txt",
                                                "eden_log.20260105-000000.txt"});
     REQUIRE(Retention::SelectForCompression("eden_log", {}).empty());
+}
+
+TEST_CASE("Censored profile folder name", "[common][log_retention]") {
+    REQUIRE(Retention::PathLeaf("C:\\Users\\jdoe42") == "jdoe42");
+    REQUIRE(Retention::PathLeaf("C:\\Users\\jdoe42\\") == "jdoe42");
+    REQUIRE(Retention::PathLeaf("/home/jdoe42") == "jdoe42");
+    REQUIRE(Retention::PathLeaf("/home/jdoe42//") == "jdoe42");
+    REQUIRE(Retention::PathLeaf("C:/Users\\jdoe42") == "jdoe42");
+    REQUIRE(Retention::PathLeaf("jdoe42") == "jdoe42");
+    REQUIRE(Retention::PathLeaf("").empty());
+    REQUIRE(Retention::PathLeaf("/").empty());
+
+    const std::vector<std::string_view> candidates{"ab", "", "abcd", "ab"};
+    REQUIRE(Retention::CensoredNames(candidates) == std::vector<std::string>{"abcd", "ab"});
+    REQUIRE(Retention::CensoredNames({}).empty());
+    const std::vector<std::string_view> same_length{"bb", "aa", "bb", "c"};
+    REQUIRE(Retention::CensoredNames(same_length) == std::vector<std::string>{"bb", "aa", "c"});
 }
 
 TEST_CASE("Session log rotation keeps the newest five archives", "[common][log_retention]") {
@@ -399,7 +417,7 @@ TEST_CASE("Session zip holds exactly the snapshot of a growing log", "[common][l
     }
 }
 
-TEST_CASE("Session zip is written from an archive only when it is missing or older",
+TEST_CASE("Crash zip is written from an archive only after an abnormal end",
           "[common][log_retention]") {
     const std::string newest = "eden_log.20260105-000000.txt";
     std::vector<Retention::FileTime> files{
@@ -408,65 +426,103 @@ TEST_CASE("Session zip is written from an archive only when it is missing or old
         {"eden_log.txt", Ago(0)},
         {"eglantine-last-session.zip", Ago(5)},
         {"eglantine-last-session.zip.part", Ago(0)},
+        {"eglantine-last-crash.zip", Ago(5)},
+        {"eglantine-last-crash.zip.part", Ago(0)},
     };
-    const auto pick = [&](std::optional<fs::file_time_type> zip) {
-        return Retention::SelectArchiveForSessionZip("eden_log", files, zip);
+    const auto pick = [&](std::optional<fs::file_time_type> session_zip,
+                          std::optional<fs::file_time_type> crash_zip) {
+        return Retention::SelectArchiveForCrashZip("eden_log", files, session_zip, crash_zip);
     };
 
-    REQUIRE(pick(std::nullopt) == newest);   // no zip yet
-    REQUIRE(pick(Ago(20)) == newest);        // the zip is older than the archive
-    REQUIRE_FALSE(pick(Ago(5)));             // the zip is newer
-    REQUIRE_FALSE(pick(files[0].modified));  // the same time is not newer
+    SECTION("the session zip says whether the previous session ended normally") {
+        REQUIRE(pick(std::nullopt, std::nullopt) == newest); // no session zip at all
+        REQUIRE(pick(Ago(20), std::nullopt) == newest);      // the session zip is older
+        REQUIRE_FALSE(pick(Ago(5), std::nullopt));           // a clean exit wrote it after the log
+        REQUIRE_FALSE(pick(files[0].modified, std::nullopt)); // the same time is not newer
+    }
+
+    SECTION("the crash zip is not rewritten by later starts") {
+        REQUIRE(pick(Ago(20), Ago(30)) == newest);          // older than the archive
+        REQUIRE_FALSE(pick(Ago(20), Ago(5)));               // already written from it
+        REQUIRE_FALSE(pick(Ago(20), files[0].modified));    // the same time is not newer
+        REQUIRE_FALSE(pick(std::nullopt, Ago(5)));
+        REQUIRE(pick(std::nullopt, Ago(30)) == newest);
+    }
 
     SECTION("the newest archive of all is the one, by name") {
         files.push_back({"eden_log.20260105-000000-1.txt", Ago(50)});
-        REQUIRE(pick(Ago(60)) == "eden_log.20260105-000000-1.txt");
-        REQUIRE_FALSE(pick(Ago(40)));
+        REQUIRE(pick(Ago(60), std::nullopt) == "eden_log.20260105-000000-1.txt");
+        REQUIRE_FALSE(pick(Ago(40), std::nullopt));
     }
 
     SECTION("no archive") {
         files.erase(files.begin(), files.begin() + 2);
-        REQUIRE_FALSE(pick(std::nullopt));
-        REQUIRE_FALSE(pick(Ago(20)));
+        REQUIRE_FALSE(pick(std::nullopt, std::nullopt));
+        REQUIRE_FALSE(pick(Ago(20), std::nullopt));
     }
 
     SECTION("the newest archive is already compressed") {
         files.push_back({"eden_log.20260106-000000.txt.zst", Ago(1)});
-        REQUIRE_FALSE(pick(std::nullopt));
+        REQUIRE_FALSE(pick(std::nullopt, std::nullopt));
     }
 
     SECTION("another log's archives are not this log's") {
         files.erase(files.begin(), files.begin() + 2);
         files.push_back({"eden_log_2.20260105-000000.txt", Ago(10)});
-        REQUIRE_FALSE(pick(std::nullopt));
+        REQUIRE_FALSE(pick(std::nullopt, std::nullopt));
     }
 }
 
-TEST_CASE("Session zip is written from the rotated log after a crash", "[common][log_retention]") {
+TEST_CASE("Crash zip is written from the rotated log and kept by a clean exit",
+          "[common][log_retention]") {
     TempDir dir;
     const fs::path log = dir.path / "eden_log.txt";
-    const fs::path zip = dir.path / std::string{Retention::SessionZipName};
-    const fs::path archive = dir.path / "eden_log.20260105-000000.txt";
-    Write(archive, "crashed session\n", 120);
+    const fs::path session_zip = dir.path / std::string{Retention::SessionZipName};
+    const fs::path crash_zip = dir.path / std::string{Retention::CrashZipName};
+    const fs::path crashed = dir.path / "eden_log.20260105-000000.txt";
+    Write(crashed, "crashed session\n", 120);
 
-    REQUIRE(Retention::WriteSessionZipFromArchive(log, std::stop_token{}));
-    auto entries = ReadZip(zip);
+    // The session ended without a session zip: the crash zip is written, the session zip is not.
+    REQUIRE(Retention::WriteCrashZipFromArchive(log, std::stop_token{}));
+    auto entries = ReadZip(crash_zip);
     REQUIRE(entries.size() == 1);
     REQUIRE(entries[0].name == "eden_log.txt");
     REQUIRE(entries[0].data == "crashed session\n");
+    REQUIRE_FALSE(fs::exists(session_zip));
 
-    // The zip is newer than the log it was written from: nothing to do at the next start.
-    REQUIRE_FALSE(Retention::WriteSessionZipFromArchive(log, std::stop_token{}));
+    // The crash zip is newer than the log it was written from: nothing to do at the next start.
+    REQUIRE_FALSE(Retention::WriteCrashZipFromArchive(log, std::stop_token{}));
 
-    // A later session ended without a zip (killed): the existing zip is replaced.
-    fs::last_write_time(zip, Ago(60));
-    Write(archive, "killed session\n", 0);
-    REQUIRE(Retention::WriteSessionZipFromArchive(log, std::stop_token{}));
-    entries = ReadZip(zip);
+    // A normal session follows and ends with a clean exit: its zip is written, the crash zip is
+    // left alone, and the start after it writes nothing.
+    const fs::path normal = dir.path / "eden_log.20260106-000000.txt";
+    Write(normal, "normal session\n", 1);
+    fs::last_write_time(normal, Ago(30));
+    REQUIRE(Retention::WriteSessionZip(normal, std::nullopt, std::stop_token{}));
+    fs::last_write_time(session_zip, Ago(10));
+    fs::last_write_time(crash_zip, Ago(60));
+    REQUIRE_FALSE(Retention::WriteCrashZipFromArchive(log, std::stop_token{}));
+    entries = ReadZip(crash_zip);
+    REQUIRE(entries.size() == 1);
+    REQUIRE(entries[0].data == "crashed session\n");
+    entries = ReadZip(session_zip);
+    REQUIRE(entries.size() == 1);
+    REQUIRE(entries[0].data == "normal session\n");
+
+    // A later session was killed: the session zip is older than its log, the crash zip is
+    // replaced and the session zip stays as it was.
+    const fs::path killed = dir.path / "eden_log.20260107-000000.txt";
+    Write(killed, "killed session\n", 0);
+    REQUIRE(Retention::WriteCrashZipFromArchive(log, std::stop_token{}));
+    entries = ReadZip(crash_zip);
     REQUIRE(entries.size() == 1);
     REQUIRE(entries[0].data == "killed session\n");
-    REQUIRE(Names(dir.path) ==
-            std::set<std::string>{"eden_log.20260105-000000.txt", "eglantine-last-session.zip"});
+    REQUIRE(ReadZip(session_zip)[0].data == "normal session\n");
+    REQUIRE(Names(dir.path) == std::set<std::string>{"eden_log.20260105-000000.txt",
+                                                     "eden_log.20260106-000000.txt",
+                                                     "eden_log.20260107-000000.txt",
+                                                     "eglantine-last-crash.zip",
+                                                     "eglantine-last-session.zip"});
 }
 
 TEST_CASE("Session zip replaces an existing one without leaving a part", "[common][log_retention]") {
@@ -534,15 +590,19 @@ TEST_CASE("Session zip takes the crash dump of the same session only", "[common]
     }
 }
 
-TEST_CASE("The session zip is not a session log archive", "[common][log_retention]") {
+TEST_CASE("The session and crash zips are not session log archives", "[common][log_retention]") {
     REQUIRE_FALSE(Retention::ParseArchiveName("eden_log", "eglantine-last-session.zip"));
     REQUIRE_FALSE(Retention::ParseArchiveName("eden_log", "eglantine-last-session.zip.part"));
+    REQUIRE_FALSE(Retention::ParseArchiveName("eden_log", "eglantine-last-crash.zip"));
+    REQUIRE_FALSE(Retention::ParseArchiveName("eden_log", "eglantine-last-crash.zip.part"));
 
     const std::vector<std::string> names{
         "eden_log.20260105-000000.txt",
         "eden_log.20260104-000000.txt",
         "eglantine-last-session.zip",
         "eglantine-last-session.zip.part",
+        "eglantine-last-crash.zip",
+        "eglantine-last-crash.zip.part",
     };
     REQUIRE(Retention::SelectForDeletion("eden_log", names, 5).empty());
     REQUIRE(Retention::SelectForCompression("eden_log", names) ==

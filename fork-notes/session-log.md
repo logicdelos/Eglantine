@@ -10,7 +10,8 @@ What the log directory (`%APPDATA%\eglantine\log` on Windows) holds, and the lin
 | `eden_log.<YYYYMMDD-HHMMSS>.txt` | The previous session, plain text. The stamp is the local time of its last write. If two logs end in the same second the second one is `eden_log.<stamp>-1.txt`. |
 | `eden_log.<YYYYMMDD-HHMMSS>.txt.zst` | An older session, compressed with zstd (`zstd -d`, or any zstd-aware viewer). |
 | `eden_log_2.txt` | Used instead of `eden_log.txt` when the current log cannot be moved (it is open in another emulator process). Its archives are named `eden_log_2.<stamp>.txt`. |
-| `eglantine-last-session.zip` | The last session's log, deflate-compressed, stored inside as `eden_log.txt`, for attaching to a bug report (GitHub takes `.zip` up to 25 MB, not `.zst`). If the session crashed and `eden_crash.dmp` was written during it, the dump is in the zip too. Always this one name, replaced every time. |
+| `eglantine-last-session.zip` | The log of the last session that was closed normally, deflate-compressed, stored inside as `eden_log.txt`, for attaching to a bug report (GitHub takes `.zip` up to 25 MB, not `.zst`). Written only when the Qt front end exits normally; always this one name, replaced every time. |
+| `eglantine-last-crash.zip` | The last session that did not end with a normal close: a crash, a freeze ended in Task Manager, or a kill; also a session run with `eden-cli`. Same format as the session zip (log stored as `eden_log.txt`); if `eden_crash.dmp` was written during that session, the dump is in the zip too. Written at the next launch, from that session's log. A normal session after it never replaces it; only the next abnormal end does. |
 
 - At launch the previous `eden_log.txt` is renamed, and the newest 5 archives of a log are kept; older ones are deleted. An empty log is simply overwritten.
 - Only the newest archive stays plain. The others are compressed once, in the background at low priority, a few seconds after launch. A compression that is cut short by closing the emulator leaves the plain file and a `.zst.part` that the next launch deletes.
@@ -18,7 +19,8 @@ What the log directory (`%APPDATA%\eglantine\log` on Windows) holds, and the lin
 - The Android build still keeps one `eden_log.txt.old.txt`: its share-log button reads that name.
 - `tools/nx2/incident.py` and `session_watch.py` read only the current log. `tools/nx2/debug-session.sh` keeps the current log and the newest archive as `prev-*`.
 - The gpu log (`eden_gpu.log`) has its own rotation and is not part of this.
-- `eglantine-last-session.zip` is written when the Qt front end exits normally, from the log this process wrote, and at the next launch from the previous session's log when a crash or a kill left the zip older than it. Set the environment variable `EDEN_NX2_SESSION_ZIP=0` to turn both off.
+- `eglantine-last-session.zip` is written when the Qt front end exits normally, from the log this process wrote. `eglantine-last-crash.zip` is written at a launch when the previous session's log is newer than `eglantine-last-session.zip` (or that zip does not exist), and only when it is missing or older than that log, so later launches do not rewrite it. Set the environment variable `EDEN_NX2_SESSION_ZIP=0` to turn both off.
+- With `censor_username` on (the default), the log replaces the account name and the profile folder name (the last part of `%USERPROFILE%` or `$HOME`) with `user`; the two differ for a Microsoft account on Windows.
 
 Lines written at launch, in this order, once the log is open:
 
@@ -26,11 +28,11 @@ Lines written at launch, in this order, once the log is open:
 Log retention: previous session log kept as eden_log.20260518-221503.txt
 Log retention: the old .old.txt log was renamed to eden_log.20260517-193012.txt
 Log retention: kept the newest 5 session logs, deleted eden_log.20260510-120000.txt.zst
-Log retention: wrote eglantine-last-session.zip from the previous session log
+Log retention: wrote eglantine-last-crash.zip from the previous session log
 Log retention: compressed 2 older session log(s) to .zst
 ```
 
-The first three appear only when they happened; the last two come from the retention thread (the zip line only when the previous session left no up-to-date zip).
+The first three appear only when they happened; the last two come from the retention thread (the zip line only when the previous session did not end with a normal close and `eglantine-last-crash.zip` was not already up to date).
 
 ## Which game file ran
 

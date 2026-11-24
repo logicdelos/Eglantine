@@ -438,6 +438,30 @@ std::vector<std::string> SelectForCompression(std::string_view stem,
     return names;
 }
 
+std::vector<std::string> CensoredNames(std::span<const std::string_view> candidates) {
+    std::vector<std::string> names;
+    for (const std::string_view candidate : candidates) {
+        if (!candidate.empty() && std::ranges::find(names, candidate) == names.end()) {
+            names.emplace_back(candidate);
+        }
+    }
+    std::ranges::stable_sort(names, [](const std::string& a, const std::string& b) {
+        return a.size() > b.size();
+    });
+    return names;
+}
+
+std::string_view PathLeaf(std::string_view path) noexcept {
+    constexpr std::string_view separators = "/\\";
+    const std::size_t last = path.find_last_not_of(separators);
+    if (last == std::string_view::npos) {
+        return {};
+    }
+    path = path.substr(0, last + 1);
+    const std::size_t separator = path.find_last_of(separators);
+    return separator == std::string_view::npos ? path : path.substr(separator + 1);
+}
+
 namespace {
 std::string FormatLocal(std::time_t time, const char* format, const char* fallback) {
     std::tm local{};
@@ -566,9 +590,10 @@ bool SessionZipEnabled() noexcept {
     return EnvGate("EDEN_NX2_SESSION_ZIP");
 }
 
-std::optional<std::string> SelectArchiveForSessionZip(
+std::optional<std::string> SelectArchiveForCrashZip(
     std::string_view stem, std::span<const FileTime> files,
-    std::optional<fs::file_time_type> zip_modified) {
+    std::optional<fs::file_time_type> session_zip_modified,
+    std::optional<fs::file_time_type> crash_zip_modified) {
     std::vector<std::string> names;
     names.reserve(files.size());
     for (const FileTime& file : files) {
@@ -579,11 +604,17 @@ std::optional<std::string> SelectArchiveForSessionZip(
         return std::nullopt;
     }
     const std::string& newest = items.front().name;
-    if (zip_modified) {
-        const auto found = std::ranges::find(files, newest, &FileTime::name);
-        if (found == files.end() || !(found->modified > *zip_modified)) {
-            return std::nullopt;
-        }
+    const auto found = std::ranges::find(files, newest, &FileTime::name);
+    if (found == files.end()) {
+        return std::nullopt;
+    }
+    // A clean exit wrote the session zip after the last line of the log; without that, or with
+    // a zip from an earlier session, this one ended abnormally.
+    if (session_zip_modified && !(found->modified > *session_zip_modified)) {
+        return std::nullopt;
+    }
+    if (crash_zip_modified && !(found->modified > *crash_zip_modified)) {
+        return std::nullopt;
     }
     return newest;
 }
@@ -643,8 +674,10 @@ bool WriteZip(const fs::path& target, std::span<const ZipInput> inputs,
 #endif
 }
 
-bool WriteSessionZip(const fs::path& log, std::optional<std::time_t> session_start,
-                     std::stop_token stop) noexcept {
+namespace {
+
+bool WriteLogZip(const fs::path& log, std::string_view zip_name,
+                 std::optional<std::time_t> session_start, std::stop_token stop) noexcept {
     try {
         // The size is taken from an open handle once: the file may be open for writing in this
         // process, and a path lookup can lag behind what it has written.
@@ -672,13 +705,20 @@ bool WriteSessionZip(const fs::path& log, std::optional<std::time_t> session_sta
                 inputs.push_back({dump, std::string{CrashDumpName}, dump_size, dump_time});
             }
         }
-        return WriteZip(dir / fs::path{SessionZipName}, inputs, stop);
+        return WriteZip(dir / fs::path{zip_name}, inputs, stop);
     } catch (...) {
         return false;
     }
 }
 
-bool WriteSessionZipFromArchive(const fs::path& log, std::stop_token stop) noexcept {
+} // namespace
+
+bool WriteSessionZip(const fs::path& log, std::optional<std::time_t> session_start,
+                     std::stop_token stop) noexcept {
+    return WriteLogZip(log, SessionZipName, session_start, stop);
+}
+
+bool WriteCrashZipFromArchive(const fs::path& log, std::stop_token stop) noexcept {
     try {
         const fs::path dir = log.parent_path();
         const std::string stem = log.stem().string();
@@ -691,19 +731,25 @@ bool WriteSessionZipFromArchive(const fs::path& log, std::stop_token stop) noexc
                 files.push_back({it->path().filename().string(), modified});
             }
         }
-        std::optional<fs::file_time_type> zip_modified;
-        const auto zip_time = fs::last_write_time(dir / fs::path{SessionZipName}, ec);
+        std::optional<fs::file_time_type> session_zip_modified;
+        const auto session_zip_time = fs::last_write_time(dir / fs::path{SessionZipName}, ec);
         if (!ec) {
-            zip_modified = zip_time;
+            session_zip_modified = session_zip_time;
         }
-        const auto archive_name = SelectArchiveForSessionZip(stem, files, zip_modified);
+        std::optional<fs::file_time_type> crash_zip_modified;
+        const auto crash_zip_time = fs::last_write_time(dir / fs::path{CrashZipName}, ec);
+        if (!ec) {
+            crash_zip_modified = crash_zip_time;
+        }
+        const auto archive_name =
+            SelectArchiveForCrashZip(stem, files, session_zip_modified, crash_zip_modified);
         if (!archive_name) {
             return false;
         }
         const fs::path archive = dir / *archive_name;
         const std::time_t last_write = ModifiedTime(archive);
-        return WriteSessionZip(archive, ArchiveSessionStart(CreationTime(archive), last_write),
-                               stop);
+        return WriteLogZip(archive, CrashZipName,
+                           ArchiveSessionStart(CreationTime(archive), last_write), stop);
     } catch (...) {
         return false;
     }

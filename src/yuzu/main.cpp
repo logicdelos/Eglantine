@@ -339,7 +339,7 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
     // The clean exit: the log of this session as eglantine-last-session.zip. A crash or a kill
-    // does not get here; the next start zips the rotated log instead.
+    // does not get here; the next start writes eglantine-last-crash.zip from the rotated log.
     Common::Log::WriteSessionZipAtExit();
     return result;
 }

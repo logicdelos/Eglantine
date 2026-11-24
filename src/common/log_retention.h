@@ -50,6 +50,15 @@ struct ArchiveName {
 [[nodiscard]] std::vector<std::string> SelectForCompression(std::string_view stem,
                                                             std::span<const std::string> filenames);
 
+/// The strings to replace when a log line is censored: the distinct non-empty ones of
+/// `candidates` (an unset or empty name is allowed), longest first, so that a name is replaced
+/// before a shorter one that is its prefix. Case-sensitive.
+[[nodiscard]] std::vector<std::string> CensoredNames(std::span<const std::string_view> candidates);
+
+/// The last component of a path, with `/` or `\` as separator and trailing separators ignored;
+/// empty for an empty path or one of separators only. A view into `path`.
+[[nodiscard]] std::string_view PathLeaf(std::string_view path) noexcept;
+
 /// `YYYYMMDD-HHMMSS` of a time in the local time zone.
 [[nodiscard]] std::string LocalStamp(std::time_t time);
 /// `YYYY-MM-DD HH:MM:SS` of a time in the local time zone.
@@ -78,12 +87,17 @@ RotateResult Rotate(const std::filesystem::path& log, std::size_t keep = KeepArc
 std::size_t CompressOlderArchives(const std::filesystem::path& log, std::stop_token stop) noexcept;
 
 // The last session's log as a zip. GitHub accepts .zip (up to 25 MB) for an issue attachment and
-// does not accept .zst or a 100 MiB text file. One file, always the same name, replaced every
-// time: a clean exit writes it from the live log, and the next start writes it from the rotated
-// log when a crash or a kill left the zip older than that log. EDEN_NX2_SESSION_ZIP=0 turns both
-// off.
+// does not accept .zst or a 100 MiB text file. Two files, each always the same name and replaced
+// every time:
+// - eglantine-last-session.zip: a clean exit writes it from the live log.
+// - eglantine-last-crash.zip: the next start writes it from the rotated log when the previous
+//   session did not end with a clean exit (the newest archive is newer than the session zip, or
+//   there is no session zip). A later clean exit never touches it, so a normal session after a
+//   crash does not replace the evidence.
+// EDEN_NX2_SESSION_ZIP=0 turns both off.
 
 inline constexpr std::string_view SessionZipName = "eglantine-last-session.zip";
+inline constexpr std::string_view CrashZipName = "eglantine-last-crash.zip";
 /// The name of the log inside the zip, whichever file it was read from.
 inline constexpr std::string_view SessionZipLogEntry = "eden_log.txt";
 /// Written next to the log by common/windows/crash_handler.cpp.
@@ -101,12 +115,15 @@ struct FileTime {
     std::filesystem::file_time_type modified;
 };
 
-/// The archive of `stem` (a name of `files`, those of one directory) to write the session zip
-/// from, when that is needed: the newest archive, if it is plain text and the zip is missing
-/// (`zip_modified` empty) or older than it. Nothing otherwise.
-[[nodiscard]] std::optional<std::string> SelectArchiveForSessionZip(
+/// The archive of `stem` (a name of `files`, those of one directory) to write the crash zip
+/// from, when that is needed: the newest archive, if it is plain text, the previous session
+/// ended abnormally (the session zip is missing, `session_zip_modified` empty, or older than the
+/// archive) and the crash zip is missing (`crash_zip_modified` empty) or older than the archive.
+/// Nothing otherwise.
+[[nodiscard]] std::optional<std::string> SelectArchiveForCrashZip(
     std::string_view stem, std::span<const FileTime> files,
-    std::optional<std::filesystem::file_time_type> zip_modified);
+    std::optional<std::filesystem::file_time_type> session_zip_modified,
+    std::optional<std::filesystem::file_time_type> crash_zip_modified);
 
 /// Whether a crash dump last written at `dump_modified` is from the session that began at
 /// `session_start`. Without a start time it is not attached.
@@ -141,8 +158,9 @@ struct ZipInput {
 bool WriteSessionZip(const std::filesystem::path& log, std::optional<std::time_t> session_start,
                      std::stop_token stop) noexcept;
 
-/// The start-up counterpart: writes the session zip from the newest archive of `log` when
-/// SelectArchiveForSessionZip asks for it. Returns whether it wrote the zip. Never throws.
-bool WriteSessionZipFromArchive(const std::filesystem::path& log, std::stop_token stop) noexcept;
+/// The start-up counterpart: writes `<dir of log>/eglantine-last-crash.zip` from the newest
+/// archive of `log` (same contents as WriteSessionZip) when SelectArchiveForCrashZip asks for
+/// it. Returns whether it wrote the zip. Never throws.
+bool WriteCrashZipFromArchive(const std::filesystem::path& log, std::stop_token stop) noexcept;
 
 } // namespace Common::Log::Retention

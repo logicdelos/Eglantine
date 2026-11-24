@@ -18,6 +18,9 @@
 #include <mutex>
 #include <regex>
 #include <thread>
+#include <string>
+#include <string_view>
+#include <vector>
 
 #if defined(__ANDROID__)
 #include <android/log.h>
@@ -400,17 +403,23 @@ private:
         if (Settings::values.censor_username.GetValue()) {
             // This must be a static otherwise it would get checked on EVERY
             // instance of logging an entry...
-            static std::string username = []() -> std::string {
-                // in order of precedence
-                // LOGNAME usually works on UNIX, USERNAME on Windows
+            static const std::vector<std::string> names = []() -> std::vector<std::string> {
+                // The account name: LOGNAME usually works on UNIX, USERNAME on Windows
                 // Some UNIX systems suck and don't use LOGNAME so we also need USER :(
+                // The profile folder name (last part of USERPROFILE / HOME) can differ from
+                // the account name (e.g. a Microsoft account on Windows), and it shows up in
+                // every path below the profile folder.
+                std::vector<std::string_view> candidates;
                 for (auto const var : { "LOGNAME", "USERNAME", "USER", })
                     if (auto const s = ::getenv(var); s != nullptr)
-                        return std::string{s};
-                return std::string{};
+                        candidates.emplace_back(s);
+                for (auto const var : { "USERPROFILE", "HOME", })
+                    if (auto const s = ::getenv(var); s != nullptr)
+                        candidates.push_back(Common::Log::Retention::PathLeaf(s));
+                return Common::Log::Retention::CensoredNames(candidates);
             }();
-            if (!username.empty())
-                boost::replace_all(message, username, "user");
+            for (const std::string& name : names)
+                boost::replace_all(message, name, "user");
         }
 #endif
         bytes_written += file->WriteSpan(std::span<const char>{message.begin(), message.end()});
@@ -696,12 +705,13 @@ void Initialize() {
 #ifdef _WIN32
                     ::SetThreadPriority(::GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
 #endif
-                    // The newest archive is the session that ended before this one. If it was
-                    // not zipped (a crash or a kill), zip it now, before the compression below.
+                    // The newest archive is the session that ended before this one. If it did
+                    // not end with a clean exit (a crash or a kill), zip it now, before the
+                    // compression below, as the crash zip that a later clean exit never replaces.
                     if (Retention::SessionZipEnabled() &&
-                        Retention::WriteSessionZipFromArchive(log_path, token))
+                        Retention::WriteCrashZipFromArchive(log_path, token))
                         LOG_INFO(Log, "Log retention: wrote {} from the previous session log",
-                                 Retention::SessionZipName);
+                                 Retention::CrashZipName);
                     const auto count = Retention::CompressOlderArchives(log_path, token);
                     if (count != 0)
                         LOG_INFO(Log, "Log retention: compressed {} older session log(s) to .zst",

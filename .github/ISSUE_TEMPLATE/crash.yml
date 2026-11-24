@@ -97,6 +97,6 @@ body:
     attributes:
       label: Log
       description: |
-        In the emulator, open File > Open Eglantine Folders > Log Folder and drag `eglantine-last-session.zip` into this box. After a crash, start the emulator once more first: it then writes the zip for the crashed session, with the crash dump inside. On releases before 0.7, attach `eden_log.txt` instead. GitHub accepts files up to 25 MB.
+        Start the emulator once more after the crash, then open File > Open Eglantine Folders > Log Folder and drag `eglantine-last-crash.zip` into this box. It holds the log of the crashed session and the crash dump. On releases before 0.7, attach `eden_log.txt` instead. GitHub accepts files up to 25 MB.
     validations:
       required: true
