@@ -94,6 +94,29 @@ inline void NoteReactiveFlushSource(ReactiveFlushSource source) {
     }
 }
 
+/// What the buffer cache saw when it answered a guest read (Verify diagnostics only).
+namespace ReactiveBufferFact {
+constexpr u32 Valid = 1U << 0;
+constexpr u32 TrackerFullyArmed = 1U << 1;  ///< Its read trap tracker counted the whole page armed.
+constexpr u32 TrackerPartlyArmed = 1U << 2; ///< ... or a part of it.
+constexpr u32 Preflushable = 1U << 3;       ///< The bytes read are marked Preflushable.
+constexpr u32 GpuBitOnPage = 1U << 4;       ///< The memory tracker holds GPU-modified bits there.
+constexpr u32 ModifiedRangeOnPage = 1U << 5;  ///< gpu_modified_ranges touches the page.
+constexpr u32 ModifiedRangeHitsRead = 1U << 6; ///< ... and the bytes read themselves.
+constexpr u32 UndownloadedAtFence = 1U << 7; ///< GPU bits no fence download covers.
+constexpr u32 AsyncDownloads = 1U << 8;
+constexpr u32 QueuedUncommitted = 1U << 9;  ///< A fence download of the page is not yet committed.
+constexpr u32 QueuedCommitted = 1U << 10;   ///< ... is committed to a fence.
+constexpr u32 QueuedPending = 1U << 11;     ///< ... is in flight.
+} // namespace ReactiveBufferFact
+
+void SetReactiveBufferFacts(u32 facts);
+
+/// Whether this process audits guest reads (EDEN_NX2_REACTIVE_MODE=verify).
+[[nodiscard]] inline bool ReactiveVerifyActive() {
+    return GetReactiveFlushMode() == ReactiveFlushMode::Verify;
+}
+
 /// True while this thread's guest read is flushing a whole armed page (Precise, and Verify's
 /// simulated precise consume). GetFlushArea then reports the union of every cache's answer
 /// instead of the first one, so a clean texture cannot hide a dirty buffer on the same page.

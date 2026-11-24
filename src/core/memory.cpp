@@ -23,6 +23,9 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+#include <unordered_map>
+
+#include <fmt/format.h>
 
 #include "common/assert.h"
 #include "common/atomic_ops.h"
@@ -67,20 +70,59 @@ bool NoReactiveRequested() {
     return requested;
 }
 
+/// How an armed page stopped being armed (Verify's page history).
+enum class VerifyPageEnd : u8 {
+    None,
+    Read,
+    Uncached,
+    Remapped,
+};
+
+/// Verify only: the life of a page in the shadow set, kept after it is released.
+struct VerifyPageHistory {
+    u64 arms{};
+    u64 last_arm_ns{};
+    u64 refused{};
+    u64 last_refused_ns{};
+    u64 last_end_ns{};
+    VerifyPageEnd last_end{VerifyPageEnd::None};
+};
+
+/// What a miss reports about its page: the shadow set now, and the history.
+struct VerifyPageReport {
+    bool known{};
+    bool armed_now{};
+    bool cached_now{};
+    u64 armed_total{};
+    u64 arms{};
+    u64 last_arm_age_ms{};
+    u64 refused{};
+    u64 last_refused_age_ms{};
+    u64 last_end_age_ms{};
+    VerifyPageEnd last_end{VerifyPageEnd::None};
+};
+
+/// Fills a VerifyPageReport for a guest address; `context` is the Impl that audits.
+using VerifyProbe = void (*)(void* context, u64 vaddr, VerifyPageReport& report);
+
 /// One guest read audited by Verify: what the shadow of armed pages says about its page.
 struct VerifyAccess {
     bool active{};
     bool shadow_armed{};
     u64 vaddr{};
+    void* context{};
+    VerifyProbe probe{};
 };
 
 thread_local VerifyAccess t_verify_access{};
 thread_local ReactiveFlushSource t_flush_source{ReactiveFlushSource::None};
+thread_local u32 t_buffer_facts{};
 thread_local bool t_page_consume{};
 
 std::atomic<u64> g_verify_checks{};
 std::atomic<u64> g_verify_requested{};
 std::atomic<u64> g_verify_uncovered{};
+std::atomic<u64> g_verify_armed_after{};
 std::atomic<u64> g_verify_last_miss_log_ns{};
 std::atomic<u64> g_verify_last_summary_ns{};
 
@@ -119,17 +161,76 @@ struct PageConsumeScope {
 
 /// Sets t_verify_access for the scope of one audited read.
 struct VerifyAccessScope {
-    VerifyAccessScope(bool shadow_armed, u64 vaddr) {
-        t_verify_access = VerifyAccess{true, shadow_armed, vaddr};
+    VerifyAccessScope(bool shadow_armed, u64 vaddr, void* context, VerifyProbe probe) {
+        t_verify_access = VerifyAccess{true, shadow_armed, vaddr, context, probe};
         t_flush_source = ReactiveFlushSource::None;
+        t_buffer_facts = 0;
     }
     ~VerifyAccessScope() {
         t_verify_access = VerifyAccess{};
         t_flush_source = ReactiveFlushSource::None;
+        t_buffer_facts = 0;
     }
     VerifyAccessScope(const VerifyAccessScope&) = delete;
     VerifyAccessScope& operator=(const VerifyAccessScope&) = delete;
 };
+
+const char* VerifyEndName(VerifyPageEnd end) {
+    switch (end) {
+    case VerifyPageEnd::None:
+        return "never";
+    case VerifyPageEnd::Read:
+        return "a guest read";
+    case VerifyPageEnd::Uncached:
+        return "the page leaving the GPU caches";
+    case VerifyPageEnd::Remapped:
+        return "a remap";
+    }
+    return "?";
+}
+
+/// What the shadow set and its history know about the page of a miss (written by the probe).
+std::string DescribeVerifyPage(const VerifyPageReport& report) {
+    std::string text = report.armed_now ? "is armed now (armed after the read looked), "
+                                        : "is not armed, ";
+    text += report.cached_now ? "cached" : "NOT cached";
+    text += fmt::format(" ({} armed pages in all); ", report.armed_total);
+    if (!report.known) {
+        return text + "never armed or refused";
+    }
+    text += fmt::format("armed {}x, last {} ms ago; ended by {} {} ms ago; arm refused {}x, last {} "
+                        "ms ago",
+                        report.arms, report.last_arm_age_ms, VerifyEndName(report.last_end),
+                        report.last_end_age_ms, report.refused, report.last_refused_age_ms);
+    return text;
+}
+
+std::string DescribeBufferFacts(u32 facts) {
+    if ((facts & ReactiveBufferFact::Valid) == 0) {
+        return "not asked";
+    }
+    static constexpr std::pair<u32, const char*> NAMES[] = {
+        {ReactiveBufferFact::TrackerFullyArmed, "tracker armed"},
+        {ReactiveBufferFact::TrackerPartlyArmed, "tracker partly armed"},
+        {ReactiveBufferFact::Preflushable, "read bytes preflushable"},
+        {ReactiveBufferFact::GpuBitOnPage, "GPU bits on page"},
+        {ReactiveBufferFact::ModifiedRangeOnPage, "modified range on page"},
+        {ReactiveBufferFact::ModifiedRangeHitsRead, "modified range hits the read"},
+        {ReactiveBufferFact::UndownloadedAtFence, "GPU bits no fence downloads"},
+        {ReactiveBufferFact::AsyncDownloads, "async downloads"},
+        {ReactiveBufferFact::QueuedUncommitted, "fence download uncommitted"},
+        {ReactiveBufferFact::QueuedCommitted, "fence download committed"},
+        {ReactiveBufferFact::QueuedPending, "fence download pending"},
+    };
+    std::string text;
+    for (const auto& [bit, name] : NAMES) {
+        if ((facts & bit) != 0) {
+            text += text.empty() ? "" : ", ";
+            text += name;
+        }
+    }
+    return text.empty() ? "no flag set" : text;
+}
 
 } // Anonymous namespace
 
@@ -174,10 +275,15 @@ bool ReactivePageConsumeActive() {
     return t_page_consume;
 }
 
+void SetReactiveBufferFacts(u32 facts) {
+    t_buffer_facts = facts;
+}
+
 void ReactiveVerifyDecision(DAddr addr, u64 size, bool requested_sync, u64 area_begin,
                             u64 area_end) {
     const VerifyAccess access = t_verify_access;
     const ReactiveFlushSource source = std::exchange(t_flush_source, ReactiveFlushSource::None);
+    const u32 buffer_facts = std::exchange(t_buffer_facts, 0U);
     if (!access.active) {
         return;
     }
@@ -186,8 +292,16 @@ void ReactiveVerifyDecision(DAddr addr, u64 size, bool requested_sync, u64 area_
         g_verify_requested.fetch_add(1, std::memory_order_relaxed);
         if (!access.shadow_armed) {
             // The blanket path flushes here but the precise one would have let the read through:
-            // a producer did not arm this page (or released it too early).
+            // a producer did not arm this page (or released it too early), or a GPU write armed
+            // it after the read looked (the page is armed again now: a race, not a hole).
             g_verify_uncovered.fetch_add(1, std::memory_order_relaxed);
+            VerifyPageReport report;
+            if (access.probe != nullptr) {
+                access.probe(access.context, access.vaddr, report);
+            }
+            if (report.armed_now) {
+                g_verify_armed_after.fetch_add(1, std::memory_order_relaxed);
+            }
             const u64 now = SteadyNowNs();
             u64 last = g_verify_last_miss_log_ns.load(std::memory_order_relaxed);
             if ((last == 0 || now - last >= VERIFY_MISS_LOG_INTERVAL_NS) &&
@@ -195,9 +309,11 @@ void ReactiveVerifyDecision(DAddr addr, u64 size, bool requested_sync, u64 area_
                                                                   std::memory_order_relaxed)) {
                 LOG_WARNING(HW_GPU,
                             "reactive verify: flush at guest page {:#x} (device {:#x}, {} bytes, "
-                            "area [{:#x}, {:#x}), source {}) was not covered by an armed trap",
+                            "area [{:#x}, {:#x}), source {}) was not covered by an armed trap; "
+                            "page {}; buffer cache: {}",
                             access.vaddr & ~YUZU_PAGEMASK, addr, size, area_begin, area_end,
-                            SourceName(source));
+                            SourceName(source), DescribeVerifyPage(report),
+                            DescribeBufferFacts(buffer_facts));
             }
         }
     }
@@ -211,10 +327,12 @@ void ReactiveVerifyDecision(DAddr addr, u64 size, bool requested_sync, u64 area_
                                                                 std::memory_order_relaxed)) {
         LOG_INFO(HW_GPU,
                  "reactive verify: {} guest reads checked, {} requested a flush, {} of those not "
-                 "covered by an armed trap",
+                 "covered by an armed trap ({} of them armed by a GPU write after the read "
+                 "looked)",
                  g_verify_checks.load(std::memory_order_relaxed),
                  g_verify_requested.load(std::memory_order_relaxed),
-                 g_verify_uncovered.load(std::memory_order_relaxed));
+                 g_verify_uncovered.load(std::memory_order_relaxed),
+                 g_verify_armed_after.load(std::memory_order_relaxed));
     }
 }
 
@@ -267,7 +385,7 @@ struct Memory::Impl {
             return;
         }
         std::scoped_lock lk{read_trap_mutex};
-        EraseArmedPagesLocked(vaddr, size);
+        EraseArmedPagesLocked(vaddr, size, VerifyPageEnd::Remapped);
     }
 
     void MapMemoryRegion(Common::PageTable& page_table, Common::ProcessAddress base, u64 size,
@@ -694,7 +812,7 @@ struct Memory::Impl {
             trap_lock = std::unique_lock<std::mutex>{read_trap_mutex};
             if (!cached) {
                 // The pages are not GPU cached any more: their traps go with them.
-                EraseArmedPagesLocked(vaddr, size);
+                EraseArmedPagesLocked(vaddr, size, VerifyPageEnd::Uncached);
             }
         }
 
@@ -860,12 +978,68 @@ struct Memory::Impl {
 
     /// Forgets the armed pages of a range without touching their protection. The caller holds
     /// read_trap_mutex.
-    void EraseArmedPagesLocked(u64 vaddr, u64 size) {
+    void EraseArmedPagesLocked(u64 vaddr, u64 size, VerifyPageEnd why) {
         if (size == 0) {
             return;
         }
-        armed_read_traps.Erase(vaddr >> YUZU_PAGEBITS, ((vaddr + size - 1) >> YUZU_PAGEBITS) + 1);
+        const u64 first = vaddr >> YUZU_PAGEBITS;
+        const u64 end = ((vaddr + size - 1) >> YUZU_PAGEBITS) + 1;
+        if (ReactiveVerifyActive()) [[unlikely]] {
+            armed_read_traps.ForEachInRange(first, end,
+                                            [&](u64 page, u64) { NoteVerifyEnd(page, why); });
+        }
+        armed_read_traps.Erase(first, end);
         SyncArmedReadTrapCount();
+    }
+
+    /// Verify's history entry of a page, or null outside Verify (and for new pages once the
+    /// history is full). The caller holds read_trap_mutex.
+    VerifyPageHistory* VerifyHistoryFor(u64 page) {
+        if (!ReactiveVerifyActive()) [[likely]] {
+            return nullptr;
+        }
+        if (verify_history.size() >= VERIFY_HISTORY_LIMIT) {
+            const auto it = verify_history.find(page);
+            return it == verify_history.end() ? nullptr : &it->second;
+        }
+        return &verify_history[page];
+    }
+
+    void NoteVerifyEnd(u64 page, VerifyPageEnd end) {
+        if (VerifyPageHistory* const history = VerifyHistoryFor(page)) {
+            history->last_end = end;
+            history->last_end_ns = SteadyNowNs();
+        }
+    }
+
+    static constexpr size_t VERIFY_HISTORY_LIMIT = size_t{1} << 21;
+
+    /// VerifyProbe: the shadow set and history of the page of a missed read.
+    static void ProbeVerifyPage(void* context, u64 vaddr, VerifyPageReport& report) {
+        Impl& self = *static_cast<Impl*>(context);
+        const u64 page = vaddr >> YUZU_PAGEBITS;
+        const u64 now = SteadyNowNs();
+        const auto age_ms = [now](u64 then) -> u64 {
+            return then == 0 || then > now ? 0 : (now - then) / 1'000'000;
+        };
+        std::scoped_lock lk{self.read_trap_mutex};
+        report.armed_now = self.armed_read_traps.Version(page).has_value();
+        report.armed_total = self.armed_read_traps.Size();
+        report.cached_now = self.current_page_table != nullptr &&
+                            std::as_const(self.current_page_table->entries)[page].Type() ==
+                                Common::PageType::RasterizerCachedMemory;
+        const auto it = self.verify_history.find(page);
+        if (it == self.verify_history.end()) {
+            return;
+        }
+        const VerifyPageHistory& history = it->second;
+        report.known = true;
+        report.arms = history.arms;
+        report.last_arm_age_ms = age_ms(history.last_arm_ns);
+        report.refused = history.refused;
+        report.last_refused_age_ms = age_ms(history.last_refused_ns);
+        report.last_end = history.last_end;
+        report.last_end_age_ms = age_ms(history.last_end_ns);
     }
 
     /// Precise mode: gives read permission to the pages of a just cached range, except the armed
@@ -920,14 +1094,23 @@ struct Memory::Impl {
                 run_pages = 0;
             }
         };
+        const u64 now = ReactiveVerifyActive() ? SteadyNowNs() : 0;
         for (u64 page = vaddr >> YUZU_PAGEBITS; page != page_end; ++page) {
             const bool cached = std::as_const(current_page_table->entries)[page].Type() ==
                                 Common::PageType::RasterizerCachedMemory;
             if (!cached) {
                 // Not a page the GPU caches (or the core does not map): nothing to trap.
                 complete = false;
+                if (VerifyPageHistory* const history = VerifyHistoryFor(page)) {
+                    ++history->refused;
+                    history->last_refused_ns = now;
+                }
                 protect_run();
                 continue;
+            }
+            if (VerifyPageHistory* const history = VerifyHistoryFor(page)) {
+                ++history->arms;
+                history->last_arm_ns = now;
             }
             if (!armed_read_traps.Arm(page)) {
                 // Armed already; Arm gave it a new version, which cancels a release in flight.
@@ -1273,7 +1456,7 @@ struct Memory::Impl {
             gpu_device_memory = &system.Host1x().MemoryManager();
         }
         {
-            const VerifyAccessScope audit{armed, v_address};
+            const VerifyAccessScope audit{armed, v_address, this, &Impl::ProbeVerifyPage};
             Common::ScratchBuffer<u32> scratch;
             gpu_device_memory->ApplyOpOnPointer(p, scratch, [&](DAddr address) {
                 (void)system.GPU().OnCPURead(address, size);
@@ -1312,6 +1495,7 @@ struct Memory::Impl {
         if (!armed_read_traps.Release(page, version)) {
             return;
         }
+        NoteVerifyEnd(page, VerifyPageEnd::Read);
         if (restore_read) {
             host_buffer->Protect(page << YUZU_PAGEBITS, YUZU_PAGESIZE,
                                  Common::MemoryPermission::Read);
@@ -1395,6 +1579,8 @@ struct Memory::Impl {
     std::array<u64, Core::Hardware::NUM_CPU_CORES> read_area_generations{};
     std::atomic<u64> read_trap_generation{};
     ArmedReadTraps armed_read_traps;
+    /// Verify only: what happened to each page of the shadow set (guarded by read_trap_mutex).
+    std::unordered_map<u64, VerifyPageHistory> verify_history;
     std::atomic<size_t> armed_read_trap_count{};
     std::mutex read_trap_mutex;
     std::array<GPUDirtyState, Core::Hardware::NUM_CPU_CORES> rasterizer_write_areas{};

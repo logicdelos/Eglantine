@@ -342,6 +342,53 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
     DAddr device_addr_end_aligned = Common::AlignUp(device_addr + size, Core::DEVICE_PAGESIZE);
     area->start_address = device_addr_start_aligned;
     area->end_address = device_addr_end_aligned;
+    if (Core::Memory::ReactiveVerifyActive()) [[unlikely]] {
+        // Verify diagnostics: the state this answer is made from, before it consumes any of it.
+        namespace Fact = Core::Memory::ReactiveBufferFact;
+        const DAddr page_begin = device_addr_start_aligned;
+        const u64 page_size = device_addr_end_aligned - device_addr_start_aligned;
+        u32 facts = Fact::Valid;
+        const u64 armed = read_trapped_ranges.ArmedBytes(page_begin, page_size);
+        if (armed == page_size) {
+            facts |= Fact::TrackerFullyArmed;
+        } else if (armed != 0) {
+            facts |= Fact::TrackerPartlyArmed;
+        }
+        if (memory_tracker.IsRegionPreflushable(device_addr, size)) {
+            facts |= Fact::Preflushable;
+        }
+        if (memory_tracker.IsRegionGpuModified(page_begin, page_size)) {
+            facts |= Fact::GpuBitOnPage;
+        }
+        if (gpu_modified_ranges.Intersects(page_begin, page_size)) {
+            facts |= Fact::ModifiedRangeOnPage;
+        }
+        if (gpu_modified_ranges.Intersects(device_addr, size)) {
+            facts |= Fact::ModifiedRangeHitsRead;
+        }
+        if (HasGpuWritesNotDownloadedAtFence(page_begin, page_size)) {
+            facts |= Fact::UndownloadedAtFence;
+        }
+        if (AsyncBufferDownloads()) {
+            facts |= Fact::AsyncDownloads;
+        }
+        if (uncommitted_gpu_modified_ranges.Intersects(page_begin, page_size)) {
+            facts |= Fact::QueuedUncommitted;
+        }
+        if (std::ranges::any_of(committed_gpu_modified_ranges,
+                                [&](const Common::RangeSet<DAddr>& ranges) {
+                                    return ranges.Intersects(page_begin, page_size);
+                                })) {
+            facts |= Fact::QueuedCommitted;
+        }
+        if (std::ranges::any_of(pending_download_ranges,
+                                [&](const Common::RangeSet<DAddr>& ranges) {
+                                    return ranges.Intersects(page_begin, page_size);
+                                })) {
+            facts |= Fact::QueuedPending;
+        }
+        Core::Memory::SetReactiveBufferFacts(facts);
+    }
     // Preflushable data is downloaded at fences, but only where it is marked (QueueGpuWrite): the
     // rest of the range still needs this flush.
     if (memory_tracker.IsRegionPreflushable(device_addr, size) &&

@@ -68,6 +68,17 @@ public:
         ranges.Subtract(address, size);
     }
 
+    /// How many bytes of [address, address + size) the tracker counts as armed (diagnostics).
+    [[nodiscard]] u64 ArmedBytes(DAddr address, u64 size) const {
+        u64 armed = 0;
+        ranges.ForEachInRange(address, size, [&](DAddr lower, DAddr upper) {
+            const DAddr begin = (std::max)(lower, address);
+            const DAddr end = (std::min)(upper, address + size);
+            armed += end > begin ? end - begin : 0;
+        });
+        return armed;
+    }
+
 private:
     Common::RangeSet<DAddr> ranges;
 };
