@@ -331,7 +331,8 @@ struct FeedbackProbe {
 
     /// A draw that renders to the target at `address`.
     void NoteTargetDraw(u64 address) {
-        for (Target& target : targets) {
+        for (size_t i = 0; i < target_count; ++i) {
+            Target& target = targets[i];
             if (target.address == address) {
                 ++target.draws;
             }
@@ -359,19 +360,20 @@ struct FeedbackProbe {
         depth_write += event.depth_write ? 1 : 0;
 
         Target* target = nullptr;
-        for (Target& candidate : targets) {
+        for (size_t i = 0; i < target_count; ++i) {
+            Target& candidate = targets[i];
             if (candidate.address == event.target && candidate.width == event.width &&
                 candidate.height == event.height && candidate.format == event.format) {
                 target = &candidate;
                 break;
             }
         }
-        if (target == nullptr && targets.size() < MaxTracked) {
-            targets.push_back({.address = event.target,
-                               .width = event.width,
-                               .height = event.height,
-                               .format = event.format});
-            target = &targets.back();
+        if (target == nullptr && target_count < MaxTracked) {
+            target = &targets[target_count++];
+            *target = {.address = event.target,
+                       .width = event.width,
+                       .height = event.height,
+                       .format = event.format};
         }
         if (target != nullptr) {
             if (target->last_frame != frames) {
@@ -393,15 +395,16 @@ struct FeedbackProbe {
         }
 
         Run* run = nullptr;
-        for (Run& candidate : run_list) {
+        for (size_t i = 0; i < run_count; ++i) {
+            Run& candidate = run_list[i];
             if (candidate.target == event.target && candidate.view == event.view) {
                 run = &candidate;
                 break;
             }
         }
-        if (run == nullptr && run_list.size() < MaxTracked) {
-            run_list.push_back({.target = event.target, .view = event.view});
-            run = &run_list.back();
+        if (run == nullptr && run_count < MaxTracked) {
+            run = &run_list[run_count++];
+            *run = {.target = event.target, .view = event.view};
         }
         if (run != nullptr && run->last_draw != serial) {
             if (run->last_draw != 0 && run->last_draw + 1 == serial) {
@@ -425,8 +428,8 @@ struct FeedbackProbe {
         const auto per = [&](u64 count) { return static_cast<double>(count) * per_frame; };
         const double copies_d = static_cast<double>(copies);
         std::vector<const Target*> order;
-        for (const Target& target : targets) {
-            order.push_back(&target);
+        for (size_t i = 0; i < target_count; ++i) {
+            order.push_back(&targets[i]);
         }
         std::stable_sort(order.begin(), order.end(),
                          [](const Target* a, const Target* b) { return a->pixels > b->pixels; });
@@ -459,8 +462,11 @@ struct FeedbackProbe {
                            : std::string{});
     }
 
-    std::vector<Target> targets;
-    std::vector<Run> run_list;
+    // Fixed storage: the probe lives in a thread_local that must stay trivially destructible.
+    std::array<Target, MaxTracked> targets{};
+    std::array<Run, MaxTracked> run_list{};
+    size_t target_count{};
+    size_t run_count{};
     u64 serial{};      ///< Draws through the check
     u64 frames{};
     u64 draws{};       ///< Draws with a copy
