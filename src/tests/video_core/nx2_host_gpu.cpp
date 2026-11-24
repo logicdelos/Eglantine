@@ -274,3 +274,195 @@ TEST_CASE("Nx2HostGpu ignores a frame without a span and follows the counter's w
     CHECK(window.TotalNs() == 10'000.0);
     CHECK(window.FirstToLastNs() == 10'000.0);
 }
+
+TEST_CASE("Nx2HostGpu names what an other span sat between, passes folded", "[video_core]") {
+    CHECK(Host::KindName(Host::Kind::Pass) == "pass");
+    CHECK(Host::KindName(Host::Kind::Idle) == "idle");
+    CHECK(Host::KindName(Host::Kind::End) == "frame end");
+    CHECK(Host::KindName(Host::Kind::Other) == "other");
+    CHECK(Host::KindName(Host::Kind::FrameStart) == "frame start");
+    CHECK(Host::KindName(Host::Kind::Compute) == "compute");
+    CHECK(Host::KindName(Host::Kind::ImageClear) == "image clear");
+    CHECK(Host::Describe(Host::Label{.kind = Host::Kind::ImageClear}) == "image clear");
+    CHECK(Host::Describe(Host::Label{.kind = Host::Kind::Transition}) == "layout transition");
+    CHECK(Host::Describe(Host::Label{.kind = Host::Kind::UpscaleChain}) == "upscale chain");
+    CHECK(std::string{Host::UnitOf(Host::Kind::ImageClear)} == "clears");
+    CHECK(std::string{Host::UnitOf(Host::Kind::Transition)} == "transitions");
+    CHECK(std::string{Host::UnitOf(Host::Kind::UpscaleChain)} == "runs");
+
+    // The frame's first span is an other span between the frame's start and a pass: 1 ms. Passes
+    // of any size are one kind, "pass".
+    const Frame frame;
+    Host::Window window;
+    window.AddFrame(frame.timestamps, frame.labels, 0, MicrosecondPerTick, 64);
+    REQUIRE(window.Pairs().size() == 1);
+    CHECK(window.Pairs()[0].before == Host::Kind::FrameStart);
+    CHECK(window.Pairs()[0].after == Host::Kind::Pass);
+    CHECK(window.OtherSpans() == 1);
+    CHECK(window.OtherNs() == 1'000'000.0);
+    CHECK(window.BucketSpans(4) == 1);
+    CHECK(window.LargestOtherNs() == 1'000'000.0);
+    CHECK(window.FormatOther().starts_with(
+        "Host GPU other, per profiled frame (1 sampled): 1.00 ms in 1.0 spans | between frame "
+        "start and pass: 1.00 ms in 1.0 spans | sizes <5 us: 0.0 spans, 0.00 ms;"));
+    CHECK(window.FormatOther().ends_with("; >2 ms: 0.0 spans, 0.00 ms | largest 1.000 ms between "
+                                         "frame start and pass"));
+
+    // Per profiled frame: the second frame changes the count, not the means.
+    window.AddFrame(frame.timestamps, frame.labels, 0, MicrosecondPerTick, 64);
+    CHECK(window.FormatOther().starts_with(
+        "Host GPU other, per profiled frame (2 sampled): 1.00 ms in 1.0 spans | between frame "
+        "start and pass: 1.00 ms in 1.0 spans"));
+
+    // Neighbours of the same kind are one pair: a pass of 1280x720 and one of 640x360 are both
+    // "pass". The span before End has End after it.
+    const std::array<Host::Label, 6> labels{
+        Host::PassLabel(1280, 720, 1, 1, false),
+        Host::Label{},
+        Host::PassLabel(640, 360, 1, 1, false),
+        Host::Label{},
+        Host::PassLabel(640, 360, 1, 1, false),
+        Host::Label{.kind = Host::Kind::End},
+    };
+    const std::array<u64, 6> timestamps{0, 1000, 3000, 4000, 4500, 5000};
+    Host::Window folded;
+    folded.AddFrame(timestamps, labels, 0, MicrosecondPerTick, 64);
+    REQUIRE(folded.Pairs().size() == 1);
+    CHECK(folded.Pairs()[0].before == Host::Kind::Pass);
+    CHECK(folded.Pairs()[0].after == Host::Kind::Pass);
+    CHECK(folded.Pairs()[0].spans == 2);
+    CHECK(folded.Pairs()[0].ns == 2'500'000.0);
+
+    const std::array<Host::Label, 3> last_labels{Host::Label{.kind = Host::Kind::Compute},
+                                                 Host::Label{},
+                                                 Host::Label{.kind = Host::Kind::End}};
+    const std::array<u64, 3> last_timestamps{0, 1000, 6000};
+    Host::Window last;
+    last.AddFrame(last_timestamps, last_labels, 0, MicrosecondPerTick, 64);
+    REQUIRE(last.Pairs().size() == 1);
+    CHECK(last.Pairs()[0].before == Host::Kind::Compute);
+    CHECK(last.Pairs()[0].after == Host::Kind::End);
+    CHECK(last.FormatOther().find("between compute and frame end: 5.00 ms in 1.0 spans") !=
+          std::string::npos);
+
+    // A continued other span after a submission's end sits between its neighbours as well.
+    const SubmitFrame submit;
+    Host::Window submits;
+    submits.AddFrame(submit.timestamps, submit.labels, 0, MicrosecondPerTick, 64);
+    CHECK(submits.FormatOther().find("between image copy and image copy: 0.20 ms in 1.0 spans") !=
+          std::string::npos);
+}
+
+TEST_CASE("Nx2HostGpu prints the top 8 pairs of other spans and counts the rest", "[video_core]") {
+    constexpr std::array<Host::Kind, 10> afters{
+        Host::Kind::ImageCopy,   Host::Kind::ImageBlit,       Host::Kind::ImageConvert,
+        Host::Kind::ImageUpload, Host::Kind::ImageDownload,   Host::Kind::BufferCopy,
+        Host::Kind::BufferUpload, Host::Kind::EmulatorCompute, Host::Kind::MipGen,
+        Host::Kind::Rescale};
+    // Compute, an other span of 10 * (i + 1) us, then a span of the i-th kind.
+    std::vector<Host::Label> labels;
+    std::vector<u64> timestamps{0};
+    for (size_t i = 0; i < afters.size(); ++i) {
+        labels.push_back(Host::Label{.kind = Host::Kind::Compute});
+        timestamps.push_back(timestamps.back() + 1);
+        labels.push_back(Host::Label{});
+        timestamps.push_back(timestamps.back() + (i + 1) * 10);
+        labels.push_back(Host::Label{.kind = afters[i]});
+        timestamps.push_back(timestamps.back() + 1);
+    }
+    labels.push_back({.kind = Host::Kind::End});
+    REQUIRE(timestamps.size() == labels.size());
+
+    Host::Window window;
+    window.AddFrame(timestamps, labels, 0, MicrosecondPerTick, 64);
+    CHECK(window.Pairs().size() == 10);
+    const std::string line = window.FormatOther();
+    CHECK(line.starts_with("Host GPU other, per profiled frame (1 sampled): 0.55 ms in 10.0 spans"));
+    // The longest first, the two shortest (10 and 20 us) are not listed but counted.
+    CHECK(line.find("between compute and rescale: 0.10 ms in 1.0 spans") != std::string::npos);
+    CHECK(line.find("between compute and rescale") < line.find("between compute and mip gen"));
+    CHECK(line.find("between compute and image convert: 0.03 ms in 1.0 spans") !=
+          std::string::npos);
+    CHECK(line.find("between compute and image copy") == std::string::npos);
+    CHECK(line.find("between compute and image blit") == std::string::npos);
+    CHECK(line.find("; 2 more pairs: 0.03 ms") != std::string::npos);
+    CHECK(line.find("| largest 0.100 ms between compute and rescale") != std::string::npos);
+}
+
+TEST_CASE("Nx2HostGpu sorts other spans into size buckets at their edges", "[video_core]") {
+    CHECK(Host::OtherBucketOf(0.0) == 0);
+    CHECK(Host::OtherBucketOf(4999.0) == 0);
+    CHECK(Host::OtherBucketOf(5000.0) == 1);
+    CHECK(Host::OtherBucketOf(19999.0) == 1);
+    CHECK(Host::OtherBucketOf(20000.0) == 2);
+    CHECK(Host::OtherBucketOf(99999.0) == 2);
+    CHECK(Host::OtherBucketOf(100000.0) == 3);
+    CHECK(Host::OtherBucketOf(499999.0) == 3);
+    CHECK(Host::OtherBucketOf(500000.0) == 4);
+    CHECK(Host::OtherBucketOf(1999999.0) == 4);
+    CHECK(Host::OtherBucketOf(2000000.0) == 5);
+    CHECK(Host::OtherBucketOf(1e12) == 5);
+    CHECK(std::string{Host::OtherBucketName(0)} == "<5 us");
+    CHECK(std::string{Host::OtherBucketName(5)} == ">2 ms");
+
+    // Ten other spans, two at each edge of a bucket (1 ns per tick), compute between them.
+    constexpr std::array<u64, 10> lengths{4999,   5000,   19999,   20000,   99999,
+                                          100000, 499999, 500000, 1999999, 2000000};
+    std::vector<Host::Label> labels;
+    std::vector<u64> timestamps{0};
+    u64 sum = 0;
+    for (const u64 length : lengths) {
+        labels.push_back({.kind = Host::Kind::Compute});
+        timestamps.push_back(timestamps.back() + 1);
+        labels.push_back({});
+        timestamps.push_back(timestamps.back() + length);
+        sum += length;
+    }
+    labels.push_back({.kind = Host::Kind::Compute});
+    timestamps.push_back(timestamps.back() + 1);
+    labels.push_back({.kind = Host::Kind::End});
+    REQUIRE(timestamps.size() == labels.size());
+
+    Host::Window window;
+    window.AddFrame(timestamps, labels, 0, 1.0, 64);
+    CHECK(window.OtherSpans() == 10);
+    CHECK(window.OtherNs() == static_cast<double>(sum));
+    CHECK(window.BucketSpans(0) == 1);
+    CHECK(window.BucketSpans(1) == 2);
+    CHECK(window.BucketSpans(2) == 2);
+    CHECK(window.BucketSpans(3) == 2);
+    CHECK(window.BucketSpans(4) == 2);
+    CHECK(window.BucketSpans(5) == 1);
+    CHECK(window.BucketNs(0) == 4999.0);
+    CHECK(window.BucketNs(1) == 24999.0);
+    CHECK(window.BucketNs(5) == 2'000'000.0);
+    CHECK(window.LargestOtherNs() == 2'000'000.0);
+    REQUIRE(window.Pairs().size() == 1);
+    CHECK(window.Pairs()[0].spans == 10);
+    const std::string line = window.FormatOther();
+    CHECK(line.find("sizes <5 us: 1.0 spans, 0.00 ms; 5-20 us: 2.0 spans, 0.02 ms; 20-100 us: "
+                    "2.0 spans, 0.12 ms; 100-500 us: 2.0 spans, 0.60 ms; 0.5-2 ms: 2.0 spans, "
+                    "2.50 ms; >2 ms: 1.0 spans, 2.00 ms") != std::string::npos);
+    CHECK(line.ends_with("| largest 2.000 ms between compute and compute"));
+}
+
+TEST_CASE("Nx2HostGpu prints no other line without other spans", "[video_core]") {
+    Host::Window window;
+    CHECK(window.FormatOther().empty());
+    const std::array<Host::Label, 2> labels{Host::Label{.kind = Host::Kind::Compute},
+                                            Host::Label{.kind = Host::Kind::End}};
+    const std::array<u64, 2> timestamps{0, 1000};
+    window.AddFrame(timestamps, labels, 0, MicrosecondPerTick, 64);
+    REQUIRE(window.Frames() == 1);
+    CHECK(window.FormatOther().empty());
+
+    // The window's clear takes the other spans with it.
+    const Frame frame;
+    window.AddFrame(frame.timestamps, frame.labels, 0, MicrosecondPerTick, 64);
+    CHECK_FALSE(window.FormatOther().empty());
+    window.Clear();
+    CHECK(window.OtherSpans() == 0);
+    CHECK(window.Pairs().empty());
+    CHECK(window.LargestOtherNs() == 0.0);
+    CHECK(window.FormatOther().empty());
+}

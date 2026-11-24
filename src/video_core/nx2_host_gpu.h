@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <span>
 #include <string>
@@ -37,6 +38,10 @@ constexpr u32 FrameInterval = 16;
 constexpr u32 MaxQueriesPerFrame = 4096;
 /// Groups a report line prints, by time.
 constexpr size_t MaxReportedGroups = 14;
+/// Pairs of neighbours the line of the "other" spans prints, by time.
+constexpr size_t MaxReportedPairs = 8;
+/// Length buckets of the "other" spans.
+constexpr size_t OtherBucketCount = 6;
 
 enum class Kind : u8 {
     Pass,            // a render pass
@@ -56,6 +61,9 @@ enum class Kind : u8 {
     EmulatorCompute, // a compute pass of the emulator (index conversion, unswizzle, ...)
     MipGen,          // mip chain generation
     Rescale,         // an image scaled up or down for resolution scaling
+    ImageClear,      // a clear of an image outside a pass (sparse tiles)
+    Transition,      // the first layout transition of an image
+    UpscaleChain,    // the game's DLSS, FSR, Streamline, temporal and camera motion work
 };
 
 /// What a span is. The size, samples and attachments tell render passes apart.
@@ -145,11 +153,34 @@ struct Label {
         return "mip gen";
     case Kind::Rescale:
         return "rescale";
+    case Kind::ImageClear:
+        return "image clear";
+    case Kind::Transition:
+        return "layout transition";
+    case Kind::UpscaleChain:
+        return "upscale chain";
     case Kind::End:
     case Kind::Other:
         break;
     }
     return "other (barriers, unlabelled work)";
+}
+
+/// How a neighbour of an "other" span is called in the pairs: the kind only, every pass is one.
+[[nodiscard]] inline std::string KindName(Kind kind) {
+    if (kind == Kind::Pass) {
+        return "pass";
+    }
+    if (kind == Kind::Idle) {
+        return "idle";
+    }
+    if (kind == Kind::End) {
+        return "frame end";
+    }
+    if (kind == Kind::Other) {
+        return "other";
+    }
+    return Describe(Label{.kind = kind});
 }
 
 /// What the spans of a kind count, nullptr for the kinds that are not counted.
@@ -177,6 +208,12 @@ struct Label {
         return "chains";
     case Kind::Rescale:
         return "rescales";
+    case Kind::ImageClear:
+        return "clears";
+    case Kind::Transition:
+        return "transitions";
+    case Kind::UpscaleChain:
+        return "runs";
     case Kind::End:
     case Kind::Other:
     case Kind::FrameStart:
@@ -184,6 +221,22 @@ struct Label {
         break;
     }
     return nullptr;
+}
+
+/// The length bucket of an "other" span: <5 us, 5-20 us, 20-100 us, 100-500 us, 0.5-2 ms, more.
+[[nodiscard]] inline size_t OtherBucketOf(double ns) {
+    static constexpr std::array<double, OtherBucketCount - 1> limits{5e3, 20e3, 100e3, 500e3, 2e6};
+    size_t bucket = 0;
+    while (bucket < limits.size() && ns >= limits[bucket]) {
+        ++bucket;
+    }
+    return bucket;
+}
+
+[[nodiscard]] inline const char* OtherBucketName(size_t bucket) {
+    static constexpr std::array<const char*, OtherBucketCount> names{
+        "<5 us", "5-20 us", "20-100 us", "100-500 us", "0.5-2 ms", ">2 ms"};
+    return names[(std::min)(bucket, names.size() - 1)];
 }
 
 /// The labels of the timestamps of one profiled frame, in the order they are written. A
@@ -257,6 +310,14 @@ public:
         u64 pixels{};
     };
 
+    /// What an "other" span sat between: the kinds of the labels before and after it.
+    struct Pair {
+        Kind before{};
+        Kind after{};
+        double ns{};
+        u64 spans{};
+    };
+
     /// Adds a profiled frame: timestamps[i] (device ticks) starts the span labels[i]; the
     /// timestamp of the End label, the last, ends the last one. A frame without a span is not
     /// added. `overflow` is what FrameLog counted. A span of Kind::Idle is the GPU waiting: it
@@ -294,6 +355,9 @@ public:
                     frame_gap_ns += ns;
                 }
                 continue;
+            }
+            if (label.kind == Kind::Other) {
+                AddOther(i == 0 ? Kind::FrameStart : labels[i - 1].kind, labels[i + 1].kind, ns);
             }
             AddSpan(label, ns);
             if (label.kind == Kind::Pass && !label.continued) {
@@ -343,6 +407,24 @@ public:
     }
     [[nodiscard]] u64 Dropped() const noexcept {
         return dropped;
+    }
+    [[nodiscard]] double OtherNs() const noexcept {
+        return other_ns;
+    }
+    [[nodiscard]] u64 OtherSpans() const noexcept {
+        return other_spans;
+    }
+    [[nodiscard]] const std::vector<Pair>& Pairs() const noexcept {
+        return pairs;
+    }
+    [[nodiscard]] u64 BucketSpans(size_t bucket) const noexcept {
+        return bucket_spans[bucket];
+    }
+    [[nodiscard]] double BucketNs(size_t bucket) const noexcept {
+        return bucket_ns[bucket];
+    }
+    [[nodiscard]] double LargestOtherNs() const noexcept {
+        return largest_other_ns;
     }
 
     /// The report line, per profiled frame (the largest gap is the largest of the window): total
@@ -404,6 +486,51 @@ public:
         return line;
     }
 
+    /// The second report line, per profiled frame: what the "other" spans sat between (the top
+    /// MaxReportedPairs pairs of neighbour kinds by time), how long they are, and the largest
+    /// one (of the window). Empty when no frame was profiled or none had an "other" span.
+    [[nodiscard]] std::string FormatOther() const {
+        if (frames == 0 || other_spans == 0) {
+            return {};
+        }
+        const double per_frame = 1.0 / static_cast<double>(frames);
+        std::vector<const Pair*> order;
+        order.reserve(pairs.size());
+        for (const Pair& pair : pairs) {
+            order.push_back(&pair);
+        }
+        std::stable_sort(order.begin(), order.end(),
+                         [](const Pair* a, const Pair* b) { return a->ns > b->ns; });
+        std::string line = fmt::format(
+            "Host GPU other, per profiled frame ({} sampled): {:.2f} ms in {:.1f} spans", frames,
+            other_ns * per_frame / 1e6, static_cast<double>(other_spans) * per_frame);
+        const size_t shown = (std::min)(order.size(), MaxReportedPairs);
+        for (size_t i = 0; i < shown; ++i) {
+            const Pair& pair = *order[i];
+            line += fmt::format("{}between {} and {}: {:.2f} ms in {:.1f} spans",
+                                i == 0 ? " | " : "; ", KindName(pair.before), KindName(pair.after),
+                                pair.ns * per_frame / 1e6,
+                                static_cast<double>(pair.spans) * per_frame);
+        }
+        if (order.size() > shown) {
+            double rest_ns = 0.0;
+            for (size_t i = shown; i < order.size(); ++i) {
+                rest_ns += order[i]->ns;
+            }
+            line += fmt::format("; {} more pairs: {:.2f} ms", order.size() - shown,
+                                rest_ns * per_frame / 1e6);
+        }
+        for (size_t bucket = 0; bucket < OtherBucketCount; ++bucket) {
+            line += fmt::format("{}{}: {:.1f} spans, {:.2f} ms", bucket == 0 ? " | sizes " : "; ",
+                                OtherBucketName(bucket),
+                                static_cast<double>(bucket_spans[bucket]) * per_frame,
+                                bucket_ns[bucket] * per_frame / 1e6);
+        }
+        line += fmt::format(" | largest {:.3f} ms between {} and {}", largest_other_ns / 1e6,
+                            KindName(largest_before), KindName(largest_after));
+        return line;
+    }
+
     void Clear() {
         *this = Window{};
     }
@@ -423,6 +550,27 @@ private:
         groups.push_back({.label = key, .ns = ns, .spans = counted, .pixels = label.pixels});
     }
 
+    void AddOther(Kind before, Kind after, double ns) {
+        ++other_spans;
+        other_ns += ns;
+        const size_t bucket = OtherBucketOf(ns);
+        ++bucket_spans[bucket];
+        bucket_ns[bucket] += ns;
+        if (ns > largest_other_ns) {
+            largest_other_ns = ns;
+            largest_before = before;
+            largest_after = after;
+        }
+        for (Pair& pair : pairs) {
+            if (pair.before == before && pair.after == after) {
+                pair.ns += ns;
+                ++pair.spans;
+                return;
+            }
+        }
+        pairs.push_back({.before = before, .after = after, .ns = ns, .spans = 1});
+    }
+
     std::vector<Group> groups;
     double total_ns{};
     double idle_ns{};
@@ -435,6 +583,14 @@ private:
     u64 passes{};
     u32 frames{};
     u32 skipped{};
+    std::vector<Pair> pairs;
+    std::array<u64, OtherBucketCount> bucket_spans{};
+    std::array<double, OtherBucketCount> bucket_ns{};
+    double other_ns{};
+    double largest_other_ns{};
+    Kind largest_before{};
+    Kind largest_after{};
+    u64 other_spans{};
 };
 
 } // namespace VideoCommon::Nx2HostGpu
