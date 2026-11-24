@@ -1093,6 +1093,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
         buffer_cache.Nx2CollectListCopies(false);
     };
 
+    if (VideoCommon::Nx2Perf::Verify()) {
+        // Claims left by a draw that never reached the check are not this draw's.
+        static_cast<void>(texture_cache.TakeUnwrittenClaims());
+    }
     if (Profile::Scope scope{Profile::Zone::Configure}; !pipeline->Configure(is_indexed)) {
         report_failure("configure failed");
         return;
@@ -1123,6 +1127,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     {
         Profile::Scope scope{Profile::Zone::DynamicState};
         UpdateDynamicStates(pipeline);
+    }
+    if (VideoCommon::Nx2Perf::Verify()) {
+        VerifyUnwrittenClaims(*pipeline);
     }
 
     query_cache.NotifySegment(true);
@@ -4144,6 +4151,48 @@ void RasterizerVulkan::UpdateLogicOp(Tegra::Engines::Maxwell3D::Regs& regs) {
     scheduler.Record([op](vk::CommandBuffer cmdbuf) { cmdbuf.SetLogicOpEXT(op); });
 }
 
+u32 RasterizerVulkan::HostColorWriteMask(const GraphicsPipeline& pipeline, size_t index) const {
+    // Mirrors how the three paths hand the write mask to the host: dynamic with the blend state,
+    // enabled or disabled as a whole, or fixed in the pipeline.
+    const auto& state = pipeline.Key().state;
+    if (state.extended_dynamic_state_3_blend) {
+        return last_color_write_masks[index];
+    }
+    if (state.color_write_enable_dynamic && last_color_write_enables[index] == VK_FALSE) {
+        return 0;
+    }
+    return static_cast<u32>(state.attachments[index].raw & 0xF) & pipeline.ColorOutputMask(index);
+}
+
+void RasterizerVulkan::VerifyUnwrittenClaims(const GraphicsPipeline& pipeline) {
+    // Nx2Perf verify of feedback_skip_unwritten and masked_target_unmodified: they judged the
+    // attachments of the claim unwritable from the registers; the host mask must agree.
+    const auto claims = texture_cache.TakeUnwrittenClaims();
+    constexpr std::array cut_opts{VideoCommon::Nx2Perf::Opt::FeedbackSkipUnwritten,
+                                  VideoCommon::Nx2Perf::Opt::MaskedTargetUnmodified};
+    static_assert(cut_opts.size() == claims.size());
+    const auto& regs = maxwell3d->regs;
+    for (size_t cut = 0; cut < claims.size(); ++cut) {
+        for (size_t index = 0; index < Maxwell::NumRenderTargets; ++index) {
+            if (((claims[cut] >> index) & 1u) == 0) {
+                continue;
+            }
+            const u32 host_mask = HostColorWriteMask(pipeline, index);
+            if (host_mask == 0) {
+                continue;
+            }
+            const auto& rt = regs.rt[index];
+            LOG_ERROR(Render_Vulkan,
+                      "Nx2Perf verify: {} judged colour target {}x{} format {} unwritten by the "
+                      "draw but the host writes it (mask {:#x}); the switch is off for the session",
+                      VideoCommon::Nx2Perf::opt_names[static_cast<size_t>(cut_opts[cut])],
+                      rt.width, rt.height, static_cast<u32>(rt.format), host_mask);
+            VideoCommon::Nx2Perf::Disable(cut_opts[cut]);
+            break;
+        }
+    }
+}
+
 void RasterizerVulkan::UpdateBlending(Tegra::Engines::Maxwell3D::Regs& regs,
                                       const GraphicsPipeline* pipeline) {
     // The write mask also excludes components the fragment shader doesn't output, so it has to be
@@ -4174,6 +4223,7 @@ void RasterizerVulkan::UpdateBlending(Tegra::Engines::Maxwell3D::Regs& regs,
             }
             current &= (color_output_mask >> (index * 4)) & 0xF;
         }
+        last_color_write_masks = setup_masks;
         scheduler.Record([setup_masks](vk::CommandBuffer cmdbuf) {
             cmdbuf.SetColorWriteMaskEXT(0, setup_masks);
         });
@@ -4248,6 +4298,7 @@ void RasterizerVulkan::UpdateColorWriteEnable(Tegra::Engines::Maxwell3D::Regs& r
         const auto& mask = regs.color_mask[regs.color_mask_common ? 0 : index];
         setup_enables[index] = (mask.R || mask.G || mask.B || mask.A) ? VK_TRUE : VK_FALSE;
     }
+    last_color_write_enables = setup_enables;
     scheduler.Record([setup_enables](vk::CommandBuffer cmdbuf) {
         cmdbuf.SetColorWriteEnableEXT(setup_enables);
     });

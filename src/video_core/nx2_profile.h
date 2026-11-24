@@ -25,6 +25,7 @@
 #include "common/common_types.h"
 #include "video_core/gpu_split.h"
 #include "common/logging.h"
+#include "video_core/texture_cache/feedback_cut.h"
 #include "common/cpu_features.h"
 
 // EDEN_NX2_GPU_PROFILE: time where the GPU thread spends its time. Each zone counts its own
@@ -339,6 +340,24 @@ struct FeedbackProbe {
         }
     }
 
+    /// What a Nx2Perf feedback cut spared: a shadow copy (a draw's second descriptor of the same
+    /// source reusing the first shadow, or a target sampled in place because the draw cannot
+    /// write it) or the modified flag of a target the draw cannot write.
+    enum class Avoided { Shared, Unwritten, Unmodified };
+    void NoteAvoided(Avoided kind) {
+        switch (kind) {
+        case Avoided::Shared:
+            ++avoided_shared;
+            break;
+        case Avoided::Unwritten:
+            ++avoided_unwritten;
+            break;
+        case Avoided::Unmodified:
+            ++avoided_unmodified;
+            break;
+        }
+    }
+
     void Add(const Event& event) {
         if (event.first_in_draw) {
             ++draws;
@@ -421,12 +440,13 @@ struct FeedbackProbe {
 
     /// The report line, per frame; empty when nothing was copied.
     [[nodiscard]] std::string Format() const {
-        if (copies == 0) {
+        if (copies == 0 && avoided_shared == 0 && avoided_unwritten == 0 &&
+            avoided_unmodified == 0) {
             return {};
         }
         const double per_frame = 1.0 / static_cast<double>((std::max)(frames, u64{1}));
         const auto per = [&](u64 count) { return static_cast<double>(count) * per_frame; };
-        const double copies_d = static_cast<double>(copies);
+        const double copies_d = (std::max)(static_cast<double>(copies), 1.0);
         std::vector<const Target*> order;
         for (size_t i = 0; i < target_count; ++i) {
             order.push_back(&targets[i]);
@@ -448,7 +468,9 @@ struct FeedbackProbe {
             "rendered level or layer: {:.1f} | colour write mask off: {:.1f} | same target and "
             "view in consecutive draws: runs of mean {:.2f}, max {} draws | rendered to by "
             "another draw between copies: {:.1f} of {:.1f} repeat copies | blend on {:.1f} | depth "
-            "test on {:.1f}, depth write on {:.1f}{}",
+            "test on {:.1f}, depth write on {:.1f} | shadow copies avoided per frame: {:.1f} shared "
+            "within the draw, {:.1f} target sampled in place (colour write mask 0) | targets not "
+            "flagged modified by a draw with mask 0: {:.1f}{}",
             per(copies), per(draws), per(pixels) / 1e6, per(repeats_in_draw),
             static_cast<double>(regions) / copies_d, regions_max, per(distinct_sum), top,
             order.size() > 3 ? "; ..." : "", per(scissor_on),
@@ -456,7 +478,7 @@ struct FeedbackProbe {
             viewport_area_sum / copies_d, per(disjoint), per(mask_off),
             runs != 0 ? static_cast<double>(run_draws) / static_cast<double>(runs) : 0.0, run_max,
             per(other_written), per(repeat_copies), per(blend_on), per(depth_test),
-            per(depth_write),
+            per(depth_write), per(avoided_shared), per(avoided_unwritten), per(avoided_unmodified),
             untracked != 0 ? fmt::format(" | {} copies of targets past the {} followed", untracked,
                                          MaxTracked)
                            : std::string{});
@@ -487,10 +509,55 @@ struct FeedbackProbe {
     u64 repeat_copies{};
     u64 other_written{};
     u64 distinct_sum{};
+    u64 avoided_shared{};
+    u64 avoided_unwritten{};
+    u64 avoided_unmodified{};
     u64 current_frame{~u64{0}}; ///< The cache's frame of the last draw
     u64 untracked{};
     double scissor_area_sum{};
     double viewport_area_sum{};
+};
+
+/// Image copies of the texture cache's runtime (CopyImage) by what asked for them: how many and
+/// how many texels. Plain counters like FeedbackProbe, added only while the profiler is enabled.
+struct ImageCopyProbe {
+    using Caller = VideoCommon::FeedbackCut::CopyCaller;
+    static constexpr std::array<const char*, static_cast<size_t>(Caller::Count)> names{
+        "feedback shadow", "alias sync", "join alias", "join overlap"};
+
+    struct Row {
+        u64 copies{};
+        u64 pixels{};
+    };
+
+    void Add(Caller caller, u64 pixels) {
+        Row& row = rows[static_cast<size_t>(caller)];
+        ++row.copies;
+        row.pixels += pixels;
+    }
+
+    /// The report line, per frame (`frames` counted by FeedbackProbe); empty when nothing was
+    /// copied.
+    [[nodiscard]] std::string Format(u64 frames) const {
+        const double per_frame = 1.0 / static_cast<double>((std::max)(frames, u64{1}));
+        Row total;
+        std::string line;
+        for (size_t i = 0; i < rows.size(); ++i) {
+            total.copies += rows[i].copies;
+            total.pixels += rows[i].pixels;
+            line += fmt::format("{}{} {:.1f} copies / {:.1f} MP", i == 0 ? "" : ", ", names[i],
+                                static_cast<double>(rows[i].copies) * per_frame,
+                                static_cast<double>(rows[i].pixels) * per_frame / 1e6);
+        }
+        if (total.copies == 0) {
+            return {};
+        }
+        return fmt::format("Image copies by caller, per frame: {} | total {:.1f} copies / {:.1f} MP",
+                           line, static_cast<double>(total.copies) * per_frame,
+                           static_cast<double>(total.pixels) * per_frame / 1e6);
+    }
+
+    std::array<Row, static_cast<size_t>(Caller::Count)> rows{};
 };
 
 struct ThreadData {
@@ -518,6 +585,7 @@ struct ThreadData {
     u64 window_start{};
     u32 generation{};
     FeedbackProbe feedback;
+    ImageCopyProbe image_copies;
 };
 
 inline thread_local ThreadData t_data;
@@ -525,6 +593,11 @@ inline thread_local ThreadData t_data;
 /// The feedback probe of this thread (the one that runs the texture cache).
 inline FeedbackProbe& Feedback() {
     return t_data.feedback;
+}
+
+/// The image copy counters of this thread (the one that runs the texture cache).
+inline ImageCopyProbe& ImageCopies() {
+    return t_data.image_copies;
 }
 
 /// Totals since the thread started, never reset by the report window: the frame spike recorder
@@ -1364,6 +1437,10 @@ inline void Report(const char* thread_name = "GPU thread") {
     }
     if (const std::string feedback = data.feedback.Format(); !feedback.empty()) {
         LOG_INFO(HW_GPU, "{}", feedback);
+    }
+    if (const std::string image_copies = data.image_copies.Format(data.feedback.frames);
+        !image_copies.empty()) {
+        LOG_INFO(HW_GPU, "{}", image_copies);
     }
     data = {};
     data.window_start = now;

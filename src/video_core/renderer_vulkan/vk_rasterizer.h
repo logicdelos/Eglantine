@@ -302,6 +302,13 @@ private:
     bool mesh_draw{}; ///< the draw being prepared uses a task/mesh pipeline
     /// Fragment output components the dynamic color write mask was last recorded with
     u32 last_color_output_mask{};
+    /// The dynamic colour write masks and enables last recorded (Nx2Perf verify reads them back)
+    std::array<VkColorComponentFlags, Tegra::Engines::Maxwell3D::Regs::NumRenderTargets>
+        last_color_write_masks{};
+    std::array<VkBool32, Tegra::Engines::Maxwell3D::Regs::NumRenderTargets>
+        last_color_write_enables{};
+    [[nodiscard]] u32 HostColorWriteMask(const GraphicsPipeline& pipeline, size_t index) const;
+    void VerifyUnwrittenClaims(const GraphicsPipeline& pipeline);
 
     /// A depth buffer drawn with a perspective camera since the last evaluation of
     /// AccelerateCameraMotionUpscale, and the state of its last such draw.

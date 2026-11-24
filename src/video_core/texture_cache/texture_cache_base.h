@@ -48,6 +48,7 @@
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/texture_cache/render_targets.h"
+#include "video_core/texture_cache/feedback_cut.h"
 #include "video_core/texture_cache/types.h"
 #include "video_core/textures/texture.h"
 
@@ -316,7 +317,21 @@ public:
 
     /// Update bound render targets and upload memory if necessary
     /// @param is_clear True when the render targets are being used for clears
-    void UpdateRenderTargets(bool is_clear);
+    /// @param honor_color_mask True for a graphics draw whose host pipeline applies the guest's
+    /// colour write masks: an attachment whose mask is 0 is then not flagged as modified
+    /// (Nx2Perf masked_target_unmodified)
+    void UpdateRenderTargets(bool is_clear, bool honor_color_mask = false);
+
+    /// Nx2Perf verify: per cut (FeedbackCut::Cut), the attachments (bit per render target
+    /// register position) the cut judged unwritable by the draw being prepared while keeping the
+    /// old behaviour; the rasterizer checks them against the host's colour write masks. Taking
+    /// them clears them.
+    [[nodiscard]] std::array<u32, static_cast<size_t>(FeedbackCut::Cut::Count)>
+    TakeUnwrittenClaims() noexcept {
+        const auto claims = unwritten_claims;
+        unwritten_claims = {};
+        return claims;
+    }
 
     /// Find a framebuffer with the currently bound render targets
     /// UpdateRenderTargets should be called before this
@@ -570,7 +585,8 @@ private:
     void PrepareImageView(ImageViewId image_view_id, bool is_modification, bool invalidate);
 
     /// Execute copies from one image to the other, even if they are incompatible
-    void CopyImage(ImageId dst_id, ImageId src_id, std::vector<ImageCopy> copies);
+    void CopyImage(ImageId dst_id, ImageId src_id, std::vector<ImageCopy> copies,
+                   FeedbackCut::CopyCaller caller);
 
     /// Bind an image view as render target, downloading resources preemtively if needed
     void BindRenderTarget(ImageViewId* old_id, ImageViewId new_id);
@@ -761,6 +777,10 @@ private:
         u64 last_frame;
     };
     std::vector<FeedbackShadow> feedback_shadows;
+    /// The colour registers of the draw as FeedbackCut sees them
+    [[nodiscard]] FeedbackCut::ColorSlots ReadColorSlots();
+    /// See TakeUnwrittenClaims
+    std::array<u32, static_cast<size_t>(FeedbackCut::Cut::Count)> unwritten_claims{};
 
     // Join caching
     boost::container::small_vector<ImageId, 4> join_overlap_ids;

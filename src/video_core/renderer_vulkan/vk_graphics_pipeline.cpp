@@ -927,7 +927,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     }
     {
         Profile::Scope scope{Profile::Zone::RenderTargets};
-        texture_cache.UpdateRenderTargets(false);
+        texture_cache.UpdateRenderTargets(false, true);
         const std::span<const VideoCommon::ImageViewInOut> view_span{views.data(), views.size()};
         if (!view_span.empty()) {
             texture_cache.CheckFeedbackLoop(view_span);

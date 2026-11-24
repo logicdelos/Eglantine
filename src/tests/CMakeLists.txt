@@ -100,6 +100,7 @@ add_executable(tests
     video_core/nx2_perf_native_qmd.cpp
     video_core/nx2_perf_query_callback.cpp
     video_core/nx2_perf_switches.cpp
+    video_core/feedback_cut.cpp
     video_core/memory_manager_runs.cpp
     video_core/nx2_sparse_residency.cpp
     video_core/spirv_storage_alignment.cpp

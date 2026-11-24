@@ -139,6 +139,15 @@ enum class Opt : unsigned {
     SemaphoreFenceLean,
     /// A draw whose image views and samplers equal the previous draw's reuses its descriptors
     DescriptorRunReuse,
+    /// Texture cache: within one draw, descriptors that sample the same colour target reuse the
+    /// one feedback shadow copy the draw already made (each keeps its own view)
+    FeedbackShadowShare,
+    /// Texture cache: a draw whose colour write mask is zero for every attachment at the sampled
+    /// target's address samples the target itself, no feedback shadow copy
+    FeedbackSkipUnwritten,
+    /// Texture cache: an attachment whose colour write mask is zero for a draw is not flagged as
+    /// modified by that draw, so its aliases are not synchronised from it
+    MaskedTargetUnmodified,
     Count,
 };
 
@@ -156,7 +165,8 @@ inline constexpr std::array<std::string_view, static_cast<size_t>(Opt::Count)> o
     "image_admission", "gp_sync_host", "worker_budget", "vram_budget_reported", "vram_priority",
     "query_landed", "dma_read_settle", "uniform_shadow_lean", "compute_unoptimized_slow",
     "compute_boot_deferred", "descriptor_handle_memo", "semaphore_fence_lean",
-    "descriptor_run_reuse",
+    "descriptor_run_reuse", "feedback_shadow_share", "feedback_skip_unwritten",
+    "masked_target_unmodified",
 };
 
 static_assert(static_cast<size_t>(Opt::Count) <= 64, "the off-mask is 64 bits");
@@ -190,7 +200,9 @@ inline constexpr u64 DefaultOffMask() {
                           Opt::BindMemo, Opt::SubmitWhileWaited, Opt::DmaForward,
                           Opt::BankOncePerFrame, Opt::DrawBeginCoalesce, Opt::PendingWake,
                           Opt::DiagDrawLite, Opt::WorkerBudget, Opt::VramBudgetReported,
-                          Opt::VramPriority, Opt::SemaphoreFenceLean, Opt::DescriptorRunReuse}) {
+                          Opt::VramPriority, Opt::SemaphoreFenceLean, Opt::DescriptorRunReuse,
+                          Opt::FeedbackShadowShare, Opt::FeedbackSkipUnwritten,
+                          Opt::MaskedTargetUnmodified}) {
         mask |= Bit(opt);
     }
     return mask;
@@ -198,7 +210,9 @@ inline constexpr u64 DefaultOffMask() {
 
 /// Off unless EDEN_NX2_PERF_ON names them: built, not yet proven by a lab run.
 inline constexpr u64 OptInMask() {
-    return Bit(Opt::SemaphoreFenceLean) | Bit(Opt::DescriptorRunReuse);
+    return Bit(Opt::SemaphoreFenceLean) | Bit(Opt::DescriptorRunReuse) |
+           Bit(Opt::FeedbackShadowShare) | Bit(Opt::FeedbackSkipUnwritten) |
+           Bit(Opt::MaskedTargetUnmodified);
 }
 
 /// The off-mask from EDEN_NX2_PERF_SAFE (safe), EDEN_NX2_PERF_ON (on) and EDEN_NX2_PERF_OFF (off).
@@ -261,6 +275,12 @@ inline bool Verify() {
         return value != nullptr && value[0] == '1';
     }();
     return verify;
+}
+
+/// Turns one switch off for the rest of the session: a verify mismatch found it unsafe.
+inline void Disable(Opt opt) {
+    static_cast<void>(On(opt)); // publishes the environment's mask first
+    detail::live_off_mask.fetch_or(Bit(opt), std::memory_order_relaxed);
 }
 
 } // namespace VideoCommon::Nx2Perf

@@ -340,6 +340,28 @@ a capture larger than the game's image, Fortune's Weave presents 3840x2160), `ED
 report/semaphore write). `C:\dev\crashrun.sh` runs eden-cli under cdb and prints the crash stack;
 `C:\dev\stackdump.sh <main> <seconds>` dumps host thread stacks of a running test.
 
+Feedback shadow cuts (texture cache, `EDEN_NX2_PERF_ON=<names>` turns them on, all off by default;
+`EDEN_NX2_PERF_OFF=<name>` or not naming them keeps the old copy; `EDEN_NX2_PERF_VERIFY=1` makes B
+and C keep the old output and only check). `feedback_shadow_share` (A): within one draw the 2nd and
+later descriptors sampling the same source image reuse the shadow already copied, each with its
+own view. `feedback_skip_unwritten` (B): a draw whose colour write mask is 0 for every render
+target slot at the sampled image's address samples the target itself, no shadow copy and no pass
+break; rescaled, multisampled, blacklisted and buffer views keep the shadow, and so does any draw
+whose registers cannot prove the mask (no slot found, a slot past `rt_control.count` that no output
+maps to). `masked_target_unmodified` (C): a graphics draw whose mask for an attachment is 0 does not
+flag that target modified, so its aliases are not synchronised from it (clears and `DrawTexture`
+keep always-modify). Slot lookup counts a position as written if either the host's identity index
+(attachment i = `rt[i]`, mask `color_mask[common ? 0 : i]`) or the control map reaches a non-zero
+mask. Verify checks the claim against the host mask where the Vulkan state is resolved (dynamic
+write mask, `colorWriteEnable`, or the pipeline's static attachment, ANDed with the fragment
+output mask); a mismatch logs the target size and format once and turns that cut off for the
+session. The `Feedback shadow copies per frame:` line keeps counting copies made and ends with the
+shadows avoided per frame (shared, sampled in place, targets not flagged modified). A second line
+per window, `Image copies by caller, per frame: ...`, gives copies and MP per frame for the feedback
+shadow, alias synchronisation (`SynchronizeAliases`), and the two image-creation joins (alias copy,
+overlap copy), plus the total; counted only while the profiler is on. `TextureCache::CopyImage` is
+reached only by alias sync and the join alias copy; guest blits use `BlitImage` and have no counter.
+
 ## Where it stops now
 
 All runs: `EDEN_NX2_AUTO_STUB=1`, 12 GB memory layout, loose ExeFS with the sibling `romfs/`.

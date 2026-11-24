@@ -1008,6 +1008,25 @@ void TextureCache<P>::ReplaceColorFeedbackViews(std::span<ImageViewInOut> views)
     const auto& regs = maxwell3d->regs;
     // The probe of the shadow copies (nx2_profile.h): plain counters while the profiler is on.
     const bool probe = VideoCommon::Nx2Profile::Enabled();
+    // The feedback cuts (Nx2Perf feedback_shadow_share, feedback_skip_unwritten). Under verify
+    // the skip only records its claim and the shadow is taken as before.
+    const bool share_shadows = Nx2Perf::On(Nx2Perf::Opt::FeedbackShadowShare);
+    const bool skip_unwritten = Nx2Perf::On(Nx2Perf::Opt::FeedbackSkipUnwritten);
+    const bool verify_skip = skip_unwritten && Nx2Perf::Verify();
+    FeedbackCut::ShadowShare<ImageId, ImageId> shared_shadows;
+    FeedbackCut::ColorSlots slots;
+    if (skip_unwritten) {
+        slots = ReadColorSlots();
+    }
+    // Points a sampled view at the same view of a shadow of its image.
+    const auto use_shadow = [&](ImageViewInOut& sampled_view, ImageId source_id,
+                                ImageId copy_id) {
+        const Image& source = slot_images[source_id];
+        const auto source_view_it = std::ranges::find(source.image_view_ids, sampled_view.id);
+        const ImageViewInfo source_view_info = source.image_view_infos[std::distance(
+            source.image_view_ids.begin(), source_view_it)];
+        sampled_view.id = FindOrEmplaceImageView(copy_id, source_view_info);
+    };
     std::vector<std::pair<ImageId, ImageViewId>> probe_views;
     if (probe) {
         VideoCommon::Nx2Profile::FeedbackProbe& feedback = VideoCommon::Nx2Profile::Feedback();
@@ -1040,6 +1059,30 @@ void TextureCache<P>::ReplaceColorFeedbackViews(std::span<ImageViewInOut> views)
             slot_images[image_id].info.num_samples != 1) {
             continue;
         }
+        if (skip_unwritten && !FeedbackCut::TargetWritten(slots, gpu_addr)) {
+            if (!verify_skip) {
+                // No render target slot at this address can be written by the draw: sample the
+                // target itself.
+                if (probe) {
+                    VideoCommon::Nx2Profile::Feedback().NoteAvoided(
+                        VideoCommon::Nx2Profile::FeedbackProbe::Avoided::Unwritten);
+                }
+                continue;
+            }
+            unwritten_claims[static_cast<size_t>(FeedbackCut::Cut::SkipUnwritten)] |=
+                FeedbackCut::HostAttachmentsAt(slots, gpu_addr);
+        }
+        if (share_shadows) {
+            if (const ImageId* const shared = shared_shadows.Find(image_id)) {
+                // The draw already copied this image: the copy is of the same state.
+                use_shadow(view, image_id, *shared);
+                if (probe) {
+                    VideoCommon::Nx2Profile::Feedback().NoteAvoided(
+                        VideoCommon::Nx2Profile::FeedbackProbe::Avoided::Shared);
+                }
+                continue;
+            }
+        }
         const auto same_shape = [&](const FeedbackShadow& entry) {
             if (std::ranges::find(used_shadows, entry.id) != used_shadows.end()) {
                 return false;
@@ -1071,6 +1114,9 @@ void TextureCache<P>::ReplaceColorFeedbackViews(std::span<ImageViewInOut> views)
         Image& shadow = slot_images[shadow_id];
         const auto copies = MakeShrinkImageCopies(shadow.info, image.info, SubresourceBase{});
         runtime.CopyImage(shadow, image, copies);
+        if (share_shadows) {
+            shared_shadows.Add(image_id, shadow_id);
+        }
         if (probe) {
             const ImageInfo& probe_info = image.info;
             const ImageViewBase& sampled = slot_image_views[view.id];
@@ -1088,6 +1134,8 @@ void TextureCache<P>::ReplaceColorFeedbackViews(std::span<ImageViewInOut> views)
                 probe_pixels += u64{copy.extent.width} * copy.extent.height * copy.extent.depth *
                                 static_cast<u64>((std::max)(copy.dst_subresource.num_layers, 1));
             }
+            VideoCommon::Nx2Profile::ImageCopies().Add(FeedbackCut::CopyCaller::FeedbackShadow,
+                                                       probe_pixels);
             const double target_width = static_cast<double>(probe_info.size.width);
             const double target_height = static_cast<double>(probe_info.size.height);
             const auto probe_fraction = [&](double width, double height) {
@@ -1144,11 +1192,24 @@ void TextureCache<P>::ReplaceColorFeedbackViews(std::span<ImageViewInOut> views)
                                                 static_cast<double>(viewport.GetHeight())),
             });
         }
-        const auto view_it = std::ranges::find(image.image_view_ids, view.id);
-        const ImageViewInfo view_info =
-            image.image_view_infos[std::distance(image.image_view_ids.begin(), view_it)];
-        view.id = FindOrEmplaceImageView(shadow_id, view_info);
+        use_shadow(view, image_id, shadow_id);
     }
+}
+
+template <class P>
+FeedbackCut::ColorSlots TextureCache<P>::ReadColorSlots() {
+    const auto& regs = maxwell3d->regs;
+    FeedbackCut::ColorSlots slots;
+    slots.count = regs.rt_control.count;
+    slots.common = regs.color_mask_common != 0;
+    for (size_t index = 0; index < FeedbackCut::NumColorSlots; ++index) {
+        const auto& rt = regs.rt[index];
+        slots.bound[index] = rt.format != Tegra::RenderTargetFormat::NONE;
+        slots.address[index] = rt.Address();
+        slots.map[index] = static_cast<u8>(regs.rt_control.Map(index));
+        slots.mask[index] = regs.color_mask[index].raw;
+    }
+    return slots;
 }
 
 template <class P>
@@ -1435,7 +1496,7 @@ bool TextureCache<P>::RescaleRenderTargets() {
 }
 
 template <class P>
-void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
+void TextureCache<P>::UpdateRenderTargets(bool is_clear, bool honor_color_mask) {
     using namespace VideoCommon::Dirty;
     struct ClearingScope {
         bool& flag;
@@ -1444,6 +1505,22 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
         }
     } clearing_scope{clearing_render_targets};
     clearing_render_targets = is_clear;
+    // Attachments whose colour write mask is 0 (Nx2Perf masked_target_unmodified): the draw does
+    // not write them, so it does not flag them as modified. Under verify the flag stays and the
+    // claim is checked against the host's mask instead.
+    u32 unwritten = 0;
+    if (honor_color_mask && !is_clear && Nx2Perf::On(Nx2Perf::Opt::MaskedTargetUnmodified)) {
+        unwritten = FeedbackCut::UnwrittenAttachments(ReadColorSlots());
+        if (Nx2Perf::Verify()) {
+            unwritten_claims[static_cast<size_t>(FeedbackCut::Cut::MaskedUnmodified)] |= unwritten;
+            unwritten = 0;
+        } else if (unwritten != 0 && VideoCommon::Nx2Profile::Enabled()) {
+            for (u32 left = unwritten; left != 0; left &= left - 1) {
+                VideoCommon::Nx2Profile::Feedback().NoteAvoided(
+                    VideoCommon::Nx2Profile::FeedbackProbe::Avoided::Unmodified);
+            }
+        }
+    }
     auto& flags = maxwell3d->dirty.flags;
     if (!flags[Dirty::RenderTargets]) {
         if (rt_active_mask == 0) {
@@ -1451,7 +1528,7 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
         }
         for (u32 mask = rt_active_mask & ((1u << NUM_RT) - 1); mask != 0; mask &= mask - 1) {
             const size_t index = static_cast<size_t>(std::countr_zero(mask));
-            PrepareImage(rt_image_id[index], true,
+            PrepareImage(rt_image_id[index], ((unwritten >> index) & 1u) == 0,
                          is_clear && IsFullClear(render_targets.color_buffer_ids[index]));
         }
         if ((rt_active_mask & (1u << NUM_RT)) != 0) {
@@ -1471,7 +1548,8 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
 
     for (size_t index = 0; index < NUM_RT; ++index) {
         ImageViewId& color_buffer_id = render_targets.color_buffer_ids[index];
-        PrepareImageView(color_buffer_id, true, is_clear && IsFullClear(color_buffer_id));
+        PrepareImageView(color_buffer_id, ((unwritten >> index) & 1u) == 0,
+                         is_clear && IsFullClear(color_buffer_id));
     }
     const ImageViewId depth_buffer_id = render_targets.depth_buffer_id;
 
@@ -4061,7 +4139,8 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             if (aliased == nullptr) {
                 continue;
             }
-            CopyImage(new_image_id, aliased->id, aliased->copies);
+            CopyImage(new_image_id, aliased->id, aliased->copies,
+                      FeedbackCut::CopyCaller::JoinAlias);
             new_image.modification_tick = overlap.modification_tick;
             continue;
         }
@@ -4072,6 +4151,10 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             const u32 up_scale = can_rescale ? resolution.up_scale : 1;
             const u32 down_shift = can_rescale ? resolution.down_shift : 0;
             auto copies = MakeShrinkImageCopies(new_info, overlap.info, base, up_scale, down_shift);
+            if (VideoCommon::Nx2Profile::Enabled()) {
+                VideoCommon::Nx2Profile::ImageCopies().Add(FeedbackCut::CopyCaller::JoinOverlap,
+                                                           FeedbackCut::CopyPixels(copies));
+            }
             if (overlap.info.num_samples != new_image.info.num_samples) {
                 runtime.CopyImageMSAA(new_image, overlap, copies);
             } else {
@@ -4991,7 +5074,7 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
         }
     }
     for (const AliasedImage* const aliased : aliased_images) {
-        CopyImage(image_id, aliased->id, aliased->copies);
+        CopyImage(image_id, aliased->id, aliased->copies, FeedbackCut::CopyCaller::AliasSync);
     }
 }
 
@@ -5085,7 +5168,8 @@ void TextureCache<P>::PrepareImageView(ImageViewId image_view_id, bool is_modifi
 }
 
 template <class P>
-void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<ImageCopy> copies) {
+void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<ImageCopy> copies,
+                                FeedbackCut::CopyCaller caller) {
     Image& dst = slot_images[dst_id];
     Image& src = slot_images[src_id];
     if (True(dst.flags & ImageFlagBits::UnwrittenSparse) ||
@@ -5114,6 +5198,9 @@ void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<Imag
                 copy.extent.height = resolution.ScaleUp(copy.extent.height);
             }
         }
+    }
+    if (VideoCommon::Nx2Profile::Enabled()) {
+        VideoCommon::Nx2Profile::ImageCopies().Add(caller, FeedbackCut::CopyPixels(copies));
     }
     const auto dst_format_type = GetFormatType(dst.info.format);
     const auto src_format_type = GetFormatType(src.info.format);
