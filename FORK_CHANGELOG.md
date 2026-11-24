@@ -25,7 +25,7 @@ Milestone 0.7, "Fast graphics path, preview". The preview switch is off by defau
 - Baseline settings version 5 pins the setting on.
 - Differential tests feed the same command words through the existing decoder and the preview, and compare consumed words, registers, shadow and dirty state, bindings, ordered renderer events and memory seen at the next draw (`[nx2_fast_graphics]`).
 - Session log zips, on by default, for attaching to a bug report. When the windowed build closes normally it writes `eglantine-last-session.zip` in the log folder, holding that session's `eden_log.txt`. When a session ended any other way (a crash, a freeze ended in Task Manager, a kill), the next start writes `eglantine-last-crash.zip` from that session's log and adds `eden_crash.dmp` when the dump was written during that session; a normal close does not replace it. One file each, replaced each time. `EDEN_NX2_SESSION_ZIP=0` turns both off. The existing log files and their retention do not change.
-- With `censor_username` on (the default), the log file now also replaces the profile folder name with `user`, not only the account name. On Windows with a Microsoft account the two differ, and paths under `C:\Users\` showed the folder name.
+- With `censor_username` on (the default), the log file now also replaces the profile folder name with `user`, not only the account name. On Windows with a Microsoft account the two differ, and paths inside the profile folder showed the folder name.
 
 ## 0.6.0 (2026-11-23)
 
