@@ -7,9 +7,11 @@
 #include <array>
 #include <memory>
 #include <random>
+#include <string_view>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "common/settings.h"
 #include "video_core/nx2_diag.h"
 #include "video_core/nx2_perf.h"
 
@@ -48,6 +50,59 @@ TEST_CASE("Nx2Perf opt-in switches stay off until EDEN_NX2_PERF_ON names them", 
         REQUIRE(!IsOff(ParseOffMask(false, opt_names[Index(opt)], ""), Index(opt)));
         REQUIRE(!IsOff(ParseOffMask(true, opt_names[Index(opt)], ""), Index(opt)));
     }
+}
+
+TEST_CASE("Nx2Perf skip_unneeded_target_copies setting gates the three copy cuts", "[nx2_perf]") {
+    REQUIRE(TargetCopyCutsMask() == (Bit(Opt::FeedbackShadowShare) |
+                                     Bit(Opt::FeedbackSkipUnwritten) |
+                                     Bit(Opt::MaskedTargetUnmodified)));
+    for (const bool safe : {false, true}) {
+        for (const std::string_view on : {std::string_view{}, std::string_view{"feedback_skip_unwritten"}}) {
+            const u64 env_mask = ParseOffMask(safe, on, "");
+            // Setting on: the environment decides as it did without the setting.
+            REQUIRE(WithTargetCopySetting(env_mask, true) == env_mask);
+            // Setting off: the three are off whatever the environment says, nothing else changes.
+            const u64 off_mask = WithTargetCopySetting(env_mask, false);
+            REQUIRE((off_mask & TargetCopyCutsMask()) == TargetCopyCutsMask());
+            REQUIRE((off_mask & ~TargetCopyCutsMask()) == (env_mask & ~TargetCopyCutsMask()));
+        }
+    }
+    // On by default, SAFE turns them off, EDEN_NX2_PERF_ON turns one back on under SAFE.
+    REQUIRE((WithTargetCopySetting(ParseOffMask(false, "", ""), true) & TargetCopyCutsMask()) == 0);
+    REQUIRE((WithTargetCopySetting(ParseOffMask(true, "", ""), true) & TargetCopyCutsMask()) ==
+            TargetCopyCutsMask());
+    const u64 safe_on = WithTargetCopySetting(ParseOffMask(true, "feedback_shadow_share", ""), true);
+    REQUIRE(!IsOff(safe_on, Index(Opt::FeedbackShadowShare)));
+    REQUIRE(IsOff(safe_on, Index(Opt::FeedbackSkipUnwritten)));
+    REQUIRE(IsOff(WithTargetCopySetting(ParseOffMask(true, "feedback_shadow_share", ""), false),
+                  Index(Opt::FeedbackShadowShare)));
+}
+
+TEST_CASE("Nx2Perf ApplySettings follows skip_unneeded_target_copies", "[nx2_perf]") {
+    constexpr std::array cuts{Opt::FeedbackShadowShare, Opt::FeedbackSkipUnwritten,
+                              Opt::MaskedTargetUnmodified};
+    auto& setting = Settings::values.skip_unneeded_target_copies;
+    const bool saved = setting.GetValue();
+    setting.SetValue(true);
+    ApplySettings();
+    std::array<bool, cuts.size()> with_setting{};
+    for (size_t i = 0; i < cuts.size(); ++i) {
+        with_setting[i] = On(cuts[i]);
+    }
+    const bool other = On(Opt::Bounds);
+    setting.SetValue(false);
+    ApplySettings();
+    for (const Opt opt : cuts) {
+        REQUIRE(!On(opt));
+    }
+    REQUIRE(On(Opt::Bounds) == other);
+    setting.SetValue(true);
+    ApplySettings();
+    for (size_t i = 0; i < cuts.size(); ++i) {
+        REQUIRE(On(cuts[i]) == with_setting[i]);
+    }
+    setting.SetValue(saved);
+    ApplySettings();
 }
 
 TEST_CASE("diag_draw_lite: folded draws equal the synchronous Touch and Note calls", "[nx2_perf]") {

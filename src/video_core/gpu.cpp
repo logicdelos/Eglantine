@@ -65,6 +65,8 @@ struct GPU::Impl {
         , is_async{is_async_}
     {
         ResolveFastGraphicsPreview();
+        // Before any draw of this session: the copy cut switches follow the setting in effect now.
+        VideoCommon::Nx2Perf::ApplySettings();
     }
 
     ~Impl() = default;

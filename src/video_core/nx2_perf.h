@@ -15,11 +15,13 @@
 #include "common/common_types.h"
 #include "common/logging.h"
 
-// Switches for the NX2 GPU optimizations, all on by default (names in opt_names).
-// EDEN_NX2_PERF_OPT=0 turns every one off; EDEN_NX2_PERF_SAFE=1 turns off the experimental ones
-// (DefaultOffMask); EDEN_NX2_PERF_ON=<name>,... turns named ones back on and
-// EDEN_NX2_PERF_OFF=<name>,... turns named ones off. EDEN_NX2_PERF_VERIFY=1 computes each
-// optimized answer the old way too, logs any difference and uses the old answer.
+// Switches for the NX2 GPU optimizations, all on by default (names in opt_names) except the
+// opt-in ones (OptInMask). EDEN_NX2_PERF_OPT=0 turns every one off; EDEN_NX2_PERF_SAFE=1 turns
+// off the experimental ones (DefaultOffMask); EDEN_NX2_PERF_ON=<name>,... turns named ones back
+// on and EDEN_NX2_PERF_OFF=<name>,... turns named ones off. EDEN_NX2_PERF_VERIFY=1 computes each
+// optimized answer the old way too, logs any difference and uses the old answer. The setting
+// skip_unneeded_target_copies (on by default) additionally gates the three copy cuts
+// (TargetCopyCutsMask): off, they are off whatever the environment says.
 namespace VideoCommon::Nx2Perf {
 
 enum class Opt : unsigned {
@@ -190,7 +192,8 @@ constexpr bool IsOff(u64 mask, size_t index) {
     return ((mask >> index) & 1) != 0;
 }
 
-/// Off under EDEN_NX2_PERF_SAFE unless EDEN_NX2_PERF_ON names them: the experimental switches.
+/// Off under EDEN_NX2_PERF_SAFE unless EDEN_NX2_PERF_ON names them: the experimental switches,
+/// the copy cuts among them.
 inline constexpr u64 DefaultOffMask() {
     u64 mask = 0;
     for (const Opt opt : {Opt::MacroReadCbOverlay, Opt::MacroReadWriterSet, Opt::PreflushAging,
@@ -210,9 +213,21 @@ inline constexpr u64 DefaultOffMask() {
 
 /// Off unless EDEN_NX2_PERF_ON names them: built, not yet proven by a lab run.
 inline constexpr u64 OptInMask() {
-    return Bit(Opt::SemaphoreFenceLean) | Bit(Opt::DescriptorRunReuse) |
-           Bit(Opt::FeedbackShadowShare) | Bit(Opt::FeedbackSkipUnwritten) |
+    return Bit(Opt::SemaphoreFenceLean) | Bit(Opt::DescriptorRunReuse);
+}
+
+/// The three texture cache copy cuts (feedback_shadow_share, feedback_skip_unwritten,
+/// masked_target_unmodified). They are on by default and the setting skip_unneeded_target_copies
+/// turns all three off.
+inline constexpr u64 TargetCopyCutsMask() {
+    return Bit(Opt::FeedbackShadowShare) | Bit(Opt::FeedbackSkipUnwritten) |
            Bit(Opt::MaskedTargetUnmodified);
+}
+
+/// The off-mask with the setting skip_unneeded_target_copies applied: false turns the three copy
+/// cuts off whatever the environment says; true leaves the environment's mask as it is.
+inline constexpr u64 WithTargetCopySetting(u64 mask, bool skip_unneeded_target_copies) {
+    return skip_unneeded_target_copies ? mask : (mask | TargetCopyCutsMask());
 }
 
 /// The off-mask from EDEN_NX2_PERF_SAFE (safe), EDEN_NX2_PERF_ON (on) and EDEN_NX2_PERF_OFF (off).
@@ -277,10 +292,17 @@ inline bool Verify() {
     return verify;
 }
 
-/// Turns one switch off for the rest of the session: a verify mismatch found it unsafe.
+/// Turns one switch off for the rest of the session: a verify mismatch found it unsafe. The next
+/// ApplySettings (the next session's GPU) recomputes the mask and forgets it.
 inline void Disable(Opt opt) {
     static_cast<void>(On(opt)); // publishes the environment's mask first
     detail::live_off_mask.fetch_or(Bit(opt), std::memory_order_relaxed);
 }
+
+/// Recomputes the off-mask from the environment and the setting skip_unneeded_target_copies as
+/// they are now (per-game values included) and publishes it, dropping the switches a verify
+/// mismatch turned off in an earlier session. Called where a session's GPU is created, before
+/// any draw; the hot On() stays one atomic load.
+void ApplySettings();
 
 } // namespace VideoCommon::Nx2Perf

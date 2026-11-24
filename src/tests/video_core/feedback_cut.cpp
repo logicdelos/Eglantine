@@ -243,7 +243,7 @@ TEST_CASE("Nx2Profile feedback probe reports the shadows the cuts avoided", "[fe
     REQUIRE(line.find("flagged modified by a draw with mask 0: 1.0") != std::string::npos);
 }
 
-TEST_CASE("Nx2Perf feedback cuts are opt-in and named", "[feedback_cut]") {
+TEST_CASE("Nx2Perf feedback cuts are named, on by default and off under SAFE", "[feedback_cut]") {
     using namespace VideoCommon::Nx2Perf;
     REQUIRE(opt_names[static_cast<size_t>(Opt::FeedbackShadowShare)] == "feedback_shadow_share");
     REQUIRE(opt_names[static_cast<size_t>(Opt::FeedbackSkipUnwritten)] ==
@@ -253,8 +253,11 @@ TEST_CASE("Nx2Perf feedback cuts are opt-in and named", "[feedback_cut]") {
     for (const Opt opt :
          {Opt::FeedbackShadowShare, Opt::FeedbackSkipUnwritten, Opt::MaskedTargetUnmodified}) {
         const size_t index = static_cast<size_t>(opt);
-        REQUIRE(IsOff(ParseOffMask(false, "", ""), index));
+        REQUIRE((OptInMask() & Bit(opt)) == 0);
+        REQUIRE(IsOff(DefaultOffMask(), index));
+        REQUIRE(!IsOff(ParseOffMask(false, "", ""), index));
         REQUIRE(IsOff(ParseOffMask(true, "", ""), index));
+        REQUIRE(IsOff(ParseOffMask(false, "", opt_names[index]), index));
         REQUIRE(!IsOff(ParseOffMask(false, opt_names[index], ""), index));
         REQUIRE(!IsOff(ParseOffMask(true, opt_names[index], ""), index));
     }

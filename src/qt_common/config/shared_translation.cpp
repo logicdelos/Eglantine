@@ -349,6 +349,11 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "Takes precedence over dynamic FPS."));
     INSERT(Settings, barrier_feedback_loops, tr("Barrier feedback loops"),
            tr("Improves rendering of transparency effects in specific games."));
+    INSERT(Settings, skip_unneeded_target_copies, tr("Skip unneeded render target copies"),
+           tr("Stops the emulator from copying an image the game is drawing to when the copy "
+              "cannot change the result.\nLowers graphics card load, most in games that draw "
+              "many shadow or depth-only passes.\nTurn off only if a game shows wrong shadows, "
+              "reflections or decals with it on.\nTakes effect the next time the game starts."));
     INSERT(Settings, enable_buffer_history, tr("Enable buffer history"),
            tr("Enables access to previous buffer states.\nThis option may improve rendering "
               "quality and performance consistency in some games."));

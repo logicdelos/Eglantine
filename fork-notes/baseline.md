@@ -44,10 +44,10 @@ Four defaults depend on the platform: `cpu_backend`, `cpuopt_unsafe_host_mmu`, `
 
 The baseline has a version number and a hash (SHA-256 of the sorted `key=value` lines). The hash changes whenever a baseline default changes, a baseline setting is added or removed, or the platform changes one of the four platform-dependent defaults. Raise the version and add a history line below whenever the list changes; the test fails until the pinned list and the pinned hash match.
 
-| Platform | Version 3 hash (128 entries) |
+| Platform | Version 4 hash (129 entries) |
 |---|---|
-| Windows x86-64 | `933b129fc1a0380368efdeec19a29e93ea28eff2f06aad4278bed65179153acf` |
-| Linux x86-64 | `248177c936ee884e85f7380c93a72a180fe63436b0e894c0381d79c1d87bb9a7` |
+| Windows x86-64 | `6f63aa6d5735a851f665382c1b34f8eb10d23a96f455cd0b6f5264bc5ecf0707` |
+| Linux x86-64 | `dbfecdb8b89b143a2b2f661a74be1a6778a6af85d2f908a66c6d64950e065ecb` |
 
 ## History
 
@@ -56,6 +56,7 @@ The baseline has a version number and a hash (SHA-256 of the sorted `key=value` 
 | 1 | Console mode Docked, anti-aliasing SMAA and scaling filter BUF become the defaults on desktop builds (before: handheld, FXAA and ScaleForce, which Android keeps). These are the settings the games in the README table were run on in releases 0.1 to 0.3. Config files that kept the old defaults follow the new ones; a value you chose yourself is kept. The debug settings that change a run (`debug_knobs`, `disable_macro_hle`, `disable_macro_jit`, `disable_web_applet`, `enable_all_controllers`, `perform_vulkan_check`, `quest_flag`, `use_auto_stub`, `use_dev_keys`) and `allow_speed_up` (off) are part of the list. Version 1 was never released, so these entries were added to it instead of raising the version. |
 | 2 | Adds `free_unused_pipelines` (off): every graphics pipeline built in a session stays in memory. Before, every pipeline unused for 150 s was destroyed and built again when the game came back to it; on, the setting destroys the least recently used ones only above 2048 (1024 while the host is low on memory). |
 | 3 | Adds `nx2_fast_graphics_preview` (off): a preview of a faster command stream decoder for graphics uniform buffer binds. Off, the decoder is the one every earlier release ran. On, a bind written as the three words from `const_buffer.size` and a `bind_groups[stage].raw_config` write is applied in one step; anything else, or any bind the step cannot prove identical, takes the old path (it is taken only on the Vulkan renderer and an NX2 Ampere channel). The effective value is taken once when the GPU starts, so changing the setting during a run has no effect. `EDEN_NX2_FAST_GRAPHICS_PREVIEW=0\|1` overrides the setting for that run without changing the saved setting (any other value counts as off, source "invalid", with a warning) and is an ordinary `EDEN_NX2_*` switch, so `--baseline` refuses it unless declared. The run log has one line with the effective value and its source (default, setting, environment, invalid), the control status reply carries the same, and one line at shutdown with the counts of accepted binds and rejected attempts by reason (packets, not NVN calls). |
+| 4 | Adds `skip_unneeded_target_copies` (on; Graphics > Advanced, per game allowed): the texture cache's three colour target copy cuts (`feedback_shadow_share`, `feedback_skip_unwritten`, `masked_target_unmodified`) now run by default, where before they ran only with `EDEN_NX2_PERF_ON` naming them. A draw that cannot write to a colour target no longer copies it before sampling it, and one draw makes at most one copy of the same target. Off, all three are off whatever the environment says and every draw copies as before. The value in effect is read when a game's GPU is created, so a change applies from the next start of the game. |
 
 ## Command line (`eden-cli`)
 

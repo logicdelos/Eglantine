@@ -14,12 +14,13 @@ All runs were made on one Windows 11 laptop: AMD Ryzen 9 8940HX, NVIDIA GeForce 
 
 ## 0.7.0 (unreleased)
 
-Milestone 0.7, "Fast graphics path, preview". Opt-in only; nothing changes with the switch off.
+Milestone 0.7, "Fast graphics path, preview". Opt-in only (the render target copy cuts below are the exception); nothing changes with the switch off.
 
 ### New
 
 - Fast graphics preview, off by default: `nx2_fast_graphics_preview` (renderer setting; `EDEN_NX2_FAST_GRAPHICS_PREVIEW=0|1` overrides it for one run without changing the saved setting). With it on, Switch 2 games on Vulkan take uniform-buffer binds (a three-word buffer description followed by its bind, on the same subchannel) through a shorter path in the GPU command decoder, with the same effects as the existing path. Anything else, and any bind the shortcut cannot prove safe (other packet shapes, split ranges, an invalid or disabled slot, a pending semaphore wait, GPU split, replay or tracing, other renderers, Switch 1 channels), goes through the existing path and is counted by reason. The effective value and its source are logged at start and reported by the control `status` command; totals are logged at shutdown as `fast graphics preview: accepted N, rejected {...}`.
 - Baseline settings version 3 pins the preview off.
+- Render target copy cuts, on by default: new setting `skip_unneeded_target_copies` (Graphics > Advanced, per game allowed, default on). A draw that cannot write to a colour target no longer copies it before sampling it, and one draw makes at most one copy of the same target. Lab run on Splatoon Raiders: host image copies 626 -> 8 per frame, graphics card time 9.7 -> 4.0 ms per frame; Fire Emblem, Xenoblade 2 and Bananza ran clean, and verify mode (`EDEN_NX2_PERF_VERIFY=1`) found no mismatch. Turn it off if a game shows wrong shadows, ink or decals; the value in effect is read when a game starts. The switches behind it (`feedback_shadow_share`, `feedback_skip_unwritten`, `masked_target_unmodified`) were opt-in through `EDEN_NX2_PERF_ON` and are now on unless the setting is off, `EDEN_NX2_PERF_OFF` names them, or `EDEN_NX2_PERF_SAFE` is set. Baseline settings version 4 pins the setting on.
 - Differential tests feed the same command words through the existing decoder and the preview, and compare consumed words, registers, shadow and dirty state, bindings, ordered renderer events and memory seen at the next draw (`[nx2_fast_graphics]`).
 
 ## 0.6.0 (2026-11-23)

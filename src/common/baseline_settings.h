@@ -25,7 +25,7 @@ struct Values;
 /// src/tests/common/baseline_settings.cpp pins the list for the current version.
 namespace Baseline {
 
-inline constexpr u32 kBaselineVersion = 3;
+inline constexpr u32 kBaselineVersion = 4;
 
 /// Settings that sit in a baseline category but belong to the user or to the running session, not
 /// to the emulation: the selected profile, the console's device name and the volume controls.

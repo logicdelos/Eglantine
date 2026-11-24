@@ -715,6 +715,14 @@ struct Values {
     SwitchableSetting<bool> barrier_feedback_loops{linkage, true, "barrier_feedback_loops",
                                                    Category::RendererAdvanced};
 
+    // On (default): the texture cache's three colour target copy cuts run (Nx2Perf
+    // feedback_shadow_share, feedback_skip_unwritten, masked_target_unmodified). Off: all three
+    // are off and every draw copies as before. Read when a game's GPU is created
+    // (Nx2Perf::ApplySettings), so a per-game value applies from the next start of that game.
+    SwitchableSetting<bool> skip_unneeded_target_copies{linkage, true,
+                                                        "skip_unneeded_target_copies",
+                                                        Category::RendererAdvanced};
+
     SwitchableSetting<bool> enable_buffer_history{linkage,
                                                   false,
                                                   "enable_buffer_history",
